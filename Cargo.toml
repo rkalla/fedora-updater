@@ -1,0 +1,33 @@
+[package]
+name = "fedora-updater"
+version = "0.2.0"
+edition = "2021"
+description = "A polished GNOME desktop front-end for Fedora system, Flatpak, and firmware updates"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["fedora", "dnf", "flatpak", "fwupd", "gtk4", "libadwaita"]
+categories = ["gui"]
+
+[lib]
+name = "fedora_updater"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fedora-updater"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { version = "0.10", package = "gtk4", features = ["v4_14"] }
+libadwaita = { version = "0.8", features = ["v1_7"] }
+glib = "0.21"
+async-channel = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

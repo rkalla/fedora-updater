@@ -1,0 +1,1407 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fedora Updater — Design boards</title>
+  <link rel="stylesheet" href="boards.css" />
+</head>
+<body>
+  <svg xmlns="http://www.w3.org/2000/svg" hidden>
+    <symbol id="i-close" viewBox="0 0 16 16">
+      <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+    </symbol>
+    <symbol id="i-max" viewBox="0 0 16 16">
+      <rect x="3.5" y="3.5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/>
+    </symbol>
+    <symbol id="i-update" viewBox="0 0 24 24">
+      <path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      <path d="M20 7v5h-5M4 17v-5h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="i-ok" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      <path d="M7.5 12.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24">
+      <rect x="6" y="11" width="12" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      <path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+    </symbol>
+    <symbol id="i-error" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      <path d="M12 8v5.2M12 16.4v.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+    </symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24">
+      <path d="M12 3.8L21 20.2H3L12 3.8z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+      <path d="M12 10v4.4M12 16.8v.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+    </symbol>
+  </svg>
+
+  <header class="studio-header">
+    <div class="studio-header-inner">
+      <p class="studio-kicker">Fedora Updater · GNOME 48 / libadwaita</p>
+      <h1>Update flow · design boards</h1>
+      <p class="studio-lead">
+        Current shipping screens next to proposed variants. One suggested action per view,
+        no in-app password, DNF / FP / FW badges kept, apply order unchanged.
+        Frames use Adwaita tokens and GNOME window chrome.
+      </p>
+      <div class="studio-toolbar">
+        <nav class="studio-nav" id="studio-nav">
+          <a href="#flow" class="active">Flow</a>
+          <a href="#idle">Idle</a>
+          <a href="#auth">Auth</a>
+          <a href="#checking">Checking</a>
+          <a href="#ready">Ready</a>
+          <a href="#running">Running</a>
+          <a href="#done">Done</a>
+          <a href="#failed">Failed</a>
+        </nav>
+        <div class="studio-controls">
+          <button type="button" id="theme-toggle" aria-pressed="false">Light</button>
+          <button type="button" id="notes-toggle" aria-pressed="false">Notes on</button>
+          <a class="studio-link" href="index.html">Phase 1 walkthrough</a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="studio-main">
+
+    <!-- ========== FLOW ========== -->
+    <section class="board" id="flow">
+      <div class="board-intro">
+        <h2>Recommended path</h2>
+        <p>
+          Check → review → Update All → finish, plus the Failed branch the Phase 1 mockups omitted.
+          These frames are the recommended variant of each screen, not the shipping UI.
+        </p>
+      </div>
+      <div class="board-row flow">
+
+        <article class="frame">
+          <p class="frame-label">1 · Idle</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon"><svg><use href="#i-update"/></svg></div>
+                  <h3 class="title-2">Check for updates</h3>
+                  <p class="desc">System, apps, and firmware. One password prompt for this session</p>
+                  <div class="status-child">
+                    <button class="btn suggested pill large">Check for Updates</button>
+                  </div>
+                </div>
+                <div class="status-footer"><span class="status-dot"></span>Last checked never</div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">First launch. Honest title. Suggested action only while there is something to do.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">2 · Authenticating</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon lock"><svg><use href="#i-lock"/></svg></div>
+                  <h3 class="title-2">Authentication required</h3>
+                  <p class="desc">A system dialog will ask for your password once so this app can check and apply updates</p>
+                  <div class="status-child">
+                    <div class="chip src-dnf" style="display:inline-flex;align-items:center;gap:8px">
+                      <span class="spinner sm"></span> Waiting for polkit
+                    </div>
+                    <button class="btn flat">Cancel</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Wait or cancel. No password field. Skipped when the helper session is already alive.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">3 · Checking</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">Checking for updates</h3>
+                      <p class="caption dim" style="margin:4px 0 0">About 30 seconds left · 2 of 3 sources</p>
+                    </div>
+                  </header>
+                  <div class="progress-block">
+                    <div class="progress"><span style="width:62%"></span></div>
+                    <div class="progress-meta"><span>System done · Apps in progress</span><span>62%</span></div>
+                  </div>
+                  <p class="list-label">Found so far</p>
+                  <div class="boxed-list">
+                    <div class="pkg-row">
+                      <span class="badge src-dnf">DNF</span>
+                      <div><div class="pkg-name">openssl</div><div class="pkg-meta mono">1:3.2.2-3.fc42 · System</div></div>
+                    </div>
+                    <div class="pkg-row">
+                      <span class="badge src-dnf">DNF</span>
+                      <div><div class="pkg-name">kernel</div><div class="pkg-meta mono">6.14.11-300.fc42 · System</div></div>
+                    </div>
+                    <div class="pkg-row">
+                      <span class="badge src-flatpak">FP</span>
+                      <div><div class="pkg-name">Thunderbird</div><div class="pkg-meta mono">org.mozilla.Thunderbird · Apps</div></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="console-bar">
+                  <button class="console-toggle" type="button">
+                    <span class="chevron">▸</span>
+                    <span class="console-preview mono">Looking for updates…</span>
+                    <span class="console-badge">live</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Determinate bar, remaining-work text, incoming packages, toggleable console.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">4 · Ready</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">12 updates available</h3>
+                      <p class="caption dim" style="margin:4px 0 0">8 system · 3 apps · 1 firmware</p>
+                    </div>
+                    <div class="header-actions">
+                      <button class="btn flat">Refresh</button>
+                      <button class="btn suggested">Update All</button>
+                    </div>
+                  </header>
+                  <div class="chips">
+                    <span class="chip src-dnf">8 system</span>
+                    <span class="chip src-flatpak">3 apps</span>
+                    <span class="chip src-firmware">1 firmware</span>
+                    <span class="chip security">3 security</span>
+                    <span class="chip bugfix">7 bugfix</span>
+                    <span class="chip enhance">2 enhancement</span>
+                  </div>
+                  <div class="boxed-scroll">
+                    <div class="boxed-list">
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">openssl <span class="sev-dot security"></span></div><div class="pkg-meta mono">1:3.2.2-1 → 1:3.2.2-3 · System</div></div>
+                        <span class="pkg-size">2.1 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">kernel <span class="sev-dot security"></span></div><div class="pkg-meta mono">6.14.9 → 6.14.11 · System</div></div>
+                        <span class="pkg-size">98 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-flatpak">FP</span>
+                        <div><div class="pkg-name">Thunderbird <span class="sev-dot bugfix"></span></div><div class="pkg-meta mono">128.0 → 128.2 · Apps</div></div>
+                        <span class="pkg-size">94 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-firmware">FW</span>
+                        <div><div class="pkg-name">UEFI dbx <span class="sev-dot bugfix"></span></div><div class="pkg-meta mono">20241101 · Firmware</div></div>
+                        <span class="pkg-size">18 KB</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Source chips stay. Severity chips join them. Still one Update All.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">5 · Running</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">Updating</h3>
+                      <p class="caption dim" style="margin:4px 0 0">About 3 minutes left · System · 5 of 12 remaining</p>
+                    </div>
+                  </header>
+                  <div class="progress-block">
+                    <div class="progress"><span style="width:58%"></span></div>
+                    <div class="progress-meta"><span>7 completed</span><span>58%</span></div>
+                  </div>
+                  <div class="completed">
+                    <button type="button"><span class="check-badge">✓</span><span><strong>7 completed</strong> · openssl, kernel, firefox…</span></button>
+                  </div>
+                  <div class="boxed-list">
+                    <div class="pkg-row active">
+                      <span class="badge src-dnf">DNF</span>
+                      <div>
+                        <div class="pkg-name">gnome-shell <span class="phase-tag">installing</span></div>
+                        <div class="pkg-meta mono">48.1 → 48.2 · 8.7 MB</div>
+                        <div class="row-progress"><div class="row-fill" style="width:72%"></div></div>
+                      </div>
+                      <span class="pkg-size">72%</span>
+                    </div>
+                    <div class="pkg-row pending">
+                      <span class="badge src-flatpak">FP</span>
+                      <div><div class="pkg-name">Thunderbird</div><div class="pkg-meta mono">queued · Apps</div></div>
+                      <span class="pkg-size">queued</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="console-bar">
+                  <button class="console-toggle" type="button">
+                    <span class="chevron">▸</span>
+                    <span class="console-preview mono">[3/5] Installing gnome-shell-48.2-1.fc42.x86_64</span>
+                    <span class="console-badge">console</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Full-width determinate bar, remaining time, structured completed / active rows.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">6 · Done</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon ok"><svg><use href="#i-ok"/></svg></div>
+                  <h3 class="title-2">All updates applied</h3>
+                  <p class="desc">12 upgraded · 8 system / 3 apps / 1 firmware · 6m&nbsp;42s</p>
+                  <div class="status-child">
+                    <div class="reboot-card">
+                      <div>
+                        <strong>Restart recommended</strong>
+                        <p>A kernel or firmware update needs a restart to finish</p>
+                      </div>
+                      <button class="btn suggested">Restart Now</button>
+                    </div>
+                    <div class="actions-row">
+                      <button class="btn flat">View full log</button>
+                      <button class="btn pill">Done</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Success title only when failed is 0. Restart Now is the single suggested action.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Failed</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon err"><svg><use href="#i-error"/></svg></div>
+                  <h3 class="title-2">All updates failed</h3>
+                  <p class="desc">dnf update -y exited 1 · nothing was applied</p>
+                  <div class="status-child">
+                    <button class="btn suggested pill">Retry</button>
+                    <div class="actions-row">
+                      <button class="btn flat">View log</button>
+                      <button class="btn pill">Back</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">StatusPage + suggested Retry. Back stays secondary. Log is selectable via View log.</p>
+        </article>
+      </div>
+      <p class="flow-note">
+        Auth is skipped after the first successful pkexec for the rest of the window lifetime.
+        Idle after an empty check uses the up-to-date frame on the Idle board — no suggested action.
+        Done with failed &gt; 0 uses the mixed-outcome frame on the Done board, not this success frame.
+      </p>
+    </section>
+
+    <!-- ========== IDLE ========== -->
+    <section class="board" id="idle" hidden>
+      <div class="board-intro">
+        <h2>Idle</h2>
+        <p>
+          Shipping title never changes. After an empty check the subtitle becomes
+          “No updates available” while the heading still says “System is up to date… maybe”.
+          Proposed: live title, and hide the suggested action when the machine is current.
+        </p>
+      </div>
+      <div class="board-row cols-3">
+
+        <article class="frame">
+          <p class="frame-label">Current</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon"><svg><use href="#i-update"/></svg></div>
+                  <h3 class="title-2">System is up to date… maybe</h3>
+                  <div class="status-child">
+                    <p class="desc">Check for system, Flatpak, and firmware updates.</p>
+                    <button class="btn suggested pill large">Check for Updates</button>
+                    <p class="hint">One polkit prompt per app run · dnf · flatpak · fwupd · no packages changed yet</p>
+                  </div>
+                </div>
+                <div class="status-footer"><span class="status-dot"></span>Ready · last checked never</div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Shipping StatusPage. Title is frozen for first launch, empty check, and post-apply.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed · first launch</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon"><svg><use href="#i-update"/></svg></div>
+                  <h3 class="title-2">Check for updates</h3>
+                  <div class="status-child">
+                    <p class="desc">System, apps, and firmware. One password prompt for this session</p>
+                    <button class="btn suggested pill large">Check for Updates</button>
+                    <p class="hint">dnf · flatpak · fwupd · nothing changes until you review</p>
+                  </div>
+                </div>
+                <div class="status-footer"><span class="status-dot"></span>Last checked never</div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Title matches the job. Suggested pill stays — there is something to do.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed · up to date</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon ok"><svg><use href="#i-ok"/></svg></div>
+                  <h3 class="title-2">System is up to date</h3>
+                  <div class="status-child">
+                    <p class="desc">Last checked today at 9:41</p>
+                    <button class="btn flat">Check Again</button>
+                  </div>
+                </div>
+                <div class="status-footer"><span class="status-dot"></span>Ready · last checked 9:41</div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">No suggested action — same rule as macOS Software Update when the machine is current.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ========== AUTH ========== -->
+    <section class="board" id="auth" hidden>
+      <div class="board-intro">
+        <h2>Authenticating</h2>
+        <p>
+          In-app UI only waits. Polkit owns the password dialog. The shipping page has no Cancel.
+          This view is skipped entirely when <code>can_skip_auth_ui()</code> is true.
+        </p>
+      </div>
+      <div class="board-row cols-2">
+
+        <article class="frame">
+          <p class="frame-label">Current</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="auth-col">
+                  <div class="spinner"></div>
+                  <h3 class="title-3">Authentication required</h3>
+                  <p class="body dim desc">A system dialog will ask for your password once so this app can check and apply updates through a privileged helper.</p>
+                  <p class="accent">Waiting for polkit…</p>
+                  <p class="hint">Credentials are never handled by this app. Elevation uses pkexec + a command allowlist helper.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Spinner + copy. Wait-only. Close the window is the only way out.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon lock"><svg><use href="#i-lock"/></svg></div>
+                  <h3 class="title-2">Authentication required</h3>
+                  <p class="desc">A system dialog will ask for your password once for this app session so it can check for updates via a privileged helper</p>
+                  <div class="status-child">
+                    <p class="accent" style="display:inline-flex;align-items:center;gap:8px;margin:0">
+                      <span class="spinner sm"></span> Waiting for polkit
+                    </p>
+                    <p class="hint">No password is collected here. Later Check and Update All reuse this session</p>
+                    <button class="btn flat">Cancel</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">StatusPage + Cancel. Still no password field. Cancel returns to Idle without starting a check.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ========== CHECKING ========== -->
+    <section class="board" id="checking" hidden>
+      <div class="board-intro">
+        <h2>Checking</h2>
+        <p>
+          HIG: spinners are for waits past about 3 seconds, not the long-task default.
+          Sequential sources are three known units of work, so a determinate bar is honest.
+          <code>packages_so_far</code> is already in state and unused.
+        </p>
+      </div>
+      <div class="board-row cols-3">
+
+        <article class="frame">
+          <p class="frame-label">Current</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="spinner"></div>
+                  <h3 class="title-3">Checking for updates</h3>
+                  <p class="desc">System · Flatpak · Firmware (sequential)</p>
+                </div>
+                <div class="console-bar">
+                  <div class="console-toggle" style="cursor:default">
+                    <span class="chevron">▸</span>
+                    <span class="console-preview mono">Updating and loading repositories:</span>
+                    <span class="console-badge">live</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Long-lived spinner. Console is one non-toggleable line. Incoming packages never listed.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed A · meta progress</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">Checking for updates</h3>
+                      <p class="caption dim" style="margin:4px 0 0">About 30 seconds left · 2 of 3 sources</p>
+                    </div>
+                  </header>
+                  <div class="progress-block">
+                    <div class="progress"><span style="width:62%"></span></div>
+                    <div class="progress-meta"><span>System done · Apps in progress · Firmware queued</span><span>62%</span></div>
+                  </div>
+                  <p class="list-label">Found so far</p>
+                  <div class="boxed-scroll">
+                    <div class="boxed-list">
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">openssl</div><div class="pkg-meta mono">1:3.2.2-3.fc42 · System</div></div>
+                        <span class="pkg-size">2.1 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">kernel</div><div class="pkg-meta mono">6.14.11-300.fc42 · System</div></div>
+                        <span class="pkg-size">98 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">firefox</div><div class="pkg-meta mono">140.0-1.fc42 · System</div></div>
+                        <span class="pkg-size">112 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-flatpak">FP</span>
+                        <div><div class="pkg-name">Thunderbird</div><div class="pkg-meta mono">org.mozilla.Thunderbird · Apps</div></div>
+                        <span class="pkg-size">94 MB</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="console-bar">
+                  <button class="console-toggle" type="button">
+                    <span class="chevron">▸</span>
+                    <span class="console-preview mono">Looking for updates…</span>
+                    <span class="console-badge">live</span>
+                  </button>
+                  <pre class="console-body mono">Updating and loading repositories:
+Repositories loaded.
+Looking for updates…
+org.mozilla.Thunderbird	flathub	128.2.0</pre>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Recommended. Determinate bar + remaining-work text + live list + Revealer console.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed B · source stepper</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">Checking for updates</h3>
+                      <p class="caption dim" style="margin:4px 0 0">Scanning apps</p>
+                    </div>
+                  </header>
+                  <div class="stepper">
+                    <div class="step done"><span class="step-mark">✓</span> System</div>
+                    <div class="step active"><span class="step-mark">●</span> Apps</div>
+                    <div class="step todo"><span class="step-mark">○</span> Firmware</div>
+                  </div>
+                  <div class="progress-block">
+                    <div class="progress"><span style="width:62%"></span></div>
+                    <div class="progress-meta"><span>About 30 seconds left</span><span>2 of 3</span></div>
+                  </div>
+                  <p class="list-label">Found so far</p>
+                  <div class="boxed-list">
+                    <div class="pkg-row">
+                      <span class="badge src-dnf">DNF</span>
+                      <div><div class="pkg-name">8 system updates</div><div class="pkg-meta">openssl, kernel, firefox…</div></div>
+                    </div>
+                    <div class="pkg-row">
+                      <span class="badge src-flatpak">FP</span>
+                      <div><div class="pkg-name">Thunderbird</div><div class="pkg-meta mono">just found</div></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="console-bar">
+                  <button class="console-toggle" type="button">
+                    <span class="chevron">▸</span>
+                    <span class="console-preview mono">flatpak remote-ls --user --updates</span>
+                    <span class="console-badge">live</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Same data, louder source state. Use if sequential backends need to be obvious.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ========== READY ========== -->
+    <section class="board" id="ready" hidden>
+      <div class="board-intro">
+        <h2>Ready</h2>
+        <p>
+          Keep Refresh (flat) and one suggested Update All. Keep DNF / FP / FW badges.
+          AdvisoryKind already exists; shipping chips only count UpdateSource.
+        </p>
+      </div>
+      <div class="board-row cols-3">
+
+        <article class="frame">
+          <p class="frame-label">Current</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">12 updates available</h3>
+                      <p class="caption dim" style="margin:4px 0 0">8 system · 3 apps · 1 firmware</p>
+                    </div>
+                    <div class="header-actions">
+                      <button class="btn flat">Refresh</button>
+                      <button class="btn suggested">Update All</button>
+                    </div>
+                  </header>
+                  <div class="chips">
+                    <span class="chip src-dnf">8 system</span>
+                    <span class="chip src-flatpak">3 apps</span>
+                    <span class="chip src-firmware">1 firmware</span>
+                  </div>
+                  <div class="boxed-scroll">
+                    <div class="boxed-list">
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">openssl</div><div class="pkg-meta mono">1:3.2.2-1.fc42 → 1:3.2.2-3.fc42 · System</div></div>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">kernel</div><div class="pkg-meta mono">6.14.9-300.fc42 → 6.14.11-300.fc42 · System</div></div>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">firefox</div><div class="pkg-meta mono">139.0-1.fc42 → 140.0-1.fc42 · System</div></div>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">mesa-dri-drivers</div><div class="pkg-meta mono">25.0.5-1.fc42 → 25.0.7-1.fc42 · System</div></div>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-flatpak">FP</span>
+                        <div><div class="pkg-name">Thunderbird</div><div class="pkg-meta mono">128.0.1 → 128.2.0 · Apps</div></div>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-firmware">FW</span>
+                        <div><div class="pkg-name">UEFI dbx</div><div class="pkg-meta mono">20241101 · Firmware</div></div>
+                      </div>
+                    </div>
+                  </div>
+                  <p class="caption dim" style="margin:8px 2px 4px">Parsed from dnf · flatpak · fwupdmgr · nothing applied yet</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Source chips and source badges only. Security / bugfix / enhancement unused.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed A · severity chips</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">12 updates available</h3>
+                      <p class="caption dim" style="margin:4px 0 0">8 system · 3 apps · 1 firmware</p>
+                    </div>
+                    <div class="header-actions">
+                      <button class="btn flat">Refresh</button>
+                      <button class="btn suggested">Update All</button>
+                    </div>
+                  </header>
+                  <div class="chips">
+                    <span class="chip src-dnf">8 system</span>
+                    <span class="chip src-flatpak">3 apps</span>
+                    <span class="chip src-firmware">1 firmware</span>
+                    <span class="chip security">3 security</span>
+                    <span class="chip bugfix">7 bugfix</span>
+                    <span class="chip enhance">2 enhancement</span>
+                  </div>
+                  <div class="boxed-scroll">
+                    <div class="boxed-list">
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">openssl <span class="sev-dot security" title="Security"></span></div><div class="pkg-meta mono">1:3.2.2-1.fc42 → 1:3.2.2-3.fc42 · System</div></div>
+                        <span class="pkg-size">2.1 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">kernel <span class="sev-dot security"></span></div><div class="pkg-meta mono">6.14.9-300.fc42 → 6.14.11-300.fc42 · System</div></div>
+                        <span class="pkg-size">98 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">firefox <span class="sev-dot security"></span></div><div class="pkg-meta mono">139.0-1.fc42 → 140.0-1.fc42 · System</div></div>
+                        <span class="pkg-size">112 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">mesa-dri-drivers <span class="sev-dot bugfix"></span></div><div class="pkg-meta mono">25.0.5-1.fc42 → 25.0.7-1.fc42 · System</div></div>
+                        <span class="pkg-size">18 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-flatpak">FP</span>
+                        <div><div class="pkg-name">Thunderbird <span class="sev-dot bugfix"></span></div><div class="pkg-meta mono">128.0.1 → 128.2.0 · Apps</div></div>
+                        <span class="pkg-size">94 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-firmware">FW</span>
+                        <div><div class="pkg-name">UEFI dbx <span class="sev-dot bugfix"></span></div><div class="pkg-meta mono">20241101 · Firmware</div></div>
+                        <span class="pkg-size">18 KB</span>
+                      </div>
+                    </div>
+                  </div>
+                  <p class="caption dim" style="margin:8px 2px 4px">Parsed from dnf · flatpak · fwupdmgr · nothing applied yet</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Recommended. Smallest delta: add severity chips and a row dot. Badges stay DNF / FP / FW.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed B · grouped sources</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">12 updates available</h3>
+                      <p class="caption dim" style="margin:4px 0 0">8 system · 3 apps · 1 firmware</p>
+                    </div>
+                    <div class="header-actions">
+                      <button class="btn flat">Refresh</button>
+                      <button class="btn suggested">Update All</button>
+                    </div>
+                  </header>
+                  <div class="chips">
+                    <span class="chip security">3 security</span>
+                    <span class="chip bugfix">7 bugfix</span>
+                    <span class="chip enhance">2 enhancement</span>
+                  </div>
+                  <div class="boxed-scroll">
+                    <div class="boxed-list" style="margin-bottom:10px">
+                      <div class="group-head">System</div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">openssl <span class="sev-dot security"></span></div><div class="pkg-meta mono">1:3.2.2-1 → 1:3.2.2-3</div></div>
+                        <span class="pkg-size">2.1 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">kernel <span class="sev-dot security"></span></div><div class="pkg-meta mono">6.14.9 → 6.14.11</div></div>
+                        <span class="pkg-size">98 MB</span>
+                      </div>
+                      <div class="pkg-row">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">+ 6 more</div><div class="pkg-meta">firefox, mesa, systemd…</div></div>
+                      </div>
+                    </div>
+                    <div class="boxed-list" style="margin-bottom:10px">
+                      <div class="group-head">Apps</div>
+                      <div class="pkg-row">
+                        <span class="badge src-flatpak">FP</span>
+                        <div><div class="pkg-name">Thunderbird <span class="sev-dot bugfix"></span></div><div class="pkg-meta mono">128.0.1 → 128.2.0</div></div>
+                        <span class="pkg-size">94 MB</span>
+                      </div>
+                    </div>
+                    <div class="boxed-list">
+                      <div class="group-head">Firmware</div>
+                      <div class="pkg-row">
+                        <span class="badge src-firmware">FW</span>
+                        <div><div class="pkg-name">UEFI dbx <span class="sev-dot bugfix"></span></div><div class="pkg-meta mono">20241101</div></div>
+                        <span class="pkg-size">18 KB</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Same actions. Groups make apply order visible. Heavier than A — only if source scanning is the story.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ========== RUNNING ========== -->
+    <section class="board" id="running" hidden>
+      <div class="board-intro">
+        <h2>Running</h2>
+        <p>
+          HIG wants an inline determinate bar plus remaining-time or unit text for work over about 30 seconds.
+          Shipping already has a header ProgressBar and a collapsed completed revealer of caption labels.
+        </p>
+      </div>
+      <div class="board-row cols-3">
+
+        <article class="frame">
+          <p class="frame-label">Current</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">Updating</h3>
+                      <p class="caption dim" style="margin:4px 0 0">Installing · System · 5 of 12 remaining (7 done)</p>
+                    </div>
+                    <div class="header-actions">
+                      <div style="width:88px;text-align:center">
+                        <div class="progress header-bar"><span style="width:58%"></span></div>
+                        <div class="caption dim" style="margin-top:4px">58%</div>
+                      </div>
+                    </div>
+                  </header>
+                  <div class="completed">
+                    <button type="button">7 completed</button>
+                    <div class="completed-list">
+                      <div class="done-row">✓  [DNF] openssl  1:3.2.2-3.fc42</div>
+                      <div class="done-row">✓  [DNF] kernel  6.14.11-300.fc42</div>
+                    </div>
+                  </div>
+                  <div class="boxed-scroll">
+                    <div class="boxed-list">
+                      <div class="pkg-row active">
+                        <span class="badge src-dnf">DNF</span>
+                        <div>
+                          <div class="pkg-name">gnome-shell <span class="phase-tag">installing</span></div>
+                          <div class="pkg-meta mono">48.1-1.fc42 → 48.2-1.fc42 · System</div>
+                          <div class="row-progress"><div class="row-fill" style="width:72%"></div></div>
+                        </div>
+                        <span class="pkg-size">72%</span>
+                      </div>
+                      <div class="pkg-row pending">
+                        <span class="badge src-dnf">DNF</span>
+                        <div><div class="pkg-name">nautilus</div><div class="pkg-meta mono">48.1 → 48.2 · System</div></div>
+                        <span class="pkg-size">queued</span>
+                      </div>
+                      <div class="pkg-row pending">
+                        <span class="badge src-flatpak">FP</span>
+                        <div><div class="pkg-name">Thunderbird</div><div class="pkg-meta mono">128.2.0 · Apps</div></div>
+                        <span class="pkg-size">queued</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="console-bar">
+                  <button class="console-toggle" type="button">
+                    <span class="chevron">▸</span>
+                    <span class="console-preview mono">[3/5] Installing gnome-shell-48.2-1.fc42.x86_64</span>
+                    <span class="console-badge">console</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Narrow header bar, percent only, completed is a flat label list. Console already works.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed A · remaining time</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">Updating</h3>
+                      <p class="caption dim" style="margin:4px 0 0">About 3 minutes left · System · 5 of 12 remaining</p>
+                    </div>
+                  </header>
+                  <div class="progress-block">
+                    <div class="progress"><span style="width:58%"></span></div>
+                    <div class="progress-meta"><span>Installing gnome-shell</span><span>58%</span></div>
+                  </div>
+                  <div class="completed">
+                    <button type="button"><span class="check-badge">✓</span><span><strong>7 completed</strong> · openssl, kernel, firefox, mesa-dri-drivers…</span></button>
+                    <div class="completed-list">
+                      <div class="done-row"><span class="check-badge">✓</span> openssl <span class="ver mono">1:3.2.2-3.fc42</span></div>
+                      <div class="done-row"><span class="check-badge">✓</span> kernel <span class="ver mono">6.14.11-300.fc42</span></div>
+                      <div class="done-row"><span class="check-badge">✓</span> firefox <span class="ver mono">140.0-1.fc42</span></div>
+                    </div>
+                  </div>
+                  <div class="boxed-list">
+                    <div class="pkg-row active">
+                      <span class="badge src-dnf">DNF</span>
+                      <div>
+                        <div class="pkg-name">gnome-shell <span class="phase-tag">installing</span></div>
+                        <div class="pkg-meta mono">48.1-1.fc42 → 48.2-1.fc42 · 8.7 MB</div>
+                        <div class="row-progress"><div class="row-fill" style="width:72%"></div></div>
+                      </div>
+                      <span class="pkg-size">72%</span>
+                    </div>
+                    <div class="pkg-row pending">
+                      <span class="badge src-dnf">DNF</span>
+                      <div><div class="pkg-name">nautilus</div><div class="pkg-meta mono">48.1 → 48.2 · 4.2 MB</div></div>
+                      <span class="pkg-size">queued</span>
+                    </div>
+                    <div class="pkg-row pending">
+                      <span class="badge src-flatpak">FP</span>
+                      <div><div class="pkg-name">Thunderbird</div><div class="pkg-meta mono">queued after System</div></div>
+                      <span class="pkg-size">queued</span>
+                    </div>
+                    <div class="pkg-row pending">
+                      <span class="badge src-firmware">FW</span>
+                      <div><div class="pkg-name">UEFI dbx</div><div class="pkg-meta mono">queued last</div></div>
+                      <span class="pkg-size">queued</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="console-bar">
+                  <button class="console-toggle" type="button">
+                    <span class="chevron">▸</span>
+                    <span class="console-preview mono">[3/5] Installing gnome-shell-48.2-1.fc42.x86_64</span>
+                    <span class="console-badge">console</span>
+                  </button>
+                  <pre class="console-body mono">Running transaction
+[1/12] Verifying gnome-shell-48.2-1.fc42.x86_64
+[2/12] Preparing gnome-shell-48.2-1.fc42.x86_64
+[3/12] Installing gnome-shell-48.2-1.fc42.x86_64</pre>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Recommended. HIG inline bar + “About 3 minutes left”. Completed is a real expander of rows.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed B · ring</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="content">
+                  <header class="content-header">
+                    <div class="header-text">
+                      <h3 class="title-4">Updating</h3>
+                      <p class="caption dim" style="margin:4px 0 0">About 3 minutes left · 5 of 12 remaining</p>
+                    </div>
+                    <div class="ring">
+                      <svg viewBox="0 0 36 36">
+                        <path class="ring-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                        <path class="ring-fill" stroke-dasharray="58, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+                      </svg>
+                      <span class="ring-label">58%</span>
+                    </div>
+                  </header>
+                  <div class="completed">
+                    <button type="button"><span class="check-badge">✓</span><span><strong>7 completed</strong></span></button>
+                  </div>
+                  <div class="boxed-list">
+                    <div class="pkg-row active">
+                      <span class="badge src-dnf">DNF</span>
+                      <div>
+                        <div class="pkg-name">gnome-shell <span class="phase-tag">installing</span></div>
+                        <div class="pkg-meta mono">48.1 → 48.2 · System</div>
+                        <div class="row-progress"><div class="row-fill" style="width:72%"></div></div>
+                      </div>
+                      <span class="pkg-size">72%</span>
+                    </div>
+                    <div class="pkg-row pending">
+                      <span class="badge src-flatpak">FP</span>
+                      <div><div class="pkg-name">Thunderbird</div><div class="pkg-meta">queued</div></div>
+                      <span class="pkg-size">queued</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="console-bar">
+                  <button class="console-toggle" type="button">
+                    <span class="chevron">▸</span>
+                    <span class="console-preview mono">[3/5] Installing gnome-shell-48.2-1.fc42.x86_64</span>
+                    <span class="console-badge">console</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Phase 1 ring kept. Custom chrome; HIG prefers the linear bar in A.</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ========== DONE ========== -->
+    <section class="board" id="done" hidden>
+      <div class="board-intro">
+        <h2>Done</h2>
+        <p>
+          Shipping title is always “All updates applied”, including when <code>failed &gt; 0</code>.
+          Restart Now already appears only in the reboot card. Do not add a second suggested action.
+        </p>
+      </div>
+      <div class="board-row cols-3">
+
+        <article class="frame">
+          <p class="frame-label">Current · failed &gt; 0</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon ok"><svg><use href="#i-ok"/></svg></div>
+                  <h3 class="title-2">All updates applied</h3>
+                  <p class="desc">11 upgraded · 8 system / 3 apps / 1 firmware · 6m&nbsp;42s</p>
+                  <div class="status-child">
+                    <div class="stats">
+                      <div class="stat-card"><span class="num">11</span><span class="lbl">upgraded</span></div>
+                      <div class="stat-card"><span class="num">1</span><span class="lbl">failed</span></div>
+                      <div class="stat-card warn"><span class="num">1</span><span class="lbl">needs reboot</span></div>
+                    </div>
+                    <div class="reboot-card">
+                      <div>
+                        <strong>Restart recommended</strong>
+                        <p>A kernel or firmware update needs a restart to finish.</p>
+                      </div>
+                      <button class="btn suggested">Restart Now</button>
+                    </div>
+                    <p class="hint">Runs systemctl reboot · or just close the app</p>
+                    <div class="actions-row">
+                      <button class="btn flat">View full log</button>
+                      <button class="btn pill">Done</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Success chrome over a failure. The “1 failed” card is the only hint.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed · success</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon ok"><svg><use href="#i-ok"/></svg></div>
+                  <h3 class="title-2">All updates applied</h3>
+                  <p class="desc">12 upgraded · 8 system / 3 apps / 1 firmware · 6m&nbsp;42s</p>
+                  <div class="status-child">
+                    <div class="stats">
+                      <div class="stat-card"><span class="num">12</span><span class="lbl">upgraded</span></div>
+                      <div class="stat-card"><span class="num">0</span><span class="lbl">failed</span></div>
+                      <div class="stat-card warn"><span class="num">1</span><span class="lbl">needs reboot</span></div>
+                    </div>
+                    <div class="reboot-card">
+                      <div>
+                        <strong>Restart recommended</strong>
+                        <p>A kernel or firmware update needs a restart to finish</p>
+                      </div>
+                      <button class="btn suggested">Restart Now</button>
+                    </div>
+                    <div class="actions-row">
+                      <button class="btn flat">View full log</button>
+                      <button class="btn pill">Done</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Unchanged success path. Restart Now only because a reboot is required.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed · mixed</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon" style="color:var(--warning-color);opacity:.9"><svg><use href="#i-warn"/></svg></div>
+                  <h3 class="title-2">Updates finished with problems</h3>
+                  <p class="desc">11 applied · 1 failed · 6m&nbsp;42s</p>
+                  <div class="status-child">
+                    <div class="stats">
+                      <div class="stat-card"><span class="num">11</span><span class="lbl">upgraded</span></div>
+                      <div class="stat-card err"><span class="num">1</span><span class="lbl">failed</span></div>
+                      <div class="stat-card warn"><span class="num">1</span><span class="lbl">needs reboot</span></div>
+                    </div>
+                    <div class="reboot-card">
+                      <div>
+                        <strong>Restart recommended</strong>
+                        <p>UEFI dbx failed · a new kernel is already installed</p>
+                      </div>
+                      <button class="btn suggested">Restart Now</button>
+                    </div>
+                    <div class="actions-row">
+                      <button class="btn flat">View full log</button>
+                      <button class="btn pill">Done</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Title tells the truth. Failed card is error-colored. Still one suggested action (Restart Now).</p>
+        </article>
+      </div>
+    </section>
+
+    <!-- ========== FAILED ========== -->
+    <section class="board" id="failed" hidden>
+      <div class="board-intro">
+        <h2>Failed</h2>
+        <p>
+          Hard fail from any phase — helper start, empty apply, polkit denial, or all packages failed.
+          Shipping is a Clamp of title + selectable detail + Back. Not a StatusPage, no Retry, no log.
+        </p>
+      </div>
+      <div class="board-row cols-3">
+
+        <article class="frame">
+          <p class="frame-label">Current</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="auth-col">
+                  <h3 class="title-3">All updates failed</h3>
+                  <p class="body dim desc" style="user-select:text">Error: Failed to obtain authentication.<br>dnf update -y exited 1</p>
+                  <button class="btn pill">Back</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">No icon, no Retry, no log. Back is the only control and it is not suggested.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed · check failed</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon err"><svg><use href="#i-error"/></svg></div>
+                  <h3 class="title-2">Could not check for updates</h3>
+                  <p class="desc" style="user-select:text">Authentication was dismissed<br>Nothing was changed</p>
+                  <div class="status-child">
+                    <button class="btn suggested pill">Retry</button>
+                    <div class="actions-row">
+                      <button class="btn flat">View log</button>
+                      <button class="btn pill">Back</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">StatusPage. Suggested Retry reuses the helper session when it is still alive.</p>
+        </article>
+
+        <article class="frame">
+          <p class="frame-label">Proposed · apply failed</p>
+          <div class="frame-slot">
+            <div class="adw-window">
+              <header class="adw-headerbar">
+                <span class="adw-header-start"></span>
+                <span class="adw-header-title">Fedora Updater</span>
+                <span class="adw-header-end">
+                  <button class="adw-winbtn" tabindex="-1" aria-hidden="true"><svg><use href="#i-max"/></svg></button>
+                  <button class="adw-winbtn close" tabindex="-1" aria-hidden="true"><svg><use href="#i-close"/></svg></button>
+                </span>
+              </header>
+              <div class="adw-body">
+                <div class="status-page">
+                  <div class="status-icon err"><svg><use href="#i-error"/></svg></div>
+                  <h3 class="title-2">All updates failed</h3>
+                  <p class="desc" style="user-select:text">dnf update -y exited 1 · nothing was applied</p>
+                  <div class="status-child">
+                    <button class="btn suggested pill">Retry</button>
+                    <div class="actions-row">
+                      <button class="btn flat">View log</button>
+                      <button class="btn pill">Back</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="frame-caption">Same skeleton as check-fail. Title comes from state. Partial failure stays on Done, not here.</p>
+        </article>
+      </div>
+    </section>
+
+  </main>
+  <script src="boards.js"></script>
+</body>
+</html>

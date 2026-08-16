@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Build a single multi-call Fedora Updater binary under ./bin/.
+#
+# Usage:
+#   ./build           # release build
+#   ./build --debug   # debug build
+#
+# After building:
+#   ./bin/fedora-updater
+#
+# Modes (same file):
+#   fedora-updater           → GUI
+#   fedora-updater --helper  → privileged allowlist (used via pkexec)
+#
+# Optional system install (polkit policy + /usr/bin):
+#   ./scripts/install-helper.sh
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+PROFILE="release"
+CARGO_FLAGS=(--release)
+
+for arg in "$@"; do
+  case "$arg" in
+    --debug) PROFILE="debug"; CARGO_FLAGS=() ;;
+    -h|--help)
+      sed -n '2,18p' "$0" | sed 's/^# \?//'
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      echo "Try: ./build --help" >&2
+      exit 2
+      ;;
+  esac
+done
+
+OUT_DIR="$ROOT/bin"
+mkdir -p "$OUT_DIR"
+
+if ! command -v blueprint-compiler >/dev/null 2>&1; then
+  if [[ -x "${HOME}/.local/bin/blueprint-compiler" ]]; then
+    export PATH="${HOME}/.local/bin:${PATH}"
+  else
+    echo "error: blueprint-compiler not found" >&2
+    echo "Install it with:  pip install --user blueprint-compiler" >&2
+    echo "             or:  sudo dnf install blueprint-compiler" >&2
+    exit 1
+  fi
+fi
+
+echo "==> Building fedora-updater ($PROFILE)…"
+cargo build "${CARGO_FLAGS[@]}" --bin fedora-updater
+
+SRC="$ROOT/target/$PROFILE/fedora-updater"
+if [[ ! -x "$SRC" ]]; then
+  echo "error: expected binary missing: $SRC" >&2
+  exit 1
+fi
+
+install -m 755 "$SRC" "$OUT_DIR/fedora-updater"
+
+# Remove stale second binary from older builds, if present.
+rm -f "$OUT_DIR/fedora-updater-helper"
+
+echo
+echo "Build complete."
+echo
+echo "  Single executable: $OUT_DIR/fedora-updater"
+echo
+echo "Run with:"
+echo "  $OUT_DIR/fedora-updater"
+echo
+echo "(Helper mode is built-in: pkexec $OUT_DIR/fedora-updater --helper)"
+echo

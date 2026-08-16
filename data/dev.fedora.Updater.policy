@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Single polkit action for Fedora Updater (multi-call binary).
+
+  The same file is used for GUI and helper:
+    /usr/bin/fedora-updater           → GUI
+    pkexec /usr/bin/fedora-updater --helper → privileged allowlist session
+
+  auth_admin_keep: after one successful authentication, subsequent
+  authorizations for this action reuse the keep-window. Combined with a
+  long-lived --helper process, the user only enters credentials once per
+  app run (until the GUI exits).
+-->
+<policyconfig>
+  <vendor>Fedora Updater</vendor>
+  <vendor_url>https://github.com/example/fedora-updater</vendor_url>
+  <icon_name>software-update-available</icon_name>
+
+  <action id="dev.fedora.Updater.helper">
+    <description>Run Fedora Updater privileged operations</description>
+    <description xml:lang="en">Run Fedora Updater privileged operations</description>
+    <message>Authentication is required to check for and install system, Flatpak (system), and firmware updates</message>
+    <message xml:lang="en">Authentication is required to check for and install system, Flatpak (system), and firmware updates</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/fedora-updater</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

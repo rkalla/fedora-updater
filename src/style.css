@@ -1,0 +1,147 @@
+/* Adwaita tokens, matching mockups/boards.css */
+
+.progress-block {
+  margin: 0 16px 12px;
+}
+
+.console-bar {
+  background-color: @view_bg_color;
+  border-top: 1px solid alpha(@window_fg_color, 0.14);
+}
+
+.console-bar button.flat {
+  padding: 8px 14px;
+  border-radius: 0;
+}
+
+.chip {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid alpha(@window_fg_color, 0.12);
+  background-color: alpha(@accent_bg_color, 0.12);
+  color: @accent_color;
+}
+
+.chip.security {
+  background-color: alpha(@error_color, 0.12);
+  color: @error_color;
+  border-color: alpha(@error_color, 0.28);
+}
+
+.chip.bugfix {
+  background-color: alpha(@accent_bg_color, 0.12);
+  color: @accent_color;
+  border-color: alpha(@accent_bg_color, 0.28);
+}
+
+.chip.enhance {
+  background-color: alpha(@purple_1, 0.16);
+  color: @purple_1;
+  border-color: alpha(@purple_1, 0.28);
+}
+
+.chip.src-dnf {
+  background-color: alpha(@accent_bg_color, 0.14);
+  color: @accent_color;
+}
+
+.chip.src-flatpak {
+  background-color: alpha(@purple_1, 0.16);
+  color: @purple_1;
+}
+
+.chip.src-firmware {
+  background-color: alpha(@warning_color, 0.14);
+  color: @warning_color;
+}
+
+.package-badge {
+  min-width: 2.2em;
+  min-height: 1.5em;
+  padding: 2px 6px;
+  border-radius: 8px;
+  font-weight: 700;
+  font-size: 0.72em;
+  background-color: alpha(@borders, 0.35);
+}
+
+.package-badge.src-dnf {
+  color: @accent_color;
+  background-color: alpha(@accent_bg_color, 0.15);
+}
+
+.package-badge.src-flatpak {
+  color: @purple_1;
+  background-color: alpha(@purple_1, 0.15);
+}
+
+.package-badge.src-firmware {
+  color: @warning_color;
+  background-color: alpha(@warning_color, 0.15);
+}
+
+.sev-dot {
+  min-width: 7px;
+  min-height: 7px;
+  border-radius: 99px;
+  padding: 0;
+  background-color: alpha(@accent_bg_color, 0.8);
+}
+
+.sev-dot.security {
+  background-color: @error_color;
+}
+
+.sev-dot.bugfix {
+  background-color: @accent_color;
+}
+
+.sev-dot.enhance {
+  background-color: @purple_1;
+}
+
+.pkg-row.pending {
+  opacity: 0.72;
+}
+
+.phase-tag {
+  font-weight: 600;
+}
+
+.row-progress {
+  min-width: 72px;
+}
+
+.stat-card {
+  background-color: alpha(@card_bg_color, 0.6);
+  border: 1px solid alpha(@borders, 0.5);
+  border-radius: 10px;
+  padding: 10px 16px;
+  min-width: 88px;
+}
+
+.stat-card.warn {
+  background-color: alpha(@warning_color, 0.1);
+  border-color: alpha(@warning_color, 0.35);
+}
+
+.stat-card.error {
+  background-color: alpha(@error_color, 0.1);
+  border-color: alpha(@error_color, 0.35);
+}
+
+.reboot-card {
+  background-color: alpha(@warning_color, 0.1);
+  border: 1px solid alpha(@warning_color, 0.35);
+  border-radius: 12px;
+  padding: 10px 14px;
+}
+
+.status-footer {
+  border-top: 1px solid alpha(@window_fg_color, 0.08);
+}
+
+.status-dot {
+  font-size: 8px;
+  line-height: 1;
+}

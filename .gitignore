@@ -1,0 +1,10 @@
+# Build outputs — clone the source and run ./build locally
+/target/
+/bin/
+
+# Editor / OS
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+.DS_Store
