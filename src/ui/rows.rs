@@ -60,7 +60,18 @@ fn caption_suffix(text: &str, extra: &[&str]) -> Label {
         .build()
 }
 
+pub struct RowParts {
+    pub row: ActionRow,
+    pub bar: Option<ProgressBar>,
+    pub pct: Option<Label>,
+}
+
 pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
+    package_row_parts(package, show_status).row
+}
+
+/// Same row as [`package_row`], plus handles so progress can be updated in place.
+pub fn package_row_parts(package: &Package, show_status: bool) -> RowParts {
     let subtitle = format!("{} · {}", package.version_line(), package.source.label());
     let row = ActionRow::builder()
         .title(&package.name)
@@ -72,6 +83,9 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
     row.add_css_class("pkg-row");
     row.add_prefix(&leading(package));
 
+    let mut bar = None;
+    let mut pct = None;
+
     if show_status {
         match package.status {
             PackageStatus::Downloading | PackageStatus::Installing => {
@@ -80,17 +94,20 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
                     package.status.label(),
                     &["accent", "phase-tag"],
                 ));
-                let bar = ProgressBar::builder()
+                let progress = ProgressBar::builder()
                     .fraction(package.progress.clamp(0.0, 1.0))
                     .valign(Align::Center)
                     .width_request(72)
                     .build();
-                bar.add_css_class("row-progress");
-                row.add_suffix(&bar);
-                row.add_suffix(&caption_suffix(
+                progress.add_css_class("row-progress");
+                let pct_label = caption_suffix(
                     &format!("{:.0}%", package.progress * 100.0),
                     &["dim-label", "numeric"],
-                ));
+                );
+                row.add_suffix(&progress);
+                row.add_suffix(&pct_label);
+                bar = Some(progress);
+                pct = Some(pct_label);
             }
             PackageStatus::Pending => {
                 row.add_css_class("pending");
@@ -115,7 +132,7 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
         row.add_suffix(&caption_suffix(&trailing, &["dim-label"]));
     }
 
-    row
+    RowParts { row, bar, pct }
 }
 
 pub fn completed_row(package: &Package) -> ActionRow {
@@ -158,6 +175,14 @@ pub fn refill_expander(
         expander.remove(child);
     }
     store.borrow_mut().clear();
+    append_expander(expander, store, rows);
+}
+
+pub fn append_expander(
+    expander: &ExpanderRow,
+    store: &std::cell::RefCell<Vec<gtk::Widget>>,
+    rows: impl IntoIterator<Item = ActionRow>,
+) {
     for row in rows {
         let widget: gtk::Widget = row.upcast();
         expander.add_row(&widget);

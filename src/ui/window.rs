@@ -1,7 +1,8 @@
 //! Main application window — thin view over the pure state machine.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use gtk::glib;
 use gtk::glib::object::IsA;
@@ -14,7 +15,8 @@ use libadwaita::{
 };
 
 use fedora_updater::model::{
-    about_time_left, check_progress, count_by_kind, count_by_source, AuthPurpose, WorkerEvent,
+    about_time_left, check_progress, count_by_kind, count_by_source, AuthPurpose, Package,
+    PackageStatus, UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
@@ -26,8 +28,11 @@ use super::{preview, rows};
 
 const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
 const LOG_WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/log_window.ui"));
+const DEFAULT_WIDTH: i32 = 760;
+const DEFAULT_HEIGHT: i32 = 660;
 
 struct Widgets {
+    window: ApplicationWindow,
     stack: Stack,
     toast: ToastOverlay,
     idle_page: StatusPage,
@@ -55,11 +60,18 @@ struct Widgets {
     run_progress: ProgressBar,
     run_progress_meta: Label,
     run_progress_pct: Label,
+    run_list_scroll: gtk::ScrolledWindow,
     run_completed_group: PreferencesGroup,
     run_completed: ExpanderRow,
     run_completed_rows: RefCell<Vec<gtk::Widget>>,
+    run_completed_keys: RefCell<Vec<String>>,
+    run_completed_user_open: Cell<bool>,
+    ignore_expand: Cell<bool>,
     run_active_group: PreferencesGroup,
     run_active_rows: RefCell<Vec<gtk::Widget>>,
+    run_active_keys: RefCell<Vec<(String, u8)>>,
+    run_active_bars: RefCell<Vec<(Option<gtk::ProgressBar>, Option<Label>)>>,
+    run_follow_name: RefCell<Option<String>>,
     run_console_line: Label,
     run_console_full: Label,
     done_page: StatusPage,
@@ -90,7 +102,10 @@ pub fn build(app: &Application) {
     let window: ApplicationWindow = obj(&builder, "window");
     window.set_application(Some(app));
 
+    window.set_default_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+
     let widgets = Rc::new(Widgets {
+        window: window.clone(),
         stack: obj(&builder, "stack"),
         toast: obj(&builder, "toast"),
         idle_page: obj(&builder, "idle_page"),
@@ -118,11 +133,18 @@ pub fn build(app: &Application) {
         run_progress: obj(&builder, "run_progress"),
         run_progress_meta: obj(&builder, "run_progress_meta"),
         run_progress_pct: obj(&builder, "run_progress_pct"),
+        run_list_scroll: obj(&builder, "run_list_scroll"),
         run_completed_group: obj(&builder, "run_completed_group"),
         run_completed: obj(&builder, "run_completed"),
         run_completed_rows: RefCell::new(Vec::new()),
+        run_completed_keys: RefCell::new(Vec::new()),
+        run_completed_user_open: Cell::new(false),
+        ignore_expand: Cell::new(false),
         run_active_group: obj(&builder, "run_active_group"),
         run_active_rows: RefCell::new(Vec::new()),
+        run_active_keys: RefCell::new(Vec::new()),
+        run_active_bars: RefCell::new(Vec::new()),
+        run_follow_name: RefCell::new(None),
         run_console_line: obj(&builder, "run_console_line"),
         run_console_full: obj(&builder, "run_console_full"),
         done_page: obj(&builder, "done_page"),
@@ -163,6 +185,20 @@ pub fn build(app: &Application) {
         &run_console_reveal,
         &run_console_chevron,
     );
+    {
+        let widgets = widgets.clone();
+        let expander = widgets.run_completed.clone();
+        expander.connect_expanded_notify(move |expander| {
+            if widgets.ignore_expand.get() {
+                return;
+            }
+            let open = expander.is_expanded();
+            widgets.run_completed_user_open.set(open);
+            if open {
+                queue_scroll_to_active(&widgets, Duration::from_millis(200));
+            }
+        });
+    }
 
     let (tx, rx) = async_channel::unbounded::<WorkerEvent>();
     let pending_purpose = Rc::new(RefCell::new(AuthPurpose::Check));
@@ -287,6 +323,7 @@ pub fn build(app: &Application) {
     });
 
     render(&state, &widgets);
+    maybe_open_preview_completed(&widgets);
     window.present();
     preview::maybe_schedule_screenshot(&window);
 }
@@ -425,6 +462,218 @@ fn obj<T: IsA<glib::Object>>(builder: &Builder, id: &str) -> T {
         .unwrap_or_else(|| panic!("missing UI object `{id}`"))
 }
 
+fn maybe_open_preview_completed(w: &Widgets) {
+    if std::env::var("FEDORA_UPDATER_PREVIEW").as_deref() != Ok("running-expanded") {
+        return;
+    }
+    w.ignore_expand.set(true);
+    w.run_completed_user_open.set(true);
+    w.run_completed.set_enable_expansion(true);
+    w.run_completed.set_expanded(true);
+    w.ignore_expand.set(false);
+    queue_scroll_to_active(w, Duration::from_millis(220));
+}
+
+fn restore_default_window_size(window: &ApplicationWindow) {
+    if window.is_maximized() || window.is_fullscreen() {
+        return;
+    }
+    let width = window.width();
+    let height = window.height();
+    if height > DEFAULT_HEIGHT + 24 {
+        window.set_default_size(
+            if width > 0 { width } else { DEFAULT_WIDTH },
+            DEFAULT_HEIGHT,
+        );
+    }
+}
+
+fn clear_running_lists(w: &Widgets) {
+    if w.run_completed_rows.borrow().is_empty() && w.run_active_rows.borrow().is_empty() {
+        return;
+    }
+    w.ignore_expand.set(true);
+    rows::refill_expander(&w.run_completed, &w.run_completed_rows, std::iter::empty());
+    rows::refill_group(&w.run_active_group, &w.run_active_rows, std::iter::empty());
+    w.run_completed_keys.borrow_mut().clear();
+    w.run_active_keys.borrow_mut().clear();
+    w.run_active_bars.borrow_mut().clear();
+    w.run_follow_name.borrow_mut().take();
+    w.run_completed_user_open.set(false);
+    w.run_completed.set_expanded(false);
+    w.run_completed_group.set_visible(false);
+    w.ignore_expand.set(false);
+}
+
+fn completed_heading(names: &[&str]) -> String {
+    let n = names.len();
+    if n == 0 {
+        return "0 completed".into();
+    }
+    if n <= 3 {
+        return format!("{n} completed · {}", names.join(", "));
+    }
+    let latest: Vec<&str> = names.iter().rev().take(3).copied().collect();
+    format!("{n} completed · {}…", latest.join(", "))
+}
+
+fn live_status_kind(status: PackageStatus) -> u8 {
+    match status {
+        PackageStatus::Downloading | PackageStatus::Installing => 1,
+        _ => 0,
+    }
+}
+
+fn render_running(
+    w: &Widgets,
+    packages: &[Package],
+    overall_progress: f64,
+    phase_label: &str,
+    current_source: Option<UpdateSource>,
+    elapsed: u64,
+    last_console: &str,
+    full_console: &str,
+) {
+    w.stack.set_visible_child_name("running");
+    let remaining = packages
+        .len()
+        .saturating_sub(packages.iter().filter(|p| p.status.is_done()).count());
+    let src = current_source.map(|s| s.label()).unwrap_or("all sources");
+    let mut foot = format!("{src} · {remaining} of {} remaining", packages.len());
+    if let Some(eta) = about_time_left(elapsed, overall_progress) {
+        foot = format!("{eta} · {foot}");
+    }
+    w.run_footnote.set_text(&foot);
+    w.run_progress.set_fraction(overall_progress);
+    w.run_progress_meta.set_text(phase_label);
+    w.run_progress_pct
+        .set_text(&format!("{:.0}%", overall_progress * 100.0));
+
+    let completed: Vec<_> = packages
+        .iter()
+        .filter(|p| p.status == PackageStatus::Completed)
+        .collect();
+    let completed_names: Vec<&str> = completed.iter().map(|p| p.name.as_str()).collect();
+    w.run_completed
+        .set_title(&completed_heading(&completed_names));
+
+    if completed.is_empty() {
+        w.run_completed_user_open.set(false);
+    }
+
+    let completed_keys: Vec<String> = completed.iter().map(|p| p.name.clone()).collect();
+    let prev_keys = w.run_completed_keys.borrow().clone();
+    w.ignore_expand.set(true);
+    if completed_keys != prev_keys {
+        if !prev_keys.is_empty() && completed_keys.starts_with(&prev_keys) {
+            rows::append_expander(
+                &w.run_completed,
+                &w.run_completed_rows,
+                completed[prev_keys.len()..]
+                    .iter()
+                    .copied()
+                    .map(rows::completed_row),
+            );
+        } else {
+            rows::refill_expander(
+                &w.run_completed,
+                &w.run_completed_rows,
+                completed.iter().copied().map(rows::completed_row),
+            );
+        }
+        *w.run_completed_keys.borrow_mut() = completed_keys;
+    }
+    w.run_completed.set_enable_expansion(!completed.is_empty());
+    w.run_completed
+        .set_expanded(w.run_completed_user_open.get() && !completed.is_empty());
+    w.run_completed_group.set_visible(!completed.is_empty());
+    w.ignore_expand.set(false);
+
+    let active: Vec<_> = packages.iter().filter(|p| !p.status.is_done()).collect();
+    let active_keys: Vec<(String, u8)> = active
+        .iter()
+        .map(|p| (p.name.clone(), live_status_kind(p.status)))
+        .collect();
+    if *w.run_active_keys.borrow() != active_keys {
+        let mut bars = Vec::with_capacity(active.len());
+        let rows: Vec<_> = active
+            .iter()
+            .map(|p| {
+                let parts = rows::package_row_parts(p, true);
+                bars.push((parts.bar, parts.pct));
+                parts.row
+            })
+            .collect();
+        rows::refill_group(&w.run_active_group, &w.run_active_rows, rows);
+        *w.run_active_keys.borrow_mut() = active_keys;
+        *w.run_active_bars.borrow_mut() = bars;
+    } else {
+        for (p, (bar, pct)) in active.iter().zip(w.run_active_bars.borrow().iter()) {
+            if let (Some(bar), Some(pct)) = (bar, pct) {
+                bar.set_fraction(p.progress.clamp(0.0, 1.0));
+                pct.set_text(&format!("{:.0}%", p.progress * 100.0));
+            }
+        }
+    }
+
+    let follow = active
+        .iter()
+        .find(|p| {
+            matches!(
+                p.status,
+                PackageStatus::Downloading | PackageStatus::Installing
+            )
+        })
+        .map(|p| p.name.clone());
+    if follow != *w.run_follow_name.borrow() {
+        *w.run_follow_name.borrow_mut() = follow;
+        queue_scroll_to_active(w, Duration::from_millis(16));
+    }
+
+    if !last_console.is_empty() {
+        w.run_console_line.set_text(last_console);
+    }
+    w.run_console_full.set_text(full_console);
+}
+
+fn queue_scroll_to_active(w: &Widgets, delay: Duration) {
+    let rows = w.run_active_rows.borrow();
+    let Some(row) = rows.iter().find(|r| r.has_css_class("active")).cloned() else {
+        return;
+    };
+    drop(rows);
+    let scroll = w.run_list_scroll.clone();
+    glib::timeout_add_local_once(delay, move || {
+        scroll_into_view(&scroll, &row);
+    });
+}
+
+fn scroll_into_view(scrolled: &gtk::ScrolledWindow, widget: &gtk::Widget) {
+    let Some(child) = scrolled.child() else {
+        return;
+    };
+    let Some(bounds) = widget.compute_bounds(&child) else {
+        return;
+    };
+    let y = f64::from(bounds.y());
+    let row_h = f64::from(bounds.height()).max(1.0);
+    let adj = scrolled.vadjustment();
+    let page = adj.page_size();
+    if page <= 0.0 {
+        return;
+    }
+    let val = adj.value();
+    let pad = 12.0;
+    let target = if y < val + pad {
+        (y - pad).max(adj.lower())
+    } else if y + row_h > val + page - pad {
+        (y + row_h - page + pad).clamp(adj.lower(), (adj.upper() - page).max(adj.lower()))
+    } else {
+        return;
+    };
+    adj.set_value(target);
+}
+
 fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     let s = state.borrow();
     let last_console = s.console.last_line().to_string();
@@ -440,6 +689,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             last_checked,
             message,
         } => {
+            clear_running_lists(w);
+            restore_default_window_size(&w.window);
             w.stack.set_visible_child_name("idle");
             let checked_at = last_checked.as_deref();
             let up_to_date = last_checked.is_some() || message.is_some();
@@ -580,56 +831,16 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             current_source,
             ..
         } => {
-            w.stack.set_visible_child_name("running");
-            let remaining = packages
-                .len()
-                .saturating_sub(packages.iter().filter(|p| p.status.is_done()).count());
-            let src = current_source.map(|s| s.label()).unwrap_or("all sources");
-            let mut foot = format!("{src} · {remaining} of {} remaining", packages.len());
-            if let Some(eta) = about_time_left(elapsed, *overall_progress) {
-                foot = format!("{eta} · {foot}");
-            }
-            w.run_footnote.set_text(&foot);
-            w.run_progress.set_fraction(*overall_progress);
-            w.run_progress_meta.set_text(phase_label);
-            w.run_progress_pct
-                .set_text(&format!("{:.0}%", overall_progress * 100.0));
-
-            let completed: Vec<_> = packages
-                .iter()
-                .filter(|p| p.status == fedora_updater::PackageStatus::Completed)
-                .collect();
-            let preview: Vec<&str> = completed.iter().take(3).map(|p| p.name.as_str()).collect();
-            let extra = if completed.len() > 3 { "…" } else { "" };
-            let names = if preview.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}{extra}", preview.join(", "))
-            };
-            w.run_completed
-                .set_title(&format!("{} completed{names}", completed.len()));
-            let expanded = w.run_completed.is_expanded();
-            rows::refill_expander(
-                &w.run_completed,
-                &w.run_completed_rows,
-                completed.iter().copied().map(rows::completed_row),
+            render_running(
+                w,
+                packages,
+                *overall_progress,
+                phase_label,
+                *current_source,
+                elapsed,
+                &last_console,
+                &full_console,
             );
-            w.run_completed.set_expanded(expanded);
-            w.run_completed.set_enable_expansion(!completed.is_empty());
-            w.run_completed_group.set_visible(!completed.is_empty());
-
-            rows::refill_group(
-                &w.run_active_group,
-                &w.run_active_rows,
-                packages
-                    .iter()
-                    .filter(|p| !p.status.is_done())
-                    .map(|p| rows::package_row(p, true)),
-            );
-            if !last_console.is_empty() {
-                w.run_console_line.set_text(&last_console);
-            }
-            w.run_console_full.set_text(&full_console);
         }
         Phase::Done {
             packages,
@@ -637,6 +848,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             needs_reboot,
             failed,
         } => {
+            clear_running_lists(w);
+            restore_default_window_size(&w.window);
             w.stack.set_visible_child_name("done");
             let upgraded = packages
                 .iter()
@@ -672,6 +885,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             w.reboot_box.set_visible(*needs_reboot);
         }
         Phase::Failed { title, detail } => {
+            clear_running_lists(w);
+            restore_default_window_size(&w.window);
             w.stack.set_visible_child_name("failed");
             w.fail_page.set_title(title);
             w.fail_page.set_description(None);
@@ -694,6 +909,7 @@ mod tests {
             "ready_chips",
             "ready_group",
             "run_completed",
+            "run_list_scroll",
             "run_active_group",
             "done_page",
             "fail_page",
@@ -708,6 +924,29 @@ mod tests {
         assert!(xml.contains("AdwActionRow") || xml.contains("AdwExpanderRow"));
         assert!(xml.contains("AdwBanner"));
         assert!(xml.contains("AdwStatusPage"));
+        assert!(
+            xml.contains("vhomogeneous"),
+            "stack must not size to the tallest page"
+        );
+        let scroll_at = xml.find("id=\"run_list_scroll\"").expect("run_list_scroll");
+        let completed_at = xml.find("id=\"run_completed\"").expect("run_completed");
+        assert!(
+            scroll_at < completed_at,
+            "completed expander must live inside the running list scroll"
+        );
+    }
+
+    #[test]
+    fn completed_heading_uses_latest_names() {
+        assert_eq!(super::completed_heading(&[]), "0 completed");
+        assert_eq!(
+            super::completed_heading(&["bat", "flatpak"]),
+            "2 completed · bat, flatpak"
+        );
+        assert_eq!(
+            super::completed_heading(&["a", "b", "c", "d", "yelp"]),
+            "5 completed · yelp, d, c…"
+        );
     }
 
     #[test]

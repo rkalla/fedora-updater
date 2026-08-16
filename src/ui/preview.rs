@@ -95,6 +95,15 @@ pub fn state_for(phase: &str) -> AppState {
             needs_reboot: false,
             failed_sources: vec![],
         },
+        "running-many" | "running-expanded" => Phase::Running {
+            packages: many_running_packages(),
+            active_index: Some(24),
+            overall_progress: 0.64,
+            phase_label: "Installing current-package".into(),
+            current_source: Some(UpdateSource::Dnf),
+            needs_reboot: false,
+            failed_sources: vec![],
+        },
         "done" => Phase::Done {
             packages: sample_packages(false)
                 .into_iter()
@@ -247,4 +256,88 @@ fn sample_packages(running: bool) -> Vec<Package> {
             0.0,
         ),
     ]
+}
+
+fn many_running_packages() -> Vec<Package> {
+    let done = [
+        "bat",
+        "distribution-gpg-keys",
+        "epiphany-runtime",
+        "exfatprogs",
+        "flatpak",
+        "flatpak-libs",
+        "flatpak-selinux",
+        "glibmm2.4",
+        "grub2-common",
+        "grub2-efi-ia32",
+        "grub2-efi-x64",
+        "grub2-pc",
+        "grub2-tools",
+        "kf6-filesystem",
+        "kf6-karchive",
+        "kf6-kimageformats",
+        "libfprint",
+        "libnfs",
+        "libsoup3",
+        "xdg-dbus-proxy",
+        "yelp",
+        "openssl",
+        "kernel",
+        "firefox",
+    ];
+    let queued = [
+        "flatpak-session-helper",
+        "gnome-shell",
+        "nautilus",
+        "gtk4",
+        "Thunderbird",
+        "UEFI dbx",
+        "mesa-dri-drivers",
+        "pipewire",
+    ];
+    let mut packages: Vec<Package> = done
+        .iter()
+        .map(|name| {
+            pkg(
+                name,
+                UpdateSource::Dnf,
+                "1.0-1.fc44",
+                "0.9-1.fc44",
+                "1 MB",
+                AdvisoryKind::Unknown,
+                PackageStatus::Completed,
+                1.0,
+            )
+        })
+        .collect();
+    packages.push(pkg(
+        "current-package",
+        UpdateSource::Dnf,
+        "2.0-1.fc44",
+        "1.9-1.fc44",
+        "8 MB",
+        AdvisoryKind::Enhancement,
+        PackageStatus::Installing,
+        0.42,
+    ));
+    packages.extend(queued.iter().map(|name| {
+        let source = if *name == "Thunderbird" {
+            UpdateSource::FlatpakUser
+        } else if *name == "UEFI dbx" {
+            UpdateSource::Firmware
+        } else {
+            UpdateSource::Dnf
+        };
+        pkg(
+            name,
+            source,
+            "2.0-1.fc44",
+            "1.9-1.fc44",
+            "4 MB",
+            AdvisoryKind::Unknown,
+            PackageStatus::Pending,
+            0.0,
+        )
+    }));
+    packages
 }

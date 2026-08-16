@@ -19,6 +19,8 @@ Adw.ApplicationWindow window {
         transition-type: crossfade;
         hexpand: true;
         vexpand: true;
+        hhomogeneous: true;
+        vhomogeneous: false;
 
         Gtk.StackPage {
           name: "idle";
@@ -130,6 +132,8 @@ Adw.ApplicationWindow window {
           name: "checking";
           child: Gtk.Box {
             orientation: vertical;
+            vexpand: true;
+            hexpand: true;
 
             Gtk.Box {
               orientation: horizontal;
@@ -189,7 +193,10 @@ Adw.ApplicationWindow window {
 
             Gtk.ScrolledWindow check_list_scroll {
               vexpand: true;
+              hexpand: true;
               hscrollbar-policy: never;
+              vscrollbar-policy: automatic;
+              styles ["list-scroll"]
 
               child: Adw.Clamp {
                 maximum-size: 700;
@@ -262,6 +269,8 @@ Adw.ApplicationWindow window {
           name: "ready";
           child: Gtk.Box {
             orientation: vertical;
+            vexpand: true;
+            hexpand: true;
 
             Gtk.Box {
               orientation: horizontal;
@@ -327,7 +336,10 @@ Adw.ApplicationWindow window {
 
             Gtk.ScrolledWindow {
               vexpand: true;
+              hexpand: true;
               hscrollbar-policy: never;
+              vscrollbar-policy: automatic;
+              styles ["list-scroll"]
 
               child: Adw.Clamp {
                 maximum-size: 700;
@@ -355,6 +367,8 @@ Adw.ApplicationWindow window {
           name: "running";
           child: Gtk.Box {
             orientation: vertical;
+            vexpand: true;
+            hexpand: true;
 
             Gtk.Box {
               orientation: horizontal;
@@ -412,33 +426,35 @@ Adw.ApplicationWindow window {
               }
             }
 
-            Adw.Clamp {
-              maximum-size: 700;
-              tightening-threshold: 500;
-              margin-start: 16;
-              margin-end: 16;
-              margin-bottom: 8;
-
-              child: Adw.PreferencesGroup run_completed_group {
-                Adw.ExpanderRow run_completed {
-                  title: "0 completed";
-                  expanded: false;
-                  enable-expansion: true;
-                }
-              };
-            }
-
-            Gtk.ScrolledWindow {
+            Gtk.ScrolledWindow run_list_scroll {
               vexpand: true;
+              hexpand: true;
               hscrollbar-policy: never;
+              vscrollbar-policy: automatic;
+              styles ["list-scroll"]
 
               child: Adw.Clamp {
                 maximum-size: 700;
                 tightening-threshold: 500;
                 margin-start: 16;
                 margin-end: 16;
+                margin-bottom: 8;
 
-                child: Adw.PreferencesGroup run_active_group {};
+                child: Gtk.Box {
+                  orientation: vertical;
+                  spacing: 12;
+
+                  Adw.PreferencesGroup run_completed_group {
+                    Adw.ExpanderRow run_completed {
+                      title: "0 completed";
+                      expanded: false;
+                      enable-expansion: true;
+                    }
+                  }
+
+                  Adw.PreferencesGroup run_active_group {
+                  }
+                };
               };
             }
 
