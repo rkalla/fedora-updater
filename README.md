@@ -2,6 +2,10 @@
 
 A polished GNOME desktop front-end for **system (DNF)**, **Flatpak**, and **firmware (fwupd)** updates on Fedora.
 
+| Review | Apply | Finish |
+|:---:|:---:|:---:|
+| [![Review available updates](screenshots/ready.png)](screenshots/ready.png) | [![Applying updates](screenshots/running.png)](screenshots/running.png) | [![Updates applied](screenshots/done.png)](screenshots/done.png) |
+
 This app is a **view layer on top of CLI tools**. It never links against libdnf or mutates packages via libraries — every host change goes through:
 
 | Area | Check | Apply |
