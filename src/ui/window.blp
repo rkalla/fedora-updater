@@ -20,7 +20,7 @@ Adw.ApplicationWindow window {
         hexpand: true;
         vexpand: true;
         hhomogeneous: true;
-        vhomogeneous: false;
+        vhomogeneous: true;
 
         Gtk.StackPage {
           name: "idle";
@@ -86,6 +86,7 @@ Adw.ApplicationWindow window {
         Gtk.StackPage {
           name: "auth";
           child: Adw.StatusPage auth_page {
+            vexpand: true;
             icon-name: "dialog-password-symbolic";
             title: "Authentication required";
             description: "A system dialog will ask for your password once for this app session so it can check for updates via a privileged helper";
@@ -134,6 +135,7 @@ Adw.ApplicationWindow window {
             orientation: vertical;
             vexpand: true;
             hexpand: true;
+            styles ["page-fill"]
 
             Gtk.Box {
               orientation: horizontal;
@@ -196,6 +198,7 @@ Adw.ApplicationWindow window {
               hexpand: true;
               hscrollbar-policy: never;
               vscrollbar-policy: automatic;
+              propagate-natural-height: false;
               styles ["list-scroll"]
 
               child: Adw.Clamp {
@@ -271,6 +274,7 @@ Adw.ApplicationWindow window {
             orientation: vertical;
             vexpand: true;
             hexpand: true;
+            styles ["page-fill"]
 
             Gtk.Box {
               orientation: horizontal;
@@ -339,6 +343,7 @@ Adw.ApplicationWindow window {
               hexpand: true;
               hscrollbar-policy: never;
               vscrollbar-policy: automatic;
+              propagate-natural-height: false;
               styles ["list-scroll"]
 
               child: Adw.Clamp {
@@ -369,6 +374,7 @@ Adw.ApplicationWindow window {
             orientation: vertical;
             vexpand: true;
             hexpand: true;
+            styles ["page-fill"]
 
             Gtk.Box {
               orientation: horizontal;
@@ -431,6 +437,7 @@ Adw.ApplicationWindow window {
               hexpand: true;
               hscrollbar-policy: never;
               vscrollbar-policy: automatic;
+              propagate-natural-height: false;
               styles ["list-scroll"]
 
               child: Adw.Clamp {
@@ -515,6 +522,7 @@ Adw.ApplicationWindow window {
         Gtk.StackPage {
           name: "done";
           child: Adw.StatusPage done_page {
+            vexpand: true;
             icon-name: "object-select-symbolic";
             title: "All updates applied";
 
@@ -646,6 +654,7 @@ Adw.ApplicationWindow window {
         Gtk.StackPage {
           name: "failed";
           child: Adw.StatusPage fail_page {
+            vexpand: true;
             icon-name: "dialog-error-symbolic";
             title: "Update failed";
 

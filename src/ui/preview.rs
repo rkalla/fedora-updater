@@ -82,6 +82,17 @@ pub fn state_for(phase: &str) -> AppState {
             packages: sample_packages(false),
             soft_errors: vec![],
         },
+        "ready-many" => Phase::Ready {
+            packages: many_running_packages()
+                .into_iter()
+                .map(|mut p| {
+                    p.status = PackageStatus::Pending;
+                    p.progress = 0.0;
+                    p
+                })
+                .collect(),
+            soft_errors: vec![],
+        },
         "ready-warn" => Phase::Ready {
             packages: sample_packages(false),
             soft_errors: vec!["Firmware metadata refresh failed".into()],
@@ -259,57 +270,22 @@ fn sample_packages(running: bool) -> Vec<Package> {
 }
 
 fn many_running_packages() -> Vec<Package> {
-    let done = [
-        "bat",
-        "distribution-gpg-keys",
-        "epiphany-runtime",
-        "exfatprogs",
-        "flatpak",
-        "flatpak-libs",
-        "flatpak-selinux",
-        "glibmm2.4",
-        "grub2-common",
-        "grub2-efi-ia32",
-        "grub2-efi-x64",
-        "grub2-pc",
-        "grub2-tools",
-        "kf6-filesystem",
-        "kf6-karchive",
-        "kf6-kimageformats",
-        "libfprint",
-        "libnfs",
-        "libsoup3",
-        "xdg-dbus-proxy",
-        "yelp",
-        "openssl",
-        "kernel",
-        "firefox",
-    ];
-    let queued = [
-        "flatpak-session-helper",
-        "gnome-shell",
-        "nautilus",
-        "gtk4",
-        "Thunderbird",
-        "UEFI dbx",
-        "mesa-dri-drivers",
-        "pipewire",
-    ];
-    let mut packages: Vec<Package> = done
-        .iter()
-        .map(|name| {
-            pkg(
-                name,
-                UpdateSource::Dnf,
-                "1.0-1.fc44",
-                "0.9-1.fc44",
-                "1 MB",
-                AdvisoryKind::Unknown,
-                PackageStatus::Completed,
-                1.0,
-            )
-        })
-        .collect();
+    // Typical large dnf transaction — the apply window must stay at default size.
+    const COMPLETED: usize = 45;
+    const QUEUED: usize = 30;
+    let mut packages = Vec::with_capacity(COMPLETED + 1 + QUEUED);
+    for i in 0..COMPLETED {
+        packages.push(pkg(
+            &format!("package-{}", i + 1),
+            UpdateSource::Dnf,
+            "1.0-1.fc44",
+            "0.9-1.fc44",
+            "1 MB",
+            AdvisoryKind::Unknown,
+            PackageStatus::Completed,
+            1.0,
+        ));
+    }
     packages.push(pkg(
         "current-package",
         UpdateSource::Dnf,
@@ -320,24 +296,58 @@ fn many_running_packages() -> Vec<Package> {
         PackageStatus::Installing,
         0.42,
     ));
-    packages.extend(queued.iter().map(|name| {
-        let source = if *name == "Thunderbird" {
-            UpdateSource::FlatpakUser
-        } else if *name == "UEFI dbx" {
-            UpdateSource::Firmware
-        } else {
-            UpdateSource::Dnf
-        };
-        pkg(
-            name,
-            source,
+    packages.push(pkg(
+        "Thunderbird",
+        UpdateSource::FlatpakUser,
+        "2.0-1.fc44",
+        "1.9-1.fc44",
+        "4 MB",
+        AdvisoryKind::Unknown,
+        PackageStatus::Pending,
+        0.0,
+    ));
+    packages.push(pkg(
+        "UEFI dbx",
+        UpdateSource::Firmware,
+        "2.0-1.fc44",
+        "1.9-1.fc44",
+        "4 MB",
+        AdvisoryKind::Unknown,
+        PackageStatus::Pending,
+        0.0,
+    ));
+    for i in 2..QUEUED {
+        packages.push(pkg(
+            &format!("queued-package-{}", i + 1),
+            UpdateSource::Dnf,
             "2.0-1.fc44",
             "1.9-1.fc44",
             "4 MB",
             AdvisoryKind::Unknown,
             PackageStatus::Pending,
             0.0,
-        )
-    }));
+        ));
+    }
     packages
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn many_running_packages_matches_a_large_transaction() {
+        let packages = super::many_running_packages();
+        assert!(
+            packages.len() >= 70,
+            "preview must cover a full-height-growth case, got {}",
+            packages.len()
+        );
+        let completed = packages
+            .iter()
+            .filter(|p| p.status == super::PackageStatus::Completed)
+            .count();
+        assert!(
+            completed >= 40,
+            "need a long completed expander, got {completed}"
+        );
+    }
 }

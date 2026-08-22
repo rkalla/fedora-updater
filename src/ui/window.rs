@@ -691,7 +691,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         } => {
             clear_running_lists(w);
             restore_default_window_size(&w.window);
-            w.stack.set_visible_child_name("idle");
+            w.stack
+                .set_visible_child_full("idle", gtk::StackTransitionType::None);
             let checked_at = last_checked.as_deref();
             let up_to_date = last_checked.is_some() || message.is_some();
             if up_to_date {
@@ -850,7 +851,9 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         } => {
             clear_running_lists(w);
             restore_default_window_size(&w.window);
-            w.stack.set_visible_child_name("done");
+            w.stack
+                .set_visible_child_full("done", gtk::StackTransitionType::None);
+            w.stack.queue_allocate();
             let upgraded = packages
                 .iter()
                 .filter(|p| p.status == fedora_updater::PackageStatus::Completed)
@@ -887,7 +890,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         Phase::Failed { title, detail } => {
             clear_running_lists(w);
             restore_default_window_size(&w.window);
-            w.stack.set_visible_child_name("failed");
+            w.stack
+                .set_visible_child_full("failed", gtk::StackTransitionType::None);
             w.fail_page.set_title(title);
             w.fail_page.set_description(None);
             w.fail_detail.set_text(detail);
@@ -926,13 +930,22 @@ mod tests {
         assert!(xml.contains("AdwStatusPage"));
         assert!(
             xml.contains("vhomogeneous"),
-            "stack must not size to the tallest page"
+            "stack must size every page to the window so Done/Idle fill after apply"
+        );
+        assert!(
+            xml.contains("id=\"done_page\"") && xml.contains("vexpand"),
+            "status pages must expand to fill the stack"
         );
         let scroll_at = xml.find("id=\"run_list_scroll\"").expect("run_list_scroll");
         let completed_at = xml.find("id=\"run_completed\"").expect("run_completed");
         assert!(
             scroll_at < completed_at,
             "completed expander must live inside the running list scroll"
+        );
+        let scroll_chunk = &xml[scroll_at..completed_at];
+        assert!(
+            scroll_chunk.contains("propagate-natural-height"),
+            "run_list_scroll must not propagate the package list height to the window"
         );
     }
 
