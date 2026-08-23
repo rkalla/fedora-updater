@@ -1,7 +1,7 @@
 //! Adwaita rows, chips, and group refill helpers.
 
 use gtk::prelude::*;
-use gtk::{Align, Image, Label, ProgressBar};
+use gtk::{Align, Label};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, ExpanderRow, PreferencesGroup};
 
@@ -60,18 +60,7 @@ fn caption_suffix(text: &str, extra: &[&str]) -> Label {
         .build()
 }
 
-pub struct RowParts {
-    pub row: ActionRow,
-    pub bar: Option<ProgressBar>,
-    pub pct: Option<Label>,
-}
-
 pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
-    package_row_parts(package, show_status).row
-}
-
-/// Same row as [`package_row`], plus handles so progress can be updated in place.
-pub fn package_row_parts(package: &Package, show_status: bool) -> RowParts {
     let subtitle = format!("{} · {}", package.version_line(), package.source.label());
     let row = ActionRow::builder()
         .title(&package.name)
@@ -83,9 +72,6 @@ pub fn package_row_parts(package: &Package, show_status: bool) -> RowParts {
     row.add_css_class("pkg-row");
     row.add_prefix(&leading(package));
 
-    let mut bar = None;
-    let mut pct = None;
-
     if show_status {
         match package.status {
             PackageStatus::Downloading | PackageStatus::Installing => {
@@ -94,20 +80,6 @@ pub fn package_row_parts(package: &Package, show_status: bool) -> RowParts {
                     package.status.label(),
                     &["accent", "phase-tag"],
                 ));
-                let progress = ProgressBar::builder()
-                    .fraction(package.progress.clamp(0.0, 1.0))
-                    .valign(Align::Center)
-                    .width_request(72)
-                    .build();
-                progress.add_css_class("row-progress");
-                let pct_label = caption_suffix(
-                    &format!("{:.0}%", package.progress * 100.0),
-                    &["dim-label", "numeric"],
-                );
-                row.add_suffix(&progress);
-                row.add_suffix(&pct_label);
-                bar = Some(progress);
-                pct = Some(pct_label);
             }
             PackageStatus::Pending => {
                 row.add_css_class("pending");
@@ -132,18 +104,89 @@ pub fn package_row_parts(package: &Package, show_status: bool) -> RowParts {
         row.add_suffix(&caption_suffix(&trailing, &["dim-label"]));
     }
 
-    RowParts { row, bar, pct }
+    row
+}
+
+/// Stable apply-list row: status caption is updated in place, no per-row bar.
+pub struct ChecklistRow {
+    pub row: ActionRow,
+    status: Label,
+}
+
+pub fn checklist_row(package: &Package) -> ChecklistRow {
+    let subtitle = format!("{} · {}", package.version_line(), package.source.label());
+    let row = ActionRow::builder()
+        .title(&package.name)
+        .subtitle(&subtitle)
+        .title_lines(1)
+        .subtitle_lines(1)
+        .activatable(false)
+        .build();
+    row.add_css_class("pkg-row");
+    row.add_prefix(&leading(package));
+
+    let status = caption_suffix("", &[]);
+    row.add_suffix(&status);
+    let built = ChecklistRow { row, status };
+    sync_checklist_row(&built, package, false);
+    built
+}
+
+pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: bool) {
+    row.row.remove_css_class("pending");
+    row.row.remove_css_class("active");
+    row.row.remove_css_class("done");
+    row.status.remove_css_class("dim-label");
+    row.status.remove_css_class("accent");
+    row.status.remove_css_class("success");
+    row.status.remove_css_class("error");
+    row.status.remove_css_class("phase-tag");
+
+    let live = is_current && !package.status.is_done();
+    if live {
+        row.row.add_css_class("active");
+        row.status.add_css_class("accent");
+        row.status.add_css_class("phase-tag");
+        let label = match package.status {
+            PackageStatus::Downloading => "downloading",
+            _ => "installing",
+        };
+        row.status.set_text(label);
+        return;
+    }
+
+    match package.status {
+        PackageStatus::Completed => {
+            row.row.add_css_class("done");
+            row.status.add_css_class("success");
+            row.status.set_text("done");
+        }
+        PackageStatus::Failed => {
+            row.status.add_css_class("error");
+            row.status.set_text("failed");
+        }
+        PackageStatus::Skipped => {
+            row.row.add_css_class("pending");
+            row.status.add_css_class("dim-label");
+            row.status.set_text("skipped");
+        }
+        _ => {
+            row.row.add_css_class("pending");
+            row.status.add_css_class("dim-label");
+            row.status.set_text("queued");
+        }
+    }
 }
 
 pub fn completed_row(package: &Package) -> ActionRow {
     let row = ActionRow::builder()
         .title(&package.name)
-        .subtitle(&package.version)
+        .subtitle(&package.version_line())
         .title_lines(1)
         .subtitle_lines(1)
         .activatable(false)
         .build();
-    let icon = Image::from_icon_name("object-select-symbolic");
+    let icon = gtk::Image::from_icon_name("object-select-symbolic");
     icon.add_css_class("success");
     row.add_prefix(&icon);
     row.add_prefix(&source_badge(package.source));

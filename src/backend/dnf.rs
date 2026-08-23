@@ -149,15 +149,6 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
         }
     } else if let Some(name) = extract_named_action(trimmed) {
         hint.package_name = Some(name);
-    } else if let Some(name) = extract_dnf5_table_package(trimmed) {
-        // dnf5 often prints bare "name arch version repo size" lines mid-transaction
-        hint.package_name = Some(name);
-        if hint.status.is_none() {
-            hint.status = Some(PackageStatus::Installing);
-        }
-        if hint.phase_label.is_none() {
-            hint.phase_label = Some("Updating packages".into());
-        }
     }
 
     if let Some(pct) = extract_percent(trimmed) {
@@ -165,35 +156,6 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
     }
 
     hint
-}
-
-/// First token that looks like a package name followed by a plausible arch.
-fn extract_dnf5_table_package(line: &str) -> Option<String> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let name = parts[0];
-    let arch = parts[1];
-    if !is_plausible_arch(arch) {
-        // Maybe name.arch form
-        if let Some((n, a)) = split_name_arch(name) {
-            if is_plausible_arch(&a) {
-                return Some(n);
-            }
-        }
-        return None;
-    }
-    if name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+' || c == '.')
-        && !name.eq_ignore_ascii_case("Package")
-        && !name.starts_with('[')
-    {
-        Some(name.to_string())
-    } else {
-        None
-    }
 }
 
 fn parse_bracket_fraction(line: &str) -> Option<(u32, u32, &str)> {
@@ -372,6 +334,17 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
         let h = parse_progress_line("[3/12] Installing gnome-shell-48.2-1.fc42.x86_64");
         assert_eq!(h.package_name.as_deref(), Some("gnome-shell"));
         assert!(h.progress.unwrap() > 0.2);
+    }
+
+    #[test]
+    fn transaction_table_dump_is_not_a_named_package() {
+        let h = parse_progress_line(
+            "kernel                    x86_64 6.14.11-300.fc42        updates     98.2 MB",
+        );
+        assert!(h.package_name.is_none());
+        let h = parse_progress_line("Upgrading:");
+        assert!(h.package_name.is_none());
+        assert_eq!(h.phase_label.as_deref(), Some("Installing"));
     }
 
     #[test]

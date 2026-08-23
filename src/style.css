@@ -109,16 +109,27 @@
   background-color: @purple_1;
 }
 
+.now-playing {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background-color: alpha(@accent_bg_color, 0.10);
+  border: 1px solid alpha(@accent_bg_color, 0.28);
+}
+
 .pkg-row.pending {
   opacity: 0.72;
 }
 
-.phase-tag {
-  font-weight: 600;
+.pkg-row.active {
+  background-color: alpha(@accent_bg_color, 0.10);
 }
 
-.row-progress {
-  min-width: 72px;
+.pkg-row.done {
+  opacity: 0.82;
+}
+
+.phase-tag {
+  font-weight: 600;
 }
 
 .stat-card {

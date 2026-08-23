@@ -281,6 +281,8 @@ fn progress_marks_package_and_completes_previous() {
         overall_progress: 0.0,
         phase_label: "x".into(),
         current_source: None,
+        current_name: None,
+        work_progress: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -309,6 +311,170 @@ fn progress_marks_package_and_completes_previous() {
     let pkgs = s.packages();
     assert_eq!(pkgs[0].status, PackageStatus::Completed);
     assert_eq!(pkgs[1].status, PackageStatus::Installing);
+}
+
+#[test]
+fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
+    let mut s = AppState::default();
+    s.phase = Phase::Running {
+        packages: vec![dnf("abrt"), dnf("kernel")],
+        active_index: None,
+        overall_progress: 0.0,
+        phase_label: "x".into(),
+        current_source: Some(UpdateSource::Dnf),
+        current_name: None,
+        work_progress: None,
+        needs_reboot: false,
+        failed_sources: Vec::new(),
+    };
+    let s = reduce(
+        s,
+        Event::ApplyProgress {
+            source: UpdateSource::Dnf,
+            package_hint: None,
+            status_hint: Some(PackageStatus::Installing),
+            progress: Some(0.5),
+            phase_label: "Downloading packages".into(),
+        },
+    )
+    .unwrap();
+    match &s.phase {
+        Phase::Running {
+            packages,
+            active_index,
+            current_name,
+            work_progress,
+            overall_progress,
+            ..
+        } => {
+            assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
+            assert_eq!(*active_index, None);
+            assert_eq!(current_name.as_deref(), None);
+            assert_eq!(*work_progress, Some(0.5));
+            assert!((*overall_progress - 0.0).abs() < f64::EPSILON);
+        }
+        other => panic!("expected Running, got {other:?}"),
+    }
+}
+
+#[test]
+fn kernel_hint_does_not_complete_kernel_core() {
+    let mut s = AppState::default();
+    s.phase = Phase::Running {
+        packages: vec![dnf("kernel"), dnf("kernel-core")],
+        active_index: None,
+        overall_progress: 0.0,
+        phase_label: "x".into(),
+        current_source: None,
+        current_name: None,
+        work_progress: None,
+        needs_reboot: false,
+        failed_sources: Vec::new(),
+    };
+    let s = reduce(
+        s,
+        Event::ApplyProgress {
+            source: UpdateSource::Dnf,
+            package_hint: Some("kernel".into()),
+            status_hint: Some(PackageStatus::Installing),
+            progress: Some(0.2),
+            phase_label: "Installing".into(),
+        },
+    )
+    .unwrap();
+    let pkgs = s.packages();
+    assert_eq!(pkgs[0].status, PackageStatus::Installing);
+    assert_eq!(pkgs[1].status, PackageStatus::Pending);
+}
+
+#[test]
+fn verify_pass_does_not_move_current_back_to_completed() {
+    let mut s = AppState::default();
+    s.phase = Phase::Running {
+        packages: vec![dnf("firefox"), dnf("kernel")],
+        active_index: Some(1),
+        overall_progress: 0.5,
+        phase_label: "Installing".into(),
+        current_source: Some(UpdateSource::Dnf),
+        current_name: Some("kernel".into()),
+        work_progress: Some(0.5),
+        needs_reboot: false,
+        failed_sources: Vec::new(),
+    };
+    match &mut s.phase {
+        Phase::Running { packages, .. } => {
+            packages[0].status = PackageStatus::Completed;
+            packages[0].progress = 1.0;
+            packages[1].status = PackageStatus::Installing;
+        }
+        _ => unreachable!(),
+    }
+    let s = reduce(
+        s,
+        Event::ApplyProgress {
+            source: UpdateSource::Dnf,
+            package_hint: Some("firefox".into()),
+            status_hint: Some(PackageStatus::Installing),
+            progress: Some(0.9),
+            phase_label: "Verifying".into(),
+        },
+    )
+    .unwrap();
+    match &s.phase {
+        Phase::Running {
+            packages,
+            active_index,
+            current_name,
+            ..
+        } => {
+            assert_eq!(packages[0].status, PackageStatus::Completed);
+            assert_eq!(packages[1].status, PackageStatus::Installing);
+            assert_eq!(*active_index, Some(1));
+            assert_eq!(current_name.as_deref(), Some("kernel"));
+        }
+        other => panic!("expected Running, got {other:?}"),
+    }
+}
+
+#[test]
+fn apply_source_started_does_not_mark_first_package() {
+    let mut s = AppState::default();
+    s.phase = Phase::Running {
+        packages: vec![dnf("abrt"), dnf("kernel")],
+        active_index: None,
+        overall_progress: 0.0,
+        phase_label: "x".into(),
+        current_source: None,
+        current_name: Some("stale".into()),
+        work_progress: Some(0.3),
+        needs_reboot: false,
+        failed_sources: Vec::new(),
+    };
+    let s = reduce(
+        s,
+        Event::ApplySourceStarted {
+            source: UpdateSource::Dnf,
+            label: "Updating System".into(),
+        },
+    )
+    .unwrap();
+    match &s.phase {
+        Phase::Running {
+            packages,
+            active_index,
+            current_name,
+            work_progress,
+            phase_label,
+            ..
+        } => {
+            assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
+            assert_eq!(*active_index, None);
+            assert_eq!(*current_name, None);
+            assert_eq!(*work_progress, None);
+            assert_eq!(phase_label, "Updating System");
+        }
+        other => panic!("expected Running, got {other:?}"),
+    }
 }
 
 #[test]

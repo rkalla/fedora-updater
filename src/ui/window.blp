@@ -432,6 +432,69 @@ Adw.ApplicationWindow window {
               }
             }
 
+            Adw.Clamp {
+              maximum-size: 700;
+              tightening-threshold: 500;
+              hexpand: true;
+              margin-start: 16;
+              margin-end: 16;
+              margin-bottom: 8;
+
+              child: Gtk.Box now_playing {
+                orientation: vertical;
+                spacing: 8;
+                hexpand: true;
+                styles ["now-playing"]
+
+                Gtk.Box {
+                  orientation: horizontal;
+                  spacing: 10;
+
+                  Adw.Spinner now_playing_spinner {
+                    width-request: 18;
+                    height-request: 18;
+                    valign: center;
+                    halign: center;
+                  }
+
+                  Gtk.Box {
+                    orientation: vertical;
+                    spacing: 2;
+                    hexpand: true;
+                    valign: center;
+
+                    Gtk.Label now_playing_title {
+                      label: "Starting…";
+                      halign: start;
+                      ellipsize: end;
+                      xalign: 0;
+                      styles ["heading"]
+                    }
+
+                    Gtk.Label now_playing_subtitle {
+                      label: "";
+                      halign: start;
+                      ellipsize: end;
+                      xalign: 0;
+                      styles ["dim-label", "caption"]
+                    }
+                  }
+
+                  Gtk.Label now_playing_pct {
+                    label: "";
+                    valign: center;
+                    width-chars: 4;
+                    styles ["numeric", "caption", "dim-label"]
+                  }
+                }
+
+                Gtk.ProgressBar now_playing_bar {
+                  fraction: 0.0;
+                  hexpand: true;
+                }
+              };
+            }
+
             Gtk.ScrolledWindow run_list_scroll {
               vexpand: true;
               hexpand: true;
@@ -447,21 +510,25 @@ Adw.ApplicationWindow window {
                 margin-end: 16;
                 margin-bottom: 8;
 
-                child: Gtk.Box {
-                  orientation: vertical;
-                  spacing: 12;
-
-                  Adw.PreferencesGroup run_completed_group {
-                    Adw.ExpanderRow run_completed {
-                      title: "0 completed";
-                      expanded: false;
-                      enable-expansion: true;
-                    }
-                  }
-
-                  Adw.PreferencesGroup run_active_group {
-                  }
+                child: Adw.PreferencesGroup run_list_group {
                 };
+              };
+            }
+
+            Adw.Clamp {
+              maximum-size: 700;
+              tightening-threshold: 500;
+              hexpand: true;
+              margin-start: 16;
+              margin-end: 16;
+              margin-bottom: 8;
+
+              child: Adw.PreferencesGroup run_completed_group {
+                Adw.ExpanderRow run_completed {
+                  title: "0 completed";
+                  expanded: false;
+                  enable-expansion: true;
+                }
               };
             }
 

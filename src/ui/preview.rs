@@ -100,21 +100,36 @@ pub fn state_for(phase: &str) -> AppState {
         "running" => Phase::Running {
             packages: sample_packages(true),
             active_index: Some(3),
-            overall_progress: 0.58,
-            phase_label: "Installing gnome-shell".into(),
+            overall_progress: 0.5,
+            phase_label: "Installing".into(),
             current_source: Some(UpdateSource::Dnf),
+            current_name: Some("gnome-shell".into()),
+            work_progress: Some(0.72),
             needs_reboot: false,
             failed_sources: vec![],
         },
-        "running-many" | "running-expanded" => Phase::Running {
-            packages: many_running_packages(),
-            active_index: Some(24),
-            overall_progress: 0.64,
-            phase_label: "Installing current-package".into(),
-            current_source: Some(UpdateSource::Dnf),
-            needs_reboot: false,
-            failed_sources: vec![],
-        },
+        "running-many" | "running-expanded" => {
+            let packages = many_running_packages();
+            let active_index = packages
+                .iter()
+                .position(|p| p.status == PackageStatus::Installing);
+            let done = packages
+                .iter()
+                .filter(|p| p.status == PackageStatus::Completed)
+                .count();
+            let overall = done as f64 / packages.len() as f64;
+            Phase::Running {
+                packages,
+                active_index,
+                overall_progress: overall,
+                phase_label: "Installing".into(),
+                current_source: Some(UpdateSource::Dnf),
+                current_name: Some("current-package".into()),
+                work_progress: Some(0.42),
+                needs_reboot: false,
+                failed_sources: vec![],
+            }
+        }
         "done" => Phase::Done {
             packages: sample_packages(false)
                 .into_iter()

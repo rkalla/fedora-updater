@@ -7,7 +7,7 @@ use async_channel::Sender;
 
 use crate::backend::{self, dnf, flatpak, fwupd};
 use crate::helper_protocol::HelperCommand;
-use crate::model::{AuthPurpose, Package, PackageStatus, UpdateSource, WorkerEvent};
+use crate::model::{AuthPurpose, Package, UpdateSource, WorkerEvent};
 use crate::privilege::{
     close_session, run_local_command, session_is_alive, with_session, SessionError, SessionEvent,
 };
@@ -414,8 +414,8 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
                 &tx,
                 WorkerEvent::ApplyProgress {
                     source,
-                    package_hint: known_names.first().cloned(),
-                    status_hint: Some(PackageStatus::Installing),
+                    package_hint: None,
+                    status_hint: None,
                     progress: None,
                     phase_label: format!("Updating {}", source.label()),
                 },
@@ -505,59 +505,28 @@ fn emit_progress_from_line(
     tx: &Sender<WorkerEvent>,
     source: UpdateSource,
     l: &str,
-    known_names: &[String],
+    _known_names: &[String],
 ) {
-    let mut hint = backend::parse_progress(source, l);
-
-    // Match known package names appearing in the line (dnf5 multi-line tables).
-    if hint.package_name.is_none() {
-        for name in known_names {
-            // Word-boundary-ish: name as token or name-version prefix
-            if l.split_whitespace()
-                .any(|t| t == name || t.starts_with(&format!("{name}-")))
-                || l.contains(&format!(" {name} "))
-                || l.starts_with(name)
-            {
-                hint.package_name = Some(name.clone());
-                if hint.status.is_none() {
-                    hint.status = Some(PackageStatus::Installing);
-                }
-                if hint.phase_label.is_none() {
-                    hint.phase_label = Some(format!("Updating {name}"));
-                }
-                break;
-            }
-        }
-    }
-
-    // Always refresh phase label from non-empty lines so the UI feels live
-    // even when we cannot map a package yet.
-    if hint.phase_label.is_none() && !l.trim().is_empty() {
-        let preview: String = l.chars().take(80).collect();
-        hint.phase_label = Some(preview);
-        if hint.status.is_none() {
-            hint.status = Some(PackageStatus::Installing);
-        }
-    }
-
-    if hint.package_name.is_some()
-        || hint.status.is_some()
-        || hint.progress.is_some()
-        || hint.phase_label.is_some()
+    let hint = backend::parse_progress(source, l);
+    if hint.package_name.is_none()
+        && hint.status.is_none()
+        && hint.progress.is_none()
+        && hint.phase_label.is_none()
     {
-        send(
-            tx,
-            WorkerEvent::ApplyProgress {
-                source,
-                package_hint: hint.package_name,
-                status_hint: hint.status,
-                progress: hint.progress,
-                phase_label: hint
-                    .phase_label
-                    .unwrap_or_else(|| format!("Updating {}", source.label())),
-            },
-        );
+        return;
     }
+    send(
+        tx,
+        WorkerEvent::ApplyProgress {
+            source,
+            package_hint: hint.package_name,
+            status_hint: hint.status,
+            progress: hint.progress,
+            phase_label: hint
+                .phase_label
+                .unwrap_or_else(|| format!("Updating {}", source.label())),
+        },
+    );
 }
 
 fn run_helper_apply(

@@ -197,12 +197,21 @@ impl Package {
         }
     }
 
+    /// True when a backend progress line named this package. Token-exact so
+    /// `kernel` does not steal `kernel-core`.
     pub fn matches_progress_name(&self, hint: &str) -> bool {
-        self.name == hint
-            || self.id == hint
-            || self.name.starts_with(hint)
-            || hint.starts_with(&self.name)
-            || self.id.contains(hint)
+        let hint = hint.trim();
+        if hint.is_empty() {
+            return false;
+        }
+        if self.name == hint || self.id == hint {
+            return true;
+        }
+        if !self.arch.is_empty() && format!("{}.{}", self.name, self.arch) == hint {
+            return true;
+        }
+        // Flatpak/fwupd ids: `flatpak:user:app/org.foo/x86_64/stable`, `fwupd:<device>`.
+        self.id.split([':', '/']).any(|part| part == hint)
     }
 }
 
@@ -437,7 +446,13 @@ pub fn finalize_source(packages: &mut [Package], source: UpdateSource, ok: bool)
     }
 }
 
-/// Apply progress hint to matching package(s) within a source.
+/// Apply a *named* progress hint. Unnamed lines must not poke the first
+/// remaining package — the now-playing card uses phase/work progress instead.
+///
+/// Download name-chasing does not complete packages (DNF names every RPM
+/// once per download, then again per install/verify). Installing name-switch
+/// completes the previous *installing* item only. Already-done packages are
+/// ignored so verify passes cannot resurrect them as current.
 pub fn apply_progress_hint(
     packages: &mut [Package],
     source: UpdateSource,
@@ -445,53 +460,87 @@ pub fn apply_progress_hint(
     status_hint: Option<PackageStatus>,
     progress: Option<f64>,
 ) -> Option<usize> {
-    // Complete previous active item in this source when switching names
-    if let Some(hint) = package_hint {
-        let mut prev_active: Option<usize> = None;
-        for (i, p) in packages.iter().enumerate() {
-            if p.source == source
-                && matches!(
-                    p.status,
-                    PackageStatus::Downloading | PackageStatus::Installing
-                )
-                && !p.matches_progress_name(hint)
-            {
-                prev_active = Some(i);
-            }
-        }
-        if let Some(i) = prev_active {
-            packages[i].status = PackageStatus::Completed;
-            packages[i].progress = 1.0;
-        }
+    let hint = package_hint.filter(|s| !s.trim().is_empty())?;
+    let idx = packages
+        .iter()
+        .position(|p| p.source == source && p.matches_progress_name(hint))?;
 
-        if let Some(idx) = packages
-            .iter()
-            .position(|p| p.source == source && p.matches_progress_name(hint))
-        {
-            if let Some(st) = status_hint {
-                packages[idx].status = st;
-            } else if packages[idx].status == PackageStatus::Pending {
-                packages[idx].status = PackageStatus::Installing;
+    if packages[idx].status.is_done() {
+        return None;
+    }
+
+    match status_hint {
+        Some(PackageStatus::Downloading) => {
+            for (i, p) in packages.iter_mut().enumerate() {
+                if i != idx && p.source == source && p.status == PackageStatus::Downloading {
+                    p.status = PackageStatus::Pending;
+                    p.progress = 0.0;
+                }
             }
-            if let Some(pr) = progress {
-                packages[idx].progress = pr.clamp(0.0, 1.0);
-            }
-            return Some(idx);
+            packages[idx].status = PackageStatus::Downloading;
         }
-    } else if let Some(st) = status_hint {
-        // Update first non-done of this source
-        if let Some(idx) = packages
-            .iter()
-            .position(|p| p.source == source && !p.status.is_done())
-        {
-            packages[idx].status = st;
-            if let Some(pr) = progress {
-                packages[idx].progress = pr.clamp(0.0, 1.0);
+        Some(PackageStatus::Installing) | None => {
+            for (i, p) in packages.iter_mut().enumerate() {
+                if i == idx || p.source != source {
+                    continue;
+                }
+                if p.status == PackageStatus::Installing {
+                    p.status = PackageStatus::Completed;
+                    p.progress = 1.0;
+                } else if p.status == PackageStatus::Downloading {
+                    p.status = PackageStatus::Pending;
+                    p.progress = 0.0;
+                }
             }
-            return Some(idx);
+            packages[idx].status = PackageStatus::Installing;
+        }
+        Some(st) => {
+            packages[idx].status = st;
         }
     }
-    None
+    if let Some(pr) = progress {
+        packages[idx].progress = pr.clamp(0.0, 1.0);
+    }
+    Some(idx)
+}
+
+/// Title for the sticky now-playing card: named package, else last hint, else phase.
+pub fn now_playing_title(
+    packages: &[Package],
+    active_index: Option<usize>,
+    current_name: Option<&str>,
+    phase_label: &str,
+) -> String {
+    if let Some(p) = active_index.and_then(|i| packages.get(i)) {
+        if !p.status.is_done() {
+            return p.name.clone();
+        }
+    }
+    if let Some(name) = current_name.map(str::trim).filter(|s| !s.is_empty()) {
+        return name.to_string();
+    }
+    if phase_label.trim().is_empty() {
+        "Starting…".into()
+    } else {
+        phase_label.to_string()
+    }
+}
+
+/// Caption under the now-playing title. Omits the phase when it duplicates the title.
+pub fn now_playing_subtitle(
+    title: &str,
+    phase_label: &str,
+    source: Option<UpdateSource>,
+) -> String {
+    let mut parts = Vec::new();
+    let phase = phase_label.trim();
+    if !phase.is_empty() && phase != title {
+        parts.push(phase.to_string());
+    }
+    if let Some(s) = source {
+        parts.push(s.label().to_string());
+    }
+    parts.join(" · ")
 }
 
 pub fn overall_progress(packages: &[Package]) -> f64 {
@@ -538,5 +587,153 @@ mod tests {
         assert!(about_time_left(30, 0.05).is_none());
         let label = about_time_left(60, 0.25).expect("estimate");
         assert!(label.contains("minute"));
+    }
+
+    #[test]
+    fn matches_progress_name_is_token_exact() {
+        let kernel = Package::new_dnf("kernel", "x86_64", "1", "updates");
+        let core = Package::new_dnf("kernel-core", "x86_64", "1", "updates");
+        assert!(kernel.matches_progress_name("kernel"));
+        assert!(kernel.matches_progress_name("kernel.x86_64"));
+        assert!(!kernel.matches_progress_name("kernel-core"));
+        assert!(core.matches_progress_name("kernel-core"));
+        assert!(!core.matches_progress_name("kernel"));
+
+        let fp = Package {
+            id: "flatpak:user:app/org.mozilla.Thunderbird/x86_64/stable".into(),
+            name: "Thunderbird".into(),
+            arch: "x86_64".into(),
+            version: "1".into(),
+            repo: "flathub".into(),
+            size: None,
+            old_version: None,
+            status: PackageStatus::Pending,
+            progress: 0.0,
+            kind: AdvisoryKind::Unknown,
+            source: UpdateSource::FlatpakUser,
+            detail: String::new(),
+        };
+        assert!(fp.matches_progress_name("Thunderbird"));
+        assert!(fp.matches_progress_name("org.mozilla.Thunderbird"));
+        assert!(!fp.matches_progress_name("Thunder"));
+    }
+
+    #[test]
+    fn unnamed_progress_does_not_touch_packages() {
+        let mut pkgs = vec![
+            Package::new_dnf("abrt", "x86_64", "1", "updates"),
+            Package::new_dnf("kernel", "x86_64", "1", "updates"),
+        ];
+        assert!(apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            None,
+            Some(PackageStatus::Installing),
+            Some(0.4),
+        )
+        .is_none());
+        assert!(pkgs
+            .iter()
+            .all(|p| p.status == PackageStatus::Pending && p.progress == 0.0));
+    }
+
+    #[test]
+    fn named_progress_completes_previous_live_item() {
+        let mut pkgs = vec![
+            Package::new_dnf("firefox", "x86_64", "1", "updates"),
+            Package::new_dnf("kernel", "x86_64", "1", "updates"),
+        ];
+        apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            Some("firefox"),
+            Some(PackageStatus::Installing),
+            Some(0.2),
+        );
+        apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            Some("kernel"),
+            Some(PackageStatus::Installing),
+            Some(0.1),
+        );
+        assert_eq!(pkgs[0].status, PackageStatus::Completed);
+        assert_eq!(pkgs[1].status, PackageStatus::Installing);
+    }
+
+    #[test]
+    fn download_name_switch_does_not_complete_previous() {
+        let mut pkgs = vec![
+            Package::new_dnf("firefox", "x86_64", "1", "updates"),
+            Package::new_dnf("kernel", "x86_64", "1", "updates"),
+        ];
+        apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            Some("firefox"),
+            Some(PackageStatus::Downloading),
+            Some(0.2),
+        );
+        apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            Some("kernel"),
+            Some(PackageStatus::Downloading),
+            Some(0.4),
+        );
+        assert_eq!(pkgs[0].status, PackageStatus::Pending);
+        assert_eq!(pkgs[1].status, PackageStatus::Downloading);
+    }
+
+    #[test]
+    fn done_package_is_not_resurrected_as_current() {
+        let mut pkgs = vec![
+            Package::new_dnf("firefox", "x86_64", "1", "updates"),
+            Package::new_dnf("kernel", "x86_64", "1", "updates"),
+        ];
+        pkgs[0].status = PackageStatus::Completed;
+        pkgs[0].progress = 1.0;
+        assert!(apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            Some("firefox"),
+            Some(PackageStatus::Installing),
+            Some(0.9),
+        )
+        .is_none());
+        assert_eq!(pkgs[0].status, PackageStatus::Completed);
+        assert_eq!(pkgs[1].status, PackageStatus::Pending);
+    }
+
+    #[test]
+    fn now_playing_prefers_named_package() {
+        let pkgs = vec![
+            Package::new_dnf("firefox", "x86_64", "1", "updates"),
+            Package::new_dnf("kernel", "x86_64", "1", "updates"),
+        ];
+        assert_eq!(
+            now_playing_title(&pkgs, Some(1), Some("kernel"), "Installing"),
+            "kernel"
+        );
+        assert_eq!(
+            now_playing_title(&pkgs, None, Some("libfoo"), "Installing"),
+            "libfoo"
+        );
+        assert_eq!(
+            now_playing_title(&pkgs, None, None, "Downloading packages"),
+            "Downloading packages"
+        );
+        assert_eq!(
+            now_playing_subtitle("kernel", "Installing", Some(UpdateSource::Dnf)),
+            "Installing · System"
+        );
+        assert_eq!(
+            now_playing_subtitle(
+                "Downloading packages",
+                "Downloading packages",
+                Some(UpdateSource::Dnf)
+            ),
+            "System"
+        );
     }
 }

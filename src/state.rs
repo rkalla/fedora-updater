@@ -36,6 +36,10 @@ pub enum Phase {
         overall_progress: f64,
         phase_label: String,
         current_source: Option<UpdateSource>,
+        /// Last package name parsed from a backend line (may not be in `packages`).
+        current_name: Option<String>,
+        /// Last transaction/download fraction for the now-playing card.
+        work_progress: Option<f64>,
         needs_reboot: bool,
         failed_sources: Vec<UpdateSource>,
     },
@@ -212,6 +216,8 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                             overall_progress: 0.0,
                             phase_label: "Starting…".into(),
                             current_source: None,
+                            current_name: None,
+                            work_progress: None,
                             needs_reboot: false,
                             failed_sources: Vec::new(),
                         };
@@ -283,17 +289,16 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
             Phase::Running {
                 phase_label,
                 current_source,
-                packages,
+                current_name,
+                work_progress,
+                active_index,
                 ..
             } => {
                 *phase_label = label;
                 *current_source = Some(source);
-                if let Some(p) = packages
-                    .iter_mut()
-                    .find(|p| p.source == source && p.status == PackageStatus::Pending)
-                {
-                    p.status = PackageStatus::Installing;
-                }
+                *current_name = None;
+                *work_progress = None;
+                *active_index = None;
                 Ok(state)
             }
             _ => Err(invalid(&state, "ApplySourceStarted")),
@@ -311,44 +316,38 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 overall_progress: op,
                 phase_label: pl,
                 current_source,
+                current_name,
+                work_progress,
                 ..
             } => {
+                if *current_source != Some(source) {
+                    *current_name = None;
+                    *work_progress = None;
+                    *active_index = None;
+                }
                 *pl = phase_label;
                 *current_source = Some(source);
-                *active_index = apply_progress_hint(
-                    packages,
-                    source,
-                    package_hint.as_deref(),
-                    status_hint,
-                    progress,
-                );
-                // If we know fractional progress for this backend but not a name,
-                // advance earlier packages so the burn-down isn't stuck.
-                if package_hint.is_none() {
-                    if let Some(frac) = progress {
-                        let idxs: Vec<usize> = packages
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, p)| p.source == source)
-                            .map(|(i, _)| i)
-                            .collect();
-                        if !idxs.is_empty() {
-                            let done_n = ((frac.clamp(0.0, 1.0) * idxs.len() as f64).floor()
-                                as usize)
-                                .min(idxs.len().saturating_sub(1));
-                            for &i in idxs.iter().take(done_n) {
-                                if !packages[i].status.is_done() {
-                                    packages[i].status = PackageStatus::Completed;
-                                    packages[i].progress = 1.0;
-                                }
-                            }
-                            if let Some(&i) = idxs.get(done_n) {
-                                if !packages[i].status.is_done() {
-                                    packages[i].status =
-                                        status_hint.unwrap_or(PackageStatus::Installing);
-                                    packages[i].progress = frac;
-                                    *active_index = Some(i);
-                                }
+                if progress.is_some() {
+                    *work_progress = progress;
+                }
+                if let Some(name) = package_hint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    match apply_progress_hint(packages, source, Some(name), status_hint, progress) {
+                        Some(idx) => {
+                            *current_name = Some(name.to_string());
+                            *active_index = Some(idx);
+                        }
+                        None => {
+                            let named_done = packages.iter().any(|p| {
+                                p.source == source
+                                    && p.matches_progress_name(name)
+                                    && p.status.is_done()
+                            });
+                            if !named_done {
+                                *current_name = Some(name.to_string());
                             }
                         }
                     }
