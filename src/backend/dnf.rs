@@ -1,8 +1,67 @@
 //! Parsers for `dnf check-update --refresh` and live `dnf update -y` output.
 
-use crate::model::{Package, PackageStatus, UpdateSource};
+use std::collections::HashMap;
+
+use crate::model::{format_bytes, Package, PackageStatus, UpdateSource};
 
 use super::ProgressHint;
+
+/// Read-only size lookup after `check-update --refresh` has warmed metadata.
+pub const REPOQUERY_UPGRADES_ARGS: &[&str] = &[
+    "-q",
+    "repoquery",
+    "--upgrades",
+    "--queryformat",
+    "%{name}\t%{arch}\t%{evr}\t%{downloadsize}\n",
+];
+
+pub fn parse_repoquery_sizes(output: &str) -> HashMap<(String, String, String), u64> {
+    let mut out = HashMap::new();
+    for raw in output.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = if line.contains('\t') {
+            line.split('\t').collect()
+        } else {
+            line.split_whitespace().collect()
+        };
+        if parts.len() < 4 {
+            continue;
+        }
+        let name = parts[0];
+        let arch = parts[1];
+        let evr = parts[2];
+        if !is_plausible_arch(arch) {
+            continue;
+        }
+        let Ok(bytes) = parts[3].trim().parse::<u64>() else {
+            continue;
+        };
+        out.insert((name.to_string(), arch.to_string(), evr.to_string()), bytes);
+    }
+    out
+}
+
+/// Fill missing `Package.size` from a repoquery download-size map. Returns how many were set.
+pub fn apply_download_sizes(
+    packages: &mut [Package],
+    sizes: &HashMap<(String, String, String), u64>,
+) -> usize {
+    let mut n = 0;
+    for p in packages.iter_mut() {
+        if p.size.is_some() {
+            continue;
+        }
+        let key = (p.name.clone(), p.arch.clone(), p.version.clone());
+        if let Some(&bytes) = sizes.get(&key) {
+            p.size = Some(format_bytes(bytes));
+            n += 1;
+        }
+    }
+    n
+}
 
 pub fn parse_check_update(output: &str) -> Vec<Package> {
     let mut packages = Vec::new();
@@ -290,15 +349,58 @@ pub fn detect_reboot_needed(log: &str, packages: &[Package]) -> bool {
     if lower.contains("reboot") || lower.contains("restart your system") {
         return true;
     }
-    packages.iter().any(|p| {
-        p.source == UpdateSource::Dnf
-            && p.status == PackageStatus::Completed
-            && (p.name == "kernel"
-                || p.name.starts_with("kernel-core")
-                || p.name.starts_with("kernel-")
-                || p.name == "linux-firmware"
-                || p.name == "glibc")
-    })
+    packages
+        .iter()
+        .any(|p| p.source == UpdateSource::Dnf && package_implies_reboot(&p.name))
+}
+
+/// Running kernel/modules images and a small set of core userspace that cannot
+/// be fully replaced without a reboot. Userspace kernel add-ons (`kernel-tools`,
+/// `kernel-devel`, headers) do not count.
+pub fn package_implies_reboot(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    if matches!(
+        n.as_str(),
+        "kernel"
+            | "kernel-rt"
+            | "kernel-debug"
+            | "kernel-smp"
+            | "kernel-pae"
+            | "glibc"
+            | "glibc-common"
+            | "linux-firmware"
+            | "microcode_ctl"
+            | "amd-ucode-firmware"
+            | "intel-microcode"
+            | "systemd"
+            | "systemd-libs"
+            | "systemd-udev"
+            | "dbus"
+            | "dbus-broker"
+            | "dbus-daemon"
+            | "dracut"
+    ) {
+        return true;
+    }
+    for prefix in [
+        "kernel-core",
+        "kernel-modules",
+        "kernel-rt-core",
+        "kernel-rt-modules",
+        "kernel-debug-core",
+        "kernel-debug-modules",
+        "kernel-uki",
+        "grub2",
+        "shim",
+    ] {
+        if n == prefix
+            || n.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('-'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// dnf check-update: 0 = none, 100 = updates available; other non-zero is error unless packages parsed.
@@ -354,5 +456,112 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
         assert!(check_exit_is_hard_error(1, &[]));
         let pkgs = vec![Package::new_dnf("a", "x86_64", "1", "updates")];
         assert!(!check_exit_is_hard_error(1, &pkgs));
+    }
+
+    #[test]
+    fn kernel_core_in_pending_transaction_implies_reboot() {
+        let pkg = Package::new_dnf("kernel-core", "x86_64", "7.1.12-200.fc44", "updates");
+        assert_eq!(pkg.status, PackageStatus::Pending);
+        assert!(detect_reboot_needed("", &[pkg]));
+    }
+
+    #[test]
+    fn kernel_tools_and_devel_do_not_imply_reboot() {
+        let tools = Package::new_dnf("kernel-tools", "x86_64", "7.1.12-200.fc44", "updates");
+        let libs = Package::new_dnf("kernel-tools-libs", "x86_64", "7.1.12-200.fc44", "updates");
+        let devel = Package::new_dnf("kernel-devel", "x86_64", "7.1.12-200.fc44", "updates");
+        let matched = Package::new_dnf(
+            "kernel-devel-matched",
+            "x86_64",
+            "7.1.12-200.fc44",
+            "updates",
+        );
+        assert!(!detect_reboot_needed("", &[tools, libs, devel, matched]));
+    }
+
+    #[test]
+    fn core_system_packages_imply_reboot() {
+        for name in [
+            "kernel",
+            "kernel-modules",
+            "kernel-modules-extra",
+            "glibc",
+            "systemd",
+            "dbus-broker",
+            "linux-firmware",
+            "grub2-efi-x64",
+        ] {
+            let pkg = Package::new_dnf(name, "x86_64", "1", "updates");
+            assert!(
+                detect_reboot_needed("", &[pkg]),
+                "{name} should recommend a reboot"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_packages_do_not_imply_reboot() {
+        let firefox = Package::new_dnf("firefox", "x86_64", "140.0-1.fc42", "updates");
+        let openssl = Package::new_dnf("openssl", "x86_64", "1", "updates");
+        assert!(!detect_reboot_needed("", &[firefox, openssl]));
+    }
+
+    #[test]
+    fn dnf_log_reboot_phrase_still_counts() {
+        let firefox = Package::new_dnf("firefox", "x86_64", "1", "updates");
+        assert!(detect_reboot_needed(
+            "Complete!\nReboot to apply changes.",
+            &[firefox]
+        ));
+    }
+
+    #[test]
+    fn repoquery_format_separates_packages_with_newlines() {
+        let qf = REPOQUERY_UPGRADES_ARGS
+            .iter()
+            .skip_while(|a| **a != "--queryformat")
+            .nth(1)
+            .expect("queryformat value");
+        assert!(
+            qf.ends_with('\n'),
+            "dnf5 concatenates packages unless queryformat ends with a newline"
+        );
+    }
+
+    #[test]
+    fn parse_repoquery_sizes_skips_noise_and_matches_nevra() {
+        let out = r#"
+Updating and loading repositories:
+Repositories loaded.
+kernel-core	x86_64	7.1.12-200.fc44	21727761
+firefox	x86_64	140.0-1.fc42	117440512
+bind-libs	x86_64	32:9.18.50-2.fc44	1388459
+"#;
+        let sizes = parse_repoquery_sizes(out);
+        assert_eq!(
+            sizes.get(&(
+                "kernel-core".into(),
+                "x86_64".into(),
+                "7.1.12-200.fc44".into()
+            )),
+            Some(&21727761)
+        );
+        assert_eq!(
+            sizes.get(&(
+                "bind-libs".into(),
+                "x86_64".into(),
+                "32:9.18.50-2.fc44".into()
+            )),
+            Some(&1388459)
+        );
+
+        let mut pkgs = vec![
+            Package::new_dnf("kernel-core", "x86_64", "7.1.12-200.fc44", "updates"),
+            Package::new_dnf("mystery", "x86_64", "1", "updates"),
+        ];
+        let n = apply_download_sizes(&mut pkgs, &sizes);
+        assert_eq!(n, 1);
+        assert_eq!(pkgs[0].size.as_deref(), Some("21 MB"));
+        assert!(pkgs[1].size.is_none());
     }
 }

@@ -15,7 +15,7 @@ use libadwaita::{
 
 use fedora_updater::model::{
     about_time_left, check_progress, count_by_kind, count_by_source, now_playing_subtitle,
-    now_playing_title, AuthPurpose, Package, UpdateSource, WorkerEvent,
+    now_playing_title, source_summary_line, AuthPurpose, Package, UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
@@ -735,8 +735,7 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 if n == 1 { "" } else { "s" }
             ));
             let (dnf, fp, fw) = count_by_source(packages);
-            w.ready_footnote
-                .set_text(&format!("{dnf} system · {fp} apps · {fw} firmware"));
+            w.ready_footnote.set_text(&source_summary_line(packages));
 
             if soft_errors.is_empty() {
                 w.ready_banner.set_revealed(false);

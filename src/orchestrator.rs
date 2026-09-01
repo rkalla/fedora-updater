@@ -149,10 +149,11 @@ pub fn run_check_all(tx: Sender<WorkerEvent>) {
             &tx,
             UpdateSource::Dnf,
             run_helper_check(&tx, HelperCommand::CheckDnf, "dnf", |log, code| {
-                let pkgs = dnf::parse_check_update(log);
+                let mut pkgs = dnf::parse_check_update(log);
                 if dnf::check_exit_is_hard_error(code, &pkgs) {
                     Err(format!("dnf check-update failed (exit {code})"))
                 } else {
+                    attach_dnf_download_sizes(&tx, &mut pkgs);
                     Ok(pkgs)
                 }
             }),
@@ -260,6 +261,28 @@ fn emit_backend_check(
                 },
             );
             soft_errors.push(e);
+        }
+    }
+}
+
+fn attach_dnf_download_sizes(tx: &Sender<WorkerEvent>, pkgs: &mut [Package]) {
+    if pkgs.is_empty() {
+        return;
+    }
+    let mut log = String::new();
+    match run_local_command("dnf", dnf::REPOQUERY_UPGRADES_ARGS, |l| {
+        log.push_str(&l);
+        log.push('\n');
+    }) {
+        Ok(_) => {
+            let sizes = dnf::parse_repoquery_sizes(&log);
+            let n = dnf::apply_download_sizes(pkgs, &sizes);
+            if n > 0 {
+                line(tx, "dnf", format!("Download sizes for {n} package(s)"));
+            }
+        }
+        Err(e) => {
+            line(tx, "dnf", format!("Could not query download sizes: {e}"));
         }
     }
 }

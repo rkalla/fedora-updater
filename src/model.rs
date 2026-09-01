@@ -354,6 +354,82 @@ pub fn count_by_source(packages: &[Package]) -> (usize, usize, usize) {
     (dnf, flatpak, firmware)
 }
 
+/// Parse a package size from DNF/Flatpak display text or a raw byte count.
+pub fn parse_size_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n);
+    }
+    let lower = s.to_ascii_lowercase().replace(',', "");
+    let split_at = lower.rfind(|c: char| c.is_ascii_digit() || c == '.')?;
+    let num = lower[..=split_at].trim();
+    let unit = lower[split_at + 1..].trim();
+    let n: f64 = num.parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    let mul = match unit {
+        "" | "b" | "byte" | "bytes" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((n * mul).round() as u64)
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < K * K {
+        format_size_unit(b / K, "KB")
+    } else if b < K * K * K {
+        format_size_unit(b / (K * K), "MB")
+    } else {
+        format_size_unit(b / (K * K * K), "GB")
+    }
+}
+
+fn format_size_unit(n: f64, unit: &str) -> String {
+    if n >= 10.0 {
+        format!("{n:.0} {unit}")
+    } else {
+        format!("{n:.1} {unit}")
+    }
+}
+
+pub fn total_download_bytes(packages: &[Package]) -> Option<u64> {
+    let mut total = 0u64;
+    let mut any = false;
+    for p in packages {
+        if let Some(n) = p.size.as_deref().and_then(parse_size_bytes) {
+            total = total.saturating_add(n);
+            any = true;
+        }
+    }
+    any.then_some(total)
+}
+
+/// Ready-view caption: `38 system · 0 apps · 0 firmware · 1.2 GB`.
+pub fn source_summary_line(packages: &[Package]) -> String {
+    let (dnf, fp, fw) = count_by_source(packages);
+    match total_download_bytes(packages) {
+        Some(bytes) if bytes > 0 => {
+            format!(
+                "{dnf} system · {fp} apps · {fw} firmware · {}",
+                format_bytes(bytes)
+            )
+        }
+        _ => format!("{dnf} system · {fp} apps · {fw} firmware"),
+    }
+}
+
 /// Counts of known advisory kinds. `Unknown` is omitted so empty chips stay hidden.
 pub fn count_by_kind(packages: &[Package]) -> (usize, usize, usize) {
     let mut security = 0;
@@ -703,6 +779,41 @@ mod tests {
         .is_none());
         assert_eq!(pkgs[0].status, PackageStatus::Completed);
         assert_eq!(pkgs[1].status, PackageStatus::Pending);
+    }
+
+    #[test]
+    fn source_summary_line_appends_rolled_up_download_size() {
+        let mut kernel = Package::new_dnf("kernel-core", "x86_64", "1", "updates");
+        kernel.size = Some("21727761".into());
+        let mut fp = Package::new_dnf("Thunderbird", "", "128", "flathub");
+        fp.source = UpdateSource::FlatpakUser;
+        fp.size = Some("164.0 MB".into());
+        let line = source_summary_line(&[kernel, fp]);
+        assert!(
+            line.starts_with("1 system · 1 apps · 0 firmware · "),
+            "got {line}"
+        );
+        assert!(
+            line.ends_with(" MB") || line.ends_with(" GB"),
+            "expected a size suffix, got {line}"
+        );
+    }
+
+    #[test]
+    fn source_summary_line_omits_size_when_unknown() {
+        let pkg = Package::new_dnf("firefox", "x86_64", "1", "updates");
+        assert_eq!(
+            source_summary_line(&[pkg]),
+            "1 system · 0 apps · 0 firmware"
+        );
+    }
+
+    #[test]
+    fn format_bytes_uses_compact_units() {
+        assert_eq!(format_bytes(900), "900 B");
+        assert_eq!(format_bytes(12 * 1024), "12 KB");
+        assert_eq!(format_bytes(21727761), "21 MB");
+        assert_eq!(format_bytes(1_288_490_189), "1.2 GB");
     }
 
     #[test]
