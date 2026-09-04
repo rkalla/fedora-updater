@@ -18,8 +18,9 @@ use fedora_updater::model::{
     now_playing_title, source_summary_line, AuthPurpose, Package, UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
-    can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
-    run_systemctl_reboot, session_started_event, worker_to_state_events,
+    can_skip_auth_ui, cancel_background_work, fail_retry_is_reboot, release_privileges,
+    run_apply_all, run_check_all, run_systemctl_reboot, session_started_event,
+    worker_to_state_events,
 };
 use fedora_updater::state::{self, AppState, Event, Phase};
 
@@ -226,6 +227,12 @@ pub fn build(app: &Application) {
         let tx = tx.clone();
         let pending_purpose = pending_purpose.clone();
         fail_retry.connect_clicked(move |_| {
+            let title = widgets.fail_page.title();
+            if fail_retry_is_reboot(&title) {
+                widgets.toast.add_toast(Toast::new("Rebooting…"));
+                run_systemctl_reboot(tx.clone());
+                return;
+            }
             start_check(&state, &widgets, &pending_purpose, tx.clone());
         });
     }

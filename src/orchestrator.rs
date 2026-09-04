@@ -605,21 +605,48 @@ fn run_local_apply(
     }
 }
 
+pub const REBOOT_FAILED_TITLE: &str = "Reboot failed";
+pub const REBOOT_SPAWN_FAILED_TITLE: &str = "Could not run systemctl reboot";
+
+/// Map `systemctl reboot` output into a Failed-page detail string.
+pub fn reboot_failure_detail(log: &str, code: i32) -> String {
+    let trimmed = log.trim();
+    if trimmed.to_ascii_lowercase().contains("block inhibitor") {
+        "A process is still blocking shutdown — often an update finishing. Try again in a few seconds.".into()
+    } else if !trimmed.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("systemctl reboot exited with {code}")
+    }
+}
+
+/// Retry on the Failed page re-runs reboot when the last failure was a reboot.
+pub fn fail_retry_is_reboot(title: &str) -> bool {
+    title == REBOOT_FAILED_TITLE || title == REBOOT_SPAWN_FAILED_TITLE
+}
+
 pub fn run_systemctl_reboot(tx: Sender<WorkerEvent>) {
     thread::spawn(move || {
-        match run_local_command("systemctl", &["reboot"], |l| line(&tx, "systemctl", l)) {
+        let mut log = String::new();
+        match run_local_command("systemctl", &["reboot"], |l| {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(&l);
+            line(&tx, "systemctl", l);
+        }) {
             Ok(0) => {}
             Ok(code) => send(
                 &tx,
                 WorkerEvent::Failed {
-                    message: "Reboot failed".into(),
-                    detail: format!("systemctl reboot exited with {code}"),
+                    message: REBOOT_FAILED_TITLE.into(),
+                    detail: reboot_failure_detail(&log, code),
                 },
             ),
             Err(e) => send(
                 &tx,
                 WorkerEvent::Failed {
-                    message: "Could not run systemctl reboot".into(),
+                    message: REBOOT_SPAWN_FAILED_TITLE.into(),
                     detail: e.to_string(),
                 },
             ),
@@ -640,4 +667,45 @@ pub fn release_privileges() {
 /// Whether Check/Apply can skip the polkit wait UI (helper already elevated).
 pub fn can_skip_auth_ui() -> bool {
     session_is_alive()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_inhibitor_explains_try_again() {
+        let detail = reboot_failure_detail(
+            "Call to Reboot failed: Operation denied due to active block inhibitor",
+            1,
+        );
+        assert!(
+            detail.to_ascii_lowercase().contains("try again"),
+            "expected a try-again hint, got {detail:?}"
+        );
+        assert!(
+            !detail.contains("exited with"),
+            "should not fall back to the exit-code line, got {detail:?}"
+        );
+    }
+
+    #[test]
+    fn other_systemctl_output_is_shown() {
+        let detail = reboot_failure_detail("Failed to talk to logind", 1);
+        assert_eq!(detail, "Failed to talk to logind");
+    }
+
+    #[test]
+    fn empty_output_falls_back_to_exit_code() {
+        let detail = reboot_failure_detail("  \n", 1);
+        assert_eq!(detail, "systemctl reboot exited with 1");
+    }
+
+    #[test]
+    fn retry_on_reboot_failed_retries_reboot() {
+        assert!(fail_retry_is_reboot("Reboot failed"));
+        assert!(fail_retry_is_reboot("Could not run systemctl reboot"));
+        assert!(!fail_retry_is_reboot("All updates failed"));
+        assert!(!fail_retry_is_reboot("Authentication cancelled"));
+    }
 }
