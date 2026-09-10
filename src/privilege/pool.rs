@@ -6,7 +6,7 @@
 
 use std::sync::Mutex;
 
-use super::session::{PrivilegedSession, SessionError};
+use super::session::{kill_recorded_helper, PrivilegedSession, SessionError};
 
 static SESSION: Mutex<Option<PrivilegedSession>> = Mutex::new(None);
 
@@ -71,12 +71,17 @@ pub fn would_prompt() -> bool {
     !session_is_alive()
 }
 
-/// End the shared session (QUIT helper / kill). Safe to call if none.
-/// Prefer calling only when the app is shutting down.
+/// End the shared session. Must never block: GTK calls this from
+/// `close_request`, and a hung `fwupdmgr` can be holding the session lock
+/// inside `with_session` / `run_command`.
+///
+/// Kill the helper process group first (so grandchildren die), then drop the
+/// session if the lock is free. Do not wait for QUIT/`__BYE__`.
 pub fn close_session() {
-    if let Ok(mut guard) = SESSION.lock() {
+    kill_recorded_helper();
+    if let Ok(mut guard) = SESSION.try_lock() {
         if let Some(session) = guard.take() {
-            let _ = session.quit();
+            session.abort();
         }
     }
 }

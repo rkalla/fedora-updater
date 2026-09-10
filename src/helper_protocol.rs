@@ -62,8 +62,20 @@ impl HelperCommand {
             Self::ApplyDnf => &["dnf", "update", "-y"],
             Self::CheckFwupdRefresh => &["fwupdmgr", "refresh"],
             Self::CheckFwupd => &["fwupdmgr", "get-updates", "--json"],
-            Self::ApplyFwupd => &["fwupdmgr", "update", "-y", "--no-reboot-check"],
-            Self::CheckFwupdReboot => &["fwupdmgr", "check-reboot-needed"],
+            // --no-unreported-check / --no-device-prompt: post-update report and
+            // device pickers block on stdin (the helper protocol pipe), same hang
+            // as an interactive reboot prompt.
+            Self::ApplyFwupd => &[
+                "fwupdmgr",
+                "update",
+                "-y",
+                "--no-reboot-check",
+                "--no-unreported-check",
+                "--no-device-prompt",
+            ],
+            // --json disables the interactive "Restart now?" prompt. Without it
+            // fwupdmgr waits on stdin after apply and the GUI never reaches Done.
+            Self::CheckFwupdReboot => &["fwupdmgr", "check-reboot-needed", "--json"],
             Self::ApplyFlatpakSystem => {
                 &["flatpak", "update", "--system", "-y", "--noninteractive"]
             }
@@ -164,5 +176,32 @@ mod tests {
                 assert!(!arg.contains('$'));
             }
         }
+    }
+
+    #[test]
+    fn check_fwupd_reboot_uses_json_so_it_cannot_prompt() {
+        let argv = HelperCommand::CheckFwupdReboot.argv();
+        assert_eq!(argv[0], "fwupdmgr");
+        assert!(argv.contains(&"check-reboot-needed"));
+        assert!(
+            argv.contains(&"--json"),
+            "interactive check-reboot-needed prompts 'Restart now?' and deadlocks the helper"
+        );
+        assert!(
+            !argv.contains(&"-y") && !argv.contains(&"--assume-yes"),
+            "assume-yes would answer the reboot prompt and restart the machine"
+        );
+    }
+
+    #[test]
+    fn apply_fwupd_skips_post_update_prompts() {
+        let argv = HelperCommand::ApplyFwupd.argv();
+        assert!(argv.contains(&"-y"));
+        assert!(argv.contains(&"--no-reboot-check"));
+        assert!(
+            argv.contains(&"--no-unreported-check"),
+            "report-history prompt hangs the helper the same way reboot-check does"
+        );
+        assert!(argv.contains(&"--no-device-prompt"));
     }
 }

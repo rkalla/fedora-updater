@@ -497,12 +497,14 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
         }
 
         if sources.contains(&UpdateSource::Firmware) {
+            line(&tx, "fwupd", "Checking whether a reboot is needed…".into());
             let mut log = String::new();
             if let Ok(code) = with_session(|session| {
                 session.run_command(HelperCommand::CheckFwupdReboot, |ev| {
                     if let SessionEvent::Line(l) = ev {
                         log.push_str(&l);
                         log.push('\n');
+                        line(&tx, "fwupd", l);
                     }
                 })
             }) {
@@ -545,9 +547,7 @@ fn emit_progress_from_line(
             package_hint: hint.package_name,
             status_hint: hint.status,
             progress: hint.progress,
-            phase_label: hint
-                .phase_label
-                .unwrap_or_else(|| format!("Updating {}", source.label())),
+            phase_label: hint.phase_label.unwrap_or_default(),
         },
     );
 }

@@ -5,11 +5,16 @@
 //! (no extra password prompts until the app closes).
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::helper_protocol::{parse_end_line, HelperCommand, HELLO_LINE};
+
+/// Helper (or pkexec) pid so window close can SIGKILL without the session lock.
+static HELPER_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Flag that selects helper mode on the multi-call binary.
 pub const HELPER_FLAG: &str = "--helper";
@@ -85,20 +90,13 @@ impl PrivilegedSession {
             || std::env::var_os("FEDORA_UPDATER_TEST_MODE").is_some();
 
         let mut child = if direct {
-            Command::new(&path)
-                .arg(HELPER_FLAG)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+            let mut cmd = Command::new(&path);
+            cmd.arg(HELPER_FLAG);
+            configure_helper_command(&mut cmd).spawn()
         } else {
-            Command::new("pkexec")
-                .arg(&path)
-                .arg(HELPER_FLAG)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+            let mut cmd = Command::new("pkexec");
+            cmd.arg(&path).arg(HELPER_FLAG);
+            configure_helper_command(&mut cmd).spawn()
         }
         .map_err(|e| {
             if !path.exists() && path.is_relative() {
@@ -137,6 +135,8 @@ impl PrivilegedSession {
         if hello != HELLO_LINE && !hello.contains("fedora-updater-helper") {
             return Err(SessionError::Protocol(format!("unexpected hello: {hello}")));
         }
+
+        HELPER_PID.store(child.id(), Ordering::SeqCst);
 
         Ok(Self {
             child,
@@ -197,21 +197,56 @@ impl PrivilegedSession {
     pub fn quit(mut self) -> Result<(), SessionError> {
         let _ = writeln!(self.stdin, "QUIT");
         let _ = self.stdin.flush();
-        if let Ok(mut reader) = self.reader.lock() {
+        if let Ok(mut reader) = self.reader.try_lock() {
             let mut line = String::new();
             let _ = reader.read_line(&mut line);
         }
-        let _ = self.child.wait();
+        self.abort();
         Ok(())
     }
+
+    /// SIGKILL the helper. Does not wait for protocol BYE or a stuck `read_line`.
+    pub fn abort(mut self) {
+        let pid = self.child.id();
+        let _ = self.child.kill();
+        let _ = self.child.try_wait();
+        HELPER_PID
+            .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .ok();
+    }
+}
+
+/// SIGKILL the helper process group. Safe from the GTK thread: no locks, no wait.
+pub fn kill_recorded_helper() {
+    let pid = HELPER_PID.swap(0, Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    let pid = pid as i32;
+    unsafe {
+        // process_group(0) at spawn makes this pid the group leader, so
+        // grandchildren (fwupdmgr) die too.
+        libc::kill(-pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+fn configure_helper_command(cmd: &mut Command) -> &mut Command {
+    // Own process group so close can kill helper + fwupdmgr together.
+    cmd.process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
 }
 
 impl Drop for PrivilegedSession {
     fn drop(&mut self) {
-        let _ = writeln!(self.stdin, "QUIT");
-        let _ = self.stdin.flush();
+        let pid = self.child.id();
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.try_wait();
+        HELPER_PID
+            .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .ok();
     }
 }
 

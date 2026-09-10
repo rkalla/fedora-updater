@@ -192,8 +192,21 @@ fn parse_text_updates(output: &str) -> Vec<Package> {
 
 pub fn parse_progress_line(line: &str) -> ProgressHint {
     let lower = line.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
     let mut hint = ProgressHint::default();
-    if lower.contains("downloading") {
+    // Post-apply inventory listings are not progress and must not match "update".
+    if trimmed.starts_with("devices with")
+        || trimmed.starts_with('•')
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("- ")
+    {
+        return hint;
+    }
+    if lower.contains("successfully installed") {
+        hint.status = Some(PackageStatus::Completed);
+        hint.phase_label = Some("Firmware installed".into());
+        hint.progress = Some(1.0);
+    } else if lower.contains("downloading") {
         hint.status = Some(PackageStatus::Downloading);
         hint.phase_label = Some("Downloading firmware".into());
     } else if lower.contains("installing")
@@ -204,9 +217,17 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
         hint.phase_label = Some("Installing firmware".into());
     } else if lower.contains("decompressing") {
         hint.phase_label = Some("Decompressing firmware".into());
+    } else if lower.contains("verifying") {
+        hint.phase_label = Some("Verifying firmware".into());
+    } else if lower.contains("restarting device") {
+        hint.phase_label = Some("Restarting device".into());
+    } else if lower.contains("waiting") {
+        hint.phase_label = Some("Waiting".into());
     }
-    if let Some(pct) = extract_percent(line) {
-        hint.progress = Some((pct / 100.0).clamp(0.0, 1.0));
+    if hint.progress.is_none() {
+        if let Some(pct) = extract_percent(line) {
+            hint.progress = Some((pct / 100.0).clamp(0.0, 1.0));
+        }
     }
     hint
 }
@@ -241,20 +262,29 @@ fn lower_find(hay: &str, needle: &str) -> Option<usize> {
 
 pub fn detect_reboot_needed(log: &str) -> bool {
     let lower = log.to_ascii_lowercase();
-    lower.contains("reboot")
-        || lower.contains("restart")
+    if lower.contains("no reboot") {
+        return false;
+    }
+    // Do not match bare "restart" — "Restarting device…" is a per-device phase,
+    // not a request to reboot the machine.
+    lower.contains("requires a reboot")
+        || lower.contains("reboot to complete")
         || lower.contains("needs-reboot")
         || lower.contains("pending reboot")
+        || lower.contains("restart your system")
+        || lower.contains("restart now")
 }
 
-/// `check-reboot-needed` exit 0 with message, or non-empty stdout indicating reboot.
+/// `fwupdmgr check-reboot-needed --json`: exit 0 means a reboot is needed,
+/// NOTHING_TO_DO (and other non-zero codes) means it is not.
+/// Text output is a fallback for hosts that ignore `--json`.
 pub fn parse_reboot_needed_output(output: &str, exit_code: i32) -> bool {
-    if exit_code != 0 {
-        // Some versions use non-zero when reboot needed — treat carefully
-        let lower = output.to_ascii_lowercase();
-        if lower.contains("reboot") || lower.contains("restart") {
-            return true;
-        }
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("no reboot") || lower.contains("nothing to do") {
+        return false;
+    }
+    if exit_code == 0 {
+        return true;
     }
     detect_reboot_needed(output)
 }
@@ -294,5 +324,58 @@ mod tests {
             "An update requires a reboot to complete"
         ));
         assert!(!detect_reboot_needed("Successfully installed firmware"));
+        assert!(
+            !detect_reboot_needed("Restarting device…: 99.0%"),
+            "device restart is not a system reboot"
+        );
+        assert!(
+            !detect_reboot_needed("No reboot is necessary"),
+            "negative phrasing must not count as needing a reboot"
+        );
+    }
+
+    #[test]
+    fn json_check_reboot_needed_uses_exit_zero_contract() {
+        // fwupdmgr check-reboot-needed --json: 0 = reboot needed, NOTHING_TO_DO otherwise.
+        assert!(parse_reboot_needed_output("", 0));
+        assert!(parse_reboot_needed_output("{}", 0));
+        assert!(!parse_reboot_needed_output("", 2));
+        assert!(!parse_reboot_needed_output("No reboot is necessary", 2));
+        assert!(parse_reboot_needed_output(
+            "An update requires a reboot to complete",
+            1
+        ));
+    }
+
+    #[test]
+    fn success_line_marks_firmware_complete() {
+        let h = parse_progress_line("Successfully installed firmware");
+        assert_eq!(h.status, Some(PackageStatus::Completed));
+        assert_eq!(h.progress, Some(1.0));
+        assert_eq!(h.phase_label.as_deref(), Some("Firmware installed"));
+    }
+
+    #[test]
+    fn firmware_phase_lines_keep_work_progress() {
+        let verifying = parse_progress_line("Verifying…: 1.0%");
+        assert_eq!(verifying.phase_label.as_deref(), Some("Verifying firmware"));
+        assert_eq!(verifying.progress, Some(0.01));
+
+        let restarting = parse_progress_line("Restarting device…: 99.0%");
+        assert_eq!(restarting.phase_label.as_deref(), Some("Restarting device"));
+        assert_eq!(restarting.progress, Some(0.99));
+        assert_ne!(restarting.status, Some(PackageStatus::Completed));
+
+        let waiting = parse_progress_line("Waiting…: 100.0%");
+        assert_eq!(waiting.phase_label.as_deref(), Some("Waiting"));
+        assert_eq!(waiting.progress, Some(1.0));
+    }
+
+    #[test]
+    fn inventory_listing_is_not_progress() {
+        let h = parse_progress_line("Devices with no available firmware updates:");
+        assert_eq!(h, ProgressHint::default());
+        let h = parse_progress_line(" • System Firmware");
+        assert_eq!(h, ProgressHint::default());
     }
 }

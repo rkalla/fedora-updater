@@ -112,3 +112,66 @@ fn helper_runs_check_dnf_if_present() {
     writeln!(stdin, "QUIT").unwrap();
     let _ = child.kill();
 }
+
+/// Window close runs `close_session` on the GTK thread. If a helper command is
+/// stuck (fwupdmgr waiting on "Restart now?"), that must not freeze the UI.
+#[test]
+fn close_session_does_not_block_when_helper_command_hangs() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::thread;
+
+    use fedora_updater::privilege::{close_session, with_session};
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("hung-helper");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf '%s\n' '__READY__ fedora-updater-helper'
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    QUIT)
+      printf '%s\n' '__BYE__'
+      exit 0
+      ;;
+    RUN*)
+      printf '%s\n' 'hung-helper: idle'
+      sleep 3600
+      ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    std::env::set_var("FEDORA_UPDATER_HELPER", &script);
+    std::env::set_var("FEDORA_UPDATER_HELPER_DIRECT", "1");
+
+    let worker = thread::spawn(|| {
+        let _ = with_session(|session| session.run_command(HelperCommand::CheckDnf, |_| {}));
+    });
+
+    thread::sleep(Duration::from_millis(300));
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        close_session();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(2)).expect(
+        "close_session blocked while a helper command was hung — this freezes GTK on window close",
+    );
+
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = worker.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker stayed blocked after close_session");
+}

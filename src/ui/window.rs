@@ -15,7 +15,8 @@ use libadwaita::{
 
 use fedora_updater::model::{
     about_time_left, check_progress, count_by_kind, count_by_source, now_playing_subtitle,
-    now_playing_title, source_summary_line, AuthPurpose, Package, UpdateSource, WorkerEvent,
+    now_playing_title, running_progress_captions, source_summary_line, AuthPurpose, Package,
+    UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, fail_retry_is_reboot, release_privileges,
@@ -324,6 +325,7 @@ pub fn build(app: &Application) {
     }
 
     window.connect_close_request(move |_| {
+        cancel_background_work();
         release_privileges();
         glib::Propagation::Proceed
     });
@@ -535,16 +537,13 @@ fn render_running(
 ) {
     w.stack.set_visible_child_name("running");
     let done = packages.iter().filter(|p| p.status.is_done()).count();
-    let remaining = packages.len().saturating_sub(done);
-    let src = current_source.map(|s| s.label()).unwrap_or("all sources");
-    let mut foot = format!("{src} · {remaining} of {} remaining", packages.len());
+    let (mut foot, meta) = running_progress_captions(current_source, done, packages.len());
     if let Some(eta) = about_time_left(elapsed, overall_progress) {
         foot = format!("{eta} · {foot}");
     }
     w.run_footnote.set_text(&foot);
     w.run_progress.set_fraction(overall_progress);
-    w.run_progress_meta
-        .set_text(&format!("{done} done · {remaining} remaining"));
+    w.run_progress_meta.set_text(&meta);
     w.run_progress_pct
         .set_text(&format!("{:.0}%", overall_progress * 100.0));
 

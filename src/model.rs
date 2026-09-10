@@ -522,8 +522,9 @@ pub fn finalize_source(packages: &mut [Package], source: UpdateSource, ok: bool)
     }
 }
 
-/// Apply a *named* progress hint. Unnamed lines must not poke the first
-/// remaining package — the now-playing card uses phase/work progress instead.
+/// Apply a progress hint. Unnamed lines must not poke the first remaining
+/// package — except an explicit Completed status, which firmware uses for
+/// "Successfully installed firmware" (no device name on that line).
 ///
 /// Download name-chasing does not complete packages (DNF names every RPM
 /// once per download, then again per install/verify). Installing name-switch
@@ -536,7 +537,21 @@ pub fn apply_progress_hint(
     status_hint: Option<PackageStatus>,
     progress: Option<f64>,
 ) -> Option<usize> {
-    let hint = package_hint.filter(|s| !s.trim().is_empty())?;
+    let hint = package_hint.filter(|s| !s.trim().is_empty());
+    let hint = match hint {
+        Some(h) => h,
+        None => {
+            if status_hint != Some(PackageStatus::Completed) {
+                return None;
+            }
+            let idx = packages
+                .iter()
+                .position(|p| p.source == source && !p.status.is_done())?;
+            packages[idx].status = PackageStatus::Completed;
+            packages[idx].progress = progress.unwrap_or(1.0).clamp(0.0, 1.0);
+            return Some(idx);
+        }
+    };
     let idx = packages
         .iter()
         .position(|p| p.source == source && p.matches_progress_name(hint))?;
@@ -627,6 +642,20 @@ pub fn overall_progress(packages: &[Package]) -> f64 {
     done as f64 / packages.len() as f64
 }
 
+/// Running-view footnote and progress-meta. Both lead with the completed count
+/// so "0 of 1 remaining" never sits above "1 done".
+pub fn running_progress_captions(
+    source: Option<UpdateSource>,
+    done: usize,
+    total: usize,
+) -> (String, String) {
+    let remaining = total.saturating_sub(done);
+    let src = source.map(|s| s.label()).unwrap_or("all sources");
+    let footnote = format!("{src} · {done} of {total} done");
+    let meta = format!("{done} done · {remaining} remaining");
+    (footnote, meta)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +740,58 @@ mod tests {
         assert!(pkgs
             .iter()
             .all(|p| p.status == PackageStatus::Pending && p.progress == 0.0));
+    }
+
+    fn firmware_pkg(name: &str) -> Package {
+        Package {
+            id: format!("fwupd:{name}"),
+            name: name.into(),
+            arch: String::new(),
+            version: "1".into(),
+            repo: "LVFS".into(),
+            size: None,
+            old_version: None,
+            status: PackageStatus::Pending,
+            progress: 0.0,
+            kind: AdvisoryKind::Security,
+            source: UpdateSource::Firmware,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn unnamed_completed_hint_finishes_current_firmware_item() {
+        let mut pkgs = vec![firmware_pkg("System Firmware"), firmware_pkg("UEFI CA")];
+        let idx = apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Firmware,
+            None,
+            Some(PackageStatus::Completed),
+            Some(1.0),
+        );
+        assert_eq!(idx, Some(0));
+        assert_eq!(pkgs[0].status, PackageStatus::Completed);
+        assert_eq!(pkgs[0].progress, 1.0);
+        assert_eq!(pkgs[1].status, PackageStatus::Pending);
+    }
+
+    #[test]
+    fn running_progress_captions_lead_with_done_count() {
+        let (foot, meta) = running_progress_captions(Some(UpdateSource::Firmware), 1, 1);
+        assert_eq!(foot, "Firmware · 1 of 1 done");
+        assert_eq!(meta, "1 done · 0 remaining");
+        assert!(
+            !foot.contains("remaining"),
+            "footnote must not invert remaining/total against the meta line, got {foot:?}"
+        );
+
+        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 0, 12);
+        assert_eq!(foot, "System · 0 of 12 done");
+        assert_eq!(meta, "0 done · 12 remaining");
+
+        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 7, 12);
+        assert_eq!(foot, "System · 7 of 12 done");
+        assert_eq!(meta, "7 done · 5 remaining");
     }
 
     #[test]

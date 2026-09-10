@@ -7,6 +7,7 @@
 //! preferably line-buffered via `stdbuf` so the GUI sees live progress.
 
 use std::io::{self, BufRead, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -119,24 +120,34 @@ fn run_allowlisted(cmd: HelperCommand, stdout: &mut impl Write, stderr: &mut imp
 }
 
 fn spawn_line_buffered(program: &str, args: &[&str]) -> io::Result<std::process::Child> {
-    if stdbuf_available() {
+    let mut cmd = if stdbuf_available() {
         let mut cmd = Command::new("stdbuf");
         cmd.args(["-oL", "-eL"]);
         cmd.arg(program);
         cmd.args(args);
-        return cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("PYTHONUNBUFFERED", "1")
-            .spawn();
-    }
-
-    Command::new(program)
-        .args(args)
+        cmd
+    } else {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        cmd
+    };
+    // Never inherit the helper protocol pipe — interactive tools (fwupdmgr
+    // "Restart now?") would steal stdin and deadlock the session.
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("PYTHONUNBUFFERED", "1")
-        .spawn()
+        .env("PYTHONUNBUFFERED", "1");
+    // If the helper is SIGKILL'd on window close, grandchildren must die too.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            if libc::getppid() == 1 {
+                libc::_exit(128 + libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()
 }
 
 fn stdbuf_available() -> bool {

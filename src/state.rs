@@ -325,22 +325,34 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                     *work_progress = None;
                     *active_index = None;
                 }
-                *pl = phase_label;
+                if !phase_label.trim().is_empty() {
+                    *pl = phase_label;
+                }
                 *current_source = Some(source);
                 if progress.is_some() {
                     *work_progress = progress;
                 }
-                if let Some(name) = package_hint
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    match apply_progress_hint(packages, source, Some(name), status_hint, progress) {
-                        Some(idx) => {
-                            *current_name = Some(name.to_string());
-                            *active_index = Some(idx);
-                        }
-                        None => {
+                match apply_progress_hint(
+                    packages,
+                    source,
+                    package_hint.as_deref(),
+                    status_hint,
+                    progress,
+                ) {
+                    Some(idx) => {
+                        *current_name = Some(packages[idx].name.clone());
+                        *active_index = if packages[idx].status.is_done() {
+                            None
+                        } else {
+                            Some(idx)
+                        };
+                    }
+                    None => {
+                        if let Some(name) = package_hint
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
                             let named_done = packages.iter().any(|p| {
                                 p.source == source
                                     && p.matches_progress_name(name)
@@ -799,6 +811,90 @@ mod tests {
                 message: None,
             } => assert_eq!(t, "just now"),
             other => panic!("expected Idle with last_checked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_phase_label_does_not_clobber_current_phase() {
+        let mut s = AppState::default();
+        s.phase = Phase::Ready {
+            packages: vec![pkg("System Firmware", UpdateSource::Firmware)],
+            soft_errors: vec![],
+        };
+        let s = reduce(s, Event::StartApply).unwrap();
+        let s = reduce(
+            s,
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+        )
+        .unwrap();
+        let s = reduce(
+            s,
+            Event::ApplyProgress {
+                source: UpdateSource::Firmware,
+                package_hint: None,
+                status_hint: Some(PackageStatus::Installing),
+                progress: Some(0.5),
+                phase_label: "Installing firmware".into(),
+            },
+        )
+        .unwrap();
+        let s = reduce(
+            s,
+            Event::ApplyProgress {
+                source: UpdateSource::Firmware,
+                package_hint: None,
+                status_hint: None,
+                progress: Some(1.0),
+                phase_label: String::new(),
+            },
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running { phase_label, .. } => {
+                assert_eq!(phase_label, "Installing firmware");
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn firmware_success_progress_completes_the_live_item() {
+        let mut s = AppState::default();
+        s.phase = Phase::Ready {
+            packages: vec![pkg("System Firmware", UpdateSource::Firmware)],
+            soft_errors: vec![],
+        };
+        let s = reduce(s, Event::StartApply).unwrap();
+        let s = reduce(
+            s,
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+        )
+        .unwrap();
+        let s = reduce(
+            s,
+            Event::ApplyProgress {
+                source: UpdateSource::Firmware,
+                package_hint: None,
+                status_hint: Some(PackageStatus::Completed),
+                progress: Some(1.0),
+                phase_label: "Firmware installed".into(),
+            },
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running {
+                packages,
+                overall_progress,
+                ..
+            } => {
+                assert_eq!(packages[0].status, PackageStatus::Completed);
+                assert!((*overall_progress - 1.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Running, got {other:?}"),
         }
     }
 
