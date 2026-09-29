@@ -1,6 +1,8 @@
 //! Exhaustive transition tests for the updater state machine.
 //! These are the safety net for UI flow integrity.
 
+use std::time::SystemTime;
+
 use fedora_updater::model::{Package, PackageStatus, UpdateSource};
 use fedora_updater::state::{phase_name, reduce, AppState, Event, Phase};
 use fedora_updater::AuthPurpose;
@@ -109,6 +111,7 @@ fn happy_path_multi_source() {
         Event::CheckComplete {
             packages: pkgs.clone(),
             soft_errors: vec!["minor warning".into()],
+            listed_at: SystemTime::UNIX_EPOCH,
         },
     )
     .unwrap();
@@ -215,7 +218,8 @@ fn illegal_transitions() {
         s.clone(),
         Event::CheckComplete {
             packages: vec![],
-            soft_errors: vec![]
+            soft_errors: vec![],
+            listed_at: SystemTime::UNIX_EPOCH,
         }
     )
     .is_err());
@@ -492,6 +496,7 @@ fn soft_errors_on_empty_check_surface_message() {
         Event::CheckComplete {
             packages: vec![],
             soft_errors: vec!["fwupd not available".into()],
+            listed_at: SystemTime::UNIX_EPOCH,
         },
     )
     .unwrap();

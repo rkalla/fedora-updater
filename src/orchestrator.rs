@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::SystemTime;
 
 use async_channel::Sender;
 
@@ -54,6 +55,7 @@ pub fn worker_to_state_events(ev: WorkerEvent) -> Vec<StateEvent> {
         } => vec![StateEvent::CheckComplete {
             packages,
             soft_errors,
+            listed_at: SystemTime::now(),
         }],
         WorkerEvent::ApplyProgress {
             source,

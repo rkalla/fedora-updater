@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use gtk::glib;
 use gtk::glib::object::IsA;
@@ -31,6 +32,7 @@ const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
 const LOG_WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/log_window.ui"));
 const DEFAULT_WIDTH: i32 = 760;
 const DEFAULT_HEIGHT: i32 = 660;
+const STALE_UPDATE_LIST_PROMPT: &str = "The list of updates is older than 24hrs - I need to refresh this list before applying the updates. Do you want to do that now?";
 
 struct Widgets {
     window: ApplicationWindow,
@@ -203,13 +205,18 @@ pub fn build(app: &Application) {
 
     let (tx, rx) = async_channel::unbounded::<WorkerEvent>();
     let pending_purpose = Rc::new(RefCell::new(AuthPurpose::Check));
+    // Set only when the user agrees to refresh a stale list before Update All.
+    // The next successful check then applies that fresh list.
+    let apply_after_refresh = Rc::new(Cell::new(false));
 
     {
         let state = state.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
         let pending_purpose = pending_purpose.clone();
+        let apply_after_refresh = apply_after_refresh.clone();
         idle_btn.connect_clicked(move |_| {
+            apply_after_refresh.set(false);
             start_check(&state, &widgets, &pending_purpose, tx.clone());
         });
     }
@@ -218,7 +225,9 @@ pub fn build(app: &Application) {
         let widgets = widgets.clone();
         let tx = tx.clone();
         let pending_purpose = pending_purpose.clone();
+        let apply_after_refresh = apply_after_refresh.clone();
         ready_refresh.connect_clicked(move |_| {
+            apply_after_refresh.set(false);
             start_check(&state, &widgets, &pending_purpose, tx.clone());
         });
     }
@@ -227,6 +236,7 @@ pub fn build(app: &Application) {
         let widgets = widgets.clone();
         let tx = tx.clone();
         let pending_purpose = pending_purpose.clone();
+        let apply_after_refresh = apply_after_refresh.clone();
         fail_retry.connect_clicked(move |_| {
             let title = widgets.fail_page.title();
             if fail_retry_is_reboot(&title) {
@@ -234,6 +244,7 @@ pub fn build(app: &Application) {
                 run_systemctl_reboot(tx.clone());
                 return;
             }
+            apply_after_refresh.set(false);
             start_check(&state, &widgets, &pending_purpose, tx.clone());
         });
     }
@@ -242,20 +253,27 @@ pub fn build(app: &Application) {
         let widgets = widgets.clone();
         let tx = tx.clone();
         let pending_purpose = pending_purpose.clone();
+        let apply_after_refresh = apply_after_refresh.clone();
         ready_update.connect_clicked(move |_| {
-            *pending_purpose.borrow_mut() = AuthPurpose::Apply;
-            let packages = state.borrow().packages().to_vec();
-            dispatch(&state, &widgets, Event::StartApply);
-            if can_skip_auth_ui() {
-                dispatch(&state, &widgets, session_started_event(AuthPurpose::Apply));
+            if state.borrow().update_list_needs_refresh(SystemTime::now()) {
+                prompt_stale_update_list(
+                    &widgets,
+                    &state,
+                    &pending_purpose,
+                    tx.clone(),
+                    &apply_after_refresh,
+                );
+                return;
             }
-            run_apply_all(tx.clone(), packages);
+            begin_apply(&state, &widgets, &pending_purpose, tx.clone());
         });
     }
     {
         let state = state.clone();
         let widgets = widgets.clone();
+        let apply_after_refresh = apply_after_refresh.clone();
         auth_cancel.connect_clicked(move |_| {
+            apply_after_refresh.set(false);
             cancel_background_work();
             dispatch(&state, &widgets, Event::CancelAuth);
         });
@@ -317,9 +335,18 @@ pub fn build(app: &Application) {
         let state = state.clone();
         let widgets = widgets.clone();
         let pending_purpose = pending_purpose.clone();
+        let apply_after_refresh = apply_after_refresh.clone();
+        let tx = tx.clone();
         glib::spawn_future_local(async move {
             while let Ok(ev) = rx.recv().await {
-                handle_worker(&state, &widgets, &pending_purpose, ev);
+                handle_worker(
+                    &state,
+                    &widgets,
+                    &pending_purpose,
+                    &apply_after_refresh,
+                    &tx,
+                    ev,
+                );
             }
         });
     }
@@ -348,6 +375,56 @@ fn start_check(
         dispatch(state, widgets, session_started_event(AuthPurpose::Check));
     }
     run_check_all(tx);
+}
+
+fn begin_apply(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &Rc<Widgets>,
+    pending_purpose: &Rc<RefCell<AuthPurpose>>,
+    tx: async_channel::Sender<WorkerEvent>,
+) {
+    *pending_purpose.borrow_mut() = AuthPurpose::Apply;
+    let packages = state.borrow().packages().to_vec();
+    dispatch(state, widgets, Event::StartApply);
+    if can_skip_auth_ui() {
+        dispatch(state, widgets, session_started_event(AuthPurpose::Apply));
+    }
+    run_apply_all(tx, packages);
+}
+
+fn can_start_apply(state: &AppState) -> bool {
+    matches!(&state.phase, Phase::Ready { packages, .. } if !packages.is_empty())
+}
+
+/// Ask before applying a list that has been sitting for more than 24 hours.
+/// Yes refreshes, then applies whatever that check finds. No leaves the list
+/// untouched — Update All asks again until the user accepts a refresh.
+fn prompt_stale_update_list(
+    widgets: &Rc<Widgets>,
+    state: &Rc<RefCell<AppState>>,
+    pending_purpose: &Rc<RefCell<AuthPurpose>>,
+    tx: async_channel::Sender<WorkerEvent>,
+    apply_after_refresh: &Rc<Cell<bool>>,
+) {
+    let dialog = libadwaita::AlertDialog::new(Some(STALE_UPDATE_LIST_PROMPT), None);
+    dialog.set_prefer_wide_layout(true);
+    dialog.add_response("no", "No");
+    dialog.add_response("yes", "Yes");
+    dialog.set_response_appearance("yes", libadwaita::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("yes"));
+    dialog.set_close_response("no");
+
+    let state = state.clone();
+    let widgets_for_cb = widgets.clone();
+    let pending_purpose = pending_purpose.clone();
+    let apply_after_refresh = apply_after_refresh.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        if response == "yes" {
+            apply_after_refresh.set(true);
+            start_check(&state, &widgets_for_cb, &pending_purpose, tx.clone());
+        }
+    });
+    dialog.present(Some(&widgets.window));
 }
 
 fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
@@ -413,8 +490,19 @@ fn handle_worker(
     state: &Rc<RefCell<AppState>>,
     widgets: &Rc<Widgets>,
     pending_purpose: &Rc<RefCell<AuthPurpose>>,
+    apply_after_refresh: &Rc<Cell<bool>>,
+    tx: &async_channel::Sender<WorkerEvent>,
     ev: WorkerEvent,
 ) {
+    if matches!(ev, WorkerEvent::Failed { .. }) {
+        apply_after_refresh.set(false);
+    }
+    let apply_after = if matches!(ev, WorkerEvent::CheckAllFinished { .. }) {
+        apply_after_refresh.replace(false)
+    } else {
+        false
+    };
+
     match &ev {
         WorkerEvent::SessionStarted => {
             let purpose = *pending_purpose.borrow();
@@ -438,14 +526,15 @@ fn handle_worker(
             widgets.run_console_full.set_text(&full);
             return;
         }
-        WorkerEvent::Failed { .. } => {}
-        WorkerEvent::ApplyAllFinished { .. } => {}
-        WorkerEvent::CheckAllFinished { .. } => {}
         _ => {}
     }
 
     for e in worker_to_state_events(ev) {
         dispatch_worker(state, widgets, e);
+    }
+
+    if apply_after && can_start_apply(&state.borrow()) {
+        begin_apply(state, widgets, pending_purpose, tx.clone());
     }
 }
 

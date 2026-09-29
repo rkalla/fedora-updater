@@ -3,6 +3,8 @@
 //! All transitions are pure functions of `(AppState, Event) → Result<AppState, TransitionError>`.
 //! Side effects (spawning processes) live outside this module.
 
+use std::time::{Duration, SystemTime};
+
 use crate::model::{
     apply_progress_hint, finalize_source, format_relative_now, overall_progress, sort_for_apply,
     AuthPurpose, ConsoleBuffer, Package, PackageStatus, Stopwatch, UpdateSource,
@@ -55,11 +57,19 @@ pub enum Phase {
     },
 }
 
+/// A Ready update list may be applied for this long after it was checked.
+/// Once the list is older than this, Update All must refresh before applying.
+pub const UPDATE_LIST_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub phase: Phase,
     pub console: ConsoleBuffer,
     pub stopwatch: Option<Stopwatch>,
+    /// When the current Ready list was produced by a check.
+    /// `None` before a successful check, after an empty check, and for preview
+    /// states that were not produced by [`Event::CheckComplete`].
+    pub updates_listed_at: Option<SystemTime>,
 }
 
 impl Default for AppState {
@@ -71,11 +81,31 @@ impl Default for AppState {
             },
             console: ConsoleBuffer::new(8_000),
             stopwatch: None,
+            updates_listed_at: None,
         }
     }
 }
 
 impl AppState {
+    /// Whether Update All should refresh before applying.
+    ///
+    /// Only a Ready list with a recorded check time can expire. A missing
+    /// timestamp (preview states) stays applicable. A backwards clock step
+    /// does not expire the list. The list is valid through [`UPDATE_LIST_MAX_AGE`]
+    /// and needs a refresh once it is older than that.
+    pub fn update_list_needs_refresh(&self, now: SystemTime) -> bool {
+        let Some(listed_at) = self.updates_listed_at else {
+            return false;
+        };
+        if !matches!(self.phase, Phase::Ready { .. }) {
+            return false;
+        }
+        match now.duration_since(listed_at) {
+            Ok(age) => age > UPDATE_LIST_MAX_AGE,
+            Err(_) => false,
+        }
+    }
+
     pub fn packages(&self) -> &[Package] {
         match &self.phase {
             Phase::Authenticating { packages, .. } => packages,
@@ -128,9 +158,12 @@ pub enum Event {
         soft_error: Option<String>,
     },
     /// Entire check pipeline finished.
+    /// `listed_at` is the clock time the check finished; the reducer stores it
+    /// when the result is a Ready list.
     CheckComplete {
         packages: Vec<Package>,
         soft_errors: Vec<String>,
+        listed_at: SystemTime,
     },
     /// Apply pipeline entered a backend.
     ApplySourceStarted {
@@ -171,6 +204,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 Phase::Idle { last_checked, .. } => last_checked.clone(),
                 _ => None,
             };
+            state.updates_listed_at = None;
             state.console.clear();
             state.stopwatch = Some(Stopwatch::start());
             state.phase = Phase::Authenticating {
@@ -261,6 +295,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
         Event::CheckComplete {
             packages,
             soft_errors,
+            listed_at,
         } => match state.phase {
             Phase::Checking { .. } => {
                 if packages.is_empty() {
@@ -269,6 +304,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                     } else {
                         format!("No updates available ({})", soft_errors.join("; "))
                     };
+                    state.updates_listed_at = None;
                     state.phase = Phase::Idle {
                         last_checked: Some(format_relative_now()),
                         message: Some(msg),
@@ -276,6 +312,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 } else {
                     let mut packages = packages;
                     sort_for_apply(&mut packages);
+                    state.updates_listed_at = Some(listed_at);
                     state.phase = Phase::Ready {
                         packages,
                         soft_errors,
@@ -548,6 +585,7 @@ mod tests {
             Event::CheckComplete {
                 packages,
                 soft_errors: vec![],
+                listed_at: SystemTime::UNIX_EPOCH,
             },
         )
         .unwrap();
@@ -571,6 +609,7 @@ mod tests {
             Event::CheckComplete {
                 packages: vec![],
                 soft_errors: vec![],
+                listed_at: SystemTime::UNIX_EPOCH,
             },
         )
         .unwrap();
@@ -896,6 +935,91 @@ mod tests {
             }
             other => panic!("expected Running, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ready_list_expires_after_24_hours() {
+        let listed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let s = reduce(AppState::default(), Event::StartCheck).unwrap();
+        let s = reduce(
+            s,
+            Event::SessionReady {
+                purpose: AuthPurpose::Check,
+            },
+        )
+        .unwrap();
+        let s = reduce(
+            s,
+            Event::CheckComplete {
+                packages: vec![pkg("kernel", UpdateSource::Dnf)],
+                soft_errors: vec![],
+                listed_at,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.updates_listed_at, Some(listed_at));
+        assert!(!s.update_list_needs_refresh(listed_at));
+        assert!(!s.update_list_needs_refresh(listed_at + UPDATE_LIST_MAX_AGE));
+        assert!(
+            s.update_list_needs_refresh(listed_at + UPDATE_LIST_MAX_AGE + Duration::from_secs(1))
+        );
+        assert!(s.update_list_needs_refresh(listed_at + Duration::from_secs(4 * 24 * 60 * 60)));
+        // Clock stepped backwards: the list is not older than the check.
+        assert!(!s.update_list_needs_refresh(listed_at - Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn empty_check_clears_list_timestamp() {
+        let mut s = AppState::default();
+        s.updates_listed_at = Some(SystemTime::UNIX_EPOCH);
+        s.phase = Phase::Checking {
+            packages_so_far: vec![],
+            soft_errors: vec![],
+            checked_sources: vec![],
+        };
+        let s = reduce(
+            s,
+            Event::CheckComplete {
+                packages: vec![],
+                soft_errors: vec![],
+                listed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(50),
+            },
+        )
+        .unwrap();
+        assert!(s.updates_listed_at.is_none());
+        assert!(!s.update_list_needs_refresh(SystemTime::now()));
+    }
+
+    #[test]
+    fn stale_timestamp_does_not_block_other_phases() {
+        let mut s = AppState::default();
+        s.updates_listed_at = Some(SystemTime::UNIX_EPOCH);
+        s.phase = Phase::Idle {
+            last_checked: None,
+            message: None,
+        };
+        assert!(!s.update_list_needs_refresh(SystemTime::now()));
+
+        s.phase = Phase::Ready {
+            packages: vec![pkg("kernel", UpdateSource::Dnf)],
+            soft_errors: vec![],
+        };
+        assert!(s.update_list_needs_refresh(SystemTime::now()));
+
+        let s = reduce(s, Event::StartCheck).unwrap();
+        assert!(s.updates_listed_at.is_none());
+        assert!(!s.update_list_needs_refresh(SystemTime::now()));
+    }
+
+    #[test]
+    fn preview_ready_without_timestamp_can_still_apply() {
+        let mut s = AppState::default();
+        s.phase = Phase::Ready {
+            packages: vec![pkg("kernel", UpdateSource::Dnf)],
+            soft_errors: vec![],
+        };
+        assert!(!s.update_list_needs_refresh(SystemTime::now()));
+        assert!(reduce(s, Event::StartApply).is_ok());
     }
 
     #[test]
