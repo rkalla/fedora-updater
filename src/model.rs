@@ -243,6 +243,8 @@ pub enum WorkerEvent {
         status_hint: Option<PackageStatus>,
         progress: Option<f64>,
         phase_label: String,
+        stage_current: Option<u32>,
+        stage_total: Option<u32>,
     },
     BackendApplyFinished {
         source: UpdateSource,
@@ -528,8 +530,9 @@ pub fn finalize_source(packages: &mut [Package], source: UpdateSource, ok: bool)
 ///
 /// Download name-chasing does not complete packages (DNF names every RPM
 /// once per download, then again per install/verify). Installing name-switch
-/// completes the previous *installing* item only. Already-done packages are
-/// ignored so verify passes cannot resurrect them as current.
+/// completes the previous *installing* item only. A hint with no status only
+/// updates that package's fraction — it must not invent an install.
+/// Already-done packages are ignored so verify passes cannot resurrect them.
 pub fn apply_progress_hint(
     packages: &mut [Package],
     source: UpdateSource,
@@ -570,7 +573,7 @@ pub fn apply_progress_hint(
             }
             packages[idx].status = PackageStatus::Downloading;
         }
-        Some(PackageStatus::Installing) | None => {
+        Some(PackageStatus::Installing) => {
             for (i, p) in packages.iter_mut().enumerate() {
                 if i == idx || p.source != source {
                     continue;
@@ -584,6 +587,12 @@ pub fn apply_progress_hint(
                 }
             }
             packages[idx].status = PackageStatus::Installing;
+        }
+        None => {
+            if let Some(pr) = progress {
+                packages[idx].progress = pr.clamp(0.0, 1.0);
+            }
+            return Some(idx);
         }
         Some(st) => {
             packages[idx].status = st;
@@ -632,6 +641,24 @@ pub fn now_playing_subtitle(
         parts.push(s.label().to_string());
     }
     parts.join(" · ")
+}
+
+/// Heading for the running page. Verifying stays its own label inside the apply pass.
+pub fn run_heading(phase_label: &str, applying: bool) -> &'static str {
+    let label = phase_label.to_ascii_lowercase();
+    if label.contains("verif") {
+        "Verifying"
+    } else if applying
+        || label.contains("install")
+        || label.contains("upgrad")
+        || label.contains("transaction")
+    {
+        "Applying"
+    } else if label.contains("download") {
+        "Downloading"
+    } else {
+        "Updating"
+    }
 }
 
 pub fn overall_progress(packages: &[Package]) -> f64 {
@@ -819,6 +846,31 @@ mod tests {
     }
 
     #[test]
+    fn progress_only_hint_does_not_complete_previous() {
+        let mut pkgs = vec![
+            Package::new_dnf("firefox", "x86_64", "1", "updates"),
+            Package::new_dnf("kernel", "x86_64", "1", "updates"),
+        ];
+        apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            Some("firefox"),
+            Some(PackageStatus::Installing),
+            Some(0.2),
+        );
+        apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            Some("kernel"),
+            None,
+            Some(0.4),
+        );
+        assert_eq!(pkgs[0].status, PackageStatus::Installing);
+        assert_eq!(pkgs[1].status, PackageStatus::Pending);
+        assert!((pkgs[1].progress - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn download_name_switch_does_not_complete_previous() {
         let mut pkgs = vec![
             Package::new_dnf("firefox", "x86_64", "1", "updates"),
@@ -895,6 +947,15 @@ mod tests {
         assert_eq!(format_bytes(12 * 1024), "12 KB");
         assert_eq!(format_bytes(21727761), "21 MB");
         assert_eq!(format_bytes(1_288_490_189), "1.2 GB");
+    }
+
+    #[test]
+    fn run_heading_switches_with_the_stage() {
+        assert_eq!(run_heading("Downloading packages", false), "Downloading");
+        assert_eq!(run_heading("Installing", true), "Applying");
+        assert_eq!(run_heading("Running transaction", true), "Applying");
+        assert_eq!(run_heading("Verifying", true), "Verifying");
+        assert_eq!(run_heading("Starting…", false), "Updating");
     }
 
     #[test]

@@ -16,8 +16,8 @@ use libadwaita::{
 
 use fedora_updater::model::{
     about_time_left, check_progress, count_by_kind, count_by_source, now_playing_subtitle,
-    now_playing_title, running_progress_captions, source_summary_line, AuthPurpose, Package,
-    UpdateSource, WorkerEvent,
+    now_playing_title, run_heading, running_progress_captions, source_summary_line, AuthPurpose,
+    Package, UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, fail_retry_is_reboot, release_privileges,
@@ -59,6 +59,7 @@ struct Widgets {
     ready_chips: WrapBox,
     ready_group: PreferencesGroup,
     ready_rows: RefCell<Vec<gtk::Widget>>,
+    run_title: Label,
     run_footnote: Label,
     run_progress: ProgressBar,
     run_progress_meta: Label,
@@ -134,6 +135,7 @@ pub fn build(app: &Application) {
         ready_chips: obj(&builder, "ready_chips"),
         ready_group: obj(&builder, "ready_group"),
         ready_rows: RefCell::new(Vec::new()),
+        run_title: obj(&builder, "run_title"),
         run_footnote: obj(&builder, "run_footnote"),
         run_progress: obj(&builder, "run_progress"),
         run_progress_meta: obj(&builder, "run_progress_meta"),
@@ -616,6 +618,9 @@ fn render_running(
     packages: &[Package],
     overall_progress: f64,
     phase_label: &str,
+    applying: bool,
+    stage_current: Option<u32>,
+    stage_total: Option<u32>,
     current_source: Option<UpdateSource>,
     active_index: Option<usize>,
     current_name: Option<&str>,
@@ -625,8 +630,18 @@ fn render_running(
     full_console: &str,
 ) {
     w.stack.set_visible_child_name("running");
-    let done = packages.iter().filter(|p| p.status.is_done()).count();
-    let (mut foot, meta) = running_progress_captions(current_source, done, packages.len());
+    w.run_title.set_text(run_heading(phase_label, applying));
+    if applying {
+        w.run_progress.add_css_class("stage-apply");
+    } else {
+        w.run_progress.remove_css_class("stage-apply");
+    }
+    let package_done = packages.iter().filter(|p| p.status.is_done()).count();
+    let (done, total) = match (stage_current, stage_total) {
+        (Some(cur), Some(stage_total)) if stage_total > 0 => (cur as usize, stage_total as usize),
+        _ => (package_done, packages.len()),
+    };
+    let (mut foot, meta) = running_progress_captions(current_source, done, total);
     if let Some(eta) = about_time_left(elapsed, overall_progress) {
         foot = format!("{eta} · {foot}");
     }
@@ -882,6 +897,9 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             active_index,
             current_name,
             work_progress,
+            applying,
+            stage_current,
+            stage_total,
             ..
         } => {
             render_running(
@@ -889,6 +907,9 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 packages,
                 *overall_progress,
                 phase_label,
+                *applying,
+                *stage_current,
+                *stage_total,
                 *current_source,
                 *active_index,
                 current_name.as_deref(),
@@ -968,6 +989,7 @@ mod tests {
             "ready_chips",
             "ready_group",
             "now_playing",
+            "run_title",
             "now_playing_title",
             "run_list_scroll",
             "run_list_group",

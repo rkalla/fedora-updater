@@ -163,6 +163,8 @@ fn happy_path_multi_source() {
                 status_hint: Some(PackageStatus::Installing),
                 progress: Some(0.5),
                 phase_label: format!("Updating {label}"),
+                stage_current: None,
+                stage_total: None,
             },
         )
         .unwrap();
@@ -287,6 +289,9 @@ fn progress_marks_package_and_completes_previous() {
         current_source: None,
         current_name: None,
         work_progress: None,
+        applying: false,
+        stage_current: None,
+        stage_total: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -298,6 +303,8 @@ fn progress_marks_package_and_completes_previous() {
             status_hint: Some(PackageStatus::Installing),
             progress: Some(0.3),
             phase_label: "Installing".into(),
+            stage_current: None,
+            stage_total: None,
         },
     )
     .unwrap();
@@ -309,6 +316,8 @@ fn progress_marks_package_and_completes_previous() {
             status_hint: Some(PackageStatus::Installing),
             progress: Some(0.1),
             phase_label: "Installing".into(),
+            stage_current: None,
+            stage_total: None,
         },
     )
     .unwrap();
@@ -328,6 +337,9 @@ fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
         current_source: Some(UpdateSource::Dnf),
         current_name: None,
         work_progress: None,
+        applying: false,
+        stage_current: None,
+        stage_total: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -339,6 +351,8 @@ fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
             status_hint: Some(PackageStatus::Installing),
             progress: Some(0.5),
             phase_label: "Downloading packages".into(),
+            stage_current: None,
+            stage_total: None,
         },
     )
     .unwrap();
@@ -372,6 +386,9 @@ fn kernel_hint_does_not_complete_kernel_core() {
         current_source: None,
         current_name: None,
         work_progress: None,
+        applying: false,
+        stage_current: None,
+        stage_total: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -383,6 +400,8 @@ fn kernel_hint_does_not_complete_kernel_core() {
             status_hint: Some(PackageStatus::Installing),
             progress: Some(0.2),
             phase_label: "Installing".into(),
+            stage_current: None,
+            stage_total: None,
         },
     )
     .unwrap();
@@ -402,6 +421,9 @@ fn verify_pass_does_not_move_current_back_to_completed() {
         current_source: Some(UpdateSource::Dnf),
         current_name: Some("kernel".into()),
         work_progress: Some(0.5),
+        applying: true,
+        stage_current: None,
+        stage_total: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -421,6 +443,8 @@ fn verify_pass_does_not_move_current_back_to_completed() {
             status_hint: Some(PackageStatus::Installing),
             progress: Some(0.9),
             phase_label: "Verifying".into(),
+            stage_current: None,
+            stage_total: None,
         },
     )
     .unwrap();
@@ -451,6 +475,9 @@ fn apply_source_started_does_not_mark_first_package() {
         current_source: None,
         current_name: Some("stale".into()),
         work_progress: Some(0.3),
+        applying: false,
+        stage_current: None,
+        stage_total: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };

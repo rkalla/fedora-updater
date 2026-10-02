@@ -40,8 +40,13 @@ pub enum Phase {
         current_source: Option<UpdateSource>,
         /// Last package name parsed from a backend line (may not be in `packages`).
         current_name: Option<String>,
-        /// Last transaction/download fraction for the now-playing card.
+        /// Last per-item fraction for the now-playing card. Not the top-bar count.
         work_progress: Option<f64>,
+        /// True after this source leaves the download pass and starts applying.
+        applying: bool,
+        /// `[cur/total]` for the active download or transaction. Drives the top bar.
+        stage_current: Option<u32>,
+        stage_total: Option<u32>,
         needs_reboot: bool,
         failed_sources: Vec<UpdateSource>,
     },
@@ -176,6 +181,8 @@ pub enum Event {
         status_hint: Option<PackageStatus>,
         progress: Option<f64>,
         phase_label: String,
+        stage_current: Option<u32>,
+        stage_total: Option<u32>,
     },
     BackendApplyDone {
         source: UpdateSource,
@@ -252,6 +259,9 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                             current_source: None,
                             current_name: None,
                             work_progress: None,
+                            applying: false,
+                            stage_current: None,
+                            stage_total: None,
                             needs_reboot: false,
                             failed_sources: Vec::new(),
                         };
@@ -329,6 +339,10 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 current_name,
                 work_progress,
                 active_index,
+                applying,
+                stage_current,
+                stage_total,
+                overall_progress,
                 ..
             } => {
                 *phase_label = label;
@@ -336,6 +350,10 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 *current_name = None;
                 *work_progress = None;
                 *active_index = None;
+                *applying = false;
+                *stage_current = None;
+                *stage_total = None;
+                *overall_progress = 0.0;
                 Ok(state)
             }
             _ => Err(invalid(&state, "ApplySourceStarted")),
@@ -346,6 +364,8 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
             status_hint,
             progress,
             phase_label,
+            stage_current,
+            stage_total,
         } => match &mut state.phase {
             Phase::Running {
                 packages,
@@ -355,17 +375,46 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 current_source,
                 current_name,
                 work_progress,
+                applying,
+                stage_current: stage_cur,
+                stage_total: stage_tot,
                 ..
             } => {
                 if *current_source != Some(source) {
                     *current_name = None;
                     *work_progress = None;
                     *active_index = None;
+                    *applying = false;
+                    *stage_cur = None;
+                    *stage_tot = None;
+                    *op = 0.0;
                 }
-                if !phase_label.trim().is_empty() {
+                if !*applying && should_enter_apply(&phase_label, status_hint) {
+                    reset_live_packages(packages);
+                    *work_progress = None;
+                    *active_index = None;
+                    *current_name = None;
+                    *stage_cur = None;
+                    *stage_tot = None;
+                    *op = 0.0;
+                    *applying = true;
+                }
+                let mut status_hint = status_hint;
+                if *applying && status_hint == Some(PackageStatus::Downloading) {
+                    status_hint = Some(PackageStatus::Installing);
+                }
+                if !phase_label.trim().is_empty() && !(*applying && phase_is_download(&phase_label))
+                {
                     *pl = phase_label;
                 }
                 *current_source = Some(source);
+                if let (Some(cur), Some(total)) = (stage_current, stage_total) {
+                    if total > 0 {
+                        *stage_cur = Some(cur);
+                        *stage_tot = Some(total);
+                        *op = (f64::from(cur) / f64::from(total)).clamp(0.0, 1.0);
+                    }
+                }
                 if progress.is_some() {
                     *work_progress = progress;
                 }
@@ -397,11 +446,19 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                             });
                             if !named_done {
                                 *current_name = Some(name.to_string());
+                                let still_current = active_index
+                                    .and_then(|i| packages.get(i))
+                                    .is_some_and(|p| p.matches_progress_name(name));
+                                if !still_current {
+                                    *active_index = None;
+                                }
                             }
                         }
                     }
                 }
-                *op = overall_progress(packages);
+                if stage_cur.is_none() && *applying {
+                    *op = overall_progress(packages);
+                }
                 Ok(state)
             }
             _ => Err(invalid(&state, "ApplyProgress")),
@@ -416,6 +473,8 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 needs_reboot: nr,
                 failed_sources,
                 overall_progress: op,
+                stage_current,
+                stage_total,
                 ..
             } => {
                 finalize_source(packages, source, success);
@@ -425,6 +484,8 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 if !success && !failed_sources.contains(&source) {
                     failed_sources.push(source);
                 }
+                *stage_current = None;
+                *stage_total = None;
                 *op = overall_progress(packages);
                 Ok(state)
             }
@@ -505,6 +566,34 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
             }
             _ => Err(invalid(&state, "CancelAuth")),
         },
+    }
+}
+
+fn phase_is_download(label: &str) -> bool {
+    label.to_ascii_lowercase().contains("download")
+}
+
+fn should_enter_apply(label: &str, status: Option<PackageStatus>) -> bool {
+    if phase_is_download(label) {
+        return false;
+    }
+    let label = label.to_ascii_lowercase();
+    label.contains("install")
+        || label.contains("upgrad")
+        || label.contains("verif")
+        || label.contains("transaction")
+        || label.contains("scriptlet")
+        || label.contains("cleanup")
+        || status == Some(PackageStatus::Installing)
+        || status == Some(PackageStatus::Completed)
+}
+
+fn reset_live_packages(packages: &mut [Package]) {
+    for package in packages.iter_mut() {
+        if !package.status.is_done() {
+            package.status = PackageStatus::Pending;
+            package.progress = 0.0;
+        }
     }
 }
 
@@ -876,6 +965,8 @@ mod tests {
                 status_hint: Some(PackageStatus::Installing),
                 progress: Some(0.5),
                 phase_label: "Installing firmware".into(),
+                stage_current: None,
+                stage_total: None,
             },
         )
         .unwrap();
@@ -887,6 +978,8 @@ mod tests {
                 status_hint: None,
                 progress: Some(1.0),
                 phase_label: String::new(),
+                stage_current: None,
+                stage_total: None,
             },
         )
         .unwrap();
@@ -896,6 +989,213 @@ mod tests {
             }
             other => panic!("expected Running, got {other:?}"),
         }
+    }
+
+    fn dnf_progress(
+        name: Option<&str>,
+        status: Option<PackageStatus>,
+        progress: Option<f64>,
+        phase_label: &str,
+        stage_current: Option<u32>,
+        stage_total: Option<u32>,
+    ) -> Event {
+        Event::ApplyProgress {
+            source: UpdateSource::Dnf,
+            package_hint: name.map(str::to_string),
+            status_hint: status,
+            progress,
+            phase_label: phase_label.into(),
+            stage_current,
+            stage_total,
+        }
+    }
+
+    #[test]
+    fn download_pass_does_not_finish_packages_and_apply_restarts_the_bar() {
+        let mut s = AppState::default();
+        s.phase = Phase::Running {
+            packages: vec![dnf_pkg("wireplumber"), dnf_pkg("glibc"), dnf_pkg("kernel")],
+            active_index: None,
+            overall_progress: 0.0,
+            phase_label: "Starting…".into(),
+            current_source: Some(UpdateSource::Dnf),
+            current_name: None,
+            work_progress: None,
+            applying: false,
+            stage_current: None,
+            stage_total: None,
+            needs_reboot: false,
+            failed_sources: Vec::new(),
+        };
+
+        for (name, cur) in [("wireplumber", 1), ("glibc", 2), ("kernel", 3)] {
+            s = reduce(
+                s,
+                dnf_progress(
+                    Some(name),
+                    Some(PackageStatus::Downloading),
+                    Some(1.0),
+                    "Downloading packages",
+                    Some(cur),
+                    Some(3),
+                ),
+            )
+            .unwrap();
+        }
+
+        match &s.phase {
+            Phase::Running {
+                packages,
+                overall_progress,
+                applying,
+                stage_current,
+                stage_total,
+                ..
+            } => {
+                assert!(
+                    packages
+                        .iter()
+                        .all(|p| p.status != PackageStatus::Completed),
+                    "downloads must not check packages off, got {packages:?}"
+                );
+                assert_eq!(packages[0].status, PackageStatus::Pending);
+                assert_eq!(packages[1].status, PackageStatus::Pending);
+                assert_eq!(packages[2].status, PackageStatus::Downloading);
+                assert!(!*applying);
+                assert_eq!((*stage_current, *stage_total), (Some(3), Some(3)));
+                assert!(
+                    (*overall_progress - 1.0).abs() < f64::EPSILON,
+                    "top bar follows the download count, got {overall_progress}"
+                );
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+
+        s = reduce(
+            s,
+            dnf_progress(None, None, None, "Running transaction", None, None),
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running {
+                packages,
+                overall_progress,
+                applying,
+                work_progress,
+                ..
+            } => {
+                assert!(*applying);
+                assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
+                assert!(work_progress.is_none());
+                assert!(
+                    (*overall_progress - 0.0).abs() < f64::EPSILON,
+                    "apply pass restarts the top bar, got {overall_progress}"
+                );
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+
+        s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Installing),
+                Some(1.0),
+                "Installing",
+                Some(16),
+                Some(137),
+            ),
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running {
+                packages,
+                overall_progress,
+                work_progress,
+                applying,
+                stage_current,
+                ..
+            } => {
+                assert!(*applying);
+                assert_eq!(status_of(packages, "glibc"), PackageStatus::Installing);
+                assert_eq!(status_of(packages, "wireplumber"), PackageStatus::Pending);
+                assert_eq!(status_of(packages, "kernel"), PackageStatus::Pending);
+                assert_eq!(*work_progress, Some(1.0));
+                assert_eq!(*stage_current, Some(16));
+                assert!(
+                    (*overall_progress - 16.0 / 137.0).abs() < 1e-9,
+                    "item 100% must not replace the transaction count, got {overall_progress}"
+                );
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+
+        s = reduce(
+            s,
+            dnf_progress(
+                Some("kernel"),
+                Some(PackageStatus::Installing),
+                Some(0.4),
+                "Installing",
+                Some(17),
+                Some(137),
+            ),
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running {
+                packages,
+                overall_progress,
+                work_progress,
+                ..
+            } => {
+                assert_eq!(status_of(packages, "glibc"), PackageStatus::Completed);
+                assert_eq!(status_of(packages, "kernel"), PackageStatus::Installing);
+                assert_eq!(*work_progress, Some(0.4));
+                assert!((*overall_progress - 17.0 / 137.0).abs() < 1e-9);
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+
+        s = reduce(
+            s,
+            dnf_progress(
+                Some("libswscale-free"),
+                Some(PackageStatus::Installing),
+                Some(1.0),
+                "Installing",
+                Some(18),
+                Some(137),
+            ),
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running {
+                packages,
+                active_index,
+                current_name,
+                overall_progress,
+                ..
+            } => {
+                assert_eq!(status_of(packages, "kernel"), PackageStatus::Installing);
+                assert_eq!(*active_index, None);
+                assert_eq!(current_name.as_deref(), Some("libswscale-free"));
+                assert!((*overall_progress - 18.0 / 137.0).abs() < 1e-9);
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    fn dnf_pkg(name: &str) -> Package {
+        Package::new_dnf(name, "x86_64", "1", "updates")
+    }
+
+    fn status_of(packages: &[Package], name: &str) -> PackageStatus {
+        packages
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .status
     }
 
     #[test]
@@ -921,6 +1221,8 @@ mod tests {
                 status_hint: Some(PackageStatus::Completed),
                 progress: Some(1.0),
                 phase_label: "Firmware installed".into(),
+                stage_current: None,
+                stage_total: None,
             },
         )
         .unwrap();

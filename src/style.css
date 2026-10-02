@@ -4,6 +4,11 @@
   margin: 0 16px 12px;
 }
 
+/* Apply pass. Download keeps the accent bar. */
+progressbar.stage-apply > trough > progress {
+  background-color: @success_bg_color;
+}
+
 /* Let list viewports shrink inside the window instead of growing it. */
 .list-scroll {
   min-height: 0;

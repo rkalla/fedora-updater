@@ -63,12 +63,16 @@ pub fn worker_to_state_events(ev: WorkerEvent) -> Vec<StateEvent> {
             status_hint,
             progress,
             phase_label,
+            stage_current,
+            stage_total,
         } => vec![StateEvent::ApplyProgress {
             source,
             package_hint,
             status_hint,
             progress,
             phase_label,
+            stage_current,
+            stage_total,
         }],
         WorkerEvent::BackendApplyFinished {
             source,
@@ -443,6 +447,8 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
                     status_hint: None,
                     progress: None,
                     phase_label: format!("Updating {}", source.label()),
+                    stage_current: None,
+                    stage_total: None,
                 },
             );
 
@@ -550,6 +556,8 @@ fn emit_progress_from_line(
             status_hint: hint.status,
             progress: hint.progress,
             phase_label: hint.phase_label.unwrap_or_default(),
+            stage_current: hint.stage_current,
+            stage_total: hint.stage_total,
         },
     );
 }

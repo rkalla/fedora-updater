@@ -142,16 +142,16 @@ pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: boo
     row.status.remove_css_class("error");
     row.status.remove_css_class("phase-tag");
 
-    let live = is_current && !package.status.is_done();
+    let live = is_current
+        && matches!(
+            package.status,
+            PackageStatus::Downloading | PackageStatus::Installing
+        );
     if live {
         row.row.add_css_class("active");
         row.status.add_css_class("accent");
         row.status.add_css_class("phase-tag");
-        let label = match package.status {
-            PackageStatus::Downloading => "downloading",
-            _ => "installing",
-        };
-        row.status.set_text(label);
+        row.status.set_text(package.status.label());
         return;
     }
 
@@ -170,7 +170,17 @@ pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: boo
             row.status.add_css_class("dim-label");
             row.status.set_text("skipped");
         }
-        _ => {
+        PackageStatus::Installing => {
+            row.status.add_css_class("accent");
+            row.status.add_css_class("phase-tag");
+            row.status.set_text("installing");
+        }
+        PackageStatus::Downloading => {
+            row.status.add_css_class("accent");
+            row.status.add_css_class("phase-tag");
+            row.status.set_text("downloading");
+        }
+        PackageStatus::Pending => {
             row.row.add_css_class("pending");
             row.status.add_css_class("dim-label");
             row.status.set_text("queued");

@@ -186,14 +186,18 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
     if lower.contains("downloading") {
         hint.phase_label = Some("Downloading packages".into());
         hint.status = Some(PackageStatus::Downloading);
-    } else if lower.contains("running transaction") {
-        hint.phase_label = Some("Running transaction".into());
-    } else if lower.contains("verifying") {
+    } else if is_verify_step(&lower) {
         hint.phase_label = Some("Verifying".into());
         hint.status = Some(PackageStatus::Installing);
-    } else if lower.contains("installing") || lower.contains("upgrading") {
+    } else if lower.contains("installing")
+        || lower.contains("upgrading")
+        || lower.contains("erasing")
+        || lower.contains("removing")
+    {
         hint.phase_label = Some("Installing".into());
         hint.status = Some(PackageStatus::Installing);
+    } else if is_transaction_step(&lower) {
+        hint.phase_label = Some("Running transaction".into());
     } else if lower.contains("complete!") {
         hint.phase_label = Some("Complete".into());
         hint.progress = Some(1.0);
@@ -201,7 +205,8 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
 
     if let Some((cur, total, rest)) = parse_bracket_fraction(trimmed) {
         if total > 0 {
-            hint.progress = Some((cur as f64 / total as f64).clamp(0.0, 1.0));
+            hint.stage_current = Some(cur);
+            hint.stage_total = Some(total);
         }
         if let Some(name) = extract_package_from_action_rest(rest) {
             hint.package_name = Some(name);
@@ -214,7 +219,29 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
         hint.progress = Some((pct / 100.0).clamp(0.0, 1.0));
     }
 
+    // dnf5 download rows are `[n/total] nevra  pp%` with no "downloading" word.
+    // Those must not be treated as installs.
+    if hint.status.is_none()
+        && hint.phase_label.is_none()
+        && hint.package_name.is_some()
+        && hint.stage_current.is_some()
+    {
+        hint.status = Some(PackageStatus::Downloading);
+        hint.phase_label = Some("Downloading packages".into());
+    }
+
     hint
+}
+
+fn is_verify_step(lower: &str) -> bool {
+    lower.contains("verifying") || lower.contains("verify ") || lower.contains("verify:")
+}
+
+fn is_transaction_step(lower: &str) -> bool {
+    lower.contains("running transaction")
+        || lower.contains("prepare transaction")
+        || lower.contains("scriptlet")
+        || lower.contains("cleanup")
 }
 
 fn parse_bracket_fraction(line: &str) -> Option<(u32, u32, &str)> {
@@ -266,7 +293,7 @@ fn extract_package_token(s: &str) -> Option<String> {
         return None;
     }
     let name = strip_to_package_name(token);
-    if name.is_empty() {
+    if name.is_empty() || is_action_verb(&name) || is_noise_name(&name) {
         None
     } else {
         Some(name)
@@ -279,11 +306,32 @@ fn is_action_verb(token: &str) -> bool {
         "installing"
             | "upgrading"
             | "verifying"
+            | "verify"
             | "erasing"
             | "removing"
             | "preparing"
+            | "prepare"
             | "downloading"
             | "running"
+            | "cleanup"
+            | "scriptlet"
+    )
+}
+
+/// Transaction words that are not RPM names (`Prepare transaction`, `Verify package files`).
+fn is_noise_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "prepare"
+            | "transaction"
+            | "scriptlet"
+            | "cleanup"
+            | "verify"
+            | "verifying"
+            | "package"
+            | "files"
+            | "running"
+            | "complete"
     )
 }
 
@@ -435,7 +483,66 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
     fn parse_progress_fraction() {
         let h = parse_progress_line("[3/12] Installing gnome-shell-48.2-1.fc42.x86_64");
         assert_eq!(h.package_name.as_deref(), Some("gnome-shell"));
-        assert!(h.progress.unwrap() > 0.2);
+        assert_eq!(h.status, Some(PackageStatus::Installing));
+        assert_eq!(h.stage_current, Some(3));
+        assert_eq!(h.stage_total, Some(12));
+        // The bracket is the transaction count. There is no per-package percent.
+        assert_eq!(h.progress, None);
+    }
+
+    #[test]
+    fn download_line_is_not_an_install_and_keeps_both_fractions() {
+        let h = parse_progress_line(
+            "[12/68] wireplumber-0.5.18-1.fc44.x86_64 100% | 1.2 MiB/s | 450.0 KiB",
+        );
+        assert_eq!(h.package_name.as_deref(), Some("wireplumber"));
+        assert_eq!(h.status, Some(PackageStatus::Downloading));
+        assert_eq!(h.phase_label.as_deref(), Some("Downloading packages"));
+        assert_eq!(h.stage_current, Some(12));
+        assert_eq!(h.stage_total, Some(68));
+        assert_eq!(h.progress, Some(1.0));
+    }
+
+    #[test]
+    fn upgrade_line_keeps_transaction_count_apart_from_item_percent() {
+        let h = parse_progress_line(
+            "[ 16/137] Upgrading glibc-0:2.43-9.fc44.x86_64 100% | 166.5 MiB/s | 1.0 MiB",
+        );
+        assert_eq!(h.package_name.as_deref(), Some("glibc"));
+        assert_eq!(h.status, Some(PackageStatus::Installing));
+        assert_eq!(h.phase_label.as_deref(), Some("Installing"));
+        assert_eq!(h.stage_current, Some(16));
+        assert_eq!(h.stage_total, Some(137));
+        assert_eq!(h.progress, Some(1.0));
+    }
+
+    #[test]
+    fn epoch_nevra_keeps_the_package_name() {
+        let glibc =
+            parse_progress_line("[3/137] Upgrading glibc-gconv-extra-0:2.43-9.fc44.x86_64 100%");
+        assert_eq!(glibc.package_name.as_deref(), Some("glibc-gconv-extra"));
+        let libs = parse_progress_line("[4/137] Upgrading bind-libs-32:9.18.50-2.fc44.x86_64");
+        assert_eq!(libs.package_name.as_deref(), Some("bind-libs"));
+        let sw = parse_progress_line("[16/137] Upgrading libswscale-free-0:8.0-1.fc44.x86_64 100%");
+        assert_eq!(sw.package_name.as_deref(), Some("libswscale-free"));
+        let legacy = parse_progress_line("[1/2] Upgrading 0:glibc-2.43-9.fc44.x86_64");
+        assert_eq!(legacy.package_name.as_deref(), Some("glibc"));
+    }
+
+    #[test]
+    fn transaction_steps_advance_the_count_without_a_package_name() {
+        let prepare = parse_progress_line("[2/137] Prepare transaction 100% | 1.0 B/s");
+        assert!(prepare.package_name.is_none());
+        assert_eq!(prepare.stage_current, Some(2));
+        assert_eq!(prepare.stage_total, Some(137));
+        assert_eq!(prepare.phase_label.as_deref(), Some("Running transaction"));
+
+        let verify = parse_progress_line("[1/137] Verify package files 100%");
+        assert!(verify.package_name.is_none());
+        assert_eq!(verify.status, Some(PackageStatus::Installing));
+        assert_eq!(verify.phase_label.as_deref(), Some("Verifying"));
+        assert_eq!(verify.stage_current, Some(1));
+        assert_eq!(verify.stage_total, Some(137));
     }
 
     #[test]

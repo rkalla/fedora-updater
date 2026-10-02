@@ -11,8 +11,12 @@ use crate::model::{Package, PackageStatus, UpdateSource};
 pub struct ProgressHint {
     pub package_name: Option<String>,
     pub status: Option<PackageStatus>,
+    /// Per-item percent (the `100%` on a dnf progress line). Not the `[cur/total]` count.
     pub progress: Option<f64>,
     pub phase_label: Option<String>,
+    /// `[cur/total]` step counter for the current download or transaction.
+    pub stage_current: Option<u32>,
+    pub stage_total: Option<u32>,
 }
 
 pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
