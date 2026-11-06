@@ -220,7 +220,13 @@ impl Package {
 pub enum WorkerEvent {
     /// Privileged session started (polkit accepted).
     SessionStarted,
+    /// Newline-terminated backend output.
     Line {
+        source_tag: String,
+        text: String,
+    },
+    /// Carriage-return progress. Replaces the open console line.
+    Draw {
         source_tag: String,
         text: String,
     },
@@ -267,6 +273,8 @@ pub enum WorkerEvent {
 pub struct ConsoleBuffer {
     lines: Vec<String>,
     max_lines: usize,
+    /// Last entry is an in-progress `\r` update and the next one replaces it.
+    live_tail: bool,
 }
 
 impl ConsoleBuffer {
@@ -274,11 +282,13 @@ impl ConsoleBuffer {
         Self {
             lines: Vec::new(),
             max_lines,
+            live_tail: false,
         }
     }
 
     pub fn push(&mut self, line: impl Into<String>) {
         self.lines.push(line.into());
+        self.live_tail = false;
         if self.lines.len() > self.max_lines {
             let excess = self.lines.len() - self.max_lines;
             self.lines.drain(0..excess);
@@ -286,11 +296,48 @@ impl ConsoleBuffer {
     }
 
     pub fn push_tagged(&mut self, tag: &str, line: &str) {
-        self.push(format!("[{tag}] {line}"));
+        self.push_committed_tagged(tag, line);
+    }
+
+    /// Carriage-return progress. Replaces the open line instead of appending.
+    pub fn push_live_tagged(&mut self, tag: &str, line: &str) {
+        let formatted = format!("[{tag}] {line}");
+        if self.live_tail {
+            if let Some(last) = self.lines.last_mut() {
+                *last = formatted;
+                return;
+            }
+        }
+        self.lines.push(formatted);
+        self.live_tail = true;
+        self.trim();
+    }
+
+    /// Newline-terminated output. A following commit replaces the open `\r` line.
+    pub fn push_committed_tagged(&mut self, tag: &str, line: &str) {
+        let formatted = format!("[{tag}] {line}");
+        if self.live_tail {
+            if let Some(last) = self.lines.last_mut() {
+                *last = formatted;
+                self.live_tail = false;
+                return;
+            }
+        }
+        self.lines.push(formatted);
+        self.live_tail = false;
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        if self.lines.len() > self.max_lines {
+            let excess = self.lines.len() - self.max_lines;
+            self.lines.drain(0..excess);
+        }
     }
 
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.live_tail = false;
     }
 
     pub fn last_line(&self) -> &str {
@@ -555,13 +602,11 @@ pub fn apply_progress_hint(
             return Some(idx);
         }
     };
+    // Same RPM name can be i686 and x86_64. The first row may already be done
+    // from the other arch; keep looking so the twin still updates.
     let idx = packages
         .iter()
-        .position(|p| p.source == source && p.matches_progress_name(hint))?;
-
-    if packages[idx].status.is_done() {
-        return None;
-    }
+        .position(|p| p.source == source && !p.status.is_done() && p.matches_progress_name(hint))?;
 
     match status_hint {
         Some(PackageStatus::Downloading) => {
@@ -675,12 +720,98 @@ pub fn running_progress_captions(
     source: Option<UpdateSource>,
     done: usize,
     total: usize,
+    applying: bool,
 ) -> (String, String) {
     let remaining = total.saturating_sub(done);
     let src = source.map(|s| s.label()).unwrap_or("all sources");
-    let footnote = format!("{src} · {done} of {total} done");
-    let meta = format!("{done} done · {remaining} remaining");
+    let verb = if applying { "done" } else { "downloaded" };
+    let footnote = format!("{src} · {done} of {total} {verb}");
+    let meta = format!("{done} {verb} · {remaining} remaining");
     (footnote, meta)
+}
+
+/// How the running page should look when backend output has gone quiet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuietUi {
+    pub show_eta: bool,
+    /// Put the spinner back over a stale 100% bar or a silent stretch.
+    pub show_spinner: bool,
+    /// Replaces the ETA prefix on the footnote. `None` keeps the normal caption.
+    pub footnote: Option<String>,
+    pub banner: Option<String>,
+    /// Ask rpm whether the planned DNF versions are already installed.
+    pub reconcile: bool,
+}
+
+pub fn quiet_ui(
+    quiet_secs: u64,
+    at_full_item: bool,
+    cache_note: Option<&str>,
+    tool_alive: bool,
+    watching_dnf: bool,
+    last_line: &str,
+) -> QuietUi {
+    let cache = cache_note.filter(|s| !s.is_empty());
+    let show_eta = quiet_secs < 15 && cache.is_none();
+    let exited = watching_dnf && !tool_alive && quiet_secs >= 20;
+    let stalled = quiet_secs >= 120 && cache.is_none() && !exited;
+    let show_spinner = cache.is_some()
+        || exited
+        || stalled
+        || (quiet_secs >= 5 && at_full_item && cache.is_none());
+    let footnote = if let Some(note) = cache {
+        Some(note.to_string())
+    } else if exited {
+        Some("dnf has exited".into())
+    } else if stalled {
+        Some(if watching_dnf {
+            "Waiting on dnf".into()
+        } else {
+            "Waiting for output".into()
+        })
+    } else {
+        None
+    };
+    let banner = if exited {
+        Some("dnf has exited. Checking whether the packages were installed.".into())
+    } else if stalled {
+        let mins = (quiet_secs / 60).max(2);
+        let last = clip_line(last_line);
+        Some(if last.is_empty() {
+            format!("No output for {mins} minutes.")
+        } else {
+            format!("No output for {mins} minutes. Last line: {last}")
+        })
+    } else {
+        None
+    };
+    QuietUi {
+        show_eta,
+        show_spinner,
+        footnote,
+        banner,
+        reconcile: exited,
+    }
+}
+
+fn clip_line(line: &str) -> String {
+    let line = line.trim();
+    let count = line.chars().count();
+    if count <= 140 {
+        line.to_string()
+    } else {
+        let head: String = line.chars().take(137).collect();
+        format!("{head}...")
+    }
+}
+
+pub fn cache_activity_note(name: &str, bytes: u64, rising: bool) -> String {
+    let size = format_bytes(bytes);
+    if rising {
+        format!("Downloading {name} — {size} and rising")
+    } else {
+        format!("Downloading {name} — {size}")
+    }
 }
 
 #[cfg(test)]
@@ -804,7 +935,7 @@ mod tests {
 
     #[test]
     fn running_progress_captions_lead_with_done_count() {
-        let (foot, meta) = running_progress_captions(Some(UpdateSource::Firmware), 1, 1);
+        let (foot, meta) = running_progress_captions(Some(UpdateSource::Firmware), 1, 1, true);
         assert_eq!(foot, "Firmware · 1 of 1 done");
         assert_eq!(meta, "1 done · 0 remaining");
         assert!(
@@ -812,13 +943,107 @@ mod tests {
             "footnote must not invert remaining/total against the meta line, got {foot:?}"
         );
 
-        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 0, 12);
+        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 0, 12, true);
         assert_eq!(foot, "System · 0 of 12 done");
         assert_eq!(meta, "0 done · 12 remaining");
 
-        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 7, 12);
+        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 7, 12, true);
         assert_eq!(foot, "System · 7 of 12 done");
         assert_eq!(meta, "7 done · 5 remaining");
+
+        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 25, 26, false);
+        assert_eq!(foot, "System · 25 of 26 downloaded");
+        assert_eq!(meta, "25 downloaded · 1 remaining");
+    }
+
+    #[test]
+    fn second_arch_receives_progress_after_the_first_is_done() {
+        let mut pkgs = vec![
+            Package::new_dnf("mesa-dri-drivers", "i686", "1", "updates"),
+            Package::new_dnf("mesa-dri-drivers", "x86_64", "1", "updates"),
+        ];
+        pkgs[0].status = PackageStatus::Completed;
+        pkgs[0].progress = 1.0;
+        let idx = apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Dnf,
+            Some("mesa-dri-drivers"),
+            Some(PackageStatus::Installing),
+            Some(0.4),
+        );
+        assert_eq!(idx, Some(1));
+        assert_eq!(pkgs[0].status, PackageStatus::Completed);
+        assert_eq!(pkgs[1].status, PackageStatus::Installing);
+        assert!((pkgs[1].progress - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn carriage_return_replaces_the_open_console_line() {
+        let mut console = ConsoleBuffer::new(20);
+        console.push_live_tagged("dnf", "[26/26] grok-bot  10%");
+        console.push_live_tagged("dnf", "[26/26] grok-bot  40%");
+        assert_eq!(console.len(), 1);
+        assert!(console.last_line().contains("40%"));
+        console.push_committed_tagged("dnf", "[26/26] grok-bot 100%");
+        assert_eq!(console.len(), 1);
+        assert!(console.last_line().contains("100%"));
+        console.push_committed_tagged("dnf", "Complete!");
+        assert_eq!(console.len(), 2);
+        assert!(console.last_line().contains("Complete!"));
+    }
+
+    #[test]
+    fn quiet_download_hides_eta_and_names_a_growing_cache_file() {
+        let fresh = quiet_ui(2, false, None, true, true, "");
+        assert!(fresh.show_eta);
+        assert!(!fresh.show_spinner);
+        assert!(fresh.banner.is_none());
+        assert!(!fresh.reconcile);
+
+        let stuck_full = quiet_ui(8, true, None, true, true, "[25/26] tzdata-java 100%");
+        assert!(stuck_full.show_spinner);
+        assert!(stuck_full.show_eta);
+
+        let growing = quiet_ui(
+            400,
+            true,
+            Some("Downloading grok-bot — 85 MB and rising"),
+            true,
+            true,
+            "[25/26] tzdata-java 100%",
+        );
+        assert!(!growing.show_eta);
+        assert!(growing.show_spinner);
+        assert_eq!(
+            growing.footnote.as_deref(),
+            Some("Downloading grok-bot — 85 MB and rising")
+        );
+        assert!(growing.banner.is_none());
+        assert!(!growing.reconcile);
+
+        let stalled = quiet_ui(180, true, None, true, true, "[25/26] tzdata-java 100%");
+        assert!(!stalled.show_eta);
+        assert!(stalled.banner.unwrap().contains("tzdata-java"));
+        assert!(!stalled.reconcile);
+
+        let exited = quiet_ui(25, true, None, false, true, "[25/26] tzdata-java 100%");
+        assert!(exited.reconcile);
+        assert!(exited.banner.unwrap().contains("Checking whether"));
+
+        let flatpak = quiet_ui(30, false, None, false, false, "");
+        assert!(!flatpak.reconcile);
+    }
+
+    #[test]
+    fn cache_activity_note_mentions_growth() {
+        assert_eq!(
+            cache_activity_note("grok-bot", 85 * 1024 * 1024, true),
+            "Downloading grok-bot — 85 MB and rising"
+        );
+        assert_eq!(
+            cache_activity_note("grok-bot", 85 * 1024 * 1024, false),
+            "Downloading grok-bot — 85 MB"
+        );
     }
 
     #[test]

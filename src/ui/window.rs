@@ -1,8 +1,9 @@
 //! Main application window — thin view over the pure state machine.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use gtk::glib;
 use gtk::glib::object::IsA;
@@ -14,15 +15,19 @@ use libadwaita::{
     StatusPage, StyleManager, Toast, ToastOverlay, Window as AdwWindow, WrapBox,
 };
 
+use fedora_updater::backend::dnf::{self, InstallCheck};
 use fedora_updater::model::{
-    about_time_left, check_progress, count_by_kind, count_by_source, now_playing_subtitle,
-    now_playing_title, run_heading, running_progress_captions, source_summary_line, AuthPurpose,
-    Package, UpdateSource, WorkerEvent,
+    about_time_left, cache_activity_note, check_progress, count_by_kind, count_by_source,
+    now_playing_subtitle, now_playing_title, quiet_ui, run_heading, running_progress_captions,
+    source_summary_line, AuthPurpose, Package, UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, fail_retry_is_reboot, release_privileges,
     run_apply_all, run_check_all, run_systemctl_reboot, session_started_event,
     worker_to_state_events,
+};
+use fedora_updater::privilege::{
+    dnf_daemon_is_running, helper_activity, kill_recorded_helper, run_local_command, HelperActivity,
 };
 use fedora_updater::state::{self, AppState, Event, Phase};
 
@@ -61,6 +66,8 @@ struct Widgets {
     ready_rows: RefCell<Vec<gtk::Widget>>,
     run_title: Label,
     run_footnote: Label,
+    run_stop: Button,
+    run_stall: Banner,
     run_progress: ProgressBar,
     run_progress_meta: Label,
     run_progress_pct: Label,
@@ -89,6 +96,14 @@ struct Widgets {
     reboot_box: gtk::Box,
     fail_page: StatusPage,
     fail_detail: Label,
+    /// Last byte from the backend, including a carriage-return redraw.
+    /// `None` until this run paints the Running page, so auth time is not quiet time.
+    last_output: Cell<Option<Instant>>,
+    cache_cursor: RefCell<Option<(PathBuf, u64)>>,
+    reconcile_inflight: Cell<bool>,
+    reconcile_not_before: Cell<Option<Instant>>,
+    dnf_reconciled: Cell<bool>,
+    reconcile_tx: async_channel::Sender<InstallCheck>,
 }
 
 pub fn build(app: &Application) {
@@ -109,6 +124,8 @@ pub fn build(app: &Application) {
     window.set_application(Some(app));
 
     window.set_default_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+
+    let (reconcile_tx, reconcile_rx) = async_channel::unbounded::<InstallCheck>();
 
     let widgets = Rc::new(Widgets {
         window: window.clone(),
@@ -137,6 +154,8 @@ pub fn build(app: &Application) {
         ready_rows: RefCell::new(Vec::new()),
         run_title: obj(&builder, "run_title"),
         run_footnote: obj(&builder, "run_footnote"),
+        run_stop: obj(&builder, "run_stop"),
+        run_stall: obj(&builder, "run_stall"),
         run_progress: obj(&builder, "run_progress"),
         run_progress_meta: obj(&builder, "run_progress_meta"),
         run_progress_pct: obj(&builder, "run_progress_pct"),
@@ -165,6 +184,12 @@ pub fn build(app: &Application) {
         reboot_box: obj(&builder, "reboot_box"),
         fail_page: obj(&builder, "fail_page"),
         fail_detail: obj(&builder, "fail_detail"),
+        last_output: Cell::new(None),
+        cache_cursor: RefCell::new(None),
+        reconcile_inflight: Cell::new(false),
+        reconcile_not_before: Cell::new(None),
+        dnf_reconciled: Cell::new(false),
+        reconcile_tx,
     });
 
     let idle_btn: Button = obj(&builder, "idle_btn");
@@ -273,6 +298,19 @@ pub fn build(app: &Application) {
     {
         let state = state.clone();
         let widgets = widgets.clone();
+        let run_stop = widgets.run_stop.clone();
+        run_stop.connect_clicked(move |_| {
+            let applying = matches!(state.borrow().phase, Phase::Running { applying: true, .. });
+            if applying {
+                prompt_stop_during_transaction(&widgets, &state);
+            } else if matches!(state.borrow().phase, Phase::Running { .. }) {
+                stop_apply(&state, &widgets, false);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
         let apply_after_refresh = apply_after_refresh.clone();
         auth_cancel.connect_clicked(move |_| {
             apply_after_refresh.set(false);
@@ -352,6 +390,23 @@ pub fn build(app: &Application) {
             }
         });
     }
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(check) = reconcile_rx.recv().await {
+                handle_install_check(&state, &widgets, check);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        glib::timeout_add_local(Duration::from_secs(1), move || {
+            refresh_quiet_chrome(&state, &widgets);
+            glib::ControlFlow::Continue
+        });
+    }
 
     window.connect_close_request(move |_| {
         cancel_background_work();
@@ -386,6 +441,11 @@ fn begin_apply(
     tx: async_channel::Sender<WorkerEvent>,
 ) {
     *pending_purpose.borrow_mut() = AuthPurpose::Apply;
+    widgets.last_output.set(None);
+    *widgets.cache_cursor.borrow_mut() = None;
+    widgets.reconcile_inflight.set(false);
+    widgets.reconcile_not_before.set(None);
+    widgets.dnf_reconciled.set(false);
     let packages = state.borrow().packages().to_vec();
     dispatch(state, widgets, Event::StartApply);
     if can_skip_auth_ui() {
@@ -504,6 +564,12 @@ fn handle_worker(
     } else {
         false
     };
+    if matches!(
+        ev,
+        WorkerEvent::Line { .. } | WorkerEvent::Draw { .. } | WorkerEvent::ApplyProgress { .. }
+    ) {
+        widgets.last_output.set(Some(Instant::now()));
+    }
 
     match &ev {
         WorkerEvent::SessionStarted => {
@@ -511,7 +577,7 @@ fn handle_worker(
             dispatch_worker(state, widgets, session_started_event(purpose));
             return;
         }
-        WorkerEvent::Line { .. } => {
+        WorkerEvent::Line { .. } | WorkerEvent::Draw { .. } => {
             for e in worker_to_state_events(ev) {
                 let current = state.borrow().clone();
                 if let Ok(next) = state::reduce(current, e) {
@@ -613,6 +679,296 @@ fn clear_running_lists(w: &Widgets) {
     w.ignore_expand.set(false);
 }
 
+fn quiet_secs(w: &Widgets) -> u64 {
+    match w.last_output.get() {
+        Some(at) => at.elapsed().as_secs(),
+        None => {
+            w.last_output.set(Some(Instant::now()));
+            0
+        }
+    }
+}
+
+fn has_sources_after_dnf(packages: &[Package]) -> bool {
+    packages
+        .iter()
+        .any(|p| p.source.apply_order() > UpdateSource::Dnf.apply_order())
+}
+
+/// Footnote, spinner, and stall banner for a quiet run. Does not rebuild the list.
+fn paint_quiet_chrome(
+    w: &Widgets,
+    caption: &str,
+    applying: bool,
+    work_progress: Option<f64>,
+    current_source: Option<UpdateSource>,
+    last_line: &str,
+    elapsed: u64,
+    overall_progress: f64,
+    packages: &[Package],
+) {
+    let secs = quiet_secs(w);
+    let at_full = work_progress.is_some_and(|frac| frac >= 0.999);
+    let watching_dnf = current_source == Some(UpdateSource::Dnf);
+    let cache_note = if secs >= 5 && watching_dnf && !applying {
+        dnf::poll_cache_growth(
+            std::path::Path::new(dnf::DNF_CACHE_ROOT),
+            &mut w.cache_cursor.borrow_mut(),
+        )
+        .map(|growth| cache_activity_note(&growth.package, growth.bytes, growth.rising))
+    } else {
+        None
+    };
+    // Absent covers preview and the moment before polkit returns. That is not
+    // "dnf exited", so the page must not rpm-reconcile the real system.
+    let tool_alive = !watching_dnf || helper_activity() != HelperActivity::Exited;
+    let quiet = quiet_ui(
+        secs,
+        at_full,
+        cache_note.as_deref(),
+        tool_alive,
+        watching_dnf,
+        last_line,
+    );
+
+    let mut foot = caption.to_string();
+    if quiet.show_eta {
+        if let Some(eta) = about_time_left(elapsed, overall_progress) {
+            foot = format!("{eta} · {foot}");
+        }
+    }
+    if let Some(note) = &quiet.footnote {
+        foot = note.clone();
+    }
+    w.run_footnote.set_text(&foot);
+
+    if quiet.show_spinner || work_progress.is_none() {
+        w.now_playing_spinner.set_opacity(1.0);
+    } else {
+        w.now_playing_spinner.set_opacity(0.0);
+    }
+
+    let banner = quiet.banner.as_ref().map(|text| {
+        if text.starts_with("No output") && dnf_daemon_is_running() {
+            format!("{text} The update is waiting on GNOME Software's dnf daemon.")
+        } else {
+            text.clone()
+        }
+    });
+    if let Some(text) = banner {
+        w.run_stall.set_title(&text);
+        w.run_stall.set_revealed(true);
+    } else {
+        w.run_stall.set_revealed(false);
+    }
+
+    if quiet.reconcile && watching_dnf {
+        maybe_reconcile_dnf(w, packages);
+    }
+}
+
+fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
+    let s = state.borrow();
+    let Phase::Running {
+        packages,
+        overall_progress,
+        applying,
+        current_source,
+        work_progress,
+        stage_current,
+        stage_total,
+        ..
+    } = &s.phase
+    else {
+        drop(s);
+        w.run_stall.set_revealed(false);
+        return;
+    };
+    let elapsed = s
+        .stopwatch
+        .as_ref()
+        .map(|sw| sw.elapsed_secs())
+        .unwrap_or(0);
+    let last = s.console.last_line().to_string();
+    let package_done = packages.iter().filter(|p| p.status.is_done()).count();
+    let (done, total) = match (stage_current, stage_total) {
+        (Some(cur), Some(stage_total)) if *stage_total > 0 => {
+            (*cur as usize, *stage_total as usize)
+        }
+        _ => (package_done, packages.len()),
+    };
+    let (caption, _) = running_progress_captions(*current_source, done, total, *applying);
+    let packages = packages.clone();
+    let applying = *applying;
+    let work_progress = *work_progress;
+    let current_source = *current_source;
+    let overall_progress = *overall_progress;
+    drop(s);
+    paint_quiet_chrome(
+        w,
+        &caption,
+        applying,
+        work_progress,
+        current_source,
+        &last,
+        elapsed,
+        overall_progress,
+        &packages,
+    );
+}
+
+fn maybe_reconcile_dnf(w: &Widgets, packages: &[Package]) {
+    if w.reconcile_inflight.get() || w.dnf_reconciled.get() {
+        return;
+    }
+    if w.reconcile_not_before
+        .get()
+        .is_some_and(|at| Instant::now() < at)
+    {
+        return;
+    }
+    let dnf_pkgs: Vec<Package> = packages
+        .iter()
+        .filter(|p| p.source == UpdateSource::Dnf)
+        .cloned()
+        .collect();
+    if dnf_pkgs.is_empty() {
+        return;
+    }
+    w.reconcile_inflight.set(true);
+    let tx = w.reconcile_tx.clone();
+    std::thread::spawn(move || {
+        let check = query_dnf_install_state(&dnf_pkgs);
+        let _ = tx.send_blocking(check);
+    });
+}
+
+fn query_dnf_install_state(packages: &[Package]) -> InstallCheck {
+    let args = dnf::rpm_query_args(packages);
+    // `-q`, `--qf`, and the format are not package specs.
+    if args.len() <= 3 {
+        return InstallCheck::Unknown;
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut output = String::new();
+    match run_local_command("rpm", &arg_refs, |line| {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&line);
+    }) {
+        Ok(_) => {
+            let installed = dnf::parse_rpm_query(&output);
+            dnf::check_packages_installed(packages, &installed)
+        }
+        Err(_) => InstallCheck::Unknown,
+    }
+}
+
+fn handle_install_check(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, check: InstallCheck) {
+    widgets.reconcile_inflight.set(false);
+    let (packages, current_source, needs_reboot) = {
+        let borrowed = state.borrow();
+        let Phase::Running {
+            packages,
+            current_source,
+            needs_reboot,
+            ..
+        } = &borrowed.phase
+        else {
+            return;
+        };
+        (packages.clone(), *current_source, *needs_reboot)
+    };
+    if current_source != Some(UpdateSource::Dnf) {
+        return;
+    }
+    match check {
+        InstallCheck::Unknown => {
+            widgets
+                .reconcile_not_before
+                .set(Some(Instant::now() + Duration::from_secs(30)));
+        }
+        InstallCheck::AllInstalled => {
+            if has_sources_after_dnf(&packages) {
+                if widgets.dnf_reconciled.replace(true) {
+                    return;
+                }
+                dispatch_worker(
+                    state,
+                    widgets,
+                    Event::BackendApplyDone {
+                        source: UpdateSource::Dnf,
+                        success: true,
+                        needs_reboot,
+                    },
+                );
+            } else {
+                cancel_background_work();
+                kill_recorded_helper();
+                dispatch_worker(state, widgets, Event::ApplyComplete { needs_reboot });
+            }
+        }
+        InstallCheck::NotInstalled => {
+            cancel_background_work();
+            kill_recorded_helper();
+            dispatch_worker(
+                state,
+                widgets,
+                Event::Fail {
+                    title: "Update did not finish".into(),
+                    detail: "dnf exited and the new package versions are not installed. Nothing from this run was committed. You can run Update All again.".into(),
+                },
+            );
+        }
+        InstallCheck::Partial { installed, total } => {
+            cancel_background_work();
+            kill_recorded_helper();
+            dispatch_worker(
+                state,
+                widgets,
+                Event::Fail {
+                    title: "Update stopped partway through".into(),
+                    detail: format!(
+                        "{installed} of {total} packages were installed before dnf exited. Check `dnf history` before running Update All again."
+                    ),
+                },
+            );
+        }
+    }
+}
+
+fn prompt_stop_during_transaction(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppState>>) {
+    let dialog = libadwaita::AlertDialog::new(
+        Some("Stop this update?"),
+        Some("Stopping dnf while it is applying packages can leave the rpm database half-applied. Check dnf history before running Update All again."),
+    );
+    dialog.add_response("wait", "Keep waiting");
+    dialog.add_response("stop", "Stop anyway");
+    dialog.set_response_appearance("stop", libadwaita::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("wait"));
+    dialog.set_close_response("wait");
+
+    let state = state.clone();
+    let widgets_for_cb = widgets.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        if response != "stop" {
+            return;
+        }
+        let during = matches!(state.borrow().phase, Phase::Running { applying: true, .. });
+        if matches!(state.borrow().phase, Phase::Running { .. }) {
+            stop_apply(&state, &widgets_for_cb, during);
+        }
+    });
+    dialog.present(Some(&widgets.window));
+}
+
+fn stop_apply(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, during_transaction: bool) {
+    cancel_background_work();
+    kill_recorded_helper();
+    dispatch_worker(state, widgets, Event::StopApply { during_transaction });
+}
+
 fn render_running(
     w: &Widgets,
     packages: &[Package],
@@ -641,11 +997,7 @@ fn render_running(
         (Some(cur), Some(stage_total)) if stage_total > 0 => (cur as usize, stage_total as usize),
         _ => (package_done, packages.len()),
     };
-    let (mut foot, meta) = running_progress_captions(current_source, done, total);
-    if let Some(eta) = about_time_left(elapsed, overall_progress) {
-        foot = format!("{eta} · {foot}");
-    }
-    w.run_footnote.set_text(&foot);
+    let (caption, meta) = running_progress_captions(current_source, done, total, applying);
     w.run_progress.set_fraction(overall_progress);
     w.run_progress_meta.set_text(&meta);
     w.run_progress_pct
@@ -737,9 +1089,21 @@ fn render_running(
         w.run_console_line.set_text(last_console);
     }
     w.run_console_full.set_text(full_console);
+    paint_quiet_chrome(
+        w,
+        &caption,
+        applying,
+        work_progress,
+        current_source,
+        last_console,
+        elapsed,
+        overall_progress,
+        packages,
+    );
 }
 
 fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
+    w.run_stall.set_revealed(false);
     let s = state.borrow();
     let last_console = s.console.last_line().to_string();
     let full_console = s.console.full_text();
@@ -990,6 +1354,8 @@ mod tests {
             "ready_group",
             "now_playing",
             "run_title",
+            "run_stop",
+            "run_stall",
             "now_playing_title",
             "run_list_scroll",
             "run_list_group",
@@ -1016,9 +1382,14 @@ mod tests {
             "status pages must expand to fill the stack"
         );
         let now_at = xml.find("id=\"now_playing\"").expect("now_playing");
+        let stall_at = xml.find("id=\"run_stall\"").expect("run_stall");
         let scroll_at = xml.find("id=\"run_list_scroll\"").expect("run_list_scroll");
         let list_at = xml.find("id=\"run_list_group\"").expect("run_list_group");
         let completed_at = xml.find("id=\"run_completed\"").expect("run_completed");
+        assert!(
+            stall_at < now_at,
+            "stall banner sits above the now-playing card"
+        );
         assert!(
             now_at < scroll_at,
             "now-playing card must stay sticky above the checklist scroll"

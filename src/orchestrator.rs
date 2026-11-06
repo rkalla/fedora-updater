@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use async_channel::Sender;
 
 use crate::backend::{self, dnf, flatpak, fwupd};
-use crate::helper_protocol::HelperCommand;
+use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
 use crate::model::{AuthPurpose, Package, UpdateSource, WorkerEvent};
 use crate::privilege::{
     close_session, run_local_command, session_is_alive, with_session, SessionError, SessionEvent,
@@ -36,6 +36,10 @@ pub fn worker_to_state_events(ev: WorkerEvent) -> Vec<StateEvent> {
     match ev {
         WorkerEvent::SessionStarted => vec![],
         WorkerEvent::Line { source_tag, text } => vec![StateEvent::ConsoleLine {
+            tag: source_tag,
+            text,
+        }],
+        WorkerEvent::Draw { source_tag, text } => vec![StateEvent::ConsoleDraw {
             tag: source_tag,
             text,
         }],
@@ -106,6 +110,34 @@ fn line(tx: &Sender<WorkerEvent>, tag: &str, text: String) {
             text,
         },
     );
+}
+
+fn live_line(tx: &Sender<WorkerEvent>, tag: &str, text: String) {
+    send(
+        tx,
+        WorkerEvent::Draw {
+            source_tag: tag.into(),
+            text,
+        },
+    );
+}
+
+/// Committed lines join `log`. Live `\r` updates update the console and the
+/// progress parser, and stay out of the log so a redraw cannot be parsed as
+/// a second package line.
+fn accept_helper_line(tx: &Sender<WorkerEvent>, tag: &str, log: &mut String, raw: &str) -> String {
+    match split_helper_line(raw) {
+        HelperOutput::Draw(text) => {
+            live_line(tx, tag, text.clone());
+            text
+        }
+        HelperOutput::Line(text) => {
+            log.push_str(&text);
+            log.push('\n');
+            line(tx, tag, text.clone());
+            text
+        }
+    }
 }
 
 fn map_session_start_err(tx: &Sender<WorkerEvent>, e: SessionError) {
@@ -306,9 +338,7 @@ where
     let code = with_session(|session| {
         session.run_command(cmd, |ev| match ev {
             SessionEvent::Line(l) => {
-                log.push_str(&l);
-                log.push('\n');
-                line(tx, tag, l);
+                accept_helper_line(tx, tag, &mut log, &l);
             }
             SessionEvent::Finished { .. } => {}
         })
@@ -510,9 +540,7 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
             if let Ok(code) = with_session(|session| {
                 session.run_command(HelperCommand::CheckFwupdReboot, |ev| {
                     if let SessionEvent::Line(l) = ev {
-                        log.push_str(&l);
-                        log.push('\n');
-                        line(&tx, "fwupd", l);
+                        accept_helper_line(&tx, "fwupd", &mut log, &l);
                     }
                 })
             }) {
@@ -573,10 +601,8 @@ fn run_helper_apply(
     match with_session(|session| {
         session.run_command(cmd, |ev| match ev {
             SessionEvent::Line(l) => {
-                log.push_str(&l);
-                log.push('\n');
-                line(tx, tag, l.clone());
-                emit_progress_from_line(tx, source, &l, known_names);
+                let text = accept_helper_line(tx, tag, &mut log, &l);
+                emit_progress_from_line(tx, source, &text, known_names);
             }
             SessionEvent::Finished { .. } => {}
         })
@@ -682,6 +708,30 @@ pub fn can_skip_auth_ui() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_draw_is_not_a_committed_console_line() {
+        let draw = worker_to_state_events(WorkerEvent::Draw {
+            source_tag: "dnf".into(),
+            text: "[26/26] grok-bot 40%".into(),
+        });
+        assert!(
+            matches!(
+                draw.as_slice(),
+                [StateEvent::ConsoleDraw { tag, text }]
+                    if tag == "dnf" && text == "[26/26] grok-bot 40%"
+            ),
+            "live draw must stay a console replacement, got {draw:?}"
+        );
+        let committed = worker_to_state_events(WorkerEvent::Line {
+            source_tag: "dnf".into(),
+            text: "[26/26] grok-bot 100%".into(),
+        });
+        assert!(matches!(
+            committed.as_slice(),
+            [StateEvent::ConsoleLine { .. }]
+        ));
+    }
 
     #[test]
     fn block_inhibitor_explains_try_again() {

@@ -156,6 +156,11 @@ pub enum Event {
         tag: String,
         text: String,
     },
+    /// In-progress `\r` update. Replaces the open console line.
+    ConsoleDraw {
+        tag: String,
+        text: String,
+    },
     /// One backend finished its check portion.
     BackendCheckDone {
         source: UpdateSource,
@@ -202,6 +207,10 @@ pub enum Event {
     },
     /// User cancelled the in-app auth wait. Does not dismiss the system polkit dialog.
     CancelAuth,
+    /// User stopped the running update. `during_transaction` is the apply pass.
+    StopApply {
+        during_transaction: bool,
+    },
 }
 
 pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionError> {
@@ -278,7 +287,11 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
             }
         },
         Event::ConsoleLine { tag, text } => {
-            state.console.push_tagged(&tag, &text);
+            state.console.push_committed_tagged(&tag, &text);
+            Ok(state)
+        }
+        Event::ConsoleDraw { tag, text } => {
+            state.console.push_live_tagged(&tag, &text);
             Ok(state)
         }
         Event::BackendCheckDone {
@@ -389,7 +402,9 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                     *stage_tot = None;
                     *op = 0.0;
                 }
-                if !*applying && should_enter_apply(&phase_label, status_hint) {
+                if !*applying
+                    && should_enter_apply(&phase_label, status_hint, package_hint.as_deref())
+                {
                     reset_live_packages(packages);
                     *work_progress = None;
                     *active_index = None;
@@ -554,6 +569,29 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
             };
             Ok(state)
         }
+        Event::StopApply { during_transaction } => match state.phase {
+            Phase::Running { mut packages, .. } => {
+                if during_transaction {
+                    state.phase = Phase::Failed {
+                        title: "Update stopped during install".into(),
+                        detail: "Stopping dnf while it is applying packages can leave the rpm database half-applied. Check `dnf history` before running Update All again.".into(),
+                    };
+                } else {
+                    for package in packages.iter_mut() {
+                        package.status = PackageStatus::Pending;
+                        package.progress = 0.0;
+                    }
+                    state.phase = Phase::Ready {
+                        packages,
+                        soft_errors: vec![
+                            "Stopped before install. Downloaded packages were not applied.".into(),
+                        ],
+                    };
+                }
+                Ok(state)
+            }
+            _ => Err(invalid(&state, "StopApply")),
+        },
         Event::CancelAuth => match state.phase {
             Phase::Authenticating { last_checked, .. } => {
                 state.console.clear();
@@ -573,19 +611,37 @@ fn phase_is_download(label: &str) -> bool {
     label.to_ascii_lowercase().contains("download")
 }
 
-fn should_enter_apply(label: &str, status: Option<PackageStatus>) -> bool {
+fn should_enter_apply(label: &str, status: Option<PackageStatus>, package: Option<&str>) -> bool {
     if phase_is_download(label) {
         return false;
     }
-    let label = label.to_ascii_lowercase();
-    label.contains("install")
-        || label.contains("upgrad")
-        || label.contains("verif")
-        || label.contains("transaction")
-        || label.contains("scriptlet")
-        || label.contains("cleanup")
-        || status == Some(PackageStatus::Installing)
-        || status == Some(PackageStatus::Completed)
+    let named = package.is_some_and(|s| !s.trim().is_empty());
+    let label_l = label.to_ascii_lowercase();
+    if label_l.contains("transaction")
+        || label_l.contains("scriptlet")
+        || label_l.contains("cleanup")
+        || label_l.contains("verif")
+    {
+        return true;
+    }
+    // The transaction preview prints a bare "Upgrading:" / "Installing:" header.
+    // That is not the apply pass. A real step names a package or a backend phase
+    // such as "Installing firmware".
+    if !named && (label_l == "installing" || label_l == "upgrading") {
+        return false;
+    }
+    if label_l.contains("install")
+        || label_l.contains("upgrad")
+        || label_l.contains("eras")
+        || label_l.contains("remov")
+    {
+        return true;
+    }
+    named
+        && matches!(
+            status,
+            Some(PackageStatus::Installing) | Some(PackageStatus::Completed)
+        )
 }
 
 fn reset_live_packages(packages: &mut [Package]) {
@@ -984,8 +1040,16 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running { phase_label, .. } => {
+            Phase::Running {
+                phase_label,
+                applying,
+                ..
+            } => {
                 assert_eq!(phase_label, "Installing firmware");
+                assert!(
+                    *applying,
+                    "Installing firmware is a real apply step and must leave the download pass"
+                );
             }
             other => panic!("expected Running, got {other:?}"),
         }
@@ -1351,5 +1415,214 @@ mod tests {
             }
             _ => panic!("expected Checking"),
         }
+    }
+
+    fn running_dnf(packages: Vec<Package>) -> AppState {
+        let mut s = AppState::default();
+        s.phase = Phase::Running {
+            packages,
+            active_index: None,
+            overall_progress: 0.0,
+            phase_label: "Starting…".into(),
+            current_source: Some(UpdateSource::Dnf),
+            current_name: None,
+            work_progress: None,
+            applying: false,
+            stage_current: None,
+            stage_total: None,
+            needs_reboot: false,
+            failed_sources: Vec::new(),
+        };
+        s
+    }
+
+    /// Same skip the orchestrator uses: a section header carries no progress.
+    fn apply_dnf_output(state: AppState, line: &str) -> AppState {
+        let hint = crate::backend::parse_progress(UpdateSource::Dnf, line);
+        if hint.package_name.is_none()
+            && hint.status.is_none()
+            && hint.progress.is_none()
+            && hint.phase_label.is_none()
+        {
+            return state;
+        }
+        reduce(
+            state,
+            Event::ApplyProgress {
+                source: UpdateSource::Dnf,
+                package_hint: hint.package_name,
+                status_hint: hint.status,
+                progress: hint.progress,
+                phase_label: hint.phase_label.unwrap_or_default(),
+                stage_current: hint.stage_current,
+                stage_total: hint.stage_total,
+            },
+        )
+        .unwrap_or_else(|e| panic!("progress line {line:?} rejected: {e}"))
+    }
+
+    #[test]
+    fn transaction_preview_does_not_mark_downloads_complete() {
+        let packages = vec![
+            Package::new_dnf("brave-browser", "x86_64", "1.99.55-1", "brave-browser"),
+            Package::new_dnf("mesa-dri-drivers", "i686", "26.2.6-1.fc44", "updates"),
+            Package::new_dnf("mesa-dri-drivers", "x86_64", "26.2.6-1.fc44", "updates"),
+            Package::new_dnf("tzdata", "noarch", "2026f-1.fc44", "updates"),
+            Package::new_dnf("tzdata-java", "noarch", "2026f-1.fc44", "updates"),
+            Package::new_dnf("grok-bot", "x86_64", "0.79.2-1", "grok-bot"),
+        ];
+        let mut s = running_dnf(packages);
+        let lines = [
+            "Upgrading:",
+            "Installing:",
+            "[1/5] brave-browser-1.99.55-1.x86_64 100% | 2.0 MiB/s | 20.0 MiB | 00:00",
+            "[2/5] mesa-dri-drivers-26.2.6-1.fc44.i686 100% | 2.0 MiB/s | 8.0 MiB | 00:00",
+            "[3/5] mesa-dri-drivers-26.2.6-1.fc44.x86_64 100% | 2.0 MiB/s | 9.0 MiB | 00:00",
+            "[4/5] tzdata-2026f-1.fc44.noarch 100% | 1.0 MiB/s | 1.0 MiB | 00:00",
+            "[5/5] tzdata-java-2026f-1.fc44.noarch 100% | 1.0 MiB/s | 200.0 KiB | 00:00",
+        ];
+        for line in lines {
+            s = apply_dnf_output(s, line);
+        }
+        match &s.phase {
+            Phase::Running {
+                packages,
+                applying,
+                phase_label,
+                stage_current,
+                stage_total,
+                current_name,
+                work_progress,
+                ..
+            } => {
+                let completed = packages.iter().filter(|p| p.status.is_done()).count();
+                assert_eq!(completed, 0, "downloads must stay unchecked: {packages:?}");
+                assert!(!*applying);
+                assert_eq!(phase_label, "Downloading packages");
+                assert_eq!((*stage_current, *stage_total), (Some(5), Some(5)));
+                assert_eq!(current_name.as_deref(), Some("tzdata-java"));
+                assert_eq!(*work_progress, Some(1.0));
+                assert_eq!(
+                    status_of(packages, "tzdata-java"),
+                    PackageStatus::Downloading
+                );
+                assert_eq!(status_of(packages, "grok-bot"), PackageStatus::Pending);
+                assert_eq!(
+                    packages
+                        .iter()
+                        .filter(|p| p.name == "mesa-dri-drivers")
+                        .filter(|p| p.status == PackageStatus::Completed)
+                        .count(),
+                    0
+                );
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_installing_status_does_not_start_the_apply_pass() {
+        let mut s = running_dnf(vec![dnf_pkg("tzdata-java")]);
+        s = reduce(
+            s,
+            dnf_progress(
+                None,
+                Some(PackageStatus::Installing),
+                None,
+                "Installing",
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        s = reduce(
+            s,
+            dnf_progress(
+                None,
+                Some(PackageStatus::Installing),
+                None,
+                "Upgrading",
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running { applying, .. } => assert!(!*applying),
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_before_install_returns_every_package_to_pending() {
+        let mut s = running_dnf(vec![dnf_pkg("tzdata-java"), dnf_pkg("grok-bot")]);
+        s = reduce(
+            s,
+            dnf_progress(
+                Some("tzdata-java"),
+                Some(PackageStatus::Downloading),
+                Some(1.0),
+                "Downloading packages",
+                Some(1),
+                Some(2),
+            ),
+        )
+        .unwrap();
+        let s = reduce(
+            s,
+            Event::StopApply {
+                during_transaction: false,
+            },
+        )
+        .unwrap();
+        match s.phase {
+            Phase::Ready {
+                packages,
+                soft_errors,
+            } => {
+                assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
+                assert!(packages.iter().all(|p| p.progress == 0.0));
+                assert!(soft_errors
+                    .iter()
+                    .any(|e| e.contains("Stopped before install")));
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_during_install_warns_that_the_rpm_database_may_be_half_applied() {
+        let mut s = running_dnf(vec![dnf_pkg("tzdata-java")]);
+        s = reduce(
+            s,
+            dnf_progress(None, None, None, "Running transaction", None, None),
+        )
+        .unwrap();
+        let s = reduce(
+            s,
+            Event::StopApply {
+                during_transaction: true,
+            },
+        )
+        .unwrap();
+        match s.phase {
+            Phase::Failed { title, detail } => {
+                assert_eq!(title, "Update stopped during install");
+                assert!(detail.contains("dnf history"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_outside_a_run_is_rejected() {
+        let err = reduce(
+            AppState::default(),
+            Event::StopApply {
+                during_transaction: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("StopApply"));
     }
 }

@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -216,6 +216,84 @@ impl PrivilegedSession {
     }
 }
 
+/// What the UI timer can see without taking the session lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperActivity {
+    /// This process never started a helper. Preview and not-yet-authenticated runs.
+    Absent,
+    /// The helper is up and still has a non-zombie child (dnf, stdbuf, fwupdmgr).
+    Running,
+    /// A helper was started and its command is gone, or the helper process is gone.
+    Exited,
+}
+
+/// Child liveness for the running-page timer.
+/// An unreadable children file counts as [`HelperActivity::Running`] so a
+/// permission error cannot start recovery. A zombie child counts as exited.
+pub fn helper_activity() -> HelperActivity {
+    activity_for_pid(HELPER_PID.load(Ordering::SeqCst))
+}
+
+fn activity_for_pid(pid: u32) -> HelperActivity {
+    if pid == 0 {
+        return HelperActivity::Absent;
+    }
+    if !Path::new(&format!("/proc/{pid}")).exists() {
+        return HelperActivity::Exited;
+    }
+    let children_path = format!("/proc/{pid}/task/{pid}/children");
+    let Ok(text) = std::fs::read_to_string(&children_path) else {
+        return HelperActivity::Running;
+    };
+    if text
+        .split_whitespace()
+        .filter_map(|tok| tok.parse::<u32>().ok())
+        .any(process_is_running)
+    {
+        HelperActivity::Running
+    } else {
+        HelperActivity::Exited
+    }
+}
+
+fn process_is_running(pid: u32) -> bool {
+    match process_state(pid) {
+        Some(state) => state != 'Z' && state != 'X',
+        None => false,
+    }
+}
+
+/// State character from `/proc/<pid>/stat`, after the comm field's closing paren.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    stat[end + 1..].trim_start().chars().next()
+}
+
+/// GNOME Software's dnf daemon. A silent dnf can be waiting on its rpm database.
+/// This only looks. It never signals the daemon.
+pub fn dnf_daemon_is_running() -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+            continue;
+        };
+        if comm.trim() == "dnf5daemon-server" {
+            return true;
+        }
+    }
+    false
+}
+
 /// SIGKILL the helper process group. Safe from the GTK thread: no locks, no wait.
 pub fn kill_recorded_helper() {
     let pid = HELPER_PID.swap(0, Ordering::SeqCst);
@@ -293,5 +371,18 @@ mod tests {
     #[test]
     fn helper_flag_is_stable() {
         assert_eq!(HELPER_FLAG, "--helper");
+    }
+
+    #[test]
+    fn child_probe_ignores_a_missing_pid_and_reads_our_own_state() {
+        assert_eq!(activity_for_pid(0), HelperActivity::Absent);
+        assert_eq!(activity_for_pid(u32::MAX), HelperActivity::Exited);
+        assert_ne!(activity_for_pid(std::process::id()), HelperActivity::Absent);
+        let state = process_state(std::process::id()).expect("this process has a stat file");
+        assert!(
+            state != 'Z' && state != 'X',
+            "the test process should be running, got state {state}"
+        );
+        assert!(process_is_running(std::process::id()));
     }
 }

@@ -1,6 +1,8 @@
 //! Parsers for `dnf check-update --refresh` and live `dnf update -y` output.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::model::{format_bytes, Package, PackageStatus, UpdateSource};
 
@@ -180,6 +182,12 @@ fn is_plausible_arch(arch: &str) -> bool {
 
 pub fn parse_progress_line(line: &str) -> ProgressHint {
     let trimmed = line.trim();
+    // `Upgrading:` in the transaction preview is a section title, not the
+    // install pass. Treating it as Installing made every later download look
+    // applied and froze the card on the last finished download.
+    if is_section_header(trimmed) {
+        return ProgressHint::default();
+    }
     let lower = trimmed.to_ascii_lowercase();
     let mut hint = ProgressHint::default();
 
@@ -231,6 +239,27 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
     }
 
     hint
+}
+
+/// `Upgrading:` / `Installing:` at the top of the transaction table.
+fn is_section_header(line: &str) -> bool {
+    if line.contains('[') {
+        return false;
+    }
+    matches!(
+        line.trim_end_matches(':')
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "upgrading"
+            | "installing"
+            | "removing"
+            | "erasing"
+            | "reinstalling"
+            | "downgrading"
+            | "obsoleting"
+            | "skipping"
+    )
 }
 
 fn is_verify_step(lower: &str) -> bool {
@@ -460,6 +489,182 @@ pub fn check_exit_is_hard_error(code: i32, packages: &[Package]) -> bool {
     !check_exit_is_ok(code, packages)
 }
 
+/// Where `dnf` writes in-progress RPMs. Readable without root on a normal install.
+pub const DNF_CACHE_ROOT: &str = "/var/cache/libdnf5";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheGrowth {
+    pub package: String,
+    pub bytes: u64,
+    /// True when this path is larger than the previous sample.
+    pub rising: bool,
+}
+
+/// Newest RPM under `root/<repo>/packages/` touched in the last few minutes.
+/// `cursor` is the previous `(path, size)` sample; a larger size sets `rising`.
+pub fn poll_cache_growth(root: &Path, cursor: &mut Option<(PathBuf, u64)>) -> Option<CacheGrowth> {
+    let mut newest: Option<(PathBuf, SystemTime, u64)> = None;
+    let Ok(repos) = std::fs::read_dir(root) else {
+        return None;
+    };
+    for repo in repos.flatten() {
+        let repo_path = repo.path();
+        if !repo_path.is_dir() {
+            continue;
+        }
+        let packages = repo_path.join("packages");
+        let dir = if packages.is_dir() {
+            packages
+        } else {
+            repo_path
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rpm") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let fresh = modified
+                .elapsed()
+                .map(|age| age < Duration::from_secs(180))
+                .unwrap_or(false);
+            if !fresh {
+                continue;
+            }
+            let bytes = meta.len();
+            let replace = newest
+                .as_ref()
+                .map(|(_, prev, _)| modified > *prev)
+                .unwrap_or(true);
+            if replace {
+                newest = Some((path, modified, bytes));
+            }
+        }
+    }
+    let (path, _, bytes) = newest?;
+    let package = package_name_from_rpm_filename(&path);
+    let rising = cursor
+        .as_ref()
+        .is_some_and(|(prev, prev_bytes)| prev == &path && bytes > *prev_bytes);
+    *cursor = Some((path, bytes));
+    Some(CacheGrowth {
+        package,
+        bytes,
+        rising,
+    })
+}
+
+fn package_name_from_rpm_filename(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("package");
+    strip_to_package_name(stem)
+}
+
+/// `listed` is the version from check-update. `installed` is `EPOCHNUM:VERSION-RELEASE`.
+pub fn evr_eq(listed: &str, installed: &str) -> bool {
+    fn norm(value: &str) -> String {
+        let value = value.trim();
+        if value.contains(':') {
+            value.to_string()
+        } else {
+            format!("0:{value}")
+        }
+    }
+    !listed.trim().is_empty() && norm(listed) == norm(installed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallCheck {
+    /// Every DNF package in the plan matches the installed EVR.
+    AllInstalled,
+    /// None of the planned DNF versions are installed.
+    NotInstalled,
+    /// Some planned versions are installed and some are not.
+    Partial { installed: usize, total: usize },
+    /// No DNF packages to compare, or the query could not be read.
+    Unknown,
+}
+
+/// Parse `rpm -q --qf '%{NAME} %{ARCH} %{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'`.
+pub fn parse_rpm_query(output: &str) -> HashMap<(String, String), String> {
+    let mut out = HashMap::new();
+    for raw in output.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.contains("is not installed") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else { continue };
+        let Some(arch) = parts.next() else { continue };
+        let Some(evr) = parts.next() else { continue };
+        if !is_plausible_arch(arch) || !evr.contains(':') {
+            continue;
+        }
+        out.insert((name.to_string(), arch.to_string()), evr.to_string());
+    }
+    out
+}
+
+/// `rpm -q` argv for the DNF rows in `packages`. The query format is the
+/// backslash-n sequence rpm interprets, because this argv is not a shell.
+pub fn rpm_query_args(packages: &[Package]) -> Vec<String> {
+    let mut args = vec![
+        "-q".to_string(),
+        "--qf".to_string(),
+        "%{NAME} %{ARCH} %{EPOCHNUM}:%{VERSION}-%{RELEASE}\\n".to_string(),
+    ];
+    for pkg in packages.iter().filter(|p| p.source == UpdateSource::Dnf) {
+        if pkg.arch.is_empty() {
+            args.push(pkg.name.clone());
+        } else {
+            args.push(format!("{}.{}", pkg.name, pkg.arch));
+        }
+    }
+    args
+}
+
+pub fn check_packages_installed(
+    packages: &[Package],
+    installed: &HashMap<(String, String), String>,
+) -> InstallCheck {
+    let planned: Vec<&Package> = packages
+        .iter()
+        .filter(|p| p.source == UpdateSource::Dnf)
+        .collect();
+    if planned.is_empty() {
+        return InstallCheck::Unknown;
+    }
+    let mut matched = 0usize;
+    for pkg in &planned {
+        if installed
+            .get(&(pkg.name.clone(), pkg.arch.clone()))
+            .is_some_and(|evr| evr_eq(&pkg.version, evr))
+        {
+            matched += 1;
+        }
+    }
+    if matched == 0 {
+        InstallCheck::NotInstalled
+    } else if matched == planned.len() {
+        InstallCheck::AllInstalled
+    } else {
+        InstallCheck::Partial {
+            installed: matched,
+            total: planned.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,7 +758,10 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
         assert!(h.package_name.is_none());
         let h = parse_progress_line("Upgrading:");
         assert!(h.package_name.is_none());
-        assert_eq!(h.phase_label.as_deref(), Some("Installing"));
+        assert!(h.phase_label.is_none());
+        assert!(h.status.is_none());
+        assert!(parse_progress_line("Installing:").status.is_none());
+        assert!(parse_progress_line("Removing:").phase_label.is_none());
     }
 
     #[test]
@@ -670,5 +878,92 @@ bind-libs	x86_64	32:9.18.50-2.fc44	1388459
         assert_eq!(n, 1);
         assert_eq!(pkgs[0].size.as_deref(), Some("21 MB"));
         assert!(pkgs[1].size.is_none());
+    }
+
+    #[test]
+    fn evr_ignores_a_missing_epoch() {
+        assert!(evr_eq("2026f-1.fc44", "0:2026f-1.fc44"));
+        assert!(evr_eq("0:1.99.55-1", "0:1.99.55-1"));
+        assert!(!evr_eq("0:2026e-1.fc44", "0:2026f-1.fc44"));
+    }
+
+    #[test]
+    fn rpm_query_matches_planned_packages_by_name_and_arch() {
+        let output = "\
+tzdata-java noarch 0:2026f-1.fc44
+grok-bot x86_64 0:0.79.2-1
+package mesa-dri-drivers is not installed
+";
+        let map = parse_rpm_query(output);
+        let pkgs = vec![
+            Package::new_dnf("tzdata-java", "noarch", "2026f-1.fc44", "updates"),
+            Package::new_dnf("grok-bot", "x86_64", "0:0.79.2-1", "grok-bot"),
+            Package::new_dnf("mesa-dri-drivers", "i686", "26.2.6-1.fc44", "updates"),
+            Package::new_dnf("mesa-dri-drivers", "x86_64", "26.2.6-1.fc44", "updates"),
+        ];
+        assert_eq!(
+            check_packages_installed(&pkgs, &map),
+            InstallCheck::Partial {
+                installed: 2,
+                total: 4
+            }
+        );
+        let done = vec![
+            Package::new_dnf("tzdata-java", "noarch", "2026f-1.fc44", "updates"),
+            Package::new_dnf("grok-bot", "x86_64", "0.79.2-1", "grok-bot"),
+        ];
+        assert_eq!(
+            check_packages_installed(&done, &map),
+            InstallCheck::AllInstalled
+        );
+    }
+
+    #[test]
+    fn rpm_query_args_name_each_arch_and_keep_the_format_literal() {
+        let pkgs = vec![
+            Package::new_dnf("mesa-dri-drivers", "i686", "1", "updates"),
+            Package::new_dnf("mesa-dri-drivers", "x86_64", "1", "updates"),
+            {
+                let mut flatpak = Package::new_dnf("Thunderbird", "x86_64", "1", "flathub");
+                flatpak.source = UpdateSource::FlatpakUser;
+                flatpak
+            },
+        ];
+        let args = rpm_query_args(&pkgs);
+        assert_eq!(args[0], "-q");
+        assert_eq!(args[1], "--qf");
+        assert!(
+            args[2].contains("\\n"),
+            "rpm interprets the backslash-n sequence; a real newline would split the argv"
+        );
+        assert!(args.contains(&"mesa-dri-drivers.i686".to_string()));
+        assert!(args.contains(&"mesa-dri-drivers.x86_64".to_string()));
+        assert!(!args.iter().any(|a| a.contains("Thunderbird")));
+    }
+
+    #[test]
+    fn cache_growth_reports_the_newest_rpm_and_whether_it_grew() {
+        let root = std::env::temp_dir().join(format!(
+            "fedora-updater-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let packages = root.join("grok-bot-deadbeef").join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        let rpm = packages.join("grok-bot-0.79.2-1.x86_64.rpm");
+        std::fs::write(&rpm, vec![0u8; 1000]).unwrap();
+        let mut cursor = None;
+        let first = poll_cache_growth(&root, &mut cursor).expect("fresh rpm");
+        assert_eq!(first.package, "grok-bot");
+        assert!(!first.rising);
+        assert_eq!(first.bytes, 1000);
+        std::fs::write(&rpm, vec![0u8; 2500]).unwrap();
+        let second = poll_cache_growth(&root, &mut cursor).expect("grew");
+        assert!(second.rising);
+        assert_eq!(second.bytes, 2500);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

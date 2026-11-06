@@ -14,6 +14,25 @@
 pub const END_PREFIX: &str = "__END__ ";
 pub const BYE_LINE: &str = "__BYE__";
 pub const HELLO_LINE: &str = "__READY__ fedora-updater-helper";
+/// A carriage-return progress update. The GUI replaces the open console line.
+pub const DRAW_PREFIX: &str = "__DRAW__ ";
+
+/// One helper stdout record after the GUI has split protocol markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperOutput {
+    /// Newline-terminated output.
+    Line(String),
+    /// In-progress `\r` update. Not part of the command log.
+    Draw(String),
+}
+
+/// Separate a live progress record from a committed line.
+pub fn split_helper_line(line: &str) -> HelperOutput {
+    match line.strip_prefix(DRAW_PREFIX) {
+        Some(text) => HelperOutput::Draw(text.to_string()),
+        None => HelperOutput::Line(line.to_string()),
+    }
+}
 
 /// Allowlisted privileged operations the helper will execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -158,6 +177,23 @@ mod tests {
         assert_eq!(parse_end_line("__END__ 100"), Some(100));
         assert_eq!(parse_end_line("__END__ 0"), Some(0));
         assert_eq!(parse_end_line("not an end"), None);
+        assert_eq!(parse_end_line("__DRAW__ [1/2] grok-bot 40%"), None);
+    }
+
+    #[test]
+    fn draw_marker_is_not_a_committed_line() {
+        assert_eq!(
+            split_helper_line("__DRAW__ [26/26] grok-bot 40%"),
+            HelperOutput::Draw("[26/26] grok-bot 40%".into())
+        );
+        assert_eq!(
+            split_helper_line("[26/26] grok-bot 100%"),
+            HelperOutput::Line("[26/26] grok-bot 100%".into())
+        );
+        assert_eq!(
+            split_helper_line("__END__ 0"),
+            HelperOutput::Line("__END__ 0".into())
+        );
     }
 
     #[test]

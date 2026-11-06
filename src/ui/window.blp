@@ -401,6 +401,13 @@ Adw.ApplicationWindow window {
                   styles ["dim-label", "caption"]
                 }
               }
+
+              Gtk.Button run_stop {
+                label: "Stop";
+                valign: center;
+                tooltip-text: "Stop this update";
+                styles ["flat"]
+              }
             }
 
             Gtk.Box {
@@ -430,6 +437,10 @@ Adw.ApplicationWindow window {
                   styles ["dim-label", "caption", "numeric"]
                 }
               }
+            }
+
+            Adw.Banner run_stall {
+              revealed: false;
             }
 
             Adw.Clamp {
