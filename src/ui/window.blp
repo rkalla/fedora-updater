@@ -31,7 +31,6 @@ Adw.ApplicationWindow window {
               vexpand: true;
               icon-name: "software-update-available-symbolic";
               title: "Check for updates";
-              description: "System, apps, and firmware. One password prompt for this session";
 
               child: Gtk.Box {
                 orientation: vertical;
@@ -599,133 +598,188 @@ Adw.ApplicationWindow window {
 
         Gtk.StackPage {
           name: "done";
-          child: Adw.StatusPage done_page {
+          child: Gtk.Box {
+            orientation: vertical;
             vexpand: true;
-            icon-name: "object-select-symbolic";
-            title: "All updates applied";
+            hexpand: true;
+            styles ["page-fill"]
 
-            child: Gtk.Box {
-              orientation: vertical;
-              spacing: 14;
-              halign: center;
+            Adw.Clamp {
+              maximum-size: 700;
+              tightening-threshold: 500;
+              margin-start: 16;
+              margin-end: 16;
+              margin-top: 8;
 
-              Gtk.Box {
-                orientation: horizontal;
+              child: Gtk.Box {
+                orientation: vertical;
                 spacing: 12;
-                halign: center;
+                hexpand: true;
+
+                Gtk.Image done_icon {
+                  icon-name: "object-select-symbolic";
+                  pixel-size: 64;
+                  halign: center;
+                }
+
+                Gtk.Label done_title {
+                  label: "All updates applied";
+                  halign: center;
+                  justify: center;
+                  wrap: true;
+                  styles ["title-1"]
+                }
+
+                Gtk.Label done_subtitle {
+                  label: "";
+                  halign: center;
+                  justify: center;
+                  wrap: true;
+                  styles ["dim-label"]
+                }
 
                 Gtk.Box {
-                  orientation: vertical;
-                  spacing: 2;
+                  orientation: horizontal;
+                  spacing: 12;
                   halign: center;
-                  styles ["stat-card"]
 
-                  Gtk.Label done_upgraded {
-                    label: "0";
+                  Gtk.Box {
+                    orientation: vertical;
+                    spacing: 2;
                     halign: center;
-                    styles ["title-1"]
+                    styles ["stat-card"]
+
+                    Gtk.Label done_upgraded {
+                      label: "0";
+                      halign: center;
+                      styles ["title-1"]
+                    }
+
+                    Gtk.Label {
+                      label: "upgraded";
+                      halign: center;
+                      styles ["caption", "dim-label"]
+                    }
                   }
 
-                  Gtk.Label {
-                    label: "upgraded";
+                  Gtk.Box done_failed_card {
+                    orientation: vertical;
+                    spacing: 2;
                     halign: center;
-                    styles ["caption", "dim-label"]
+                    styles ["stat-card"]
+
+                    Gtk.Label done_failed {
+                      label: "0";
+                      halign: center;
+                      styles ["title-1"]
+                    }
+
+                    Gtk.Label {
+                      label: "failed";
+                      halign: center;
+                      styles ["caption", "dim-label"]
+                    }
+                  }
+
+                  Gtk.Box done_reboot_card {
+                    orientation: vertical;
+                    spacing: 2;
+                    halign: center;
+                    styles ["stat-card"]
+
+                    Gtk.Label done_reboot_lbl {
+                      label: "0";
+                      halign: center;
+                      styles ["title-1"]
+                    }
+
+                    Gtk.Label {
+                      label: "needs reboot";
+                      halign: center;
+                      styles ["caption", "dim-label"]
+                    }
                   }
                 }
 
-                Gtk.Box done_failed_card {
-                  orientation: vertical;
-                  spacing: 2;
-                  halign: center;
-                  styles ["stat-card"]
-
-                  Gtk.Label done_failed {
-                    label: "0";
-                    halign: center;
-                    styles ["title-1"]
-                  }
-
-                  Gtk.Label {
-                    label: "failed";
-                    halign: center;
-                    styles ["caption", "dim-label"]
-                  }
-                }
-
-                Gtk.Box done_reboot_card {
-                  orientation: vertical;
-                  spacing: 2;
-                  halign: center;
-                  styles ["stat-card"]
-
-                  Gtk.Label done_reboot_lbl {
-                    label: "0";
-                    halign: center;
-                    styles ["title-1"]
-                  }
-
-                  Gtk.Label {
-                    label: "needs reboot";
-                    halign: center;
-                    styles ["caption", "dim-label"]
-                  }
-                }
-              }
-
-              Gtk.Box reboot_box {
-                orientation: horizontal;
-                spacing: 12;
-                halign: center;
-                valign: center;
-                styles ["reboot-card"]
-
-                Gtk.Box {
-                  orientation: vertical;
-                  spacing: 2;
+                Gtk.Box reboot_box {
+                  orientation: horizontal;
+                  spacing: 12;
                   hexpand: true;
-
-                  Gtk.Label {
-                    label: "Restart recommended";
-                    halign: start;
-                    styles ["heading"]
-                  }
-
-                  Gtk.Label {
-                    label: "A kernel or firmware update needs a restart to finish";
-                    wrap: true;
-                    halign: start;
-                    styles ["dim-label", "caption"]
-                  }
-                }
-
-                Gtk.Button reboot_btn {
-                  styles ["suggested-action"]
                   valign: center;
+                  styles ["reboot-card"]
 
-                  child: Adw.ButtonContent {
-                    icon-name: "system-reboot-symbolic";
-                    label: "Restart Now";
-                    can-shrink: true;
-                  };
+                  Gtk.Box {
+                    orientation: vertical;
+                    spacing: 2;
+                    hexpand: true;
+
+                    Gtk.Label {
+                      label: "Restart recommended";
+                      halign: start;
+                      styles ["heading"]
+                    }
+
+                    Gtk.Label {
+                      label: "A kernel or firmware update needs a restart to finish";
+                      wrap: true;
+                      halign: start;
+                      styles ["dim-label", "caption"]
+                    }
+                  }
+
+                  Gtk.Button reboot_btn {
+                    styles ["suggested-action"]
+                    valign: center;
+
+                    child: Adw.ButtonContent {
+                      icon-name: "system-reboot-symbolic";
+                      label: "Restart Now";
+                      can-shrink: true;
+                    };
+                  }
                 }
+              };
+            }
+
+            Gtk.ScrolledWindow done_installed_scroll {
+              vexpand: true;
+              hexpand: true;
+              hscrollbar-policy: never;
+              vscrollbar-policy: automatic;
+              propagate-natural-height: false;
+              styles ["list-scroll"]
+
+              child: Adw.Clamp {
+                maximum-size: 700;
+                tightening-threshold: 500;
+                margin-start: 16;
+                margin-end: 16;
+                margin-bottom: 8;
+
+                child: Adw.PreferencesGroup done_installed {
+                  title: "Installed";
+                };
+              };
+            }
+
+            Gtk.Box {
+              orientation: horizontal;
+              spacing: 8;
+              halign: center;
+              margin-top: 8;
+              margin-bottom: 12;
+              styles ["summary-actions"]
+
+              Gtk.Button done_log_btn {
+                label: "View full log";
+                styles ["flat"]
               }
 
-              Gtk.Box {
-                orientation: horizontal;
-                spacing: 8;
-                halign: center;
-
-                Gtk.Button done_log_btn {
-                  label: "View full log";
-                  styles ["flat"]
-                }
-
-                Gtk.Button done_btn {
-                  label: "Done";
-                  styles ["pill"]
-                }
+              Gtk.Button done_btn {
+                label: "Done";
+                styles ["pill"]
               }
-            };
+            }
           };
         }
 

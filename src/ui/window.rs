@@ -48,6 +48,8 @@ struct Widgets {
     idle_btn: Button,
     idle_btn_content: ButtonContent,
     idle_hint: Label,
+    /// True only on the first-run "Check for Updates" page, so Enter starts a check.
+    focus_idle_check: Cell<bool>,
     auth_page: StatusPage,
     check_footnote: Label,
     check_progress: ProgressBar,
@@ -87,7 +89,12 @@ struct Widgets {
     ignore_expand: Cell<bool>,
     run_console_line: Label,
     run_console_full: Label,
-    done_page: StatusPage,
+    done_icon: gtk::Image,
+    done_title: Label,
+    done_subtitle: Label,
+    done_installed_scroll: gtk::ScrolledWindow,
+    done_installed: PreferencesGroup,
+    done_installed_rows: RefCell<Vec<gtk::Widget>>,
     done_upgraded: Label,
     done_failed: Label,
     done_failed_card: gtk::Box,
@@ -136,6 +143,7 @@ pub fn build(app: &Application) {
         idle_btn: obj(&builder, "idle_btn"),
         idle_btn_content: obj(&builder, "idle_btn_content"),
         idle_hint: obj(&builder, "idle_hint"),
+        focus_idle_check: Cell::new(false),
         auth_page: obj(&builder, "auth_page"),
         check_footnote: obj(&builder, "check_footnote"),
         check_progress: obj(&builder, "check_progress"),
@@ -175,7 +183,12 @@ pub fn build(app: &Application) {
         ignore_expand: Cell::new(false),
         run_console_line: obj(&builder, "run_console_line"),
         run_console_full: obj(&builder, "run_console_full"),
-        done_page: obj(&builder, "done_page"),
+        done_icon: obj(&builder, "done_icon"),
+        done_title: obj(&builder, "done_title"),
+        done_subtitle: obj(&builder, "done_subtitle"),
+        done_installed_scroll: obj(&builder, "done_installed_scroll"),
+        done_installed: obj(&builder, "done_installed"),
+        done_installed_rows: RefCell::new(Vec::new()),
         done_upgraded: obj(&builder, "done_upgraded"),
         done_failed: obj(&builder, "done_failed"),
         done_failed_card: obj(&builder, "done_failed_card"),
@@ -414,7 +427,25 @@ pub fn build(app: &Application) {
         glib::Propagation::Proceed
     });
 
+    {
+        let hooked = widgets.clone();
+        let idle_btn = hooked.idle_btn.clone();
+        idle_btn.connect_map(move |btn| {
+            if hooked.focus_idle_check.get() {
+                btn.grab_focus();
+            }
+        });
+    }
+
     render(&state, &widgets);
+    {
+        let hooked = widgets.clone();
+        glib::idle_add_local_once(move || {
+            if hooked.focus_idle_check.get() {
+                hooked.idle_btn.grab_focus();
+            }
+        });
+    }
     maybe_open_preview_completed(&widgets);
     window.present();
     preview::maybe_schedule_screenshot(&window);
@@ -1102,8 +1133,22 @@ fn render_running(
     );
 }
 
+fn arm_idle_check_focus(w: &Widgets) {
+    w.focus_idle_check.set(true);
+    w.window.set_default_widget(Some(&w.idle_btn));
+    w.idle_btn.grab_focus();
+}
+
+fn clear_idle_check_focus(w: &Widgets) {
+    w.focus_idle_check.set(false);
+    if w.window.default_widget().as_ref() == Some(w.idle_btn.upcast_ref()) {
+        w.window.set_default_widget(None::<&gtk::Widget>);
+    }
+}
+
 fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     w.run_stall.set_revealed(false);
+    clear_idle_check_focus(w);
     let s = state.borrow();
     let last_console = s.console.last_line().to_string();
     let full_console = s.console.full_text();
@@ -1155,9 +1200,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 w.idle_btn.add_css_class("suggested-action");
                 w.idle_btn.add_css_class("pill");
                 w.idle_hint.set_visible(true);
-                w.idle_page.set_description(Some(
-                    "System, apps, and firmware. One password prompt for this session",
-                ));
+                w.idle_page.set_description(None);
+                arm_idle_check_focus(w);
             }
             let footer = checked_at
                 .map(|t| format!("Ready · last checked {t}"))
@@ -1300,19 +1344,19 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 .count();
             let (dnf, fp, fw) = count_by_source(packages);
             if *failed > 0 {
-                w.done_page.set_title("Updates finished with problems");
-                w.done_page.set_icon_name(Some("dialog-warning-symbolic"));
-                w.done_page.set_description(Some(&format!(
+                w.done_title.set_text("Updates finished with problems");
+                w.done_icon.set_icon_name(Some("dialog-warning-symbolic"));
+                w.done_subtitle.set_text(&format!(
                     "{upgraded} applied · {failed} failed · {duration}"
-                )));
+                ));
                 w.done_failed.add_css_class("error");
                 w.done_failed_card.add_css_class("error");
             } else {
-                w.done_page.set_title("All updates applied");
-                w.done_page.set_icon_name(Some("object-select-symbolic"));
-                w.done_page.set_description(Some(&format!(
+                w.done_title.set_text("All updates applied");
+                w.done_icon.set_icon_name(Some("object-select-symbolic"));
+                w.done_subtitle.set_text(&format!(
                     "{upgraded} upgraded · {dnf} system / {fp} apps / {fw} firmware · {duration}"
-                )));
+                ));
                 w.done_failed.remove_css_class("error");
                 w.done_failed_card.remove_css_class("error");
             }
@@ -1326,6 +1370,20 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 w.done_reboot_card.remove_css_class("warn");
             }
             w.reboot_box.set_visible(*needs_reboot);
+            w.done_installed
+                .set_title(if *failed > 0 { "Finished" } else { "Installed" });
+            let mut listed: Vec<&fedora_updater::Package> = packages.iter().collect();
+            listed.sort_by_key(|package| match package.status {
+                fedora_updater::PackageStatus::Failed => 0,
+                fedora_updater::PackageStatus::Completed => 1,
+                _ => 2,
+            });
+            rows::refill_group(
+                &w.done_installed,
+                &w.done_installed_rows,
+                listed.into_iter().map(finished_row),
+            );
+            w.done_installed_scroll.set_visible(!packages.is_empty());
         }
         Phase::Failed { title, detail } => {
             clear_running_lists(w);
@@ -1360,7 +1418,11 @@ mod tests {
             "run_list_scroll",
             "run_list_group",
             "run_completed",
-            "done_page",
+            "done_title",
+            "done_icon",
+            "done_subtitle",
+            "done_installed",
+            "done_installed_scroll",
             "fail_page",
             "reboot_btn",
         ] {
@@ -1378,8 +1440,18 @@ mod tests {
             "stack must size every page to the window so Done/Idle fill after apply"
         );
         assert!(
-            xml.contains("id=\"done_page\"") && xml.contains("vexpand"),
-            "status pages must expand to fill the stack"
+            xml.contains("id=\"idle_page\"") && xml.contains("vexpand"),
+            "idle status page must expand to fill the stack"
+        );
+        assert!(
+            !xml.contains("One password prompt"),
+            "the idle page hint already covers what the check looks at"
+        );
+        let installed_at = xml.find("id=\"done_installed\"").expect("done_installed");
+        let done_btn_at = xml.find("id=\"done_btn\"").expect("done_btn");
+        assert!(
+            installed_at < done_btn_at,
+            "installed list sits above the summary actions"
         );
         let now_at = xml.find("id=\"now_playing\"").expect("now_playing");
         let stall_at = xml.find("id=\"run_stall\"").expect("run_stall");
