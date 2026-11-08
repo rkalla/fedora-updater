@@ -103,6 +103,7 @@ pub fn state_for(phase: &str) -> AppState {
             work_progress: Some(0.72),
             pass: RunPass::Apply,
             stage: None,
+            recovery: fedora_updater::state::RecoveryLatch::Idle,
             needs_reboot: false,
             failed_sources: vec![],
         },
@@ -126,6 +127,7 @@ pub fn state_for(phase: &str) -> AppState {
                 work_progress: Some(0.42),
                 pass: RunPass::Apply,
                 stage: None,
+                recovery: fedora_updater::state::RecoveryLatch::Idle,
                 needs_reboot: false,
                 failed_sources: vec![],
             }

@@ -292,6 +292,7 @@ fn progress_marks_package_and_completes_previous() {
         work_progress: None,
         pass: RunPass::Download,
         stage: None,
+        recovery: fedora_updater::state::RecoveryLatch::Idle,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -339,6 +340,7 @@ fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
         work_progress: None,
         pass: RunPass::Download,
         stage: None,
+        recovery: fedora_updater::state::RecoveryLatch::Idle,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -387,6 +389,7 @@ fn kernel_hint_does_not_complete_kernel_core() {
         work_progress: None,
         pass: RunPass::Download,
         stage: None,
+        recovery: fedora_updater::state::RecoveryLatch::Idle,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -421,6 +424,7 @@ fn verify_pass_does_not_move_current_back_to_completed() {
         work_progress: Some(0.5),
         pass: RunPass::Apply,
         stage: None,
+        recovery: fedora_updater::state::RecoveryLatch::Idle,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -474,6 +478,7 @@ fn apply_source_started_does_not_mark_first_package() {
         work_progress: Some(0.3),
         pass: RunPass::Download,
         stage: None,
+        recovery: fedora_updater::state::RecoveryLatch::Idle,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };

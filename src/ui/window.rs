@@ -29,7 +29,7 @@ use fedora_updater::orchestrator::{
 use fedora_updater::privilege::{
     dnf_daemon_is_running, helper_activity, kill_recorded_helper, run_local_command, HelperActivity,
 };
-use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase};
+use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RecoveryLatch};
 
 use super::{preview, rows};
 
@@ -107,9 +107,6 @@ struct Widgets {
     /// `None` until this run paints the Running page, so auth time is not quiet time.
     last_output: Cell<Option<Instant>>,
     cache_cursor: RefCell<Option<(PathBuf, u64)>>,
-    reconcile_inflight: Cell<bool>,
-    reconcile_not_before: Cell<Option<Instant>>,
-    dnf_reconciled: Cell<bool>,
     reconcile_tx: async_channel::Sender<InstallCheck>,
 }
 
@@ -199,9 +196,6 @@ pub fn build(app: &Application) {
         fail_detail: obj(&builder, "fail_detail"),
         last_output: Cell::new(None),
         cache_cursor: RefCell::new(None),
-        reconcile_inflight: Cell::new(false),
-        reconcile_not_before: Cell::new(None),
-        dnf_reconciled: Cell::new(false),
         reconcile_tx,
     });
 
@@ -448,9 +442,6 @@ fn begin_apply(
 ) {
     widgets.last_output.set(None);
     *widgets.cache_cursor.borrow_mut() = None;
-    widgets.reconcile_inflight.set(false);
-    widgets.reconcile_not_before.set(None);
-    widgets.dnf_reconciled.set(false);
     let packages = state.borrow().packages().to_vec();
     dispatch(state, widgets, Event::StartApply);
     if can_skip_auth_ui() {
@@ -689,6 +680,7 @@ fn has_sources_after_dnf(packages: &[Package]) -> bool {
 
 /// Footnote, spinner, and stall banner for a quiet run. Does not rebuild the list.
 fn paint_quiet_chrome(
+    state: &Rc<RefCell<AppState>>,
     w: &Widgets,
     caption: &str,
     applying: bool,
@@ -721,6 +713,7 @@ fn paint_quiet_chrome(
         tool_alive,
         watching_dnf,
         last_line,
+        dnf_daemon_is_running(),
     );
 
     let mut foot = caption.to_string();
@@ -740,22 +733,15 @@ fn paint_quiet_chrome(
         w.now_playing_spinner.set_opacity(0.0);
     }
 
-    let banner = quiet.banner.as_ref().map(|text| {
-        if text.starts_with("No output") && dnf_daemon_is_running() {
-            format!("{text} The update is waiting on GNOME Software's dnf daemon.")
-        } else {
-            text.clone()
-        }
-    });
-    if let Some(text) = banner {
-        w.run_stall.set_title(&text);
+    if let Some(text) = quiet.banner.as_deref() {
+        w.run_stall.set_title(text);
         w.run_stall.set_revealed(true);
     } else {
         w.run_stall.set_revealed(false);
     }
 
     if quiet.reconcile && watching_dnf {
-        maybe_reconcile_dnf(w, packages);
+        maybe_reconcile_dnf(state, w, packages);
     }
 }
 
@@ -794,6 +780,7 @@ fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     let overall_progress = *overall_progress;
     drop(s);
     paint_quiet_chrome(
+        state,
         w,
         &caption,
         applying,
@@ -806,16 +793,7 @@ fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     );
 }
 
-fn maybe_reconcile_dnf(w: &Widgets, packages: &[Package]) {
-    if w.reconcile_inflight.get() || w.dnf_reconciled.get() {
-        return;
-    }
-    if w.reconcile_not_before
-        .get()
-        .is_some_and(|at| Instant::now() < at)
-    {
-        return;
-    }
+fn maybe_reconcile_dnf(state: &Rc<RefCell<AppState>>, w: &Widgets, packages: &[Package]) {
     let dnf_pkgs: Vec<Package> = packages
         .iter()
         .filter(|p| p.source == UpdateSource::Dnf)
@@ -824,7 +802,43 @@ fn maybe_reconcile_dnf(w: &Widgets, packages: &[Package]) {
     if dnf_pkgs.is_empty() {
         return;
     }
-    w.reconcile_inflight.set(true);
+    let before = {
+        let Ok(borrowed) = state.try_borrow() else {
+            return;
+        };
+        match &borrowed.phase {
+            Phase::Running { recovery, .. } => *recovery,
+            _ => return,
+        }
+    };
+    let can_start = match before {
+        RecoveryLatch::Idle => true,
+        RecoveryLatch::Backoff { not_before } => Instant::now() >= not_before,
+        RecoveryLatch::InFlight | RecoveryLatch::Settled => false,
+    };
+    if !can_start {
+        return;
+    }
+    let current = {
+        let Ok(borrowed) = state.try_borrow() else {
+            return;
+        };
+        borrowed.clone()
+    };
+    let Ok(next) = state::reduce(current, Event::RecoveryProbeStarted) else {
+        return;
+    };
+    let moved = matches!(
+        &next.phase,
+        Phase::Running {
+            recovery: RecoveryLatch::InFlight,
+            ..
+        }
+    );
+    *state.borrow_mut() = next;
+    if !moved {
+        return;
+    }
     let tx = w.reconcile_tx.clone();
     std::thread::spawn(move || {
         let check = query_dnf_install_state(&dnf_pkgs);
@@ -855,34 +869,33 @@ fn query_dnf_install_state(packages: &[Package]) -> InstallCheck {
 }
 
 fn handle_install_check(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, check: InstallCheck) {
-    widgets.reconcile_inflight.set(false);
-    let (packages, current_source, needs_reboot) = {
+    let (packages, current_source, needs_reboot, recovery) = {
         let borrowed = state.borrow();
         let Phase::Running {
             packages,
             current_source,
             needs_reboot,
+            recovery,
             ..
         } = &borrowed.phase
         else {
             return;
         };
-        (packages.clone(), *current_source, *needs_reboot)
+        (packages.clone(), *current_source, *needs_reboot, *recovery)
     };
     if current_source != Some(UpdateSource::Dnf) {
         return;
     }
     match check {
         InstallCheck::Unknown => {
-            widgets
-                .reconcile_not_before
-                .set(Some(Instant::now() + Duration::from_secs(30)));
+            dispatch_worker(state, widgets, Event::RecoveryProbeUnknown);
         }
         InstallCheck::AllInstalled => {
             if has_sources_after_dnf(&packages) {
-                if widgets.dnf_reconciled.replace(true) {
+                if matches!(recovery, RecoveryLatch::Settled) {
                     return;
                 }
+                dispatch_worker(state, widgets, Event::RecoveryProbeSettled);
                 dispatch_worker(
                     state,
                     widgets,
@@ -967,6 +980,7 @@ fn stop_apply(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, during_trans
 }
 
 fn render_running(
+    state: &Rc<RefCell<AppState>>,
     w: &Widgets,
     packages: &[Package],
     overall_progress: f64,
@@ -1086,6 +1100,7 @@ fn render_running(
     }
     w.run_console_full.set_text(full_console);
     paint_quiet_chrome(
+        state,
         w,
         &caption,
         pass == RunPass::Apply,
@@ -1258,6 +1273,7 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             ..
         } => {
             render_running(
+                state,
                 w,
                 packages,
                 *overall_progress,

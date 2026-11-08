@@ -3,13 +3,22 @@
 //! All transitions are pure functions of `(AppState, Event) → Result<AppState, TransitionError>`.
 //! Side effects (spawning processes) live outside this module.
 
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::model::{
     apply_progress_hint, finalize_source, format_relative_now, overall_progress, sort_for_apply,
     AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
     StageCount, Stopwatch, UpdateSource,
 };
+
+/// dnf rpm-reconcile latch. The view owns the clock and the probe thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryLatch {
+    Idle,
+    InFlight,
+    Backoff { not_before: Instant },
+    Settled,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Phase {
@@ -44,6 +53,8 @@ pub enum Phase {
         pass: RunPass,
         /// `[current/total]` when both numbers arrived and `total > 0`.
         stage: Option<StageCount>,
+        /// rpm -q recovery for a quiet dnf apply. Not reset when the next source starts.
+        recovery: RecoveryLatch,
         needs_reboot: bool,
         failed_sources: Vec<UpdateSource>,
     },
@@ -215,6 +226,12 @@ pub enum Event {
     StopApply {
         during_transaction: bool,
     },
+    /// The view is about to spawn `rpm -q`. Idle or a past backoff becomes in flight.
+    RecoveryProbeStarted,
+    /// `rpm -q` could not decide. Back off; do not fail the update.
+    RecoveryProbeUnknown,
+    /// The planned dnf versions are installed and a later source still has work.
+    RecoveryProbeSettled,
 }
 
 pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionError> {
@@ -276,6 +293,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                             work_progress: None,
                             pass: RunPass::Download,
                             stage: None,
+                            recovery: RecoveryLatch::Idle,
                             needs_reboot: false,
                             failed_sources: Vec::new(),
                         };
@@ -623,6 +641,41 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 Ok(state)
             }
             _ => Err(invalid(&state, "CancelAuth")),
+        },
+        Event::RecoveryProbeStarted => match &mut state.phase {
+            Phase::Running { recovery, .. } => {
+                let start = match *recovery {
+                    RecoveryLatch::Idle => true,
+                    RecoveryLatch::Backoff { not_before } => Instant::now() >= not_before,
+                    RecoveryLatch::InFlight | RecoveryLatch::Settled => false,
+                };
+                if start {
+                    *recovery = RecoveryLatch::InFlight;
+                }
+                Ok(state)
+            }
+            _ => Err(invalid(&state, "RecoveryProbeStarted")),
+        },
+        Event::RecoveryProbeUnknown => match &mut state.phase {
+            Phase::Running { recovery, .. } => {
+                // The issue table stores the backoff clock on this transition.
+                if matches!(*recovery, RecoveryLatch::InFlight) {
+                    *recovery = RecoveryLatch::Backoff {
+                        not_before: Instant::now() + Duration::from_secs(30),
+                    };
+                }
+                Ok(state)
+            }
+            _ => Err(invalid(&state, "RecoveryProbeUnknown")),
+        },
+        Event::RecoveryProbeSettled => match &mut state.phase {
+            Phase::Running { recovery, .. } => {
+                if !matches!(*recovery, RecoveryLatch::Settled) {
+                    *recovery = RecoveryLatch::Settled;
+                }
+                Ok(state)
+            }
+            _ => Err(invalid(&state, "RecoveryProbeSettled")),
         },
     }
 }
@@ -1158,6 +1211,7 @@ mod tests {
             work_progress: None,
             pass: RunPass::Download,
             stage: None,
+            recovery: RecoveryLatch::Idle,
             needs_reboot: false,
             failed_sources: Vec::new(),
         };
@@ -1507,6 +1561,7 @@ mod tests {
             work_progress: None,
             pass: RunPass::Download,
             stage: None,
+            recovery: RecoveryLatch::Idle,
             needs_reboot: false,
             failed_sources: Vec::new(),
         };
@@ -2288,5 +2343,85 @@ mod tests {
             ),
             "got {normal:?}"
         );
+    }
+
+    #[test]
+    fn recovery_starts_once() {
+        let s = started_apply(vec![dnf_pkg("glibc")]);
+        let s = reduce(s, Event::RecoveryProbeStarted).unwrap();
+        match &s.phase {
+            Phase::Running {
+                recovery: RecoveryLatch::InFlight,
+                ..
+            } => {}
+            other => panic!("expected in flight, got {other:?}"),
+        }
+        let s = reduce(s, Event::RecoveryProbeStarted).unwrap();
+        match &s.phase {
+            Phase::Running {
+                recovery: RecoveryLatch::InFlight,
+                ..
+            } => {}
+            other => panic!("second start must stay in flight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_unknown_waits_thirty_seconds() {
+        let s = started_apply(vec![dnf_pkg("glibc")]);
+        let s = reduce(s, Event::RecoveryProbeStarted).unwrap();
+        let started = std::time::Instant::now();
+        let s = reduce(s, Event::RecoveryProbeUnknown).unwrap();
+        match &s.phase {
+            Phase::Running {
+                recovery: RecoveryLatch::Backoff { not_before },
+                ..
+            } => {
+                assert!(
+                    *not_before >= started + std::time::Duration::from_secs(30),
+                    "backoff {not_before:?} is not 30s ahead of {started:?}"
+                );
+            }
+            other => panic!("expected backoff, got {other:?}"),
+        }
+        let s = reduce(s, Event::RecoveryProbeStarted).unwrap();
+        match &s.phase {
+            Phase::Running {
+                recovery: RecoveryLatch::Backoff { .. },
+                ..
+            } => {}
+            other => panic!("early probe must stay in backoff, got {other:?}"),
+        }
+        assert!(!matches!(s.phase, Phase::Failed { .. }));
+    }
+
+    #[test]
+    fn recovery_settled_sticks_across_the_next_source() {
+        let s = started_apply(vec![dnf_pkg("glibc")]);
+        match &s.phase {
+            Phase::Running {
+                recovery: RecoveryLatch::Idle,
+                pass: RunPass::Download,
+                ..
+            } => {}
+            other => panic!("apply session starts idle on download, got {other:?}"),
+        }
+        let s = reduce(s, Event::RecoveryProbeSettled).unwrap();
+        let s = reduce(
+            s,
+            Event::ApplySourceStarted {
+                source: UpdateSource::FlatpakUser,
+                label: "Updating Apps".into(),
+            },
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running {
+                recovery: RecoveryLatch::Settled,
+                pass: RunPass::Download,
+                ..
+            } => {}
+            other => panic!("expected settled download, got {other:?}"),
+        }
     }
 }
