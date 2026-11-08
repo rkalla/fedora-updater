@@ -20,7 +20,7 @@ use fedora_updater::model::{
     about_time_left, cache_activity_note, check_progress, count_by_kind, count_by_source,
     idle_chrome, now_playing_subtitle, now_playing_title, quiet_ui, run_heading,
     running_progress_captions, source_summary_line, AuthPurpose, IdleScreen, Package, RetryAction,
-    UpdateSource, WorkerEvent,
+    RunPass, StageCount, UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
@@ -295,8 +295,14 @@ pub fn build(app: &Application) {
         let widgets = widgets.clone();
         let run_stop = widgets.run_stop.clone();
         run_stop.connect_clicked(move |_| {
-            let applying = matches!(state.borrow().phase, Phase::Running { applying: true, .. });
-            if applying {
+            let pass_is_apply = matches!(
+                state.borrow().phase,
+                Phase::Running {
+                    pass: RunPass::Apply,
+                    ..
+                }
+            );
+            if pass_is_apply {
                 prompt_stop_during_transaction(&widgets, &state);
             } else if matches!(state.borrow().phase, Phase::Running { .. }) {
                 stop_apply(&state, &widgets, false);
@@ -758,11 +764,10 @@ fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     let Phase::Running {
         packages,
         overall_progress,
-        applying,
+        pass,
         current_source,
         work_progress,
-        stage_current,
-        stage_total,
+        stage,
         ..
     } = &s.phase
     else {
@@ -777,15 +782,13 @@ fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         .unwrap_or(0);
     let last = s.console.last_line().to_string();
     let package_done = packages.iter().filter(|p| p.status.is_done()).count();
-    let (done, total) = match (stage_current, stage_total) {
-        (Some(cur), Some(stage_total)) if *stage_total > 0 => {
-            (*cur as usize, *stage_total as usize)
-        }
+    let (done, total) = match *stage {
+        Some(StageCount { current, total }) if total > 0 => (current as usize, total as usize),
         _ => (package_done, packages.len()),
     };
-    let (caption, _) = running_progress_captions(*current_source, done, total, *applying);
+    let (caption, _) = running_progress_captions(*current_source, done, total, *pass);
     let packages = packages.clone();
-    let applying = *applying;
+    let applying = *pass == RunPass::Apply;
     let work_progress = *work_progress;
     let current_source = *current_source;
     let overall_progress = *overall_progress;
@@ -943,7 +946,13 @@ fn prompt_stop_during_transaction(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppS
         if response != "stop" {
             return;
         }
-        let during = matches!(state.borrow().phase, Phase::Running { applying: true, .. });
+        let during = matches!(
+            state.borrow().phase,
+            Phase::Running {
+                pass: RunPass::Apply,
+                ..
+            }
+        );
         if matches!(state.borrow().phase, Phase::Running { .. }) {
             stop_apply(&state, &widgets_for_cb, during);
         }
@@ -962,9 +971,8 @@ fn render_running(
     packages: &[Package],
     overall_progress: f64,
     phase_label: &str,
-    applying: bool,
-    stage_current: Option<u32>,
-    stage_total: Option<u32>,
+    pass: RunPass,
+    stage: Option<StageCount>,
     current_source: Option<UpdateSource>,
     active_index: Option<usize>,
     current_name: Option<&str>,
@@ -974,18 +982,18 @@ fn render_running(
     full_console: &str,
 ) {
     w.stack.set_visible_child_name("running");
-    w.run_title.set_text(run_heading(phase_label, applying));
-    if applying {
+    w.run_title.set_text(run_heading(phase_label, pass));
+    if pass == RunPass::Apply {
         w.run_progress.add_css_class("stage-apply");
     } else {
         w.run_progress.remove_css_class("stage-apply");
     }
     let package_done = packages.iter().filter(|p| p.status.is_done()).count();
-    let (done, total) = match (stage_current, stage_total) {
-        (Some(cur), Some(stage_total)) if stage_total > 0 => (cur as usize, stage_total as usize),
+    let (done, total) = match stage {
+        Some(StageCount { current, total }) if total > 0 => (current as usize, total as usize),
         _ => (package_done, packages.len()),
     };
-    let (caption, meta) = running_progress_captions(current_source, done, total, applying);
+    let (caption, meta) = running_progress_captions(current_source, done, total, pass);
     w.run_progress.set_fraction(overall_progress);
     w.run_progress_meta.set_text(&meta);
     w.run_progress_pct
@@ -1080,7 +1088,7 @@ fn render_running(
     paint_quiet_chrome(
         w,
         &caption,
-        applying,
+        pass == RunPass::Apply,
         work_progress,
         current_source,
         last_console,
@@ -1245,9 +1253,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             active_index,
             current_name,
             work_progress,
-            applying,
-            stage_current,
-            stage_total,
+            pass,
+            stage,
             ..
         } => {
             render_running(
@@ -1255,9 +1262,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 packages,
                 *overall_progress,
                 phase_label,
-                *applying,
-                *stage_current,
-                *stage_total,
+                *pass,
+                *stage,
                 *current_source,
                 *active_index,
                 current_name.as_deref(),

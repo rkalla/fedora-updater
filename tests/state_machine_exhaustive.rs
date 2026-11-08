@@ -3,7 +3,7 @@
 
 use std::time::SystemTime;
 
-use fedora_updater::model::{Package, PackageStatus, UpdateSource};
+use fedora_updater::model::{Package, PackageStatus, RunPass, UpdateSource};
 use fedora_updater::state::{phase_name, reduce, AppState, Event, Phase};
 use fedora_updater::AuthPurpose;
 
@@ -290,9 +290,8 @@ fn progress_marks_package_and_completes_previous() {
         current_source: None,
         current_name: None,
         work_progress: None,
-        applying: false,
-        stage_current: None,
-        stage_total: None,
+        pass: RunPass::Download,
+        stage: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -338,9 +337,8 @@ fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
         current_source: Some(UpdateSource::Dnf),
         current_name: None,
         work_progress: None,
-        applying: false,
-        stage_current: None,
-        stage_total: None,
+        pass: RunPass::Download,
+        stage: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -387,9 +385,8 @@ fn kernel_hint_does_not_complete_kernel_core() {
         current_source: None,
         current_name: None,
         work_progress: None,
-        applying: false,
-        stage_current: None,
-        stage_total: None,
+        pass: RunPass::Download,
+        stage: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -422,9 +419,8 @@ fn verify_pass_does_not_move_current_back_to_completed() {
         current_source: Some(UpdateSource::Dnf),
         current_name: Some("kernel".into()),
         work_progress: Some(0.5),
-        applying: true,
-        stage_current: None,
-        stage_total: None,
+        pass: RunPass::Apply,
+        stage: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
@@ -476,9 +472,8 @@ fn apply_source_started_does_not_mark_first_package() {
         current_source: None,
         current_name: Some("stale".into()),
         work_progress: Some(0.3),
-        applying: false,
-        stage_current: None,
-        stage_total: None,
+        pass: RunPass::Download,
+        stage: None,
         needs_reboot: false,
         failed_sources: Vec::new(),
     };

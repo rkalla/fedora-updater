@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::model::{
     apply_progress_hint, finalize_source, format_relative_now, overall_progress, sort_for_apply,
-    AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction, Stopwatch,
-    UpdateSource,
+    AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
+    StageCount, Stopwatch, UpdateSource,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,11 +40,10 @@ pub enum Phase {
         current_name: Option<String>,
         /// Last per-item fraction for the now-playing card. Not the top-bar count.
         work_progress: Option<f64>,
-        /// True after this source leaves the download pass and starts applying.
-        applying: bool,
-        /// `[cur/total]` for the active download or transaction. Drives the top bar.
-        stage_current: Option<u32>,
-        stage_total: Option<u32>,
+        /// Download or apply pass for the current source.
+        pass: RunPass,
+        /// `[current/total]` when both numbers arrived and `total > 0`.
+        stage: Option<StageCount>,
         needs_reboot: bool,
         failed_sources: Vec<UpdateSource>,
     },
@@ -275,9 +274,8 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                             current_source: None,
                             current_name: None,
                             work_progress: None,
-                            applying: false,
-                            stage_current: None,
-                            stage_total: None,
+                            pass: RunPass::Download,
+                            stage: None,
                             needs_reboot: false,
                             failed_sources: Vec::new(),
                         };
@@ -360,9 +358,8 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 current_name,
                 work_progress,
                 active_index,
-                applying,
-                stage_current,
-                stage_total,
+                pass,
+                stage,
                 overall_progress,
                 ..
             } => {
@@ -371,9 +368,8 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 *current_name = None;
                 *work_progress = None;
                 *active_index = None;
-                *applying = false;
-                *stage_current = None;
-                *stage_total = None;
+                *pass = RunPass::Download;
+                *stage = None;
                 *overall_progress = 0.0;
                 Ok(state)
             }
@@ -396,46 +392,47 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 current_source,
                 current_name,
                 work_progress,
-                applying,
-                stage_current: stage_cur,
-                stage_total: stage_tot,
+                pass,
+                stage,
                 ..
             } => {
                 if *current_source != Some(source) {
                     *current_name = None;
                     *work_progress = None;
                     *active_index = None;
-                    *applying = false;
-                    *stage_cur = None;
-                    *stage_tot = None;
+                    *pass = RunPass::Download;
+                    *stage = None;
                     *op = 0.0;
                 }
-                if !*applying
+                if *pass != RunPass::Apply
                     && should_enter_apply(&phase_label, status_hint, package_hint.as_deref())
                 {
                     reset_live_packages(packages);
                     *work_progress = None;
                     *active_index = None;
                     *current_name = None;
-                    *stage_cur = None;
-                    *stage_tot = None;
+                    *stage = None;
                     *op = 0.0;
-                    *applying = true;
+                    *pass = RunPass::Apply;
                 }
                 let mut status_hint = status_hint;
-                if *applying && status_hint == Some(PackageStatus::Downloading) {
+                if *pass == RunPass::Apply && status_hint == Some(PackageStatus::Downloading) {
                     status_hint = Some(PackageStatus::Installing);
                 }
-                if !phase_label.trim().is_empty() && !(*applying && phase_is_download(&phase_label))
+                if !phase_label.trim().is_empty()
+                    && !(*pass == RunPass::Apply && phase_is_download(&phase_label))
                 {
                     *pl = phase_label;
                 }
                 *current_source = Some(source);
-                if let (Some(cur), Some(total)) = (stage_current, stage_total) {
-                    if total > 0 {
-                        *stage_cur = Some(cur);
-                        *stage_tot = Some(total);
-                        *op = (f64::from(cur) / f64::from(total)).clamp(0.0, 1.0);
+                match (stage_current, stage_total) {
+                    (Some(current), Some(total)) if total > 0 => {
+                        *stage = Some(StageCount { current, total });
+                        *op = (f64::from(current) / f64::from(total)).clamp(0.0, 1.0);
+                    }
+                    (None, None) => {}
+                    _ => {
+                        *stage = None;
                     }
                 }
                 if progress.is_some() {
@@ -479,7 +476,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                         }
                     }
                 }
-                if stage_cur.is_none() && *applying {
+                if stage.is_none() && *pass == RunPass::Apply {
                     *op = overall_progress(packages);
                 }
                 Ok(state)
@@ -496,8 +493,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 needs_reboot: nr,
                 failed_sources,
                 overall_progress: op,
-                stage_current,
-                stage_total,
+                stage,
                 ..
             } => {
                 finalize_source(packages, source, success);
@@ -507,8 +503,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 if !success && !failed_sources.contains(&source) {
                     failed_sources.push(source);
                 }
-                *stage_current = None;
-                *stage_total = None;
+                *stage = None;
                 *op = overall_progress(packages);
                 Ok(state)
             }
@@ -1118,13 +1113,12 @@ mod tests {
         .unwrap();
         match &s.phase {
             Phase::Running {
-                phase_label,
-                applying,
-                ..
+                phase_label, pass, ..
             } => {
                 assert_eq!(phase_label, "Installing firmware");
-                assert!(
-                    *applying,
+                assert_eq!(
+                    *pass,
+                    RunPass::Apply,
                     "Installing firmware is a real apply step and must leave the download pass"
                 );
             }
@@ -1162,9 +1156,8 @@ mod tests {
             current_source: Some(UpdateSource::Dnf),
             current_name: None,
             work_progress: None,
-            applying: false,
-            stage_current: None,
-            stage_total: None,
+            pass: RunPass::Download,
+            stage: None,
             needs_reboot: false,
             failed_sources: Vec::new(),
         };
@@ -1188,9 +1181,8 @@ mod tests {
             Phase::Running {
                 packages,
                 overall_progress,
-                applying,
-                stage_current,
-                stage_total,
+                pass,
+                stage,
                 ..
             } => {
                 assert!(
@@ -1202,8 +1194,14 @@ mod tests {
                 assert_eq!(packages[0].status, PackageStatus::Pending);
                 assert_eq!(packages[1].status, PackageStatus::Pending);
                 assert_eq!(packages[2].status, PackageStatus::Downloading);
-                assert!(!*applying);
-                assert_eq!((*stage_current, *stage_total), (Some(3), Some(3)));
+                assert_eq!(*pass, RunPass::Download);
+                assert_eq!(
+                    *stage,
+                    Some(StageCount {
+                        current: 3,
+                        total: 3
+                    })
+                );
                 assert!(
                     (*overall_progress - 1.0).abs() < f64::EPSILON,
                     "top bar follows the download count, got {overall_progress}"
@@ -1221,11 +1219,11 @@ mod tests {
             Phase::Running {
                 packages,
                 overall_progress,
-                applying,
+                pass,
                 work_progress,
                 ..
             } => {
-                assert!(*applying);
+                assert_eq!(*pass, RunPass::Apply);
                 assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
                 assert!(work_progress.is_none());
                 assert!(
@@ -1253,16 +1251,22 @@ mod tests {
                 packages,
                 overall_progress,
                 work_progress,
-                applying,
-                stage_current,
+                pass,
+                stage,
                 ..
             } => {
-                assert!(*applying);
+                assert_eq!(*pass, RunPass::Apply);
                 assert_eq!(status_of(packages, "glibc"), PackageStatus::Installing);
                 assert_eq!(status_of(packages, "wireplumber"), PackageStatus::Pending);
                 assert_eq!(status_of(packages, "kernel"), PackageStatus::Pending);
                 assert_eq!(*work_progress, Some(1.0));
-                assert_eq!(*stage_current, Some(16));
+                assert_eq!(
+                    *stage,
+                    Some(StageCount {
+                        current: 16,
+                        total: 137
+                    })
+                );
                 assert!(
                     (*overall_progress - 16.0 / 137.0).abs() < 1e-9,
                     "item 100% must not replace the transaction count, got {overall_progress}"
@@ -1501,9 +1505,8 @@ mod tests {
             current_source: Some(UpdateSource::Dnf),
             current_name: None,
             work_progress: None,
-            applying: false,
-            stage_current: None,
-            stage_total: None,
+            pass: RunPass::Download,
+            stage: None,
             needs_reboot: false,
             failed_sources: Vec::new(),
         };
@@ -1561,19 +1564,24 @@ mod tests {
         match &s.phase {
             Phase::Running {
                 packages,
-                applying,
+                pass,
                 phase_label,
-                stage_current,
-                stage_total,
+                stage,
                 current_name,
                 work_progress,
                 ..
             } => {
                 let completed = packages.iter().filter(|p| p.status.is_done()).count();
                 assert_eq!(completed, 0, "downloads must stay unchecked: {packages:?}");
-                assert!(!*applying);
+                assert_eq!(*pass, RunPass::Download);
                 assert_eq!(phase_label, "Downloading packages");
-                assert_eq!((*stage_current, *stage_total), (Some(5), Some(5)));
+                assert_eq!(
+                    *stage,
+                    Some(StageCount {
+                        current: 5,
+                        total: 5
+                    })
+                );
                 assert_eq!(current_name.as_deref(), Some("tzdata-java"));
                 assert_eq!(*work_progress, Some(1.0));
                 assert_eq!(
@@ -1622,7 +1630,280 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running { applying, .. } => assert!(!*applying),
+            Phase::Running {
+                pass: RunPass::Download,
+                ..
+            } => {}
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    /// Ready → StartApply → SessionReady, so the new pass tests do not
+    /// hand-build a `Phase::Running` past the transition.
+    fn started_apply(packages: Vec<Package>) -> AppState {
+        let mut s = AppState::default();
+        s.phase = Phase::Ready {
+            packages,
+            soft_errors: vec![],
+        };
+        let s = reduce(s, Event::StartApply).unwrap();
+        reduce(
+            s,
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_download_without_stage(s: &AppState) {
+        match &s.phase {
+            Phase::Running {
+                pass: RunPass::Download,
+                stage: None,
+                ..
+            } => {}
+            other => panic!("expected Download with no stage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage_count_requires_a_positive_total() {
+        let s = started_apply(vec![dnf_pkg("glibc")]);
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.2),
+                "Downloading packages",
+                Some(1),
+                Some(0),
+            ),
+        )
+        .unwrap();
+        assert_download_without_stage(&s);
+
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.2),
+                "Downloading packages",
+                Some(2),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_download_without_stage(&s);
+
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.2),
+                "Downloading packages",
+                None,
+                Some(4),
+            ),
+        )
+        .unwrap();
+        assert_download_without_stage(&s);
+
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.5),
+                "Downloading packages",
+                Some(2),
+                Some(4),
+            ),
+        )
+        .unwrap();
+        match &s.phase {
+            Phase::Running { stage, .. } => {
+                assert_eq!(
+                    *stage,
+                    Some(StageCount {
+                        current: 2,
+                        total: 4
+                    })
+                );
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.5),
+                "Downloading packages",
+                Some(2),
+                Some(0),
+            ),
+        )
+        .unwrap();
+        assert_download_without_stage(&s);
+
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.5),
+                "Downloading packages",
+                Some(1),
+                Some(4),
+            ),
+        )
+        .unwrap();
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.5),
+                "Downloading packages",
+                Some(3),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_download_without_stage(&s);
+    }
+
+    #[test]
+    fn stage_count_sets_both() {
+        let mut s = started_apply(vec![dnf_pkg("glibc")]);
+        s.apply_when_ready = true;
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.5),
+                "Downloading packages",
+                Some(2),
+                Some(4),
+            ),
+        )
+        .unwrap();
+        assert!(s.apply_when_ready);
+        match &s.phase {
+            Phase::Running {
+                pass,
+                stage,
+                overall_progress,
+                ..
+            } => {
+                assert_eq!(*pass, RunPass::Download);
+                assert_eq!(
+                    *stage,
+                    Some(StageCount {
+                        current: 2,
+                        total: 4
+                    })
+                );
+                assert!((*overall_progress - 0.5).abs() < 1e-9);
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+
+        let kept = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Downloading),
+                Some(0.8),
+                "Downloading packages",
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        match &kept.phase {
+            Phase::Running {
+                pass,
+                stage,
+                overall_progress,
+                ..
+            } => {
+                assert_eq!(*pass, RunPass::Download);
+                assert_eq!(
+                    *stage,
+                    Some(StageCount {
+                        current: 2,
+                        total: 4
+                    })
+                );
+                assert!((*overall_progress - 0.5).abs() < 1e-9);
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_switch_returns_to_download() {
+        let mut s = started_apply(vec![dnf_pkg("glibc")]);
+        s.apply_when_ready = true;
+        let s = reduce(
+            s,
+            dnf_progress(
+                Some("glibc"),
+                Some(PackageStatus::Installing),
+                Some(0.4),
+                "Installing",
+                Some(2),
+                Some(4),
+            ),
+        )
+        .unwrap();
+        assert!(s.apply_when_ready);
+        match &s.phase {
+            Phase::Running { pass, stage, .. } => {
+                assert_eq!(*pass, RunPass::Apply);
+                assert_eq!(
+                    *stage,
+                    Some(StageCount {
+                        current: 2,
+                        total: 4
+                    })
+                );
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+        let s = reduce(
+            s,
+            Event::ApplySourceStarted {
+                source: UpdateSource::FlatpakUser,
+                label: "Updating Apps".into(),
+            },
+        )
+        .unwrap();
+        assert!(s.apply_when_ready);
+        match &s.phase {
+            Phase::Running {
+                pass,
+                stage,
+                current_name,
+                work_progress,
+                active_index,
+                overall_progress,
+                ..
+            } => {
+                assert_eq!(*pass, RunPass::Download);
+                assert!(stage.is_none());
+                assert!(current_name.is_none());
+                assert!(work_progress.is_none());
+                assert!(active_index.is_none());
+                assert!((*overall_progress - 0.0).abs() < f64::EPSILON);
+            }
             other => panic!("expected Running, got {other:?}"),
         }
     }

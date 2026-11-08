@@ -103,6 +103,21 @@ pub enum RetryAction {
     Reboot,
 }
 
+/// Download vs apply inside one backend source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPass {
+    Download,
+    Apply,
+}
+
+/// `[current/total]` for the active download or transaction.
+/// Built only when both numbers are present and `total > 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageCount {
+    pub current: u32,
+    pub total: u32,
+}
+
 /// Idle page copy and button style. One row per [`IdleScreen`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdleChrome {
@@ -768,11 +783,11 @@ pub fn now_playing_subtitle(
 }
 
 /// Heading for the running page. Verifying stays its own label inside the apply pass.
-pub fn run_heading(phase_label: &str, applying: bool) -> &'static str {
+pub fn run_heading(phase_label: &str, pass: RunPass) -> &'static str {
     let label = phase_label.to_ascii_lowercase();
     if label.contains("verif") {
         "Verifying"
-    } else if applying
+    } else if pass == RunPass::Apply
         || label.contains("install")
         || label.contains("upgrad")
         || label.contains("transaction")
@@ -799,11 +814,15 @@ pub fn running_progress_captions(
     source: Option<UpdateSource>,
     done: usize,
     total: usize,
-    applying: bool,
+    pass: RunPass,
 ) -> (String, String) {
     let remaining = total.saturating_sub(done);
     let src = source.map(|s| s.label()).unwrap_or("all sources");
-    let verb = if applying { "done" } else { "downloaded" };
+    let verb = if pass == RunPass::Apply {
+        "done"
+    } else {
+        "downloaded"
+    };
     let footnote = format!("{src} · {done} of {total} {verb}");
     let meta = format!("{done} {verb} · {remaining} remaining");
     (footnote, meta)
@@ -1071,7 +1090,8 @@ mod tests {
 
     #[test]
     fn running_progress_captions_lead_with_done_count() {
-        let (foot, meta) = running_progress_captions(Some(UpdateSource::Firmware), 1, 1, true);
+        let (foot, meta) =
+            running_progress_captions(Some(UpdateSource::Firmware), 1, 1, RunPass::Apply);
         assert_eq!(foot, "Firmware · 1 of 1 done");
         assert_eq!(meta, "1 done · 0 remaining");
         assert!(
@@ -1079,15 +1099,18 @@ mod tests {
             "footnote must not invert remaining/total against the meta line, got {foot:?}"
         );
 
-        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 0, 12, true);
+        let (foot, meta) =
+            running_progress_captions(Some(UpdateSource::Dnf), 0, 12, RunPass::Apply);
         assert_eq!(foot, "System · 0 of 12 done");
         assert_eq!(meta, "0 done · 12 remaining");
 
-        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 7, 12, true);
+        let (foot, meta) =
+            running_progress_captions(Some(UpdateSource::Dnf), 7, 12, RunPass::Apply);
         assert_eq!(foot, "System · 7 of 12 done");
         assert_eq!(meta, "7 done · 5 remaining");
 
-        let (foot, meta) = running_progress_captions(Some(UpdateSource::Dnf), 25, 26, false);
+        let (foot, meta) =
+            running_progress_captions(Some(UpdateSource::Dnf), 25, 26, RunPass::Download);
         assert_eq!(foot, "System · 25 of 26 downloaded");
         assert_eq!(meta, "25 downloaded · 1 remaining");
     }
@@ -1312,11 +1335,17 @@ mod tests {
 
     #[test]
     fn run_heading_switches_with_the_stage() {
-        assert_eq!(run_heading("Downloading packages", false), "Downloading");
-        assert_eq!(run_heading("Installing", true), "Applying");
-        assert_eq!(run_heading("Running transaction", true), "Applying");
-        assert_eq!(run_heading("Verifying", true), "Verifying");
-        assert_eq!(run_heading("Starting…", false), "Updating");
+        assert_eq!(
+            run_heading("Downloading packages", RunPass::Download),
+            "Downloading"
+        );
+        assert_eq!(run_heading("Installing", RunPass::Apply), "Applying");
+        assert_eq!(
+            run_heading("Running transaction", RunPass::Apply),
+            "Applying"
+        );
+        assert_eq!(run_heading("Verifying", RunPass::Apply), "Verifying");
+        assert_eq!(run_heading("Starting…", RunPass::Download), "Updating");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use gtk::prelude::*;
 
 use fedora_updater::model::{
     AdvisoryKind, AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction,
-    Stopwatch, UpdateSource,
+    RunPass, Stopwatch, UpdateSource,
 };
 use fedora_updater::state::{AppState, Phase};
 
@@ -101,9 +101,8 @@ pub fn state_for(phase: &str) -> AppState {
             current_source: Some(UpdateSource::Dnf),
             current_name: Some("gnome-shell".into()),
             work_progress: Some(0.72),
-            applying: true,
-            stage_current: None,
-            stage_total: None,
+            pass: RunPass::Apply,
+            stage: None,
             needs_reboot: false,
             failed_sources: vec![],
         },
@@ -125,9 +124,8 @@ pub fn state_for(phase: &str) -> AppState {
                 current_source: Some(UpdateSource::Dnf),
                 current_name: Some("current-package".into()),
                 work_progress: Some(0.42),
-                applying: true,
-                stage_current: None,
-                stage_total: None,
+                pass: RunPass::Apply,
+                stage: None,
                 needs_reboot: false,
                 failed_sources: vec![],
             }
