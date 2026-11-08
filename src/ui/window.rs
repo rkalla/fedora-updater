@@ -18,18 +18,18 @@ use libadwaita::{
 use fedora_updater::backend::dnf::{self, InstallCheck};
 use fedora_updater::model::{
     about_time_left, cache_activity_note, check_progress, count_by_kind, count_by_source,
-    now_playing_subtitle, now_playing_title, quiet_ui, run_heading, running_progress_captions,
-    source_summary_line, AuthPurpose, Package, UpdateSource, WorkerEvent,
+    idle_chrome, now_playing_subtitle, now_playing_title, quiet_ui, run_heading,
+    running_progress_captions, source_summary_line, AuthPurpose, IdleScreen, Package, RetryAction,
+    UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
-    can_skip_auth_ui, cancel_background_work, fail_retry_is_reboot, release_privileges,
-    run_apply_all, run_check_all, run_systemctl_reboot, session_started_event,
-    worker_to_state_events,
+    can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
+    run_systemctl_reboot, session_started_event, worker_to_state_events,
 };
 use fedora_updater::privilege::{
     dnf_daemon_is_running, helper_activity, kill_recorded_helper, run_local_command, HelperActivity,
 };
-use fedora_updater::state::{self, AppState, Event, Phase};
+use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase};
 
 use super::{preview, rows};
 
@@ -244,68 +244,50 @@ pub fn build(app: &Application) {
     }
 
     let (tx, rx) = async_channel::unbounded::<WorkerEvent>();
-    let pending_purpose = Rc::new(RefCell::new(AuthPurpose::Check));
-    // Set only when the user agrees to refresh a stale list before Update All.
-    // The next successful check then applies that fresh list.
-    let apply_after_refresh = Rc::new(Cell::new(false));
 
     {
         let state = state.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
-        let pending_purpose = pending_purpose.clone();
-        let apply_after_refresh = apply_after_refresh.clone();
         idle_btn.connect_clicked(move |_| {
-            apply_after_refresh.set(false);
-            start_check(&state, &widgets, &pending_purpose, tx.clone());
+            start_check(&state, &widgets, tx.clone(), false);
         });
     }
     {
         let state = state.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
-        let pending_purpose = pending_purpose.clone();
-        let apply_after_refresh = apply_after_refresh.clone();
         ready_refresh.connect_clicked(move |_| {
-            apply_after_refresh.set(false);
-            start_check(&state, &widgets, &pending_purpose, tx.clone());
+            start_check(&state, &widgets, tx.clone(), false);
         });
     }
     {
         let state = state.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
-        let pending_purpose = pending_purpose.clone();
-        let apply_after_refresh = apply_after_refresh.clone();
         fail_retry.connect_clicked(move |_| {
-            let title = widgets.fail_page.title();
-            if fail_retry_is_reboot(&title) {
+            let retry = match &state.borrow().phase {
+                Phase::Failed { retry, .. } => *retry,
+                _ => return,
+            };
+            if retry == RetryAction::Reboot {
                 widgets.toast.add_toast(Toast::new("Rebooting…"));
                 run_systemctl_reboot(tx.clone());
                 return;
             }
-            apply_after_refresh.set(false);
-            start_check(&state, &widgets, &pending_purpose, tx.clone());
+            start_check(&state, &widgets, tx.clone(), false);
         });
     }
     {
         let state = state.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
-        let pending_purpose = pending_purpose.clone();
-        let apply_after_refresh = apply_after_refresh.clone();
         ready_update.connect_clicked(move |_| {
             if state.borrow().update_list_needs_refresh(SystemTime::now()) {
-                prompt_stale_update_list(
-                    &widgets,
-                    &state,
-                    &pending_purpose,
-                    tx.clone(),
-                    &apply_after_refresh,
-                );
+                prompt_stale_update_list(&widgets, &state, tx.clone());
                 return;
             }
-            begin_apply(&state, &widgets, &pending_purpose, tx.clone());
+            begin_apply(&state, &widgets, tx.clone());
         });
     }
     {
@@ -324,9 +306,7 @@ pub fn build(app: &Application) {
     {
         let state = state.clone();
         let widgets = widgets.clone();
-        let apply_after_refresh = apply_after_refresh.clone();
         auth_cancel.connect_clicked(move |_| {
-            apply_after_refresh.set(false);
             cancel_background_work();
             dispatch(&state, &widgets, Event::CancelAuth);
         });
@@ -387,19 +367,10 @@ pub fn build(app: &Application) {
     {
         let state = state.clone();
         let widgets = widgets.clone();
-        let pending_purpose = pending_purpose.clone();
-        let apply_after_refresh = apply_after_refresh.clone();
         let tx = tx.clone();
         glib::spawn_future_local(async move {
             while let Ok(ev) = rx.recv().await {
-                handle_worker(
-                    &state,
-                    &widgets,
-                    &pending_purpose,
-                    &apply_after_refresh,
-                    &tx,
-                    ev,
-                );
+                handle_worker(&state, &widgets, &tx, ev);
             }
         });
     }
@@ -454,11 +425,10 @@ pub fn build(app: &Application) {
 fn start_check(
     state: &Rc<RefCell<AppState>>,
     widgets: &Rc<Widgets>,
-    pending_purpose: &Rc<RefCell<AuthPurpose>>,
     tx: async_channel::Sender<WorkerEvent>,
+    then_apply: bool,
 ) {
-    *pending_purpose.borrow_mut() = AuthPurpose::Check;
-    dispatch(state, widgets, Event::StartCheck);
+    dispatch(state, widgets, Event::StartCheck { then_apply });
     if can_skip_auth_ui() {
         dispatch(state, widgets, session_started_event(AuthPurpose::Check));
     }
@@ -468,10 +438,8 @@ fn start_check(
 fn begin_apply(
     state: &Rc<RefCell<AppState>>,
     widgets: &Rc<Widgets>,
-    pending_purpose: &Rc<RefCell<AuthPurpose>>,
     tx: async_channel::Sender<WorkerEvent>,
 ) {
-    *pending_purpose.borrow_mut() = AuthPurpose::Apply;
     widgets.last_output.set(None);
     *widgets.cache_cursor.borrow_mut() = None;
     widgets.reconcile_inflight.set(false);
@@ -495,9 +463,7 @@ fn can_start_apply(state: &AppState) -> bool {
 fn prompt_stale_update_list(
     widgets: &Rc<Widgets>,
     state: &Rc<RefCell<AppState>>,
-    pending_purpose: &Rc<RefCell<AuthPurpose>>,
     tx: async_channel::Sender<WorkerEvent>,
-    apply_after_refresh: &Rc<Cell<bool>>,
 ) {
     let dialog = libadwaita::AlertDialog::new(Some(STALE_UPDATE_LIST_PROMPT), None);
     dialog.set_prefer_wide_layout(true);
@@ -509,12 +475,9 @@ fn prompt_stale_update_list(
 
     let state = state.clone();
     let widgets_for_cb = widgets.clone();
-    let pending_purpose = pending_purpose.clone();
-    let apply_after_refresh = apply_after_refresh.clone();
     dialog.connect_response(None, move |_dialog, response| {
         if response == "yes" {
-            apply_after_refresh.set(true);
-            start_check(&state, &widgets_for_cb, &pending_purpose, tx.clone());
+            start_check(&state, &widgets_for_cb, tx.clone(), true);
         }
     });
     dialog.present(Some(&widgets.window));
@@ -582,19 +545,10 @@ fn dispatch_worker(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, event: 
 fn handle_worker(
     state: &Rc<RefCell<AppState>>,
     widgets: &Rc<Widgets>,
-    pending_purpose: &Rc<RefCell<AuthPurpose>>,
-    apply_after_refresh: &Rc<Cell<bool>>,
     tx: &async_channel::Sender<WorkerEvent>,
     ev: WorkerEvent,
 ) {
-    if matches!(ev, WorkerEvent::Failed { .. }) {
-        apply_after_refresh.set(false);
-    }
-    let apply_after = if matches!(ev, WorkerEvent::CheckAllFinished { .. }) {
-        apply_after_refresh.replace(false)
-    } else {
-        false
-    };
+    let check_finished = matches!(ev, WorkerEvent::CheckAllFinished { .. });
     if matches!(
         ev,
         WorkerEvent::Line { .. } | WorkerEvent::Draw { .. } | WorkerEvent::ApplyProgress { .. }
@@ -604,8 +558,9 @@ fn handle_worker(
 
     match &ev {
         WorkerEvent::SessionStarted => {
-            let purpose = *pending_purpose.borrow();
-            dispatch_worker(state, widgets, session_started_event(purpose));
+            if let Some(purpose) = session_started_purpose(&state.borrow().phase) {
+                dispatch_worker(state, widgets, session_started_event(purpose));
+            }
             return;
         }
         WorkerEvent::Line { .. } | WorkerEvent::Draw { .. } => {
@@ -632,8 +587,8 @@ fn handle_worker(
         dispatch_worker(state, widgets, e);
     }
 
-    if apply_after && can_start_apply(&state.borrow()) {
-        begin_apply(state, widgets, pending_purpose, tx.clone());
+    if check_finished && state.borrow().apply_when_ready && can_start_apply(&state.borrow()) {
+        begin_apply(state, widgets, tx.clone());
     }
 }
 
@@ -949,6 +904,7 @@ fn handle_install_check(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, ch
                 Event::Fail {
                     title: "Update did not finish".into(),
                     detail: "dnf exited and the new package versions are not installed. Nothing from this run was committed. You can run Update All again.".into(),
+                    retry: RetryAction::CheckAgain,
                 },
             );
         }
@@ -963,6 +919,7 @@ fn handle_install_check(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, ch
                     detail: format!(
                         "{installed} of {total} packages were installed before dnf exited. Check `dnf history` before running Update All again."
                     ),
+                    retry: RetryAction::CheckAgain,
                 },
             );
         }
@@ -1159,54 +1116,37 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         .unwrap_or(0);
 
     match &s.phase {
-        Phase::Idle {
-            last_checked,
-            message,
-        } => {
+        Phase::Idle(screen) => {
             clear_running_lists(w);
             restore_default_window_size(&w.window);
             w.stack
                 .set_visible_child_full("idle", gtk::StackTransitionType::None);
-            let checked_at = last_checked.as_deref();
-            let up_to_date = last_checked.is_some() || message.is_some();
-            if up_to_date {
-                w.idle_page.set_title("System is up to date");
-                w.idle_page.set_icon_name(Some("object-select-symbolic"));
-                w.idle_btn_content.set_label("Check Again");
-                w.idle_btn_content.set_icon_name("view-refresh-symbolic");
-                w.idle_btn.remove_css_class("suggested-action");
-                w.idle_btn.remove_css_class("pill");
-                w.idle_btn.add_css_class("flat");
-                w.idle_hint.set_visible(false);
-                let subtitle = match message.as_deref() {
-                    Some(m) if m.starts_with("No updates") && m.contains('(') => m.to_string(),
-                    Some(m) if m == "System updated" => checked_at
-                        .map(|t| format!("Last checked {t}"))
-                        .unwrap_or_else(|| "Last checked just now".into()),
-                    Some(m) if !m.starts_with("No updates") => m.to_string(),
-                    _ => checked_at
-                        .map(|t| format!("Last checked {t}"))
-                        .unwrap_or_else(|| "Last checked just now".into()),
-                };
-                w.idle_page.set_description(Some(subtitle.as_str()));
-            } else {
-                w.idle_page.set_title("Check for updates");
-                w.idle_page
-                    .set_icon_name(Some("software-update-available-symbolic"));
-                w.idle_btn_content.set_label("Check for Updates");
-                w.idle_btn_content
-                    .set_icon_name("software-update-available-symbolic");
-                w.idle_btn.remove_css_class("flat");
+            let chrome = idle_chrome(screen);
+            w.idle_page.set_title(chrome.title);
+            w.idle_page.set_icon_name(Some(chrome.icon));
+            w.idle_btn_content.set_label(chrome.button);
+            w.idle_btn_content.set_icon_name(chrome.button_icon);
+            if chrome.suggested {
                 w.idle_btn.add_css_class("suggested-action");
+            } else {
+                w.idle_btn.remove_css_class("suggested-action");
+            }
+            if chrome.pill {
                 w.idle_btn.add_css_class("pill");
-                w.idle_hint.set_visible(true);
-                w.idle_page.set_description(None);
+            } else {
+                w.idle_btn.remove_css_class("pill");
+            }
+            if chrome.flat {
+                w.idle_btn.add_css_class("flat");
+            } else {
+                w.idle_btn.remove_css_class("flat");
+            }
+            w.idle_hint.set_visible(chrome.hint_visible);
+            w.idle_page.set_description(chrome.description.as_deref());
+            w.idle_status.set_text(&chrome.footer);
+            if matches!(screen, IdleScreen::Fresh) {
                 arm_idle_check_focus(w);
             }
-            let footer = checked_at
-                .map(|t| format!("Ready · last checked {t}"))
-                .unwrap_or_else(|| "Last checked never".into());
-            w.idle_status.set_text(&footer);
         }
         Phase::Authenticating { purpose, .. } => {
             w.stack.set_visible_child_name("auth");
@@ -1385,7 +1325,7 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             );
             w.done_installed_scroll.set_visible(!packages.is_empty());
         }
-        Phase::Failed { title, detail } => {
+        Phase::Failed { title, detail, .. } => {
             clear_running_lists(w);
             restore_default_window_size(&w.window);
             w.stack

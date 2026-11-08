@@ -8,7 +8,7 @@ use async_channel::Sender;
 
 use crate::backend::{self, dnf, flatpak, fwupd};
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
-use crate::model::{AuthPurpose, Package, UpdateSource, WorkerEvent};
+use crate::model::{AuthPurpose, Package, RetryAction, UpdateSource, WorkerEvent};
 use crate::privilege::{
     close_session, run_local_command, session_is_alive, with_session, SessionError, SessionEvent,
 };
@@ -91,10 +91,18 @@ pub fn worker_to_state_events(ev: WorkerEvent) -> Vec<StateEvent> {
         WorkerEvent::ApplyAllFinished { needs_reboot, .. } => {
             vec![StateEvent::ApplyComplete { needs_reboot }]
         }
-        WorkerEvent::Failed { message, detail } => vec![StateEvent::Fail {
-            title: message,
-            detail,
-        }],
+        WorkerEvent::Failed { message, detail } => {
+            let retry = if fail_retry_is_reboot(&message) {
+                RetryAction::Reboot
+            } else {
+                RetryAction::CheckAgain
+            };
+            vec![StateEvent::Fail {
+                title: message,
+                detail,
+                retry,
+            }]
+        }
     }
 }
 

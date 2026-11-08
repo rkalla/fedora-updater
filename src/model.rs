@@ -80,6 +80,85 @@ impl fmt::Display for AuthPurpose {
     }
 }
 
+/// Which idle page the window is showing. The view renders [`idle_chrome`];
+/// it does not choose a screen by matching subtitle text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleScreen {
+    /// Never checked in this session.
+    Fresh,
+    /// A check finished with nothing to install.
+    /// `detail` is set only when a backend reported a soft error.
+    Current {
+        checked_at: String,
+        detail: Option<String>,
+    },
+    /// The user left the Done page after an apply.
+    Updated { checked_at: String },
+}
+
+/// What the Failed page's Retry button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAction {
+    CheckAgain,
+    Reboot,
+}
+
+/// Idle page copy and button style. One row per [`IdleScreen`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleChrome {
+    pub title: &'static str,
+    pub icon: &'static str,
+    pub button: &'static str,
+    pub button_icon: &'static str,
+    pub suggested: bool,
+    pub pill: bool,
+    pub flat: bool,
+    pub hint_visible: bool,
+    pub description: Option<String>,
+    pub footer: String,
+}
+
+pub fn idle_chrome(screen: &IdleScreen) -> IdleChrome {
+    match screen {
+        IdleScreen::Fresh => IdleChrome {
+            title: "Check for updates",
+            icon: "software-update-available-symbolic",
+            button: "Check for Updates",
+            button_icon: "software-update-available-symbolic",
+            suggested: true,
+            pill: true,
+            flat: false,
+            hint_visible: true,
+            description: None,
+            footer: "Last checked never".into(),
+        },
+        IdleScreen::Current {
+            checked_at,
+            detail: Some(text),
+        } => up_to_date_chrome(checked_at, Some(text.clone())),
+        IdleScreen::Current {
+            checked_at,
+            detail: None,
+        }
+        | IdleScreen::Updated { checked_at } => up_to_date_chrome(checked_at, None),
+    }
+}
+
+fn up_to_date_chrome(checked_at: &str, detail: Option<String>) -> IdleChrome {
+    IdleChrome {
+        title: "System is up to date",
+        icon: "object-select-symbolic",
+        button: "Check Again",
+        button_icon: "view-refresh-symbolic",
+        suggested: false,
+        pill: false,
+        flat: true,
+        hint_visible: false,
+        description: Some(detail.unwrap_or_else(|| format!("Last checked {checked_at}"))),
+        footer: format!("Ready · last checked {checked_at}"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageStatus {
     Pending,
@@ -817,6 +896,63 @@ pub fn cache_activity_note(name: &str, bytes: u64, rising: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_up_to_date(chrome: &IdleChrome, checked_at: &str, description: &str) {
+        assert_eq!(chrome.title, "System is up to date");
+        assert_eq!(chrome.icon, "object-select-symbolic");
+        assert_eq!(chrome.button, "Check Again");
+        assert_eq!(chrome.button_icon, "view-refresh-symbolic");
+        assert!(!chrome.suggested);
+        assert!(!chrome.pill);
+        assert!(chrome.flat);
+        assert!(!chrome.hint_visible);
+        assert_eq!(chrome.description.as_deref(), Some(description));
+        assert_eq!(chrome.footer, format!("Ready · last checked {checked_at}"));
+    }
+
+    #[test]
+    fn idle_chrome_fresh() {
+        let chrome = idle_chrome(&IdleScreen::Fresh);
+        assert_eq!(chrome.title, "Check for updates");
+        assert_eq!(chrome.icon, "software-update-available-symbolic");
+        assert_eq!(chrome.button, "Check for Updates");
+        assert_eq!(chrome.button_icon, "software-update-available-symbolic");
+        assert!(chrome.suggested);
+        assert!(chrome.pill);
+        assert!(!chrome.flat);
+        assert!(chrome.hint_visible);
+        assert_eq!(chrome.description, None);
+        assert_eq!(chrome.footer, "Last checked never");
+    }
+
+    #[test]
+    fn idle_chrome_current_without_detail() {
+        let checked_at = "3 hours ago";
+        let chrome = idle_chrome(&IdleScreen::Current {
+            checked_at: checked_at.into(),
+            detail: None,
+        });
+        assert_up_to_date(&chrome, checked_at, "Last checked 3 hours ago");
+    }
+
+    #[test]
+    fn idle_chrome_current_with_detail() {
+        let checked_at = "yesterday";
+        let chrome = idle_chrome(&IdleScreen::Current {
+            checked_at: checked_at.into(),
+            detail: Some("No updates available (fwupd offline)".into()),
+        });
+        assert_up_to_date(&chrome, checked_at, "No updates available (fwupd offline)");
+    }
+
+    #[test]
+    fn idle_chrome_updated() {
+        let checked_at = "just now";
+        let chrome = idle_chrome(&IdleScreen::Updated {
+            checked_at: checked_at.into(),
+        });
+        assert_up_to_date(&chrome, checked_at, "Last checked just now");
+    }
 
     #[test]
     fn count_by_kind_skips_unknown() {

@@ -6,7 +6,8 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use fedora_updater::model::{
-    AdvisoryKind, AuthPurpose, ConsoleBuffer, Package, PackageStatus, Stopwatch, UpdateSource,
+    AdvisoryKind, AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction,
+    Stopwatch, UpdateSource,
 };
 use fedora_updater::state::{AppState, Phase};
 
@@ -51,24 +52,18 @@ pub fn state_for(phase: &str) -> AppState {
     console.push("[3/5] Installing gnome-shell-48.2-1.fc42.x86_64");
 
     let mut state = AppState {
-        phase: Phase::Idle {
-            last_checked: None,
-            message: None,
-        },
+        phase: Phase::Idle(IdleScreen::Fresh),
         console,
         stopwatch: Some(Stopwatch::start()),
         updates_listed_at: None,
+        apply_when_ready: false,
     };
 
     state.phase = match phase {
-        "idle" => Phase::Idle {
-            last_checked: None,
-            message: None,
-        },
-        "idle-current" | "up-to-date" => Phase::Idle {
-            last_checked: Some("just now".into()),
-            message: Some("System updated".into()),
-        },
+        "idle" => Phase::Idle(IdleScreen::Fresh),
+        "idle-current" | "up-to-date" => Phase::Idle(IdleScreen::Updated {
+            checked_at: "just now".into(),
+        }),
         "auth" => Phase::Authenticating {
             purpose: AuthPurpose::Check,
             packages: vec![],
@@ -167,13 +162,11 @@ pub fn state_for(phase: &str) -> AppState {
         "failed" => Phase::Failed {
             title: "All updates failed".into(),
             detail: "dnf update -y exited 1 · nothing was applied".into(),
+            retry: RetryAction::CheckAgain,
         },
         other => {
             eprintln!("unknown FEDORA_UPDATER_PREVIEW={other}, using idle");
-            Phase::Idle {
-                last_checked: None,
-                message: None,
-            }
+            Phase::Idle(IdleScreen::Fresh)
         }
     };
     state
@@ -355,6 +348,44 @@ fn many_running_packages() -> Vec<Package> {
 
 #[cfg(test)]
 mod tests {
+    use fedora_updater::model::{IdleScreen, RetryAction};
+    use fedora_updater::state::Phase;
+
+    #[test]
+    fn preview_state_for_idle_and_failed() {
+        let idle = super::state_for("idle");
+        assert!(!idle.apply_when_ready);
+        assert!(matches!(idle.phase, Phase::Idle(IdleScreen::Fresh)));
+
+        let unknown = super::state_for("not-a-real-phase");
+        assert!(!unknown.apply_when_ready);
+        assert!(matches!(unknown.phase, Phase::Idle(IdleScreen::Fresh)));
+
+        for name in ["idle-current", "up-to-date"] {
+            let state = super::state_for(name);
+            assert!(!state.apply_when_ready);
+            match state.phase {
+                Phase::Idle(IdleScreen::Updated { checked_at }) => {
+                    assert_eq!(checked_at, "just now");
+                }
+                other => panic!("{name} should be Updated, got {other:?}"),
+            }
+        }
+
+        match super::state_for("failed").phase {
+            Phase::Failed {
+                title,
+                detail,
+                retry,
+            } => {
+                assert_eq!(title, "All updates failed");
+                assert_eq!(detail, "dnf update -y exited 1 · nothing was applied");
+                assert_eq!(retry, RetryAction::CheckAgain);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn many_running_packages_matches_a_large_transaction() {
         let packages = super::many_running_packages();

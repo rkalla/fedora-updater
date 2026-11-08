@@ -54,7 +54,7 @@ fn happy_path_multi_source() {
     let s = AppState::default();
     assert_phase(&s, "Idle");
 
-    let s = reduce(s, Event::StartCheck).unwrap();
+    let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
     assert_phase(&s, "Authenticating");
 
     let s = reduce(
@@ -255,7 +255,7 @@ fn cannot_apply_empty_ready() {
 
 #[test]
 fn in_app_cancel_auth_returns_idle() {
-    let s = reduce(AppState::default(), Event::StartCheck).unwrap();
+    let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
     assert_phase(&s, "Authenticating");
     let s = reduce(s, Event::CancelAuth).unwrap();
     assert_phase(&s, "Idle");
@@ -264,12 +264,13 @@ fn in_app_cancel_auth_returns_idle() {
 
 #[test]
 fn auth_cancel_style_fail() {
-    let s = reduce(AppState::default(), Event::StartCheck).unwrap();
+    let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
     let s = reduce(
         s,
         Event::Fail {
             title: "Authentication cancelled".into(),
             detail: "polkit denied".into(),
+            retry: fedora_updater::RetryAction::CheckAgain,
         },
     )
     .unwrap();
@@ -510,7 +511,7 @@ fn apply_source_started_does_not_mark_first_package() {
 
 #[test]
 fn soft_errors_on_empty_check_surface_message() {
-    let s = reduce(AppState::default(), Event::StartCheck).unwrap();
+    let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
     let s = reduce(
         s,
         Event::SessionReady {
@@ -528,10 +529,13 @@ fn soft_errors_on_empty_check_surface_message() {
     )
     .unwrap();
     match s.phase {
-        Phase::Idle {
-            message: Some(m), ..
-        } => assert!(m.contains("fwupd")),
-        _ => panic!("expected idle with message"),
+        Phase::Idle(fedora_updater::IdleScreen::Current {
+            detail: Some(m), ..
+        }) => {
+            assert!(m.starts_with("No updates available ("), "{m}");
+            assert!(m.contains("fwupd"), "{m}");
+        }
+        other => panic!("expected idle with soft-error detail, got {other:?}"),
     }
 }
 
@@ -593,7 +597,7 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
 
 #[test]
 fn session_ready_wrong_purpose_rejected() {
-    let s = reduce(AppState::default(), Event::StartCheck).unwrap();
+    let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
     assert!(reduce(
         s,
         Event::SessionReady {
