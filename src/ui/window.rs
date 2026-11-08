@@ -793,40 +793,28 @@ fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     );
 }
 
-fn maybe_reconcile_dnf(state: &Rc<RefCell<AppState>>, w: &Widgets, packages: &[Package]) {
-    let dnf_pkgs: Vec<Package> = packages
-        .iter()
-        .filter(|p| p.source == UpdateSource::Dnf)
-        .cloned()
-        .collect();
-    if dnf_pkgs.is_empty() {
-        return;
-    }
-    let before = {
-        let Ok(borrowed) = state.try_borrow() else {
-            return;
-        };
-        match &borrowed.phase {
+/// Writes `RecoveryProbeStarted` onto the latch. Returns whether that moved it
+/// to `InFlight`. The caller must not hold a `Ref` on `state`: a shared borrow
+/// still outstanding panics on `borrow_mut` instead of skipping the probe.
+fn commit_recovery_probe_started(state: &Rc<RefCell<AppState>>) -> bool {
+    let can_start = {
+        let borrowed = state.borrow();
+        let recovery = match &borrowed.phase {
             Phase::Running { recovery, .. } => *recovery,
-            _ => return,
+            _ => return false,
+        };
+        match recovery {
+            RecoveryLatch::Idle => true,
+            RecoveryLatch::Backoff { not_before } => Instant::now() >= not_before,
+            RecoveryLatch::InFlight | RecoveryLatch::Settled => false,
         }
     };
-    let can_start = match before {
-        RecoveryLatch::Idle => true,
-        RecoveryLatch::Backoff { not_before } => Instant::now() >= not_before,
-        RecoveryLatch::InFlight | RecoveryLatch::Settled => false,
-    };
     if !can_start {
-        return;
+        return false;
     }
-    let current = {
-        let Ok(borrowed) = state.try_borrow() else {
-            return;
-        };
-        borrowed.clone()
-    };
+    let current = state.borrow().clone();
     let Ok(next) = state::reduce(current, Event::RecoveryProbeStarted) else {
-        return;
+        return false;
     };
     let moved = matches!(
         &next.phase,
@@ -836,7 +824,19 @@ fn maybe_reconcile_dnf(state: &Rc<RefCell<AppState>>, w: &Widgets, packages: &[P
         }
     );
     *state.borrow_mut() = next;
-    if !moved {
+    moved
+}
+
+fn maybe_reconcile_dnf(state: &Rc<RefCell<AppState>>, w: &Widgets, packages: &[Package]) {
+    let dnf_pkgs: Vec<Package> = packages
+        .iter()
+        .filter(|p| p.source == UpdateSource::Dnf)
+        .cloned()
+        .collect();
+    if dnf_pkgs.is_empty() {
+        return;
+    }
+    if !commit_recovery_probe_started(state) {
         return;
     }
     let tx = w.reconcile_tx.clone();
@@ -1138,6 +1138,66 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         .map(|sw| sw.elapsed_secs())
         .unwrap_or(0);
 
+    // Quiet reconcile writes the recovery latch. Clone the Running page and
+    // drop this Ref before that paint; a shared borrow still held here panics
+    // on the write and the rpm probe never starts.
+    let running = match &s.phase {
+        Phase::Running {
+            packages,
+            overall_progress,
+            phase_label,
+            current_source,
+            active_index,
+            current_name,
+            work_progress,
+            pass,
+            stage,
+            ..
+        } => Some((
+            packages.clone(),
+            *overall_progress,
+            phase_label.clone(),
+            *current_source,
+            *active_index,
+            current_name.clone(),
+            *work_progress,
+            *pass,
+            *stage,
+        )),
+        _ => None,
+    };
+    if let Some((
+        packages,
+        overall_progress,
+        phase_label,
+        current_source,
+        active_index,
+        current_name,
+        work_progress,
+        pass,
+        stage,
+    )) = running
+    {
+        drop(s);
+        render_running(
+            state,
+            w,
+            &packages,
+            overall_progress,
+            &phase_label,
+            pass,
+            stage,
+            current_source,
+            active_index,
+            current_name.as_deref(),
+            work_progress,
+            elapsed,
+            &last_console,
+            &full_console,
+        );
+        return;
+    }
+
     match &s.phase {
         Phase::Idle(screen) => {
             clear_running_lists(w);
@@ -1260,34 +1320,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 packages.iter().map(|p| rows::package_row(p, false)),
             );
         }
-        Phase::Running {
-            packages,
-            overall_progress,
-            phase_label,
-            current_source,
-            active_index,
-            current_name,
-            work_progress,
-            pass,
-            stage,
-            ..
-        } => {
-            render_running(
-                state,
-                w,
-                packages,
-                *overall_progress,
-                phase_label,
-                *pass,
-                *stage,
-                *current_source,
-                *active_index,
-                current_name.as_deref(),
-                *work_progress,
-                elapsed,
-                &last_console,
-                &full_console,
-            );
+        Phase::Running { .. } => {
+            unreachable!("Running is painted after the state borrow is dropped");
         }
         Phase::Done {
             packages,
@@ -1448,5 +1482,79 @@ mod tests {
         let xml = super::LOG_WINDOW_UI;
         assert!(xml.contains("id=\"log_view\""));
         assert!(xml.contains("id=\"copy_btn\""));
+    }
+
+    fn running_after_session_ready() -> fedora_updater::state::AppState {
+        use fedora_updater::model::{AuthPurpose, Package};
+        use fedora_updater::state::{AppState, Event, Phase};
+        let mut s = AppState::default();
+        s.phase = Phase::Ready {
+            packages: vec![Package::new_dnf("glibc", "x86_64", "1", "updates")],
+            soft_errors: vec![],
+        };
+        let s = fedora_updater::state::reduce(s, Event::StartApply).unwrap();
+        fedora_updater::state::reduce(
+            s,
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recovery_probe_commit_writes_inflight_and_panics_if_a_borrow_is_held() {
+        use fedora_updater::state::{Phase, RecoveryLatch};
+        use std::cell::RefCell;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::rc::Rc;
+
+        let state = Rc::new(RefCell::new(running_after_session_ready()));
+        assert!(
+            matches!(
+                state.borrow().phase,
+                Phase::Running {
+                    recovery: RecoveryLatch::Idle,
+                    ..
+                }
+            ),
+            "SessionReady for Apply starts the latch Idle"
+        );
+        assert!(super::commit_recovery_probe_started(&state));
+        assert!(matches!(
+            state.borrow().phase,
+            Phase::Running {
+                recovery: RecoveryLatch::InFlight,
+                ..
+            }
+        ));
+        assert!(
+            !super::commit_recovery_probe_started(&state),
+            "a second start leaves InFlight and does not spawn another probe"
+        );
+
+        let state = Rc::new(RefCell::new(running_after_session_ready()));
+        let held = state.borrow();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            super::commit_recovery_probe_started(&state);
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(
+            panicked.is_err(),
+            "a held Ref must panic on the latch write, not skip the probe"
+        );
+        drop(held);
+        assert!(
+            matches!(
+                state.borrow().phase,
+                Phase::Running {
+                    recovery: RecoveryLatch::Idle,
+                    ..
+                }
+            ),
+            "the panicked write must leave the latch Idle"
+        );
     }
 }
