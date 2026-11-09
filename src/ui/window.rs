@@ -1666,6 +1666,14 @@ mod tests {
         assert!(xml.contains("max-width: 500px"));
         assert!(xml.contains("About Fedora Updater"));
         assert!(xml.contains("Main Menu"));
+        // AdwHeaderBar.pack_end prepends. The first end child is the trailing
+        // app button, so the menu is emitted before Stop.
+        let menu_at = xml.find("id=\"header_menu\"").expect("header_menu");
+        let stop_at = xml.find("id=\"run_stop\"").expect("run_stop");
+        assert!(
+            menu_at < stop_at,
+            "pack_end prepends: list the menu before Stop so Stop is the start-side button"
+        );
         assert!(xml.contains("Update All"));
         assert!(xml.contains("View Full Log"));
         assert!(xml.contains("View Log"));

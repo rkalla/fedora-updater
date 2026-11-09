@@ -25,13 +25,8 @@ Adw.ApplicationWindow window {
           title: "Fedora Updater";
         };
 
-        [end]
-        Gtk.Button run_stop {
-          label: "Stop";
-          tooltip-text: "Stop this update";
-          visible: false;
-        }
-
+        // pack_end prepends, so the first end child is the trailing one.
+        // The menu is listed first so Stop sits before it.
         [end]
         Gtk.MenuButton header_menu {
           icon-name: "open-menu-symbolic";
@@ -43,6 +38,13 @@ Adw.ApplicationWindow window {
               item ("About Fedora Updater", "win.about")
             }
           };
+        }
+
+        [end]
+        Gtk.Button run_stop {
+          label: "Stop";
+          tooltip-text: "Stop this update";
+          visible: false;
         }
       }
 
