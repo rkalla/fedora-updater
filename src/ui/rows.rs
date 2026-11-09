@@ -1,11 +1,11 @@
-//! Adwaita rows, chips, and group refill helpers.
+//! Adwaita rows and group refill helpers.
 
 use gtk::prelude::*;
 use gtk::{Align, Label};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, ExpanderRow, PreferencesGroup};
 
-use fedora_updater::model::{AdvisoryKind, Package, PackageStatus, UpdateSource};
+use fedora_updater::model::{Package, PackageStatus, UpdateSource};
 
 pub fn source_badge(source: UpdateSource) -> Label {
     Label::builder()
@@ -16,37 +16,10 @@ pub fn source_badge(source: UpdateSource) -> Label {
         .build()
 }
 
-pub fn chip(text: &str, class: &str) -> Label {
-    Label::builder()
-        .label(text)
-        .valign(Align::Center)
-        .css_classes(["chip", class, "caption"])
-        .build()
-}
-
-fn sev_dot(kind: AdvisoryKind) -> Option<gtk::Box> {
-    if kind == AdvisoryKind::Unknown {
-        return None;
-    }
-    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    dot.add_css_class("sev-dot");
-    dot.add_css_class(kind.css_class());
-    dot.set_valign(Align::Center);
-    dot.set_halign(Align::Center);
-    dot.set_hexpand(false);
-    dot.set_vexpand(false);
-    dot.set_size_request(7, 7);
-    dot.set_overflow(gtk::Overflow::Hidden);
-    Some(dot)
-}
-
 fn leading(package: &Package) -> gtk::Box {
     let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     box_.set_valign(Align::Center);
     box_.append(&source_badge(package.source));
-    if let Some(dot) = sev_dot(package.kind) {
-        box_.append(&dot);
-    }
     box_
 }
 
@@ -83,7 +56,7 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
             }
             PackageStatus::Pending => {
                 row.add_css_class("pending");
-                row.add_suffix(&caption_suffix("queued", &["dim-label"]));
+                row.add_suffix(&caption_suffix("queued", &["dimmed"]));
             }
             PackageStatus::Failed => {
                 row.add_suffix(&caption_suffix("failed", &["error"]));
@@ -93,7 +66,7 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
             }
             PackageStatus::Skipped => {
                 row.add_css_class("pending");
-                row.add_suffix(&caption_suffix("skipped", &["dim-label"]));
+                row.add_suffix(&caption_suffix("skipped", &["dimmed"]));
             }
         }
     } else {
@@ -101,7 +74,7 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
             .size
             .clone()
             .unwrap_or_else(|| package.source.badge().into());
-        row.add_suffix(&caption_suffix(&trailing, &["dim-label"]));
+        row.add_suffix(&caption_suffix(&trailing, &["dimmed"]));
     }
 
     row
@@ -136,7 +109,7 @@ pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: boo
     row.row.remove_css_class("pending");
     row.row.remove_css_class("active");
     row.row.remove_css_class("done");
-    row.status.remove_css_class("dim-label");
+    row.status.remove_css_class("dimmed");
     row.status.remove_css_class("accent");
     row.status.remove_css_class("success");
     row.status.remove_css_class("error");
@@ -167,7 +140,7 @@ pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: boo
         }
         PackageStatus::Skipped => {
             row.row.add_css_class("pending");
-            row.status.add_css_class("dim-label");
+            row.status.add_css_class("dimmed");
             row.status.set_text("skipped");
         }
         PackageStatus::Installing => {
@@ -182,24 +155,19 @@ pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: boo
         }
         PackageStatus::Pending => {
             row.row.add_css_class("pending");
-            row.status.add_css_class("dim-label");
+            row.status.add_css_class("dimmed");
             row.status.set_text("queued");
         }
     }
 }
 
-pub fn completed_row(package: &Package) -> ActionRow {
-    let row = ActionRow::builder()
-        .title(&package.name)
-        .subtitle(&package.version_line())
-        .title_lines(1)
-        .subtitle_lines(1)
-        .activatable(false)
-        .build();
-    let icon = gtk::Image::from_icon_name("object-select-symbolic");
-    icon.add_css_class("success");
-    row.add_prefix(&icon);
-    row.add_prefix(&source_badge(package.source));
+/// Finished package on the Done list and in the running completed expander.
+/// Source badge, name, version and source, lowercase status, and size only when known.
+pub fn finished_row(package: &Package) -> ActionRow {
+    let row = package_row(package, true);
+    if let Some(size) = package.size.as_deref() {
+        row.add_suffix(&caption_suffix(size, &["dimmed"]));
+    }
     row
 }
 
@@ -240,14 +208,5 @@ pub fn append_expander(
         let widget: gtk::Widget = row.upcast();
         expander.add_row(&widget);
         store.borrow_mut().push(widget);
-    }
-}
-
-pub fn refill_chips(chips: &libadwaita::WrapBox, items: &[(&str, &str)]) {
-    while let Some(child) = chips.first_child() {
-        chips.remove(&child);
-    }
-    for (text, class) in items {
-        chips.append(&chip(text, class));
     }
 }

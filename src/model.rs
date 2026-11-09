@@ -119,33 +119,31 @@ pub struct StageCount {
 }
 
 /// Idle page copy and button style. One row per [`IdleScreen`].
+/// The view paints these fields only. It does not paint a button icon, a hint, or a footer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdleChrome {
     pub title: &'static str,
     pub icon: &'static str,
     pub button: &'static str,
-    pub button_icon: &'static str,
     pub suggested: bool,
     pub pill: bool,
     pub flat: bool,
-    pub hint_visible: bool,
     pub description: Option<String>,
-    pub footer: String,
 }
 
 pub fn idle_chrome(screen: &IdleScreen) -> IdleChrome {
     match screen {
         IdleScreen::Fresh => IdleChrome {
-            title: "Check for updates",
+            title: "Check for Updates",
             icon: "software-update-available-symbolic",
             button: "Check for Updates",
-            button_icon: "software-update-available-symbolic",
             suggested: true,
             pill: true,
             flat: false,
-            hint_visible: true,
-            description: None,
-            footer: "Last checked never".into(),
+            description: Some(
+                "System packages, apps, and firmware. Nothing changes until the list is reviewed."
+                    .into(),
+            ),
         },
         IdleScreen::Current {
             checked_at,
@@ -164,13 +162,10 @@ fn up_to_date_chrome(checked_at: &str, detail: Option<String>) -> IdleChrome {
         title: "System is up to date",
         icon: "object-select-symbolic",
         button: "Check Again",
-        button_icon: "view-refresh-symbolic",
         suggested: false,
         pill: false,
         flat: true,
-        hint_visible: false,
         description: Some(detail.unwrap_or_else(|| format!("Last checked {checked_at}"))),
-        footer: format!("Ready · last checked {checked_at}"),
     }
 }
 
@@ -988,20 +983,18 @@ pub fn quiet_ui(
     } else {
         None
     };
+    // `last_line` stays in the signature. The stall banner does not quote it.
+    // The running page shows that line in the console bar instead.
+    let _ = last_line;
     let banner = if exited {
         Some("dnf has exited. Checking whether the packages were installed.".into())
     } else if stalled {
         let mins = (quiet_secs / 60).max(2);
-        let last = clip_line(last_line);
-        let mut text = if last.is_empty() {
-            format!("No output for {mins} minutes.")
+        Some(if daemon_running {
+            format!("No output for {mins} minutes. Waiting on GNOME Software.")
         } else {
-            format!("No output for {mins} minutes. Last line: {last}")
-        };
-        if daemon_running {
-            text.push_str(" The update is waiting on GNOME Software's dnf daemon.");
-        }
-        Some(text)
+            format!("No output for {mins} minutes.")
+        })
     } else {
         None
     };
@@ -1012,17 +1005,6 @@ pub fn quiet_ui(
         footnote,
         banner,
         reconcile: exited,
-    }
-}
-
-fn clip_line(line: &str) -> String {
-    let line = line.trim();
-    let count = line.chars().count();
-    if count <= 140 {
-        line.to_string()
-    } else {
-        let head: String = line.chars().take(137).collect();
-        format!("{head}...")
     }
 }
 
@@ -1039,32 +1021,31 @@ pub fn cache_activity_note(name: &str, bytes: u64, rising: bool) -> String {
 mod tests {
     use super::*;
 
-    fn assert_up_to_date(chrome: &IdleChrome, checked_at: &str, description: &str) {
+    fn assert_up_to_date(chrome: &IdleChrome, _checked_at: &str, description: &str) {
         assert_eq!(chrome.title, "System is up to date");
         assert_eq!(chrome.icon, "object-select-symbolic");
         assert_eq!(chrome.button, "Check Again");
-        assert_eq!(chrome.button_icon, "view-refresh-symbolic");
         assert!(!chrome.suggested);
         assert!(!chrome.pill);
         assert!(chrome.flat);
-        assert!(!chrome.hint_visible);
         assert_eq!(chrome.description.as_deref(), Some(description));
-        assert_eq!(chrome.footer, format!("Ready · last checked {checked_at}"));
     }
 
     #[test]
     fn idle_chrome_fresh() {
         let chrome = idle_chrome(&IdleScreen::Fresh);
-        assert_eq!(chrome.title, "Check for updates");
+        assert_eq!(chrome.title, "Check for Updates");
         assert_eq!(chrome.icon, "software-update-available-symbolic");
         assert_eq!(chrome.button, "Check for Updates");
-        assert_eq!(chrome.button_icon, "software-update-available-symbolic");
         assert!(chrome.suggested);
         assert!(chrome.pill);
         assert!(!chrome.flat);
-        assert!(chrome.hint_visible);
-        assert_eq!(chrome.description, None);
-        assert_eq!(chrome.footer, "Last checked never");
+        assert_eq!(
+            chrome.description.as_deref(),
+            Some(
+                "System packages, apps, and firmware. Nothing changes until the list is reviewed."
+            )
+        );
     }
 
     #[test]
@@ -1368,7 +1349,10 @@ mod tests {
         );
         assert_eq!(stalled.mode, QuietMode::Stalled);
         assert!(!stalled.show_eta);
-        assert!(stalled.banner.unwrap().contains("tzdata-java"));
+        let stalled_banner = stalled.banner.expect("stalled banner");
+        assert_eq!(stalled_banner, "No output for 3 minutes.");
+        assert!(!stalled_banner.contains("tzdata-java"));
+        assert!(!stalled_banner.contains("Last line:"));
         assert!(!stalled.reconcile);
 
         let exited = quiet_ui(
@@ -1421,8 +1405,17 @@ mod tests {
             true,
         );
         let on_banner = on.banner.expect("stalled banner");
-        assert!(on_banner.contains("No output"), "{on_banner}");
-        assert!(on_banner.contains("dnf daemon"), "{on_banner}");
+        assert_eq!(
+            on_banner,
+            "No output for 3 minutes. Waiting on GNOME Software."
+        );
+        assert!(
+            on_banner.contains("Waiting on GNOME Software"),
+            "{on_banner}"
+        );
+        assert!(!on_banner.contains("dnf daemon"), "{on_banner}");
+        assert!(!on_banner.contains("Last line:"), "{on_banner}");
+        assert!(!on_banner.contains("tzdata-java"), "{on_banner}");
 
         let off = quiet_ui(
             180,
@@ -1434,8 +1427,14 @@ mod tests {
             false,
         );
         let off_banner = off.banner.expect("stalled banner");
-        assert!(off_banner.contains("No output"), "{off_banner}");
+        assert_eq!(off_banner, "No output for 3 minutes.");
+        assert!(
+            !off_banner.contains("Waiting on GNOME Software"),
+            "{off_banner}"
+        );
         assert!(!off_banner.contains("dnf daemon"), "{off_banner}");
+        assert!(!off_banner.contains("Last line:"), "{off_banner}");
+        assert!(!off_banner.contains("tzdata-java"), "{off_banner}");
     }
 
     #[test]

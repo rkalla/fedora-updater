@@ -2,58 +2,51 @@ using Gtk 4.0;
 using Adw 1;
 
 Adw.Window log_window {
-  title: "Full log";
+  title: "Full Log";
   default-width: 720;
   default-height: 480;
   modal: true;
+  resizable: true;
 
   content: Adw.ToolbarView {
     [top]
     Adw.HeaderBar {
       show-end-title-buttons: true;
       title-widget: Adw.WindowTitle {
-        title: "Full log";
+        title: "Full Log";
       };
     }
 
-    content: Gtk.Box {
-      orientation: vertical;
+    content: Gtk.ScrolledWindow {
+      hexpand: true;
+      vexpand: true;
 
-      Gtk.ScrolledWindow {
-        hexpand: true;
-        vexpand: true;
-
-        child: Gtk.TextView log_view {
-          editable: false;
-          cursor-visible: false;
-          monospace: true;
-          wrap-mode: word_char;
-          left-margin: 12;
-          right-margin: 12;
-          top-margin: 12;
-          bottom-margin: 12;
-        };
-      }
-
-      Gtk.Box {
-        orientation: horizontal;
-        spacing: 8;
-        halign: end;
-        margin-top: 8;
-        margin-bottom: 8;
-        margin-end: 12;
-        margin-start: 12;
-
-        Gtk.Button copy_btn {
-          label: "Copy all";
-          styles ["flat"]
-        }
-
-        Gtk.Button close_btn {
-          label: "Close";
-          styles ["suggested-action"]
-        }
-      }
+      child: Gtk.TextView log_view {
+        editable: false;
+        cursor-visible: false;
+        monospace: true;
+        wrap-mode: word_char;
+        left-margin: 12;
+        right-margin: 12;
+        top-margin: 12;
+        bottom-margin: 12;
+      };
     };
+
+    [bottom]
+    Gtk.Box {
+      orientation: horizontal;
+      spacing: 8;
+      halign: end;
+      margin-top: 8;
+      margin-bottom: 8;
+      margin-end: 12;
+      margin-start: 12;
+
+      Gtk.Button copy_btn {
+        label: "Copy All";
+        styles ["suggested-action"]
+      }
+    }
   };
 }

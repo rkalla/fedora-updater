@@ -5,22 +5,23 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
+use gtk::gio;
 use gtk::glib;
 use gtk::glib::object::IsA;
 use gtk::prelude::*;
 use gtk::{Builder, Button, Label, ProgressBar, Revealer, Stack, TextView};
 use libadwaita::prelude::*;
 use libadwaita::{
-    Application, ApplicationWindow, Banner, ButtonContent, ExpanderRow, PreferencesGroup, Spinner,
-    StatusPage, StyleManager, Toast, ToastOverlay, Window as AdwWindow, WrapBox,
+    Application, ApplicationWindow, Banner, Breakpoint, ExpanderRow, PreferencesGroup, Spinner,
+    StatusPage, StyleManager, Toast, ToastOverlay, Window as AdwWindow, WindowTitle,
 };
 
 use fedora_updater::backend::dnf::{self, InstallCheck};
 use fedora_updater::model::{
-    about_time_left, cache_activity_note, check_progress, count_by_kind, count_by_source,
-    idle_chrome, now_playing_subtitle, now_playing_title, quiet_ui, run_heading,
-    running_progress_captions, source_summary_line, AuthPurpose, IdleScreen, Package, RetryAction,
-    RunPass, StageCount, UpdateSource, WorkerEvent,
+    about_time_left, cache_activity_note, check_progress, count_by_source, idle_chrome,
+    now_playing_subtitle, now_playing_title, quiet_ui, run_heading, running_progress_captions,
+    source_summary_line, AuthPurpose, IdleScreen, Package, RetryAction, RunPass, StageCount,
+    UpdateSource, WorkerEvent,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
@@ -37,21 +38,156 @@ const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
 const LOG_WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/log_window.ui"));
 const DEFAULT_WIDTH: i32 = 760;
 const DEFAULT_HEIGHT: i32 = 660;
-const STALE_UPDATE_LIST_PROMPT: &str = "The list of updates is older than 24hrs - I need to refresh this list before applying the updates. Do you want to do that now?";
+const ABOUT_NAME: &str = "Fedora Updater";
+const ABOUT_COMMENTS: &str = "A desktop front-end for Fedora system, Flatpak, and firmware updates";
+const AUTH_DESCRIPTION: &str =
+    "A system dialog asks for an administrator password. The password is not stored in this window.";
+
+/// Title and subtitle for the one shared header. `narrow` blanks the subtitle on every phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeaderChrome {
+    title: String,
+    subtitle: String,
+}
+
+#[derive(Clone, Copy)]
+enum HeaderView<'a> {
+    Idle,
+    Authenticating(AuthPurpose),
+    Checking { footnote: &'a str },
+    Ready { count: usize, summary: &'a str },
+    Running { heading: &'a str, footnote: &'a str },
+    Done { failed: bool, subtitle: &'a str },
+    Failed,
+}
+
+fn window_header(view: HeaderView<'_>, narrow: bool) -> HeaderChrome {
+    let (title, subtitle): (String, String) = match view {
+        HeaderView::Idle | HeaderView::Failed => ("Fedora Updater".into(), String::new()),
+        HeaderView::Authenticating(AuthPurpose::Check) => {
+            ("Fedora Updater".into(), "Checking for updates".into())
+        }
+        HeaderView::Authenticating(AuthPurpose::Apply) => {
+            ("Fedora Updater".into(), "Applying updates".into())
+        }
+        HeaderView::Checking { footnote } => ("Checking for Updates".into(), footnote.to_string()),
+        HeaderView::Ready { count, summary } => {
+            let title = if count == 1 {
+                "1 Update Available".into()
+            } else {
+                format!("{count} Updates Available")
+            };
+            (title, summary.to_string())
+        }
+        HeaderView::Running { heading, footnote } => (heading.to_string(), footnote.to_string()),
+        HeaderView::Done { failed, subtitle } => {
+            let title = if failed {
+                "Updates Finished With Problems"
+            } else {
+                "All Updates Applied"
+            };
+            (title.into(), subtitle.to_string())
+        }
+    };
+    HeaderChrome {
+        title,
+        subtitle: if narrow { String::new() } else { subtitle },
+    }
+}
+
+fn checking_footnote(groups_done: u32, eta: Option<&str>) -> String {
+    match eta {
+        Some(eta) if !eta.is_empty() => format!("{eta} · {groups_done} of 3 sources"),
+        _ => format!("{groups_done} of 3 sources"),
+    }
+}
+
+fn done_header_subtitle(
+    failed: usize,
+    upgraded: usize,
+    dnf: usize,
+    flatpak: usize,
+    firmware: usize,
+    duration: &str,
+) -> String {
+    if failed > 0 {
+        format!("{upgraded} applied · {failed} failed · {duration}")
+    } else {
+        format!("{upgraded} upgraded · {dnf} system / {flatpak} apps / {firmware} firmware · {duration}")
+    }
+}
+
+fn soft_error_banner_title(count: usize) -> String {
+    if count == 1 {
+        "1 source could not be checked".into()
+    } else {
+        format!("{count} sources could not be checked")
+    }
+}
+
+fn fail_retry_label(retry: RetryAction) -> &'static str {
+    match retry {
+        RetryAction::CheckAgain => "Check Again",
+        RetryAction::Reboot => "Restart",
+    }
+}
+
+/// Copy the two alert dialogs pass to `Adw.AlertDialog`. Response ids stay stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DialogCopy {
+    heading: &'static str,
+    body: &'static str,
+    close_id: &'static str,
+    close_label: &'static str,
+    confirm_id: &'static str,
+    confirm_label: &'static str,
+    confirm_destructive: bool,
+    confirm_suggested: bool,
+    default_id: &'static str,
+}
+
+fn stale_update_dialog() -> DialogCopy {
+    DialogCopy {
+        heading: "Refresh Update List?",
+        body: "This list is more than a day old. Refresh it before applying these updates.",
+        close_id: "no",
+        close_label: "_Cancel",
+        confirm_id: "yes",
+        confirm_label: "_Refresh",
+        confirm_destructive: false,
+        confirm_suggested: true,
+        default_id: "yes",
+    }
+}
+
+fn stop_update_dialog() -> DialogCopy {
+    DialogCopy {
+        heading: "Stop This Update?",
+        body: "Stopping while packages are being installed can leave the package database incomplete. Check package history before trying again.",
+        close_id: "wait",
+        close_label: "_Keep Waiting",
+        confirm_id: "stop",
+        confirm_label: "Stop _Anyway",
+        confirm_destructive: true,
+        confirm_suggested: false,
+        default_id: "wait",
+    }
+}
 
 struct Widgets {
     window: ApplicationWindow,
+    window_title: WindowTitle,
+    /// Un-narrowed subtitle. Header paint reads [`Widgets::narrow`] so a later render keeps it hidden.
+    header_subtitle: RefCell<String>,
+    narrow: Cell<bool>,
+    header_refresh: Button,
     stack: Stack,
     toast: ToastOverlay,
     idle_page: StatusPage,
-    idle_status: Label,
     idle_btn: Button,
-    idle_btn_content: ButtonContent,
-    idle_hint: Label,
     /// True only on the first-run "Check for Updates" page, so Enter starts a check.
     focus_idle_check: Cell<bool>,
     auth_page: StatusPage,
-    check_footnote: Label,
     check_progress: ProgressBar,
     check_progress_meta: Label,
     check_progress_pct: Label,
@@ -60,23 +196,19 @@ struct Widgets {
     check_rows: RefCell<Vec<gtk::Widget>>,
     check_console_line: Label,
     check_console_full: Label,
-    ready_title: Label,
-    ready_footnote: Label,
     ready_banner: Banner,
-    ready_chips: WrapBox,
     ready_group: PreferencesGroup,
     ready_rows: RefCell<Vec<gtk::Widget>>,
-    run_title: Label,
-    run_footnote: Label,
     run_stop: Button,
     run_stall: Banner,
     run_progress: ProgressBar,
     run_progress_meta: Label,
     run_progress_pct: Label,
+    now_playing_badge: Label,
     now_playing_title: Label,
     now_playing_subtitle: Label,
+    now_playing_size: Label,
     now_playing_pct: Label,
-    now_playing_bar: ProgressBar,
     now_playing_spinner: Spinner,
     run_list_group: PreferencesGroup,
     run_list_rows: RefCell<Vec<rows::ChecklistRow>>,
@@ -89,20 +221,13 @@ struct Widgets {
     ignore_expand: Cell<bool>,
     run_console_line: Label,
     run_console_full: Label,
-    done_icon: gtk::Image,
-    done_title: Label,
-    done_subtitle: Label,
+    done_btn: Button,
+    reboot_banner: Banner,
     done_installed_scroll: gtk::ScrolledWindow,
     done_installed: PreferencesGroup,
     done_installed_rows: RefCell<Vec<gtk::Widget>>,
-    done_upgraded: Label,
-    done_failed: Label,
-    done_failed_card: gtk::Box,
-    done_reboot_lbl: Label,
-    done_reboot_card: gtk::Box,
-    reboot_box: gtk::Box,
     fail_page: StatusPage,
-    fail_detail: Label,
+    fail_retry: Button,
     /// Last byte from the backend, including a carriage-return redraw.
     /// `None` until this run paints the Running page, so auth time is not quiet time.
     last_output: Cell<Option<Instant>>,
@@ -133,16 +258,16 @@ pub fn build(app: &Application) {
 
     let widgets = Rc::new(Widgets {
         window: window.clone(),
+        window_title: obj(&builder, "window_title"),
+        header_subtitle: RefCell::new(String::new()),
+        narrow: Cell::new(false),
+        header_refresh: obj(&builder, "header_refresh"),
         stack: obj(&builder, "stack"),
         toast: obj(&builder, "toast"),
         idle_page: obj(&builder, "idle_page"),
-        idle_status: obj(&builder, "idle_status"),
         idle_btn: obj(&builder, "idle_btn"),
-        idle_btn_content: obj(&builder, "idle_btn_content"),
-        idle_hint: obj(&builder, "idle_hint"),
         focus_idle_check: Cell::new(false),
         auth_page: obj(&builder, "auth_page"),
-        check_footnote: obj(&builder, "check_footnote"),
         check_progress: obj(&builder, "check_progress"),
         check_progress_meta: obj(&builder, "check_progress_meta"),
         check_progress_pct: obj(&builder, "check_progress_pct"),
@@ -151,23 +276,19 @@ pub fn build(app: &Application) {
         check_rows: RefCell::new(Vec::new()),
         check_console_line: obj(&builder, "check_console_line"),
         check_console_full: obj(&builder, "check_console_full"),
-        ready_title: obj(&builder, "ready_title"),
-        ready_footnote: obj(&builder, "ready_footnote"),
         ready_banner: obj(&builder, "ready_banner"),
-        ready_chips: obj(&builder, "ready_chips"),
         ready_group: obj(&builder, "ready_group"),
         ready_rows: RefCell::new(Vec::new()),
-        run_title: obj(&builder, "run_title"),
-        run_footnote: obj(&builder, "run_footnote"),
         run_stop: obj(&builder, "run_stop"),
         run_stall: obj(&builder, "run_stall"),
         run_progress: obj(&builder, "run_progress"),
         run_progress_meta: obj(&builder, "run_progress_meta"),
         run_progress_pct: obj(&builder, "run_progress_pct"),
+        now_playing_badge: obj(&builder, "now_playing_badge"),
         now_playing_title: obj(&builder, "now_playing_title"),
         now_playing_subtitle: obj(&builder, "now_playing_subtitle"),
+        now_playing_size: obj(&builder, "now_playing_size"),
         now_playing_pct: obj(&builder, "now_playing_pct"),
-        now_playing_bar: obj(&builder, "now_playing_bar"),
         now_playing_spinner: obj(&builder, "now_playing_spinner"),
         run_list_group: obj(&builder, "run_list_group"),
         run_list_rows: RefCell::new(Vec::new()),
@@ -180,41 +301,56 @@ pub fn build(app: &Application) {
         ignore_expand: Cell::new(false),
         run_console_line: obj(&builder, "run_console_line"),
         run_console_full: obj(&builder, "run_console_full"),
-        done_icon: obj(&builder, "done_icon"),
-        done_title: obj(&builder, "done_title"),
-        done_subtitle: obj(&builder, "done_subtitle"),
+        done_btn: obj(&builder, "done_btn"),
+        reboot_banner: obj(&builder, "reboot_banner"),
         done_installed_scroll: obj(&builder, "done_installed_scroll"),
         done_installed: obj(&builder, "done_installed"),
         done_installed_rows: RefCell::new(Vec::new()),
-        done_upgraded: obj(&builder, "done_upgraded"),
-        done_failed: obj(&builder, "done_failed"),
-        done_failed_card: obj(&builder, "done_failed_card"),
-        done_reboot_lbl: obj(&builder, "done_reboot_lbl"),
-        done_reboot_card: obj(&builder, "done_reboot_card"),
-        reboot_box: obj(&builder, "reboot_box"),
         fail_page: obj(&builder, "fail_page"),
-        fail_detail: obj(&builder, "fail_detail"),
+        fail_retry: obj(&builder, "fail_retry"),
         last_output: Cell::new(None),
         cache_cursor: RefCell::new(None),
         reconcile_tx,
     });
 
-    let idle_btn: Button = obj(&builder, "idle_btn");
-    let ready_refresh: Button = obj(&builder, "ready_refresh");
+    let about = gio::SimpleAction::new("about", None);
+    {
+        let window = window.clone();
+        about.connect_activate(move |_, _| present_about(&window));
+    }
+    window.add_action(&about);
+
+    {
+        let widgets = widgets.clone();
+        let breakpoint: Breakpoint = obj(&builder, "narrow_breakpoint");
+        breakpoint.connect_apply(move |_| {
+            widgets.narrow.set(true);
+            apply_header_subtitle(&widgets);
+        });
+    }
+    {
+        let widgets = widgets.clone();
+        let breakpoint: Breakpoint = obj(&builder, "narrow_breakpoint");
+        breakpoint.connect_unapply(move |_| {
+            widgets.narrow.set(false);
+            apply_header_subtitle(&widgets);
+        });
+    }
+
+    let idle_btn = widgets.idle_btn.clone();
+    let header_refresh = widgets.header_refresh.clone();
     let ready_update: Button = obj(&builder, "ready_update");
     let auth_cancel: Button = obj(&builder, "auth_cancel");
-    let reboot_btn: Button = obj(&builder, "reboot_btn");
-    let done_btn: Button = obj(&builder, "done_btn");
+    let done_btn = widgets.done_btn.clone();
     let done_log_btn: Button = obj(&builder, "done_log_btn");
-    let fail_retry: Button = obj(&builder, "fail_retry");
+    let fail_retry = widgets.fail_retry.clone();
     let fail_log: Button = obj(&builder, "fail_log");
-    let fail_back: Button = obj(&builder, "fail_back");
     let check_console_toggle: Button = obj(&builder, "check_console_toggle");
     let check_console_reveal: Revealer = obj(&builder, "check_console_reveal");
-    let check_console_chevron: Label = obj(&builder, "check_console_chevron");
+    let check_console_chevron: gtk::Image = obj(&builder, "check_console_chevron");
     let run_console_toggle: Button = obj(&builder, "run_console_toggle");
     let run_console_reveal: Revealer = obj(&builder, "run_console_reveal");
-    let run_console_chevron: Label = obj(&builder, "run_console_chevron");
+    let run_console_chevron: gtk::Image = obj(&builder, "run_console_chevron");
 
     wire_console(
         &check_console_toggle,
@@ -251,7 +387,7 @@ pub fn build(app: &Application) {
         let state = state.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
-        ready_refresh.connect_clicked(move |_| {
+        header_refresh.connect_clicked(move |_| {
             start_check(&state, &widgets, tx.clone(), false);
         });
     }
@@ -352,16 +488,10 @@ pub fn build(app: &Application) {
     {
         let tx = tx.clone();
         let widgets = widgets.clone();
-        reboot_btn.connect_clicked(move |_| {
+        let banner = widgets.reboot_banner.clone();
+        banner.connect_button_clicked(move |_| {
             widgets.toast.add_toast(Toast::new("Rebooting…"));
             run_systemctl_reboot(tx.clone());
-        });
-    }
-    {
-        let state = state.clone();
-        let widgets = widgets.clone();
-        fail_back.connect_clicked(move |_| {
-            dispatch(&state, &widgets, Event::ResetToIdle { message: None });
         });
     }
 
@@ -463,22 +593,25 @@ fn prompt_stale_update_list(
     state: &Rc<RefCell<AppState>>,
     tx: async_channel::Sender<WorkerEvent>,
 ) {
-    let dialog = libadwaita::AlertDialog::new(Some(STALE_UPDATE_LIST_PROMPT), None);
-    dialog.set_prefer_wide_layout(true);
-    dialog.add_response("no", "No");
-    dialog.add_response("yes", "Yes");
-    dialog.set_response_appearance("yes", libadwaita::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("yes"));
-    dialog.set_close_response("no");
+    let copy = stale_update_dialog();
+    let dialog = build_dialog(&copy);
 
     let state = state.clone();
     let widgets_for_cb = widgets.clone();
     dialog.connect_response(None, move |_dialog, response| {
-        if response == "yes" {
+        if response == copy.confirm_id {
             start_check(&state, &widgets_for_cb, tx.clone(), true);
         }
     });
     dialog.present(Some(&widgets.window));
+}
+
+fn present_about(parent: &impl IsA<gtk::Widget>) {
+    let dialog = libadwaita::AboutDialog::new();
+    dialog.set_application_name(ABOUT_NAME);
+    dialog.set_version(env!("CARGO_PKG_VERSION"));
+    dialog.set_comments(ABOUT_COMMENTS);
+    dialog.present(Some(parent));
 }
 
 fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
@@ -486,7 +619,6 @@ fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
     let win: AdwWindow = obj(&builder, "log_window");
     let view: TextView = obj(&builder, "log_view");
     let copy_btn: Button = obj(&builder, "copy_btn");
-    let close_btn: Button = obj(&builder, "close_btn");
 
     if let Some(parent_win) = parent.root().and_downcast::<gtk::Window>() {
         win.set_transient_for(Some(&parent_win));
@@ -502,10 +634,17 @@ fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
         }
     });
     {
-        let win = win.clone();
-        close_btn.connect_clicked(move |_| {
-            win.close();
+        let esc_win = win.clone();
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gtk::gdk::Key::Escape {
+                esc_win.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
         });
+        win.add_controller(key);
     }
 
     win.present();
@@ -619,19 +758,93 @@ fn handle_worker(
     }
 }
 
-fn wire_console(toggle: &Button, reveal: &Revealer, chevron: &Label) {
+fn wire_console(toggle: &Button, reveal: &Revealer, chevron: &gtk::Image) {
     let reveal = reveal.clone();
     let chevron = chevron.clone();
     toggle.connect_clicked(move |_| {
         let open = !reveal.reveals_child();
         reveal.set_reveal_child(open);
-        chevron.set_text(if open { "▾" } else { "▸" });
-        if open {
-            chevron.add_css_class("console-open");
+        chevron.set_icon_name(Some(if open {
+            "pan-down-symbolic"
         } else {
-            chevron.remove_css_class("console-open");
-        }
+            "pan-end-symbolic"
+        }));
     });
+}
+
+fn paint_header(w: &Widgets, view: HeaderView<'_>) {
+    let full = window_header(view, false);
+    *w.header_subtitle.borrow_mut() = full.subtitle;
+    w.window_title.set_title(&full.title);
+    apply_header_subtitle(w);
+}
+
+fn apply_header_subtitle(w: &Widgets) {
+    let subtitle = if w.narrow.get() {
+        String::new()
+    } else {
+        w.header_subtitle.borrow().clone()
+    };
+    w.window_title.set_subtitle(&subtitle);
+}
+
+fn paint_stop_button(button: &Button, pass: RunPass) {
+    if pass == RunPass::Apply {
+        button.set_label("Stop…");
+        button.add_css_class("destructive-action");
+    } else {
+        button.set_label("Stop");
+        button.remove_css_class("destructive-action");
+    }
+}
+
+fn paint_source_badge(label: &Label, package: Option<&Package>) {
+    label.remove_css_class("package-badge");
+    label.remove_css_class("src-dnf");
+    label.remove_css_class("src-flatpak");
+    label.remove_css_class("src-firmware");
+    if let Some(package) = package {
+        label.set_label(package.source.badge());
+        label.add_css_class("package-badge");
+        label.add_css_class(package.source.css_class());
+        label.set_visible(true);
+    } else {
+        label.set_visible(false);
+    }
+}
+
+fn current_package<'a>(
+    packages: &'a [Package],
+    active_index: Option<usize>,
+    current_name: Option<&str>,
+) -> Option<&'a Package> {
+    if let Some(package) = active_index.and_then(|index| packages.get(index)) {
+        if !package.status.is_done() {
+            return Some(package);
+        }
+    }
+    let name = current_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?;
+    packages
+        .iter()
+        .find(|package| package.name == name && !package.status.is_done())
+}
+
+fn build_dialog(copy: &DialogCopy) -> libadwaita::AlertDialog {
+    let dialog = libadwaita::AlertDialog::new(Some(copy.heading), Some(copy.body));
+    dialog.add_response(copy.close_id, copy.close_label);
+    dialog.add_response(copy.confirm_id, copy.confirm_label);
+    if copy.confirm_destructive {
+        dialog
+            .set_response_appearance(copy.confirm_id, libadwaita::ResponseAppearance::Destructive);
+    }
+    if copy.confirm_suggested {
+        dialog.set_response_appearance(copy.confirm_id, libadwaita::ResponseAppearance::Suggested);
+    }
+    dialog.set_default_response(Some(copy.default_id));
+    dialog.set_close_response(copy.close_id);
+    dialog
 }
 
 fn obj<T: IsA<glib::Object>>(builder: &Builder, id: &str) -> T {
@@ -652,11 +865,7 @@ fn maybe_open_preview_completed(w: &Widgets) {
 }
 
 fn finished_row(package: &Package) -> libadwaita::ActionRow {
-    if package.status == fedora_updater::PackageStatus::Completed {
-        rows::completed_row(package)
-    } else {
-        rows::package_row(package, true)
-    }
+    rows::finished_row(package)
 }
 
 fn restore_default_window_size(window: &ApplicationWindow) {
@@ -755,7 +964,13 @@ fn paint_quiet_chrome(
     if let Some(note) = &quiet.footnote {
         foot = note.clone();
     }
-    w.run_footnote.set_text(&foot);
+    paint_header(
+        w,
+        HeaderView::Running {
+            heading: &w.window_title.title(),
+            footnote: &foot,
+        },
+    );
 
     if quiet.show_spinner || work_progress.is_none() {
         w.now_playing_spinner.set_opacity(1.0);
@@ -973,20 +1188,13 @@ fn handle_install_check(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, ch
 }
 
 fn prompt_stop_during_transaction(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppState>>) {
-    let dialog = libadwaita::AlertDialog::new(
-        Some("Stop this update?"),
-        Some("Stopping dnf while it is applying packages can leave the rpm database half-applied. Check dnf history before running Update All again."),
-    );
-    dialog.add_response("wait", "Keep waiting");
-    dialog.add_response("stop", "Stop anyway");
-    dialog.set_response_appearance("stop", libadwaita::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("wait"));
-    dialog.set_close_response("wait");
+    let copy = stop_update_dialog();
+    let dialog = build_dialog(&copy);
 
     let state = state.clone();
     let widgets_for_cb = widgets.clone();
     dialog.connect_response(None, move |_dialog, response| {
-        if response != "stop" {
+        if response != copy.confirm_id {
             return;
         }
         let during = matches!(
@@ -1027,12 +1235,10 @@ fn render_running(
     full_console: &str,
 ) {
     w.stack.set_visible_child_name("running");
-    w.run_title.set_text(run_heading(phase_label, pass));
-    if pass == RunPass::Apply {
-        w.run_progress.add_css_class("stage-apply");
-    } else {
-        w.run_progress.remove_css_class("stage-apply");
-    }
+    w.header_refresh.set_visible(false);
+    w.run_stop.set_visible(true);
+    paint_stop_button(&w.run_stop, pass);
+    w.window_title.set_title(run_heading(phase_label, pass));
     let package_done = packages.iter().filter(|p| p.status.is_done()).count();
     let (done, total) = match stage {
         Some(StageCount { current, total }) if total > 0 => (current as usize, total as usize),
@@ -1053,15 +1259,20 @@ fn render_running(
         &subtitle
     });
     w.now_playing_subtitle.set_visible(true);
-    w.now_playing_bar.set_visible(true);
+    let playing = current_package(packages, active_index, current_name);
+    paint_source_badge(&w.now_playing_badge, playing);
+    if let Some(size) = playing.and_then(|package| package.size.as_deref()) {
+        w.now_playing_size.set_text(size);
+        w.now_playing_size.set_visible(true);
+    } else {
+        w.now_playing_size.set_visible(false);
+    }
     if let Some(frac) = work_progress {
         let frac = frac.clamp(0.0, 1.0);
         w.now_playing_spinner.set_opacity(0.0);
-        w.now_playing_bar.set_fraction(frac);
         w.now_playing_pct.set_text(&format!("{:.0}%", frac * 100.0));
     } else {
         w.now_playing_spinner.set_opacity(1.0);
-        w.now_playing_bar.set_fraction(0.0);
         w.now_playing_pct.set_text("");
     }
 
@@ -1229,6 +1440,10 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         return;
     }
 
+    w.header_refresh
+        .set_visible(matches!(s.phase, Phase::Ready { .. }));
+    w.run_stop.set_visible(false);
+
     match &s.phase {
         Phase::Idle(screen) => {
             clear_running_lists(w);
@@ -1238,8 +1453,7 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             let chrome = idle_chrome(screen);
             w.idle_page.set_title(chrome.title);
             w.idle_page.set_icon_name(Some(chrome.icon));
-            w.idle_btn_content.set_label(chrome.button);
-            w.idle_btn_content.set_icon_name(chrome.button_icon);
+            w.idle_btn.set_label(chrome.button);
             if chrome.suggested {
                 w.idle_btn.add_css_class("suggested-action");
             } else {
@@ -1255,18 +1469,17 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             } else {
                 w.idle_btn.remove_css_class("flat");
             }
-            w.idle_hint.set_visible(chrome.hint_visible);
             w.idle_page.set_description(chrome.description.as_deref());
-            w.idle_status.set_text(&chrome.footer);
+            paint_header(w, HeaderView::Idle);
             if matches!(screen, IdleScreen::Fresh) {
                 arm_idle_check_focus(w);
             }
         }
         Phase::Authenticating { purpose, .. } => {
             w.stack.set_visible_child_name("auth");
-            w.auth_page.set_description(Some(&format!(
-                "A system dialog will ask for your password once for this app session so it can {purpose} via a privileged helper"
-            )));
+            w.auth_page.set_title("Authentication Required");
+            w.auth_page.set_description(Some(AUTH_DESCRIPTION));
+            paint_header(w, HeaderView::Authenticating(*purpose));
         }
         Phase::Checking {
             packages_so_far,
@@ -1275,11 +1488,9 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         } => {
             w.stack.set_visible_child_name("checking");
             let (_step, frac, groups_done, status) = check_progress(checked_sources);
-            let mut foot = format!("{groups_done} of 3 sources");
-            if let Some(eta) = about_time_left(elapsed, frac) {
-                foot = format!("{eta} · {foot}");
-            }
-            w.check_footnote.set_text(&foot);
+            let eta = about_time_left(elapsed, frac);
+            let foot = checking_footnote(groups_done, eta.as_deref());
+            paint_header(w, HeaderView::Checking { footnote: &foot });
             w.check_progress.set_fraction(frac);
             w.check_progress_meta.set_text(status);
             w.check_progress_pct
@@ -1301,49 +1512,23 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             soft_errors,
         } => {
             w.stack.set_visible_child_name("ready");
-            let n = packages.len();
-            w.ready_title.set_text(&format!(
-                "{n} update{} available",
-                if n == 1 { "" } else { "s" }
-            ));
-            let (dnf, fp, fw) = count_by_source(packages);
-            w.ready_footnote.set_text(&source_summary_line(packages));
+            let summary = source_summary_line(packages);
+            paint_header(
+                w,
+                HeaderView::Ready {
+                    count: packages.len(),
+                    summary: &summary,
+                },
+            );
 
             if soft_errors.is_empty() {
                 w.ready_banner.set_revealed(false);
             } else {
-                w.ready_banner.set_title(&soft_errors.join(" · "));
-                w.ready_banner.set_button_label(Some("View log"));
+                w.ready_banner
+                    .set_title(&soft_error_banner_title(soft_errors.len()));
+                w.ready_banner.set_button_label(Some("View Log"));
                 w.ready_banner.set_revealed(true);
             }
-
-            let (sec, bug, enh) = count_by_kind(packages);
-            let mut chips = Vec::new();
-            let dnf_s = format!("{dnf} system");
-            let fp_s = format!("{fp} apps");
-            let fw_s = format!("{fw} firmware");
-            let sec_s = format!("{sec} security");
-            let bug_s = format!("{bug} bugfix");
-            let enh_s = format!("{enh} enhancement");
-            if dnf > 0 {
-                chips.push((dnf_s.as_str(), "src-dnf"));
-            }
-            if fp > 0 {
-                chips.push((fp_s.as_str(), "src-flatpak"));
-            }
-            if fw > 0 {
-                chips.push((fw_s.as_str(), "src-firmware"));
-            }
-            if sec > 0 {
-                chips.push((sec_s.as_str(), "security"));
-            }
-            if bug > 0 {
-                chips.push((bug_s.as_str(), "bugfix"));
-            }
-            if enh > 0 {
-                chips.push((enh_s.as_str(), "enhance"));
-            }
-            rows::refill_chips(&w.ready_chips, &chips);
 
             rows::refill_group(
                 &w.ready_group,
@@ -1370,33 +1555,27 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 .filter(|p| p.status == fedora_updater::PackageStatus::Completed)
                 .count();
             let (dnf, fp, fw) = count_by_source(packages);
-            if *failed > 0 {
-                w.done_title.set_text("Updates finished with problems");
-                w.done_icon.set_icon_name(Some("dialog-warning-symbolic"));
-                w.done_subtitle.set_text(&format!(
-                    "{upgraded} applied · {failed} failed · {duration}"
-                ));
-                w.done_failed.add_css_class("error");
-                w.done_failed_card.add_css_class("error");
-            } else {
-                w.done_title.set_text("All updates applied");
-                w.done_icon.set_icon_name(Some("object-select-symbolic"));
-                w.done_subtitle.set_text(&format!(
-                    "{upgraded} upgraded · {dnf} system / {fp} apps / {fw} firmware · {duration}"
-                ));
-                w.done_failed.remove_css_class("error");
-                w.done_failed_card.remove_css_class("error");
-            }
-            w.done_upgraded.set_text(&upgraded.to_string());
-            w.done_failed.set_text(&failed.to_string());
-            w.done_reboot_lbl
-                .set_text(if *needs_reboot { "1" } else { "0" });
+            let subtitle = done_header_subtitle(*failed, upgraded, dnf, fp, fw, duration);
+            paint_header(
+                w,
+                HeaderView::Done {
+                    failed: *failed > 0,
+                    subtitle: &subtitle,
+                },
+            );
             if *needs_reboot {
-                w.done_reboot_card.add_css_class("warn");
+                w.reboot_banner
+                    .set_button_style(libadwaita::BannerButtonStyle::Suggested);
+                w.reboot_banner.set_revealed(true);
+                w.done_btn.remove_css_class("suggested-action");
+                w.done_btn.remove_css_class("pill");
             } else {
-                w.done_reboot_card.remove_css_class("warn");
+                w.reboot_banner
+                    .set_button_style(libadwaita::BannerButtonStyle::Default);
+                w.reboot_banner.set_revealed(false);
+                w.done_btn.add_css_class("suggested-action");
+                w.done_btn.remove_css_class("pill");
             }
-            w.reboot_box.set_visible(*needs_reboot);
             w.done_installed
                 .set_title(if *failed > 0 { "Finished" } else { "Installed" });
             let mut listed: Vec<&fedora_updater::Package> = packages.iter().collect();
@@ -1412,15 +1591,19 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             );
             w.done_installed_scroll.set_visible(!packages.is_empty());
         }
-        Phase::Failed { title, detail, .. } => {
+        Phase::Failed {
+            title,
+            detail,
+            retry,
+        } => {
             clear_running_lists(w);
             restore_default_window_size(&w.window);
             w.stack
                 .set_visible_child_full("failed", gtk::StackTransitionType::None);
+            paint_header(w, HeaderView::Failed);
             w.fail_page.set_title(title);
-            w.fail_page.set_description(None);
-            w.fail_detail.set_text(detail);
-            w.fail_detail.set_visible(!detail.is_empty());
+            w.fail_page.set_description(Some(detail));
+            w.fail_retry.set_label(fail_retry_label(*retry));
         }
     }
 }
@@ -1431,37 +1614,69 @@ mod tests {
     fn window_template_has_adwaita_pages() {
         let xml = super::WINDOW_UI;
         for id in [
+            "window_title",
+            "header_menu",
+            "header_refresh",
             "idle_page",
             "auth_page",
             "check_group",
+            "check_console_toggle",
             "ready_banner",
-            "ready_chips",
             "ready_group",
-            "now_playing",
-            "run_title",
+            "ready_update",
+            "current_package",
             "run_stop",
             "run_stall",
             "now_playing_title",
             "run_list_scroll",
             "run_list_group",
             "run_completed",
-            "done_title",
-            "done_icon",
-            "done_subtitle",
+            "run_console_toggle",
             "done_installed",
             "done_installed_scroll",
+            "done_btn",
+            "done_log_btn",
+            "reboot_banner",
             "fail_page",
-            "reboot_btn",
+            "narrow_breakpoint",
         ] {
             assert!(
                 xml.contains(&format!("id=\"{id}\"")),
                 "window.ui missing id={id}"
             );
         }
+        for gone in [
+            "ready_chips",
+            "done_icon",
+            "reboot_btn",
+            "now_playing",
+            "close_btn",
+            "fail_back",
+            "idle_hint",
+        ] {
+            assert!(
+                !xml.contains(&format!("id=\"{gone}\"")),
+                "window.ui still has id={gone}"
+            );
+        }
         assert!(xml.contains("AdwPreferencesGroup"));
         assert!(xml.contains("AdwBanner"));
         assert!(xml.contains("AdwStatusPage"));
         assert!(xml.contains("AdwSpinner"));
+        assert!(xml.contains("max-width: 500px"));
+        assert!(xml.contains("About Fedora Updater"));
+        assert!(xml.contains("Main Menu"));
+        assert!(xml.contains("Update All"));
+        assert!(xml.contains("View Full Log"));
+        assert!(xml.contains("View Log"));
+        assert!(xml.contains("Waiting for authentication"));
+        assert!(xml.contains("Nothing is applied until Update All is chosen"));
+        assert!(
+            !xml.contains("Waiting for polkit"),
+            "auth spinner line is Waiting for authentication"
+        );
+        assert!(!xml.contains("Keyboard Shortcuts"));
+        assert!(!xml.contains("One password prompt"));
         assert!(
             xml.contains("vhomogeneous"),
             "stack must size every page to the window so Done/Idle fill after apply"
@@ -1470,28 +1685,24 @@ mod tests {
             xml.contains("id=\"idle_page\"") && xml.contains("vexpand"),
             "idle status page must expand to fill the stack"
         );
-        assert!(
-            !xml.contains("One password prompt"),
-            "the idle page hint already covers what the check looks at"
-        );
         let installed_at = xml.find("id=\"done_installed\"").expect("done_installed");
         let done_btn_at = xml.find("id=\"done_btn\"").expect("done_btn");
         assert!(
             installed_at < done_btn_at,
             "installed list sits above the summary actions"
         );
-        let now_at = xml.find("id=\"now_playing\"").expect("now_playing");
+        let card_at = xml.find("id=\"current_package\"").expect("current_package");
         let stall_at = xml.find("id=\"run_stall\"").expect("run_stall");
         let scroll_at = xml.find("id=\"run_list_scroll\"").expect("run_list_scroll");
         let list_at = xml.find("id=\"run_list_group\"").expect("run_list_group");
         let completed_at = xml.find("id=\"run_completed\"").expect("run_completed");
         assert!(
-            stall_at < now_at,
-            "stall banner sits above the now-playing card"
+            stall_at < card_at,
+            "stall banner sits above the current-package card"
         );
         assert!(
-            now_at < scroll_at,
-            "now-playing card must stay sticky above the checklist scroll"
+            card_at < scroll_at,
+            "current-package card must stay sticky above the checklist scroll"
         );
         assert!(
             scroll_at < list_at && list_at < completed_at,
@@ -1506,6 +1717,11 @@ mod tests {
             completed_at > xml.find("id=\"run_list_scroll\"").unwrap(),
             "completed expander must not live inside the remaining-work scroll"
         );
+        let blp = include_str!("window.blp");
+        assert!(!blp.contains("margin-start: 16"));
+        assert!(!blp.contains("margin-end: 16"));
+        assert!(blp.contains("margin-start: 12"));
+        assert!(blp.contains("margin-end: 12"));
     }
 
     #[test]
@@ -1513,6 +1729,227 @@ mod tests {
         let xml = super::LOG_WINDOW_UI;
         assert!(xml.contains("id=\"log_view\""));
         assert!(xml.contains("id=\"copy_btn\""));
+        assert!(xml.contains("Copy All"));
+        assert!(xml.contains("Full Log"));
+        assert!(
+            !xml.contains("id=\"close_btn\""),
+            "header close and Esc close the log window"
+        );
+        assert!(!xml.contains("Copy all"));
+        assert!(!xml.contains("Full log"));
+    }
+
+    #[test]
+    fn rows_and_stylesheet_drop_removed_chrome() {
+        let rows = include_str!("rows.rs");
+        let css = include_str!("../style.css");
+        for token in [
+            "sev-dot",
+            "dim-label",
+            "stage-apply",
+            ".chip",
+            ".stat-card",
+            ".reboot-card",
+            ".now-playing",
+            ".status-footer",
+            ".status-dot",
+        ] {
+            assert!(!rows.contains(token), "rows.rs still has {token}");
+            assert!(!css.contains(token), "style.css still has {token}");
+        }
+        assert!(css.contains(".package-badge.src-flatpak"));
+        assert!(css.contains("@purple_1"));
+        assert!(css.contains("opacity: 0.72"));
+        assert!(css.contains("opacity: 0.82"));
+        assert!(css.contains("margin: 0 12px 12px"));
+        assert!(rows.contains("package-badge"));
+        assert!(!rows.contains("object-select-symbolic"));
+    }
+
+    #[test]
+    fn header_titles_follow_the_phase_table() {
+        use fedora_updater::model::{run_heading, AuthPurpose, RunPass};
+
+        let cases = [
+            (super::HeaderView::Idle, "Fedora Updater", ""),
+            (
+                super::HeaderView::Authenticating(AuthPurpose::Check),
+                "Fedora Updater",
+                "Checking for updates",
+            ),
+            (
+                super::HeaderView::Authenticating(AuthPurpose::Apply),
+                "Fedora Updater",
+                "Applying updates",
+            ),
+            (
+                super::HeaderView::Checking {
+                    footnote: "2 of 3 sources",
+                },
+                "Checking for Updates",
+                "2 of 3 sources",
+            ),
+            (
+                super::HeaderView::Checking {
+                    footnote: "about 1 minute · 1 of 3 sources",
+                },
+                "Checking for Updates",
+                "about 1 minute · 1 of 3 sources",
+            ),
+            (
+                super::HeaderView::Ready {
+                    count: 1,
+                    summary: "1 system · 0 apps · 0 firmware",
+                },
+                "1 Update Available",
+                "1 system · 0 apps · 0 firmware",
+            ),
+            (
+                super::HeaderView::Ready {
+                    count: 4,
+                    summary: "2 system · 2 apps · 0 firmware",
+                },
+                "4 Updates Available",
+                "2 system · 2 apps · 0 firmware",
+            ),
+            (
+                super::HeaderView::Running {
+                    heading: "Downloading",
+                    footnote: "System · 4 of 19 downloaded",
+                },
+                "Downloading",
+                "System · 4 of 19 downloaded",
+            ),
+            (
+                super::HeaderView::Done {
+                    failed: false,
+                    subtitle: "12 upgraded · 10 system / 2 apps / 0 firmware · 4 minutes",
+                },
+                "All Updates Applied",
+                "12 upgraded · 10 system / 2 apps / 0 firmware · 4 minutes",
+            ),
+            (
+                super::HeaderView::Done {
+                    failed: true,
+                    subtitle: "8 applied · 1 failed · 4 minutes",
+                },
+                "Updates Finished With Problems",
+                "8 applied · 1 failed · 4 minutes",
+            ),
+            (super::HeaderView::Failed, "Fedora Updater", ""),
+        ];
+        for (view, title, subtitle) in cases {
+            let wide = super::window_header(view, false);
+            assert_eq!(wide.title, title);
+            assert_eq!(wide.subtitle, subtitle);
+            assert_ne!(wide.subtitle, "Waiting for authentication");
+            let narrow = super::window_header(view, true);
+            assert_eq!(narrow.title, title);
+            assert_eq!(narrow.subtitle, "");
+        }
+
+        for pass in [RunPass::Download, RunPass::Apply] {
+            for label in [
+                "",
+                "Downloading",
+                "Installing packages",
+                "Verifying",
+                "transaction",
+                "Updating",
+            ] {
+                let heading = run_heading(label, pass);
+                let chrome = super::window_header(
+                    super::HeaderView::Running {
+                        heading,
+                        footnote: "System · 1 of 2 downloaded",
+                    },
+                    false,
+                );
+                assert_ne!(chrome.title, "Installing");
+                assert_eq!(chrome.title, heading);
+            }
+        }
+        assert_eq!(
+            super::done_header_subtitle(0, 12, 10, 2, 0, "4 minutes"),
+            "12 upgraded · 10 system / 2 apps / 0 firmware · 4 minutes"
+        );
+        assert_eq!(
+            super::done_header_subtitle(1, 8, 8, 0, 0, "4 minutes"),
+            "8 applied · 1 failed · 4 minutes"
+        );
+        assert_eq!(super::checking_footnote(2, None), "2 of 3 sources");
+        assert_eq!(
+            super::checking_footnote(1, Some("about 1 minute")),
+            "about 1 minute · 1 of 3 sources"
+        );
+        assert_eq!(
+            super::soft_error_banner_title(1),
+            "1 source could not be checked"
+        );
+        assert_eq!(
+            super::soft_error_banner_title(3),
+            "3 sources could not be checked"
+        );
+        assert_eq!(
+            super::ABOUT_COMMENTS,
+            "A desktop front-end for Fedora system, Flatpak, and firmware updates"
+        );
+        assert_eq!(super::ABOUT_NAME, "Fedora Updater");
+        assert!(!super::ABOUT_COMMENTS.contains("polished"));
+        assert_eq!(
+            super::AUTH_DESCRIPTION,
+            "A system dialog asks for an administrator password. The password is not stored in this window."
+        );
+        assert_ne!(
+            super::window_header(super::HeaderView::Authenticating(AuthPurpose::Check), false)
+                .subtitle,
+            "Waiting for authentication"
+        );
+    }
+
+    #[test]
+    fn alert_dialogs_use_the_accepted_copy() {
+        let stale = super::stale_update_dialog();
+        assert_eq!(stale.heading, "Refresh Update List?");
+        assert_eq!(
+            stale.body,
+            "This list is more than a day old. Refresh it before applying these updates."
+        );
+        assert_eq!(stale.close_id, "no");
+        assert_eq!(stale.close_label, "_Cancel");
+        assert_eq!(stale.confirm_id, "yes");
+        assert_eq!(stale.confirm_label, "_Refresh");
+        assert!(stale.confirm_suggested);
+        assert!(!stale.confirm_destructive);
+        assert_eq!(stale.default_id, "yes");
+        assert_eq!(stale.default_id, stale.confirm_id);
+        assert_ne!(stale.default_id, stale.close_id);
+
+        let stop = super::stop_update_dialog();
+        assert_eq!(stop.heading, "Stop This Update?");
+        assert_eq!(
+            stop.body,
+            "Stopping while packages are being installed can leave the package database incomplete. Check package history before trying again."
+        );
+        assert_eq!(stop.close_id, "wait");
+        assert_eq!(stop.close_label, "_Keep Waiting");
+        assert_eq!(stop.confirm_id, "stop");
+        assert_eq!(stop.confirm_label, "Stop _Anyway");
+        assert!(stop.confirm_destructive);
+        assert!(!stop.confirm_suggested);
+        assert_eq!(stop.default_id, "wait");
+        assert_eq!(stop.default_id, stop.close_id);
+        assert_ne!(stop.default_id, stop.confirm_id);
+    }
+
+    #[test]
+    fn fail_retry_label_follows_the_action() {
+        use fedora_updater::model::RetryAction;
+        assert_eq!(
+            super::fail_retry_label(RetryAction::CheckAgain),
+            "Check Again"
+        );
+        assert_eq!(super::fail_retry_label(RetryAction::Reboot), "Restart");
     }
 
     fn running_after_session_ready() -> fedora_updater::state::AppState {
