@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fedora Updater — libadwaita 1.10 audit</title>
+<style>
+  :root {
+    --doc-bg: #eceae6;
+    --doc-fg: #241f31;
+    --doc-dim: rgba(36, 31, 49, 0.68);
+    --doc-card: #fff;
+    --doc-line: rgba(0, 0, 0, 0.12);
+    --accent: #3584e4;
+    --accent-fg: #fff;
+    --destructive: #e01b24;
+    --ok: #1a7f37;
+    --warn: #c64600;
+    --err: #c01c28;
+    --win: #fafafa;
+    --fg: rgba(0, 0, 0, 0.8);
+    --dim: rgba(0, 0, 0, 0.55);
+    --card: #fff;
+    --border: rgba(0, 0, 0, 0.12);
+    --view: #fff;
+    --purple-1: #dc8add;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 12px 32px rgba(0, 0, 0, 0.12);
+    font-family: Cantarell, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--doc-bg);
+    color: var(--doc-fg);
+    line-height: 1.45;
+  }
+  header.top, main { max-width: 1180px; margin: 0 auto; padding: 28px 20px; }
+  header.top { padding-bottom: 8px; }
+  h1 { font-size: 1.7rem; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h2 { font-size: 1.25rem; margin: 0 0 8px; }
+  h3 { font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 10px; color: var(--doc-dim); }
+  p { margin: 0 0 10px; }
+  a { color: #1c71d8; }
+  code { font-family: ui-monospace, monospace; font-size: 0.88em; }
+  .lede { max-width: 78ch; color: var(--doc-dim); }
+  .note, .okbox {
+    background: var(--doc-card);
+    border: 1px solid var(--doc-line);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin: 14px 0;
+  }
+  .okbox h2, .note h2 { font-size: 1rem; }
+  .okbox ul, .note ul { margin: 6px 0 0; padding-left: 18px; }
+  table { width: 100%; border-collapse: collapse; background: var(--doc-card); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--doc-line); vertical-align: top; font-size: 0.94rem; }
+  th { font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--doc-dim); }
+  tr:last-child td { border-bottom: 0; }
+  .pri { font-weight: 700; font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; }
+  .pri.high { color: var(--err); }
+  .pri.med { color: var(--warn); }
+  nav.tabs {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; gap: 6px; flex-wrap: wrap;
+    background: rgba(236, 234, 230, 0.94);
+    backdrop-filter: blur(8px);
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--doc-line);
+    max-width: 1180px; margin: 0 auto;
+  }
+  nav.tabs button {
+    border: 1px solid var(--doc-line);
+    background: var(--doc-card);
+    border-radius: 999px;
+    padding: 6px 10px;
+    font: inherit;
+    font-size: 0.82rem;
+    cursor: pointer;
+    color: var(--doc-fg);
+  }
+  nav.tabs button[aria-selected="true"] {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .panel[hidden] { display: none; }
+  .cite { font-size: 0.88rem; color: var(--doc-dim); margin-bottom: 14px; max-width: 85ch; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; }
+  @media (max-width: 980px) { .pair { grid-template-columns: 1fr; } }
+  .win {
+    width: min(100%, 460px);
+    background: var(--win);
+    color: var(--fg);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    min-height: 520px;
+    display: flex;
+    flex-direction: column;
+    font-size: 13.5px;
+  }
+  .win.short { min-height: 0; }
+  .win.narrow { width: 280px; min-height: 420px; }
+  .hb {
+    min-height: 46px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px 4px 10px;
+  }
+  .hb .side { display: flex; gap: 4px; align-items: center; min-width: 36px; }
+  .hb .side.end { justify-content: flex-end; }
+  .wtitle { text-align: center; font-weight: 700; line-height: 1.15; }
+  .wtitle small { display: block; font-weight: 400; color: var(--dim); font-size: 11px; }
+  .close, .iconbtn, .menu {
+    width: 28px; height: 28px; border-radius: 8px;
+    display: grid; place-items: center; color: var(--fg);
+  }
+  .close { font-size: 15px; opacity: 0.75; }
+  .content { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .status {
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; padding: 24px 28px 16px; gap: 8px;
+  }
+  .glyph {
+    width: 72px; height: 72px; border-radius: 18px;
+    display: grid; place-items: center; color: var(--dim); margin-bottom: 4px;
+  }
+  .status h4, .block h4 { margin: 0; font-size: 1.35rem; font-weight: 800; letter-spacing: -0.02em; }
+  .status .desc, .muted { color: var(--dim); font-size: 12.5px; max-width: 36ch; }
+  .accent-text { color: var(--accent); font-weight: 600; }
+  .rowline { display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    border-radius: 8px; padding: 6px 12px; background: rgba(0, 0, 0, 0.06);
+    font-weight: 700; font-size: 13px; white-space: nowrap;
+  }
+  .btn.pill { border-radius: 999px; padding: 8px 16px; }
+  .btn.suggested { background: var(--accent); color: var(--accent-fg); }
+  .btn.destructive { background: var(--destructive); color: white; }
+  .btn.flat { background: transparent; font-weight: 600; color: var(--fg); }
+  .btn.icononly { width: 32px; height: 32px; padding: 0; border-radius: 8px; background: transparent; }
+  .footer {
+    display: flex; gap: 8px; align-items: center;
+    margin: 8px 16px 12px; padding-top: 8px;
+    border-top: 1px solid rgba(0, 0, 0, 0.08);
+    color: var(--dim); font-size: 12px;
+  }
+  .dotg { color: #2ec27e; font-size: 9px; }
+  .pagehead {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px 8px;
+  }
+  .pagehead .grow { flex: 1; min-width: 0; }
+  .pagehead strong { display: block; font-size: 1.15rem; }
+  .pagehead span, .cap { color: var(--dim); font-size: 12px; }
+  .progress { height: 6px; border-radius: 99px; background: rgba(0, 0, 0, 0.1); margin: 0 16px; overflow: hidden; }
+  .progress > i { display: block; height: 100%; background: var(--accent); border-radius: 99px; }
+  .progress.apply > i { background: #2ec27e; }
+  .meta { display: flex; justify-content: space-between; padding: 6px 16px 8px; color: var(--dim); font-size: 12px; gap: 8px; }
+  .group { margin: 4px 16px 10px; }
+  .glabel { font-weight: 700; font-size: 12.5px; margin: 4px 2px 6px; }
+  .list { background: var(--card); border-radius: 12px; box-shadow: 0 0 0 1px var(--border); overflow: hidden; }
+  .prow {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center;
+    padding: 8px 12px; border-top: 1px solid rgba(0, 0, 0, 0.06);
+  }
+  .prow:first-child { border-top: 0; }
+  .prow b { display: block; font-weight: 650; }
+  .prow small { color: var(--dim); }
+  .prow.pending { opacity: 0.72; }
+  .badge {
+    min-width: 2.2em; text-align: center; font-size: 10px; font-weight: 800;
+    padding: 3px 5px; border-radius: 7px; background: rgba(53, 132, 228, 0.15); color: var(--accent);
+  }
+  .badge.fp { background: rgba(220, 138, 221, 0.18); color: #dc8add; }
+  .badge.fw { background: rgba(229, 165, 10, 0.18); color: #c64600; }
+  .sev { width: 7px; height: 7px; border-radius: 99px; background: var(--accent); }
+  .sev.sec { background: var(--err); }
+  .sev.enh { background: #c061cb; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 16px 8px; }
+  .chip {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid rgba(0, 0, 0, 0.12); background: rgba(53, 132, 228, 0.12); color: var(--accent);
+  }
+  .chip.sec { background: rgba(192, 28, 40, 0.12); color: var(--err); border-color: rgba(192, 28, 40, 0.28); }
+  .chip.fp, .chip.enh, .chip.bad { background: rgba(220, 138, 221, 0.16); color: var(--purple-1); border-color: rgba(220, 138, 221, 0.35); }
+  .banner {
+    margin: 0 0 8px; background: #f8e8c8; color: #5e4010;
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px; font-size: 12.5px;
+  }
+  .banner button, .textbtn { margin-left: auto; background: transparent; border: 0; color: var(--accent); font-weight: 700; font-family: inherit; font-size: 12.5px; cursor: default; }
+  .console {
+    margin-top: auto; background: #fff; border-top: 1px solid rgba(0, 0, 0, 0.14);
+    display: flex; gap: 8px; align-items: center; padding: 8px 12px;
+    font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--dim);
+  }
+  .console .live { color: var(--accent); font-family: Cantarell, sans-serif; font-weight: 700; margin-left: auto; }
+  .card {
+    margin: 0 16px 8px; padding: 12px 14px; border-radius: 12px;
+    background: rgba(53, 132, 228, 0.1); border: 1px solid rgba(53, 132, 228, 0.28);
+  }
+  .card.theme {
+    background: var(--card); border: 0; box-shadow: 0 0 0 1px var(--border);
+  }
+  .stats { display: flex; gap: 10px; justify-content: center; margin: 8px 0; }
+  .stat {
+    min-width: 84px; text-align: center; border-radius: 10px; padding: 8px 12px;
+    background: rgba(255, 255, 255, 0.6); border: 1px solid rgba(0, 0, 0, 0.18);
+  }
+  .stat b { display: block; font-size: 1.4rem; }
+  .stat span { color: var(--dim); font-size: 11px; }
+  .stat.warn { background: rgba(229, 165, 10, 0.12); border-color: rgba(229, 165, 10, 0.4); }
+  .reboot {
+    display: flex; gap: 10px; align-items: center; margin: 4px 0 0;
+    background: rgba(229, 165, 10, 0.12); border: 1px solid rgba(229, 165, 10, 0.4);
+    border-radius: 12px; padding: 10px 12px; text-align: left;
+  }
+  .actions { display: flex; gap: 8px; justify-content: center; padding: 8px 12px 12px; border-top: 1px solid rgba(0, 0, 0, 0.08); }
+  .bottom {
+    margin-top: auto; min-height: 46px; display: flex; align-items: center; justify-content: flex-end;
+    gap: 8px; padding: 6px 10px; box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.06);
+  }
+  .scrim {
+    flex: 1; background: rgba(0, 0, 0, 0.18);
+    display: grid; place-items: center; padding: 18px;
+  }
+  .dialog {
+    width: min(100%, 380px); background: #fafafa; border-radius: 16px;
+    box-shadow: var(--shadow); padding: 18px 16px 12px; text-align: center;
+  }
+  .dialog h4 { margin: 0 0 8px; font-size: 1.05rem; }
+  .dialog p { color: var(--dim); font-size: 13px; }
+  .dactions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+  .u { text-decoration: underline; text-underline-offset: 2px; }
+  .menu-pop {
+    position: relative; width: 220px; margin: 8px 12px 12px auto;
+    background: #fff; border-radius: 12px; box-shadow: var(--shadow); padding: 6px;
+  }
+  .menu-pop div { padding: 8px 10px; border-radius: 8px; }
+  .menu-pop div:hover { background: rgba(0, 0, 0, 0.05); }
+  .split { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .swatch { width: 220px; }
+  .tag { font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--doc-dim); margin-bottom: 6px; }
+  .call { font-size: 0.92rem; }
+  kbd { font-family: ui-monospace, monospace; font-size: 0.85em; border: 1px solid var(--doc-line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: #fff; }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>Fedora Updater against libadwaita 1.10</h1>
+  <p class="lede">Audit of the current GTK 4 / libadwaita UI (<code>src/ui/window.blp</code>, <code>src/ui/log_window.blp</code>, <code>src/ui/rows.rs</code>, <code>src/style.css</code>) against the <a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/">libadwaita 1.10</a> widget and style guidance and the <a href="https://developer.gnome.org/hig/">GNOME HIG</a> patterns those docs point at. The crate is <code>libadwaita 0.8</code> with the <code>v1_7</code> feature. Findings below are deviations, not a rewrite of the update flow.</p>
+  <div class="okbox">
+    <h2>Already in line with the kit</h2>
+    <ul>
+      <li><code>AdwApplicationWindow</code>, <code>AdwToolbarView</code>, <code>AdwHeaderBar</code>, and <code>AdwToastOverlay</code> are the right shells. Color scheme follows the system.</li>
+      <li>Idle, authentication, and failure use <code>AdwStatusPage</code>. The idle primary button is a single suggested pill.</li>
+      <li>Confirmations use <code>AdwAlertDialog</code>, not the deprecated message dialog. Stop defaults to “keep waiting”, marks “stop” destructive, and Esc cancels.</li>
+      <li>Package lists are <code>AdwPreferencesGroup</code> plus <code>AdwActionRow</code> inside <code>AdwClamp</code>. Completed rows use <code>AdwExpanderRow</code>. Soft errors and a stalled run use <code>AdwBanner</code>. Spinners use <code>AdwSpinner</code>.</li>
+      <li>Toasts cover reboot and internal errors, which is the right weight for those events.</li>
+    </ul>
+  </div>
+</header>
+
+<nav class="tabs" aria-label="Proposed changes">
+  <button type="button" data-panel="summary" aria-selected="true">Summary</button>
+  <button type="button" data-panel="menu">Menu</button>
+  <button type="button" data-panel="idle">Idle</button>
+  <button type="button" data-panel="auth">Authentication</button>
+  <button type="button" data-panel="checking">Checking</button>
+  <button type="button" data-panel="ready">Updates</button>
+  <button type="button" data-panel="rows">Rows</button>
+  <button type="button" data-panel="running">Updating</button>
+  <button type="button" data-panel="done">Finished</button>
+  <button type="button" data-panel="failed">Failed</button>
+  <button type="button" data-panel="dialogs">Dialogs</button>
+  <button type="button" data-panel="log">Log</button>
+  <button type="button" data-panel="style">Stylesheet</button>
+</nav>
+
+<main>
+<section class="panel" id="summary">
+  <h2>Summary</h2>
+  <p class="lede">Each row is one proposed change. The link opens that change in this file.</p>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Priority</th><th>Change</th><th>Why it diverges</th><th>Mockup</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td><td><span class="pri high">High</span></td>
+        <td>Add a primary menu and an About dialog.</td>
+        <td>The header bar has no menu. Every GNOME primary menu includes About, and the button uses <code>open-menu-symbolic</code> with the tooltip “Main Menu”.</td>
+        <td><a href="#menu">Menu</a></td>
+      </tr>
+      <tr>
+        <td>2</td><td><span class="pri med">Medium</span></td>
+        <td>Make the idle page a single status page. Drop the footer dot and the tool names.</td>
+        <td>A green bullet paints “never checked” as success. The hint names dnf, flatpak, and fwupd. The button pairs an icon with a label outside the header bar.</td>
+        <td><a href="#idle">Idle</a></td>
+      </tr>
+      <tr>
+        <td>3</td><td><span class="pri med">Medium</span></td>
+        <td>Shorten authentication copy and drop the word “polkit”.</td>
+        <td>Status-page text should be short and use the user’s words. The page currently explains the helper twice.</td>
+        <td><a href="#auth">Authentication</a></td>
+      </tr>
+      <tr>
+        <td>4</td><td><span class="pri med">Medium</span></td>
+        <td>Move the check title into the header bar, and make the log a real bottom bar.</td>
+        <td>The view title sits in a second header. The console uses a text triangle and is not a <code>ToolbarView</code> bottom bar, so it gets no undershoot.</td>
+        <td><a href="#checking">Checking</a></td>
+      </tr>
+      <tr>
+        <td>5</td><td><span class="pri high">High</span></td>
+        <td>Rebuild the update list: header title, one suggested action, no chips, a short banner, a narrow breakpoint.</td>
+        <td>Title and buttons collide when the window is narrow. Flatpak and enhancement chips use <code>@purple_1</code> (<code>#dc8add</code>) as text, about 2.4:1 on white. The banner title is a joined error string. Update All is an icon-plus-label suggested button in the page body.</td>
+        <td><a href="#ready">Updates</a></td>
+      </tr>
+      <tr>
+        <td>6</td><td><span class="pri high">High</span></td>
+        <td>Say the source and the advisory in text. Stop fading rows with raw opacity.</td>
+        <td>Security versus bugfix is only a 7px color dot. Pending rows set <code>opacity: 0.72</code> instead of <code>.dimmed</code>, so high contrast cannot adjust them. The DNF/FP/FW badge repeats the subtitle.</td>
+        <td><a href="#rows">Rows</a></td>
+      </tr>
+      <tr>
+        <td>7</td><td><span class="pri high">High</span></td>
+        <td>One progress bar, a theme card for the current package, and a destructive “Stop…” during install.</td>
+        <td>A second bar restates the same task. Stopping an install needs confirmation, so the button takes an ellipsis and the destructive style. The stall banner is a paragraph.</td>
+        <td><a href="#running">Updating</a></td>
+      </tr>
+      <tr>
+        <td>8</td><td><span class="pri high">High</span></td>
+        <td>Replace the finished-page stat cards with a header, a reboot banner, and the installed list.</td>
+        <td>Custom cards reimplement <code>.card</code> and compete with the list. Restart and Done are both shaped as primary actions. The reboot state belongs in a banner.</td>
+        <td><a href="#done">Finished</a></td>
+      </tr>
+      <tr>
+        <td>9</td><td><span class="pri med">Medium</span></td>
+        <td>Put the failure detail in the status-page description, and use one pill.</td>
+        <td>The detail is a separate dim label. Retry carries an icon. Back is a second pill, and the label stays “Retry” even when the action is a restart.</td>
+        <td><a href="#failed">Failed</a></td>
+      </tr>
+      <tr>
+        <td>10</td><td><span class="pri high">High</span></td>
+        <td>Rewrite both alerts: short heading, body, specific verbs, header capitalization.</td>
+        <td>The stale-list heading is a first-person paragraph with Yes/No. Stop uses “Keep waiting” and “Stop anyway”. Dialog examples use access keys.</td>
+        <td><a href="#dialogs">Dialogs</a></td>
+      </tr>
+      <tr>
+        <td>11</td><td><span class="pri med">Medium</span></td>
+        <td>Keep the log as a secondary window. Remove the extra Close button.</td>
+        <td>The header bar already closes the window. Close is <code>.suggested-action</code>, and the buttons are not a <code>ToolbarView</code> bottom bar. “Copy all” is not header capitalization.</td>
+        <td><a href="#log">Log</a></td>
+      </tr>
+      <tr>
+        <td>12</td><td><span class="pri high">High</span></td>
+        <td>Replace custom colors, 16px margins, and <code>.dim-label</code> with style classes and the 12px rhythm.</td>
+        <td><code>.dim-label</code> is deprecated since 1.7. Raw opacity and <code>alpha()</code> borders skip the high-contrast variables. <code>@purple_1</code> text stays <code>#dc8add</code> in light and dark. Page margins use 16px instead of the 12px clamp rhythm.</td>
+        <td><a href="#style">Stylesheet</a></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="panel" id="menu" hidden>
+  <h2>1. Primary menu and About</h2>
+  <p class="cite">HIG <a href="https://developer.gnome.org/hig/patterns/controls/menus.html">Menus</a>: most apps have a primary menu at the end of the header bar, using <code>open-menu-symbolic</code>, tooltip “Main Menu”. Every such menu includes About [App Name]. Libadwaita 1.5+ provides <a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/class.AboutDialog.html">AdwAboutDialog</a> (<code>AdwAboutWindow</code> is deprecated since 1.6). There is no menu in <code>window.blp</code>.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win short" style="min-height:280px">
+        <div class="hb">
+          <div class="side"></div>
+          <div class="wtitle">Fedora Updater</div>
+          <div class="side end"><div class="close" aria-hidden="true">×</div></div>
+        </div>
+        <div class="content status">
+          <div class="glyph" aria-hidden="true">
+            <svg width="48" height="48" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5 9.2 5h3.6l-2.9 2.1 1.1 3.4L8 8.4 4.9 10.5 6 7.1 3.1 5h3.6z"/></svg>
+          </div>
+          <h4>Check for updates</h4>
+          <p class="desc">The header never changes, and there is no way to open About.</p>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win short" style="min-height:280px">
+        <div class="hb">
+          <div class="side"></div>
+          <div class="wtitle">Fedora Updater</div>
+          <div class="side end">
+            <div class="menu" title="Main Menu" aria-label="Main Menu">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 4h12v1.4H2zm0 3.3h12v1.4H2zM2 10.6h12V12H2z"/></svg>
+            </div>
+            <div class="close" aria-hidden="true">×</div>
+          </div>
+        </div>
+        <div class="menu-pop" role="menu">
+          <div><span class="u">A</span>bout Fedora Updater</div>
+          <div><span class="u">K</span>eyboard Shortcuts</div>
+        </div>
+        <div class="dialog" style="margin: 0 auto 16px;">
+          <div class="glyph" style="margin:0 auto 6px; width:64px; height:64px;" aria-hidden="true">
+            <svg width="40" height="40" viewBox="0 0 16 16" fill="#3584e4"><circle cx="8" cy="8" r="6"/></svg>
+          </div>
+          <h4>Fedora Updater</h4>
+          <p>A desktop front-end for Fedora system, Flatpak, and firmware updates</p>
+          <p>Version 0.2.0</p>
+        </div>
+      </div>
+      <p class="call"><code>AdwShortcutsDialog</code> arrived in libadwaita 1.8. The crate feature stops at <code>v1_7</code>, so ship About now and add Keyboard Shortcuts when that feature is enabled. Do not add Quit. Do not add Preferences until the app has any.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="idle" hidden>
+  <h2>2. Idle and up to date</h2>
+  <p class="cite">HIG <a href="https://developer.gnome.org/hig/patterns/feedback/placeholders.html">Placeholder pages</a> and <a href="https://developer.gnome.org/hig/guidelines/writing-style.html">Writing style</a>: one heading, one short description, familiar words, no jargon. <a href="https://developer.gnome.org/hig/patterns/controls/buttons.html">Buttons</a>: outside a header bar, a button is an icon or a label, not both. <a href="https://developer.gnome.org/hig/guidelines/ui-styling.html">UI styling</a>: do not use color as the only signal. The fresh footer paints a <code>.success</code> “●” next to “Last checked never”. Up to date repeats the timestamp in the description and the footer.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content">
+          <div class="status">
+            <div class="glyph"><svg width="42" height="42" viewBox="0 0 16 16" fill="currentColor"><path d="M3 8a5 5 0 0 1 8.5-3.5L13 3v4H9l1.4-1.4A3.5 3.5 0 1 0 11.5 10H13A5 5 0 0 1 3 8z"/></svg></div>
+            <h4>Check for updates</h4>
+            <div class="btn suggested pill"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M3 8a5 5 0 0 1 8.5-3.5L13 3v4H9l1.4-1.4A3.5 3.5 0 1 0 11.5 10H13A5 5 0 0 1 3 8z"/></svg> Check for Updates</div>
+            <p class="desc">dnf · flatpak · fwupd · nothing changes until you review</p>
+          </div>
+          <div class="footer"><span class="dotg">●</span> Last checked never</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win">
+        <div class="hb">
+          <div class="side"></div>
+          <div class="wtitle">Fedora Updater</div>
+          <div class="side end"><div class="menu" title="Main Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 4h12v1.4H2zm0 3.3h12v1.4H2zM2 10.6h12V12H2z"/></svg></div><div class="close">×</div></div>
+        </div>
+        <div class="content">
+          <div class="status">
+            <div class="glyph"><svg width="42" height="42" viewBox="0 0 16 16" fill="currentColor"><path d="M3 8a5 5 0 0 1 8.5-3.5L13 3v4H9l1.4-1.4A3.5 3.5 0 1 0 11.5 10H13A5 5 0 0 1 3 8z"/></svg></div>
+            <h4>Check for Updates</h4>
+            <p class="desc">System packages, apps, and firmware. Nothing changes until the list is reviewed.</p>
+            <div class="btn suggested pill">Check for Updates</div>
+          </div>
+        </div>
+      </div>
+      <p class="call">Up to date keeps the flat “Check Again” button and puts “Last checked just now” only in the description. No second footer, no success color until a check has actually succeeded.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="auth" hidden>
+  <h2>3. Authentication</h2>
+  <p class="cite">Same placeholder and writing rules. The status page already is the right widget. The description names “polkit” and “a privileged helper”, then a caption says the password is not collected here. Terminology should be the task, not the mechanism. One sentence is enough, and a single sentence does not take a final period.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content status">
+          <div class="glyph"><svg width="40" height="40" viewBox="0 0 16 16" fill="currentColor"><path d="M6 7V5a2 2 0 1 1 4 0v2h1v6H5V7zm1.2 0h1.6V5a.8.8 0 0 0-1.6 0z"/></svg></div>
+          <h4>Authentication required</h4>
+          <p class="desc">A system dialog will ask for your password once for this app session so it can check for updates via a privileged helper</p>
+          <div class="rowline"><span class="accent-text">◌ Waiting for polkit</span></div>
+          <p class="desc">No password is collected here. Later Check and Update All reuse this session</p>
+          <div class="btn flat">Cancel</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater<small>Waiting for authentication</small></div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content status">
+          <div class="glyph"><svg width="40" height="40" viewBox="0 0 16 16" fill="currentColor"><path d="M6 7V5a2 2 0 1 1 4 0v2h1v6H5V7zm1.2 0h1.6V5a.8.8 0 0 0-1.6 0z"/></svg></div>
+          <h4>Authentication Required</h4>
+          <p class="desc">A system dialog asks for an administrator password. The password is not stored in this window.</p>
+          <div class="rowline"><span class="muted">◌ Waiting for authentication</span></div>
+          <div class="btn flat">Cancel</div>
+        </div>
+      </div>
+      <p class="call">The spinner stays an <code>AdwSpinner</code>. “Waiting for authentication” uses the dimmed style, not <code>.accent</code>. Cancel stays a quiet button. The same page serves Check and Update All. The purpose goes in the header subtitle (“Checking for updates” or “Applying updates”), not in a second paragraph.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="checking" hidden>
+  <h2>4. Checking</h2>
+  <p class="cite">HIG <a href="https://developer.gnome.org/hig/patterns/containers/header-bars.html">Header bars</a>: the heading updates with the view. <a href="https://developer.gnome.org/hig/patterns/feedback/progress-bars.html">Progress bars</a>: one bar, plus text such as “1 of 3 sources” or “About 1 minute left”. <a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/class.ToolbarView.html">ToolbarView</a> bottom bars get undershoot and drag. <a href="https://developer.gnome.org/hig/guidelines/ui-icons.html">UI icons</a> are symbolic, so a “▸” character is not a disclosure icon and does not flip for right-to-left text.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content">
+          <div class="pagehead"><div class="grow"><strong>Checking for updates</strong><span>About 1 minute left · 1 of 3 sources</span></div></div>
+          <div class="progress"><i style="width:25%"></i></div>
+          <div class="meta"><span>System done · Apps in progress · Firmware queued</span><span>25%</span></div>
+          <div class="group"><div class="glabel">Found so far</div>
+            <div class="list">
+              <div class="prow"><span class="badge">DNF</span><div><b>kernel</b><small>6.17.7 → 6.17.8 · System</small></div><small>86 MB</small></div>
+              <div class="prow"><span class="badge fp">FP</span><div><b>org.mozilla.Firefox</b><small>144.0 → 145.0 · Apps</small></div><small>112 MB</small></div>
+            </div>
+          </div>
+          <div class="console"><span>▸</span><span>Downloading metadata…</span><span class="live">live</span></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win">
+        <div class="hb">
+          <div class="side"></div>
+          <div class="wtitle">Checking for Updates<small>About 1 minute left · 1 of 3 sources</small></div>
+          <div class="side end"><div class="menu" title="Main Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 4h12v1.4H2zm0 3.3h12v1.4H2zM2 10.6h12V12H2z"/></svg></div><div class="close">×</div></div>
+        </div>
+        <div class="content">
+          <div class="progress" style="margin-top:12px"><i style="width:25%"></i></div>
+          <div class="meta"><span>System done · Apps in progress · Firmware queued</span><span>25%</span></div>
+          <div class="group"><div class="glabel">Found so far</div>
+            <div class="list">
+              <div class="prow"><div><b>kernel</b><small>6.17.7 → 6.17.8 · System</small></div><small>86 MB</small></div>
+              <div class="prow"><div><b>Firefox</b><small>144.0 → 145.0 · Apps</small></div><small>112 MB</small></div>
+            </div>
+          </div>
+          <div class="bottom" style="justify-content:flex-start; gap:8px;">
+            <span class="iconbtn" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 3.2 11 8 6 12.8z"/></svg></span>
+            <span class="cap" style="font-family:ui-monospace,monospace">Downloading metadata…</span>
+          </div>
+        </div>
+      </div>
+      <p class="call">The group status string stays. The percent stays, with <code>.numeric</code>. The disclosure is <code>pan-end-symbolic</code> / <code>pan-down-symbolic</code> inside a <code>.toolbar</code> bottom bar. “live” goes away. The same bar is used on the update page.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="ready" hidden>
+  <h2>5. Updates available</h2>
+  <p class="cite"><a href="https://developer.gnome.org/hig/patterns/controls/buttons.html">Buttons</a>: one suggested or destructive button per view. Outside the header bar, do not combine an icon and a label. Suggested buttons are a poor fit in a primary header bar, so the call to action moves to a bottom bar, which <a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/adaptive-layouts.html">breakpoints</a> can keep visible when the window is narrow. <a href="https://developer.gnome.org/hig/patterns/feedback/banners.html">Banners</a> take a short factual title, not a joined log line. Chip colors are covered in the stylesheet section. There is no <code>AdwBreakpoint</code> today. The ready header is one horizontal box: title, Refresh, Update All.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content">
+          <div class="pagehead">
+            <div class="grow"><strong>12 updates available</strong><span>8 system · 3 apps · 1 firmware</span></div>
+            <div class="btn flat">Refresh</div>
+            <div class="btn suggested"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M3 8h10v1.4H3z"/></svg> Update All</div>
+          </div>
+          <div class="banner">fwupd: failed to connect to daemon · flatpak: user installation not available <button>View log</button></div>
+          <div class="chips">
+            <span class="chip">8 system</span>
+            <span class="chip bad">3 apps</span>
+            <span class="chip">1 firmware</span>
+            <span class="chip sec">2 security</span>
+            <span class="chip bad">1 enhancement</span>
+          </div>
+          <div class="group"><div class="list">
+            <div class="prow"><span class="badge">DNF</span><span class="sev sec"></span><div><b>kernel</b><small>6.17.7 → 6.17.8 · System</small></div><small>86 MB</small></div>
+            <div class="prow"><span class="badge fp">FP</span><div><b>org.mozilla.Firefox</b><small>144.0 → 145.0 · Apps</small></div><small>112 MB</small></div>
+          </div></div>
+          <p class="cap" style="padding:0 16px 10px">Parsed from dnf · flatpak · fwupdmgr · nothing applied yet</p>
+        </div>
+      </div>
+      <p class="tag">Narrow, same layout</p>
+      <div class="win narrow">
+        <div class="hb"><div class="wtitle" style="font-size:12px">Fedora Updater</div><div class="close">×</div></div>
+        <div class="pagehead" style="flex-wrap:wrap">
+          <div class="grow"><strong style="font-size:14px">12 updates…</strong></div>
+          <div class="btn flat">Refresh</div>
+          <div class="btn suggested">Update All</div>
+        </div>
+        <p class="cap" style="padding:0 12px">The title and both buttons share one row. Nothing wraps on purpose.</p>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win">
+        <div class="hb">
+          <div class="side"><div class="iconbtn" title="Refresh"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M13 8a5 5 0 1 1-1.2-3.3L10 6.5V2h4.5L12.7 3.8A6.5 6.5 0 1 0 14.5 8z"/></svg></div></div>
+          <div class="wtitle">12 Updates Available<small>8 system · 3 apps · 1 firmware</small></div>
+          <div class="side end"><div class="menu" title="Main Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 4h12v1.4H2zm0 3.3h12v1.4H2zM2 10.6h12V12H2z"/></svg></div><div class="close">×</div></div>
+        </div>
+        <div class="banner">2 sources could not be checked <button>View Log</button></div>
+        <div class="content">
+          <div class="group" style="margin-top:10px"><div class="list">
+            <div class="prow"><div><b>kernel</b><small>6.17.7 → 6.17.8 · System · Security</small></div><small>86 MB</small></div>
+            <div class="prow"><div><b>Firefox</b><small>144.0 → 145.0 · Apps</small></div><small>112 MB</small></div>
+          </div></div>
+          <p class="cap" style="padding:0 16px">Nothing is applied until Update All is chosen</p>
+          <div class="bottom"><div class="btn suggested">Update All</div></div>
+        </div>
+      </div>
+      <p class="tag">Narrow breakpoint</p>
+      <div class="win narrow">
+        <div class="hb">
+          <div class="iconbtn" title="Refresh"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M13 8a5 5 0 1 1-1.2-3.3L10 6.5V2h4.5L12.7 3.8A6.5 6.5 0 1 0 14.5 8z"/></svg></div>
+          <div class="wtitle" style="font-size:12px">12 Updates Available</div>
+          <div class="close">×</div>
+        </div>
+        <div class="content"><p class="cap" style="padding:12px">List keeps the full width. Update All stays in the bottom bar instead of crushing the title.</p>
+          <div class="bottom"><div class="btn suggested">Update All</div></div>
+        </div>
+      </div>
+      <p class="call">Refresh is a recognized icon with tooltip “Refresh”. Below about 500px, an <code>AdwBreakpoint</code> can hide the header subtitle. The bottom bar does not need to move. Banner button label is “View Log”. The long tool names leave the footer.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="rows" hidden>
+  <h2>6. Package rows</h2>
+  <p class="cite"><a href="https://developer.gnome.org/hig/guidelines/ui-styling.html">UI styling</a>: color cannot be the only way to tell items apart. The advisory is a 7px <code>.sev-dot</code> with no text (<code>rows.rs</code>). The subtitle already says System, Apps, or Firmware, and the prefix badge repeats it as DNF, FP, or FW. <a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/styles-and-appearance.html">Styles and appearance</a>: use <code>.dimmed</code> rather than a fixed opacity, because high contrast changes <code>--dim-opacity</code>. Pending and skipped rows set <code>opacity: 0.72</code>, and completed rows set <code>0.82</code>.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win short">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content" style="padding-top:12px">
+          <div class="group"><div class="glabel">Remaining</div>
+            <div class="list">
+              <div class="prow" style="background:rgba(53,132,228,.10)"><span class="badge">DNF</span><span class="sev sec"></span><div><b>kernel</b><small>6.17.7 → 6.17.8 · System</small></div><span class="accent-text">installing</span></div>
+              <div class="prow pending"><span class="badge fp">FP</span><span class="sev enh"></span><div><b>org.mozilla.Firefox</b><small>144.0 → 145.0 · Apps</small></div><span class="cap">queued</span></div>
+              <div class="prow" style="opacity:.82"><span class="badge fw">FW</span><div><b>UEFI Device Firmware</b><small>1.2 → 1.4 · Firmware</small></div><span style="color:#1a7f37">done</span></div>
+            </div>
+          </div>
+          <p class="cap" style="padding:0 16px 12px">The red and purple dots are the only security and enhancement markers. The FP badge uses <code>@purple_1</code> (<code>#dc8add</code>) as its text color.</p>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win short">
+        <div class="hb"><div class="side"></div><div class="wtitle">Installing<small>4 of 19</small></div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content" style="padding-top:12px">
+          <div class="group"><div class="glabel">Remaining</div>
+            <div class="list">
+              <div class="prow"><div><b>kernel</b><small>6.17.7 → 6.17.8 · System · Security</small></div><span class="accent-text">Installing</span></div>
+              <div class="prow"><div style="opacity:1"><b style="color:rgba(0,0,0,.55)">Firefox</b><small>144.0 → 145.0 · Apps · Enhancement</small></div><span class="cap">Queued</span></div>
+              <div class="prow"><div><b>UEFI Device Firmware</b><small>1.2 → 1.4 · Firmware</small></div><span style="color:#1a7f37">Done</span></div>
+            </div>
+          </div>
+          <p class="call">Prefix badges and dots go away. “Security” uses the <code>.error</code> caption color and the word. “Enhancement” is text, not a purple dot. Queued rows take <code>.dimmed</code> on the title. Status words use header capitalization because they are short labels. The row stays an <code>AdwActionRow</code>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="running" hidden>
+  <h2>7. Updating</h2>
+  <p class="cite"><a href="https://developer.gnome.org/hig/patterns/feedback/progress-bars.html">Progress bars</a>: show one combined bar unless a subtask can be paused on its own. The page has an overall bar and a second bar inside <code>.now-playing</code>. <a href="https://developer.gnome.org/hig/patterns/controls/buttons.html">Destructive</a> is the warning style, and a view gets only one. <a href="https://developer.gnome.org/hig/guidelines/writing-style.html">Ellipsis</a> belongs on a control that still needs confirmation. Apply already opens the stop dialog. Download stops immediately, so that button stays “Stop” and is not destructive. <a href="https://developer.gnome.org/hig/patterns/feedback/banners.html">Banner</a> titles stay short. The stall banner is “No output for N minutes. Last line: …” plus a daemon sentence. The current-package plate is a custom bordered box, not <a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/style-classes.html#boxed-lists-cards"><code>.card</code></a>.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content">
+          <div class="pagehead"><div class="grow"><strong>Installing</strong><span>4 of 19 · about 6 minutes left</span></div><div class="btn flat" title="Stop this update">Stop</div></div>
+          <div class="progress apply"><i style="width:22%"></i></div>
+          <div class="meta"><span>Installing system packages</span><span>22%</span></div>
+          <div class="banner">No output for 2 minutes. Last line: Running transaction… The update is waiting on GNOME Software's dnf daemon.</div>
+          <div class="card">
+            <div style="display:flex;justify-content:space-between"><b>kernel</b><span class="cap">40%</span></div>
+            <div class="cap">Installing</div>
+            <div class="progress" style="margin:8px 0 0"><i style="width:40%"></i></div>
+          </div>
+          <div class="group"><div class="list">
+            <div class="prow pending"><span class="badge">DNF</span><div><b>tzdata</b><small>queued</small></div></div>
+          </div></div>
+          <div class="console"><span>▸</span><span>Running transaction…</span><span class="live">console</span></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win">
+        <div class="hb">
+          <div class="side"></div>
+          <div class="wtitle">Installing<small>4 of 19 · about 6 minutes left</small></div>
+          <div class="side end"><div class="btn destructive" title="Stop this update">Stop…</div><div class="close">×</div></div>
+        </div>
+        <div class="banner">No output for 2 minutes <span class="cap" style="margin-left:auto;color:#5e4010">Waiting on GNOME Software</span></div>
+        <div class="content">
+          <div class="progress" style="margin-top:12px"><i style="width:22%"></i></div>
+          <div class="meta"><span>Installing system packages</span><span>22%</span></div>
+          <div class="card theme">
+            <b>kernel</b>
+            <div class="cap">6.17.7 → 6.17.8 · System · Security</div>
+          </div>
+          <div class="group"><div class="glabel">2 completed</div>
+            <div class="list"><div class="prow"><div><b>tzdata</b><small>2025b · System</small></div><span style="color:#1a7f37">Done</span></div></div>
+          </div>
+          <div class="bottom" style="justify-content:flex-start"><span class="iconbtn"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 3.2 11 8 6 12.8z"/></svg></span><span class="cap" style="font-family:ui-monospace,monospace">Running transaction…</span></div>
+        </div>
+      </div>
+      <p class="call">The bar keeps the accent color for both download and install. The caption already says which pass is running. The last console line stays in the bottom bar, not in the banner. Download uses a plain “Stop” with no ellipsis, because it does not ask again.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="done" hidden>
+  <h2>8. Finished</h2>
+  <p class="cite">A placeholder is for an empty view. This view has a list, so a 64px icon plus three hand-drawn stat cards duplicates “12 upgraded · 0 failed · 4 minutes”. <code>.stat-card</code> and <code>.reboot-card</code> copy the card look with their own radius, padding, and <code>alpha()</code> borders. A restart that must happen is a persistent state, which is a <a href="https://developer.gnome.org/hig/patterns/feedback/banners.html">banner</a>. Banner buttons can use the suggested style since 1.7 (<code>AdwBannerButtonStyle</code>). “Done” is also a pill, so the view has two primary shapes. “View full log” is not header capitalization.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content">
+          <div style="text-align:center;padding:12px 16px 0">
+            <div class="glyph" style="margin:0 auto"><svg width="48" height="48" viewBox="0 0 16 16" fill="#1a7f37"><path d="M6.2 11.2 3.4 8.4l1-1 1.8 1.8 4.4-4.4 1 1z"/></svg></div>
+            <h4 style="margin:0">All updates applied</h4>
+            <p class="desc" style="margin:4px auto 0">12 upgraded · 8 system / 3 apps / 1 firmware · 4 min</p>
+            <div class="stats">
+              <div class="stat"><b>12</b><span>upgraded</span></div>
+              <div class="stat"><b>0</b><span>failed</span></div>
+              <div class="stat warn"><b>1</b><span>needs reboot</span></div>
+            </div>
+            <div class="reboot">
+              <div style="flex:1"><b>Restart recommended</b><div class="cap">A kernel or firmware update needs a restart to finish</div></div>
+              <div class="btn suggested"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 2v2a4 4 0 1 1-3.2 1.6L6 6.8 2.5 8 3 4.2l1.3 1.2A5.5 5.5 0 1 0 8 2z"/></svg> Restart Now</div>
+            </div>
+          </div>
+          <div class="group"><div class="glabel">Installed</div><div class="list"><div class="prow"><span class="badge">DNF</span><div><b>kernel</b><small>6.17.8</small></div></div></div></div>
+          <div class="actions"><div class="btn flat">View full log</div><div class="btn pill">Done</div></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win">
+        <div class="hb">
+          <div class="side"></div>
+          <div class="wtitle">All Updates Applied<small>12 upgraded · 4 minutes</small></div>
+          <div class="side end"><div class="close">×</div></div>
+        </div>
+        <div class="banner">Restart recommended to finish installing <button>Restart Now</button></div>
+        <div class="content">
+          <div class="group" style="margin-top:10px"><div class="glabel">Installed</div>
+            <div class="list">
+              <div class="prow"><div><b>kernel</b><small>6.17.8 · System</small></div><span style="color:#1a7f37">Done</span></div>
+              <div class="prow"><div><b>Firefox</b><small>145.0 · Apps</small></div><span style="color:#1a7f37">Done</span></div>
+            </div>
+          </div>
+          <div class="bottom">
+            <div class="btn flat">View Full Log</div>
+            <div class="btn">Done</div>
+          </div>
+        </div>
+      </div>
+      <p class="call">When nothing needs a restart, the banner hides and Done becomes the one suggested button. When something failed, the title is “Updates Finished With Problems” and failed rows stay first. The counts are the subtitle, not a second grid. Restart Now is label only, on the banner, and is the only suggested control.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="failed" hidden>
+  <h2>9. Failed</h2>
+  <p class="cite">The page is already an <code>AdwStatusPage</code>, but the explanation is a child <code>Gtk.Label</code> instead of <code>description</code>, which is the property that gets the placeholder typography. The suggested Retry button also has an icon. Back is a second pill, so two buttons in that row have different widths. The label is always “Retry” even when <code>RetryAction::Reboot</code> restarts the machine. Use the verb the button performs.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content status">
+          <div class="glyph" style="color:var(--err)"><svg width="42" height="42" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.6 15 14H1zm0 4.2-.7 4h1.4zM7.3 12h1.4V13.4H7.3z"/></svg></div>
+          <h4>Update did not finish</h4>
+          <p class="desc">dnf exited and the new package versions are not installed. Nothing from this run was committed. You can run Update All again.</p>
+          <div class="btn suggested pill"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13 8a5 5 0 1 1-1.5-3.5"/></svg> Retry</div>
+          <div class="rowline"><div class="btn flat">View log</div><div class="btn pill">Back</div></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win">
+        <div class="hb"><div class="side"></div><div class="wtitle">Fedora Updater</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content status">
+          <div class="glyph" style="color:var(--err)"><svg width="42" height="42" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.6 15 14H1zm0 4.2-.7 4h1.4zM7.3 12h1.4V13.4H7.3z"/></svg></div>
+          <h4>Update Did Not Finish</h4>
+          <p class="desc">The new package versions are not installed. Nothing from this run was committed.</p>
+          <div class="btn suggested pill">Check Again</div>
+          <div class="btn flat">View Log</div>
+        </div>
+      </div>
+      <p class="call">A reboot failure says “Restart” on that same pill, because that is what the click does. “Back” goes away. The window close button, and Check Again, cover leaving the page. Returning to the idle screen can stay on Check Again’s success path, or on a flat “Done” if a direct exit is still needed. It should not be a second pill.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="dialogs" hidden>
+  <h2>10. Confirmation dialogs</h2>
+  <p class="cite">HIG <a href="https://developer.gnome.org/hig/patterns/feedback/dialogs.html">Dialogs</a>: a short heading, the explanation in the body, cancel before the affirmative button, Esc cancels, and Return activates the affirmative button only when that is safe. Button labels are imperative verbs in <a href="https://developer.gnome.org/hig/guidelines/writing-style.html#header-capitalization">header capitalization</a>, not Yes/No. The stop dialog already gets the safe default right. The stale-list dialog puts the entire question in the heading, in the first person, and forces a wide layout to fit it. Neither dialog uses access keys. Libadwaita’s own example labels are “_Cancel” and “_Replace”.</p>
+  <div class="pair">
+    <div>
+      <h3>Current — stale list</h3>
+      <div class="win short"><div class="scrim"><div class="dialog">
+        <h4>The list of updates is older than 24hrs - I need to refresh this list before applying the updates. Do you want to do that now?</h4>
+        <div class="dactions"><div class="btn">No</div><div class="btn suggested">Yes</div></div>
+      </div></div></div>
+      <h3 style="margin-top:16px">Current — stop during install</h3>
+      <div class="win short"><div class="scrim"><div class="dialog">
+        <h4>Stop this update?</h4>
+        <p>Stopping dnf while it is applying packages can leave the rpm database half-applied. Check dnf history before running Update All again.</p>
+        <div class="dactions"><div class="btn">Keep waiting</div><div class="btn destructive">Stop anyway</div></div>
+      </div></div></div>
+    </div>
+    <div>
+      <h3>Proposed — stale list</h3>
+      <div class="win short"><div class="scrim"><div class="dialog">
+        <h4>Refresh Update List?</h4>
+        <p>This list is more than a day old. Refresh it before applying these updates.</p>
+        <div class="dactions"><div class="btn"><span class="u">C</span>ancel</div><div class="btn suggested"><span class="u">R</span>efresh</div></div>
+      </div></div></div>
+      <h3 style="margin-top:16px">Proposed — stop during install</h3>
+      <div class="win short"><div class="scrim"><div class="dialog">
+        <h4>Stop This Update?</h4>
+        <p>Stopping while packages are being installed can leave the package database incomplete. Check package history before trying again.</p>
+        <div class="dactions"><div class="btn"><span class="u">K</span>eep Waiting</div><div class="btn destructive">Stop <span class="u">A</span>nyway</div></div>
+      </div></div></div>
+      <p class="call">Esc still maps to Cancel and Keep Waiting. Return maps to Refresh. Return does not map to Stop Anyway. “dnf”, “rpm”, and “24hrs” leave the dialog. The behavior is unchanged: Refresh checks, then applies. No leaves the list alone.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="log" hidden>
+  <h2>11. Full log</h2>
+  <p class="cite">The log is a modal secondary window with a parent, which matches the <a href="https://developer.gnome.org/hig/patterns/containers/windows.html">windows</a> guidance. The header bar already has a close button. A second Close, styled <code>.suggested-action</code>, makes dismissal the accent action. The button row is an ordinary box, so <code>AdwToolbarView</code> does not manage its undershoot or its 6px toolbar spacing. “Copy all” should be “Copy All”.</p>
+  <div class="pair">
+    <div>
+      <h3>Current</h3>
+      <div class="win short" style="min-height:360px">
+        <div class="hb"><div class="side"></div><div class="wtitle">Full log</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content">
+          <pre style="flex:1;margin:0;padding:12px;font-size:11.5px;white-space:pre-wrap;color:var(--fg)">Updating Subscription
+Downloading metadata...
+Running transaction
+Complete!</pre>
+          <div class="actions" style="justify-content:flex-end;border-top:0">
+            <div class="btn flat">Copy all</div>
+            <div class="btn suggested">Close</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed</h3>
+      <div class="win short" style="min-height:360px">
+        <div class="hb"><div class="side"></div><div class="wtitle">Full Log</div><div class="side end"><div class="close">×</div></div></div>
+        <div class="content">
+          <pre style="flex:1;margin:0;padding:12px;font-size:11.5px;white-space:pre-wrap;color:var(--fg)">Updating Subscription
+Downloading metadata...
+Running transaction
+Complete!</pre>
+          <div class="bottom"><div class="btn suggested">Copy All</div></div>
+        </div>
+      </div>
+      <p class="call">Copy All is the one suggested button because it is the action unique to this window. Closing stays on the header bar and on Esc. A long log stays a resizable window. An <code>AdwDialog</code> would collapse to a bottom sheet, which is a worse place to read a transaction log.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="style" hidden>
+  <h2>12. Stylesheet</h2>
+  <p class="cite"><a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/style-classes.html#dimmed"><code>.dim-label</code> is deprecated since 1.7</a>. <code>.dimmed</code> is the replacement, and the crate already enables <code>v1_7</code>. The blueprint and <code>rows.rs</code> still apply <code>dim-label</code>. <a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/styles-and-appearance.html">High contrast</a> asks for style classes and CSS variables instead of fixed opacity and handmade borders. <code>src/style.css</code> sets <code>.pkg-row.pending { opacity: 0.72 }</code>, borders with <code>alpha(@window_fg_color, 0.14)</code>, and Flatpak and enhancement text to <code>@purple_1</code>. In libadwaita 1.10 that named color is <code>#dc8add</code>, and it does not change between light and dark. Against white that is about 2.4:1, short of 4.5:1. On the dark window it is about 6.6:1, so the miss is the light style and high contrast, which will not darken this palette stop. The <a href="https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.10/adaptive-layouts.html">clamp example</a> uses 12px side margins and 24px between groups. The pages use 16px. <code>.stage-apply</code> repaints the progress bar with <code>@success_bg_color</code> even though the caption already names the pass.</p>
+  <div class="pair">
+    <div>
+      <h3>Current specimens</h3>
+      <div class="win short">
+        <div class="content" style="padding:16px; gap:12px;">
+          <div class="tag">Light window, @purple_1 (#dc8add) text</div>
+          <div class="chips" style="padding:0">
+            <span class="chip bad">3 apps</span>
+            <span class="chip bad">1 enhancement</span>
+            <span class="chip sec">2 security</span>
+          </div>
+          <div class="tag">Custom cards</div>
+          <div class="stats" style="justify-content:flex-start">
+            <div class="stat"><b>12</b><span>upgraded</span></div>
+            <div class="stat warn"><b>1</b><span>needs reboot</span></div>
+          </div>
+          <div class="card">now-playing, radius 12, accent wash</div>
+          <div class="tag">Margins and bar</div>
+          <div class="progress apply" style="margin:0"><i style="width:60%"></i></div>
+          <p class="cap">16px page insets. Green bar only while applying. Pending row opacity 0.72. Class <code>dim-label</code>.</p>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h3>Proposed specimens</h3>
+      <div class="win short">
+        <div class="content" style="padding:12px; gap:12px;">
+          <div class="tag">Words plus semantic color</div>
+          <div class="list">
+            <div class="prow"><div><b>kernel</b><small style="color:var(--err)">System · Security</small></div><span class="cap">86 MB</span></div>
+            <div class="prow"><div><b style="color:rgba(0,0,0,.55)">Firefox</b><small>Apps · Enhancement</small></div><span class="cap">Queued</span></div>
+          </div>
+          <div class="tag">.card and the accent bar</div>
+          <div class="card theme"><b>kernel</b><div class="cap">Installing · System</div></div>
+          <div class="progress" style="margin:0"><i style="width:60%"></i></div>
+          <p class="cap">12px insets. <code>.dimmed</code> instead of <code>.dim-label</code> and instead of opacity 0.72. Borders come from <code>.card</code> / <code>--border-color</code>. Source and advisory are words in the theme foreground, with <code>.error</code> only as a second cue. One accent progress color.</p>
+        </div>
+      </div>
+      <p class="call">Keep <code>@success_color</code>, <code>@warning_color</code>, and <code>@error_color</code> when a style class cannot be applied. Those semantic colors follow the theme. Drop <code>.chip</code>, <code>.stat-card</code>, <code>.reboot-card</code>, <code>.sev-dot</code>, and <code>.package-badge</code> once the screens above land. <code>.now-playing</code> becomes <code>.card</code>.</p>
+    </div>
+  </div>
+</section>
+</main>
+<script>
+  const tabs = document.querySelectorAll("nav.tabs button");
+  const panels = document.querySelectorAll("main .panel");
+  function show(id) {
+    tabs.forEach((tab) => tab.setAttribute("aria-selected", tab.dataset.panel === id ? "true" : "false"));
+    panels.forEach((panel) => { panel.hidden = panel.id !== id; });
+    if (location.hash !== "#" + id) history.replaceState(null, "", "#" + id);
+  }
+  tabs.forEach((tab) => tab.addEventListener("click", () => show(tab.dataset.panel)));
+  document.querySelectorAll('a[href^="#"]').forEach((link) => {
+    link.addEventListener("click", (event) => {
+      const id = link.getAttribute("href").slice(1);
+      if (!document.getElementById(id)) return;
+      event.preventDefault();
+      show(id);
+    });
+  });
+  const initial = location.hash.slice(1);
+  if (initial && document.getElementById(initial)) show(initial);
+</script>
+</body>
+</html>
