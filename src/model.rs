@@ -589,9 +589,23 @@ pub fn count_by_kind(packages: &[Package]) -> (usize, usize, usize) {
     (security, bugfix, enhancement)
 }
 
+/// Check-page cursor. Chosen from which sources have finished, then matched
+/// to the status sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStep {
+    /// Dnf is not in the checked list yet.
+    System,
+    /// Dnf is in. Flatpak user and Flatpak system are not both in.
+    Apps,
+    /// Both Flatpak sides are in. Firmware is not.
+    Firmware,
+    /// All three groups are in.
+    Done,
+}
+
 /// Check progress from finished backends. Three user-facing groups:
 /// System (DNF), Apps (both Flatpak scopes), Firmware.
-pub fn check_progress(checked: &[UpdateSource]) -> (f64, u32, &'static str) {
+pub fn check_progress(checked: &[UpdateSource]) -> (CheckStep, f64, u32, &'static str) {
     let sys = checked.contains(&UpdateSource::Dnf);
     let fp_user = checked.contains(&UpdateSource::FlatpakUser);
     let fp_sys = checked.contains(&UpdateSource::FlatpakSystem);
@@ -603,16 +617,19 @@ pub fn check_progress(checked: &[UpdateSource]) -> (f64, u32, &'static str) {
     // Keep the bar off empty so the view never looks frozen at 0%.
     let fraction = (backends as f64 / 4.0).clamp(0.05, 1.0);
 
-    let status = if !sys {
-        "System in progress · Apps queued · Firmware queued"
-    } else if !apps {
-        "System done · Apps in progress · Firmware queued"
-    } else if !fw {
-        "System done · Apps done · Firmware in progress"
-    } else {
-        "System · Apps · Firmware done"
+    let step = match (sys, apps, fw) {
+        (false, _, _) => CheckStep::System,
+        (true, false, _) => CheckStep::Apps,
+        (true, true, false) => CheckStep::Firmware,
+        (true, true, true) => CheckStep::Done,
     };
-    (fraction, groups_done, status)
+    let status = match step {
+        CheckStep::System => "System in progress · Apps queued · Firmware queued",
+        CheckStep::Apps => "System done · Apps in progress · Firmware queued",
+        CheckStep::Firmware => "System done · Apps done · Firmware in progress",
+        CheckStep::Done => "System · Apps · Firmware done",
+    };
+    (step, fraction, groups_done, status)
 }
 
 /// HIG remaining-work text once progress is trustworthy.
@@ -1091,18 +1108,68 @@ mod tests {
 
     #[test]
     fn check_progress_groups_flatpak() {
-        let (frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
+        let (_step, frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
         assert!(frac > 0.0 && frac < 1.0);
         assert_eq!(groups, 1);
         assert!(status.contains("Apps in progress"));
 
-        let (_, groups, status) = check_progress(&[
+        let (_, _, groups, status) = check_progress(&[
             UpdateSource::Dnf,
             UpdateSource::FlatpakUser,
             UpdateSource::FlatpakSystem,
         ]);
         assert_eq!(groups, 2);
         assert!(status.contains("Firmware in progress"));
+    }
+
+    #[test]
+    fn check_step_names_the_cursor() {
+        let (step, frac, groups, status) = check_progress(&[]);
+        assert_eq!(step, CheckStep::System);
+        assert!((frac - 0.05).abs() < 1e-9);
+        assert_eq!(groups, 0);
+        assert_eq!(status, "System in progress · Apps queued · Firmware queued");
+
+        let (step, frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
+        assert_eq!(step, CheckStep::Apps);
+        assert!((frac - 0.25).abs() < 1e-9);
+        assert_eq!(groups, 1);
+        assert_eq!(status, "System done · Apps in progress · Firmware queued");
+
+        let (step, frac, groups, status) =
+            check_progress(&[UpdateSource::Dnf, UpdateSource::FlatpakUser]);
+        assert_eq!(step, CheckStep::Apps);
+        assert!((frac - 0.5).abs() < 1e-9);
+        assert_eq!(groups, 1);
+        assert_eq!(status, "System done · Apps in progress · Firmware queued");
+
+        let (step, frac, groups, status) = check_progress(&[
+            UpdateSource::Dnf,
+            UpdateSource::FlatpakUser,
+            UpdateSource::FlatpakSystem,
+        ]);
+        assert_eq!(step, CheckStep::Firmware);
+        assert!((frac - 0.75).abs() < 1e-9);
+        assert_eq!(groups, 2);
+        assert_eq!(status, "System done · Apps done · Firmware in progress");
+
+        let (step, frac, groups, status) = check_progress(&[
+            UpdateSource::Dnf,
+            UpdateSource::FlatpakUser,
+            UpdateSource::FlatpakSystem,
+            UpdateSource::Firmware,
+        ]);
+        assert_eq!(step, CheckStep::Done);
+        assert!((frac - 1.0).abs() < 1e-9);
+        assert_eq!(groups, 3);
+        assert_eq!(status, "System · Apps · Firmware done");
+
+        let (step, frac, groups, status) =
+            check_progress(&[UpdateSource::Dnf, UpdateSource::Firmware]);
+        assert_eq!(step, CheckStep::Apps);
+        assert!((frac - 0.5).abs() < 1e-9);
+        assert_eq!(groups, 2);
+        assert_eq!(status, "System done · Apps in progress · Firmware queued");
     }
 
     #[test]

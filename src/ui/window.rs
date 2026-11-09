@@ -1243,7 +1243,7 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             ..
         } => {
             w.stack.set_visible_child_name("checking");
-            let (frac, groups_done, status) = check_progress(checked_sources);
+            let (_step, frac, groups_done, status) = check_progress(checked_sources);
             let mut foot = format!("{groups_done} of 3 sources");
             if let Some(eta) = about_time_left(elapsed, frac) {
                 foot = format!("{eta} · {foot}");
