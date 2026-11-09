@@ -296,9 +296,10 @@ pub fn build(app: &Application) {
                     ..
                 }
             );
+            let running = matches!(state.borrow().phase, Phase::Running { .. });
             if pass_is_apply {
                 prompt_stop_during_transaction(&widgets, &state);
-            } else if matches!(state.borrow().phase, Phase::Running { .. }) {
+            } else if running {
                 stop_apply(&state, &widgets, false);
             }
         });
@@ -539,6 +540,27 @@ fn dispatch_worker(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, event: 
     }
 }
 
+/// Stores `SessionReady` for a helper `SessionStarted`. Returns whether that
+/// event was written. The caller must not hold a `Ref` on `state`: `borrow_mut`
+/// panics instead of leaving the window on Authenticating.
+fn commit_session_started(state: &Rc<RefCell<AppState>>) -> Result<bool, state::TransitionError> {
+    let purpose = {
+        let borrowed = state.borrow();
+        session_started_purpose(&borrowed.phase)
+    };
+    let Some(purpose) = purpose else {
+        return Ok(false);
+    };
+    let current = state.borrow().clone();
+    match state::reduce(current, session_started_event(purpose)) {
+        Ok(next) => {
+            *state.borrow_mut() = next;
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn handle_worker(
     state: &Rc<RefCell<AppState>>,
     widgets: &Rc<Widgets>,
@@ -555,8 +577,10 @@ fn handle_worker(
 
     match &ev {
         WorkerEvent::SessionStarted => {
-            if let Some(purpose) = session_started_purpose(&state.borrow().phase) {
-                dispatch_worker(state, widgets, session_started_event(purpose));
+            match commit_session_started(state) {
+                Ok(true) => render(state, widgets),
+                Ok(false) => {}
+                Err(e) => eprintln!("ignored worker event: {e}"),
             }
             return;
         }
@@ -584,7 +608,13 @@ fn handle_worker(
         dispatch_worker(state, widgets, e);
     }
 
-    if check_finished && state.borrow().apply_when_ready && can_start_apply(&state.borrow()) {
+    let apply_now = if check_finished {
+        let borrowed = state.borrow();
+        borrowed.apply_when_ready && can_start_apply(&borrowed)
+    } else {
+        false
+    };
+    if apply_now {
         begin_apply(state, widgets, tx.clone());
     }
 }
@@ -966,7 +996,8 @@ fn prompt_stop_during_transaction(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppS
                 ..
             }
         );
-        if matches!(state.borrow().phase, Phase::Running { .. }) {
+        let running = matches!(state.borrow().phase, Phase::Running { .. });
+        if running {
             stop_apply(&state, &widgets_for_cb, during);
         }
     });
@@ -1555,6 +1586,56 @@ mod tests {
                 }
             ),
             "the panicked write must leave the latch Idle"
+        );
+    }
+
+    #[test]
+    fn session_started_commit_leaves_auth_and_panics_if_a_borrow_is_held() {
+        use fedora_updater::model::AuthPurpose;
+        use fedora_updater::state::Phase;
+        use std::cell::RefCell;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::rc::Rc;
+
+        let authenticating = || {
+            let mut auth = fedora_updater::state::AppState::default();
+            auth.phase = Phase::Authenticating {
+                purpose: AuthPurpose::Check,
+                packages: vec![],
+                last_checked: None,
+            };
+            Rc::new(RefCell::new(auth))
+        };
+
+        let state = authenticating();
+        assert!(super::commit_session_started(&state).expect("SessionReady"));
+        assert!(
+            matches!(state.borrow().phase, Phase::Checking { .. }),
+            "a finished polkit session must leave Authenticating"
+        );
+
+        let state = authenticating();
+        let held = state.borrow();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let _ = super::commit_session_started(&state);
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(
+            panicked.is_err(),
+            "a held Ref must panic on the session write, not skip it"
+        );
+        drop(held);
+        assert!(
+            matches!(
+                state.borrow().phase,
+                Phase::Authenticating {
+                    purpose: AuthPurpose::Check,
+                    ..
+                }
+            ),
+            "the panicked write must leave the phase on Authenticating"
         );
     }
 }
