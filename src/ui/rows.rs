@@ -33,7 +33,7 @@ fn caption_suffix(text: &str, extra: &[&str]) -> Label {
         .build()
 }
 
-pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
+fn action_row(package: &Package) -> ActionRow {
     let subtitle = format!("{} · {}", package.version_line(), package.source.label());
     let row = ActionRow::builder()
         .title(&package.name)
@@ -44,31 +44,37 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
         .build();
     row.add_css_class("pkg-row");
     row.add_prefix(&leading(package));
+    row
+}
+
+fn add_status_caption(row: &ActionRow, status: PackageStatus) {
+    match status {
+        PackageStatus::Downloading | PackageStatus::Installing => {
+            row.add_css_class("active");
+            row.add_suffix(&caption_suffix(status.label(), &["accent", "phase-tag"]));
+        }
+        PackageStatus::Pending => {
+            row.add_css_class("pending");
+            row.add_suffix(&caption_suffix("queued", &["dimmed"]));
+        }
+        PackageStatus::Failed => {
+            row.add_suffix(&caption_suffix("failed", &["error"]));
+        }
+        PackageStatus::Completed => {
+            row.add_suffix(&caption_suffix("done", &["success"]));
+        }
+        PackageStatus::Skipped => {
+            row.add_css_class("pending");
+            row.add_suffix(&caption_suffix("skipped", &["dimmed"]));
+        }
+    }
+}
+
+pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
+    let row = action_row(package);
 
     if show_status {
-        match package.status {
-            PackageStatus::Downloading | PackageStatus::Installing => {
-                row.add_css_class("active");
-                row.add_suffix(&caption_suffix(
-                    package.status.label(),
-                    &["accent", "phase-tag"],
-                ));
-            }
-            PackageStatus::Pending => {
-                row.add_css_class("pending");
-                row.add_suffix(&caption_suffix("queued", &["dimmed"]));
-            }
-            PackageStatus::Failed => {
-                row.add_suffix(&caption_suffix("failed", &["error"]));
-            }
-            PackageStatus::Completed => {
-                row.add_suffix(&caption_suffix("done", &["success"]));
-            }
-            PackageStatus::Skipped => {
-                row.add_css_class("pending");
-                row.add_suffix(&caption_suffix("skipped", &["dimmed"]));
-            }
-        }
+        add_status_caption(&row, package.status);
     } else {
         let trailing = package
             .size
@@ -162,9 +168,17 @@ pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: boo
 }
 
 /// Finished package on the Done list and in the running completed expander.
-/// Source badge, name, version and source, lowercase status, and size only when known.
-pub fn finished_row(package: &Package) -> ActionRow {
-    let row = package_row(package, true);
+/// Source badge, name, version and source, and size only when known.
+///
+/// `mark_completed` adds the green "done" word. The running expander uses it.
+/// The Installed review does not: the header already says the apply finished,
+/// and the word sits in the middle of a wrapped subtitle. Failed and skipped
+/// rows still name their status.
+pub fn finished_row(package: &Package, mark_completed: bool) -> ActionRow {
+    let row = action_row(package);
+    if mark_completed || package.status != PackageStatus::Completed {
+        add_status_caption(&row, package.status);
+    }
     if let Some(size) = package.size.as_deref() {
         row.add_suffix(&caption_suffix(size, &["dimmed"]));
     }

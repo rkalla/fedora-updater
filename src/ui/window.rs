@@ -865,7 +865,7 @@ fn maybe_open_preview_completed(w: &Widgets) {
 }
 
 fn finished_row(package: &Package) -> libadwaita::ActionRow {
-    rows::finished_row(package)
+    rows::finished_row(package, true)
 }
 
 fn restore_default_window_size(window: &ApplicationWindow) {
@@ -1587,7 +1587,9 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             rows::refill_group(
                 &w.done_installed,
                 &w.done_installed_rows,
-                listed.into_iter().map(finished_row),
+                listed
+                    .into_iter()
+                    .map(|package| rows::finished_row(package, false)),
             );
             w.done_installed_scroll.set_visible(!packages.is_empty());
         }
