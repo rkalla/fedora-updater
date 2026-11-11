@@ -39,7 +39,7 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
         .title(&package.name)
         .subtitle(&subtitle)
         .title_lines(1)
-        .subtitle_lines(1)
+        .subtitle_lines(2)
         .activatable(false)
         .build();
     row.add_css_class("pkg-row");
@@ -92,7 +92,7 @@ pub fn checklist_row(package: &Package) -> ChecklistRow {
         .title(&package.name)
         .subtitle(&subtitle)
         .title_lines(1)
-        .subtitle_lines(1)
+        .subtitle_lines(2)
         .activatable(false)
         .build();
     row.add_css_class("pkg-row");

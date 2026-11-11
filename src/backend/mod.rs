@@ -1,4 +1,5 @@
-//! Parsers and progress hints for each update backend (CLI output only).
+//! Parsers and progress hints for each update backend.
+//! Flatpak discovery calls libflatpak. Installs still go through the flatpak CLI.
 
 pub mod dnf;
 pub mod flatpak;

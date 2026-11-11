@@ -6,13 +6,13 @@ A polished GNOME desktop front-end for **system (DNF)**, **Flatpak**, and **firm
 |:---:|:---:|:---:|
 | [![Review available updates](screenshots/ready.png)](screenshots/ready.png) | [![Applying updates](screenshots/running.png)](screenshots/running.png) | [![Updates applied](screenshots/done.png)](screenshots/done.png) |
 
-This app is a **view layer on top of CLI tools**. It never links against libdnf or mutates packages via libraries — every host change goes through:
+This app is a **view layer on top of the system tools**. It never links against libdnf. Flatpak *discovery* uses libflatpak's `list_installed_refs_for_update` (the same call GNOME Software uses), so a runtime whose commit is current still shows up when a related extension such as the NVIDIA driver needs installing. Every host change still goes through a CLI tool:
 
 | Area | Check | Apply |
 |------|--------|--------|
 | System | `dnf check-update --refresh` | `dnf update -y` |
-| Flatpak (user) | `flatpak remote-ls --user --updates …` | `flatpak update --user -y --noninteractive` |
-| Flatpak (system) | `flatpak remote-ls --system --updates …` | `flatpak update --system -y --noninteractive` |
+| Flatpak (user) | libflatpak `list_installed_refs_for_update` | `flatpak update --user -y --noninteractive` |
+| Flatpak (system) | libflatpak `list_installed_refs_for_update` | `flatpak update --system -y --noninteractive` |
 | Firmware | `fwupdmgr refresh` + `get-updates` | `fwupdmgr update -y --no-reboot-check` |
 | Reboot | — | `systemctl reboot` |
 
@@ -85,10 +85,10 @@ fedora-updater (GUI)
        │
        ├── privilege session ── pkexec ──► fedora-updater --helper
        │                                      └── allowlisted dnf/fwupd/flatpak-system
-       └── local commands ─────────────────── flatpak user (+ appstream refresh)
+       └── local commands ─────────────────── flatpak check via libflatpak, apply via flatpak(1)
 
 state.rs                Pure state machine (heavily tested)
-backend/*               Parsers only (dnf / flatpak / fwupd stdout)
+backend/*               dnf/fwupd parsers, flatpak libflatpak check + stdout progress
 orchestrator.rs         Sequential check/apply pipelines
 helper_protocol.rs      RUN <id> / __END__ <code> wire format
 helper_mode.rs          Privileged allowlist implementation

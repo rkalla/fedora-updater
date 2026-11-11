@@ -207,25 +207,32 @@ pub fn run_check_all(tx: Sender<WorkerEvent>) {
             &mut soft_errors,
         );
 
-        // 2) Flatpak metadata (unprivileged)
+        // 2) Flatpak appstream (unprivileged). Names and versions come from this
+        // metadata; the update set itself comes from libflatpak below.
         let _ = run_local_command(
             "flatpak",
-            &["update", "--appstream", "--noninteractive"],
-            |l| line(&tx, "flatpak", l),
+            &["update", "--user", "--appstream", "--noninteractive"],
+            |l| line(&tx, "flatpak-user", l),
+        );
+        let _ = run_local_command(
+            "flatpak",
+            &["update", "--system", "--appstream", "--noninteractive"],
+            |l| line(&tx, "flatpak-system", l),
         );
 
-        // 3–4) Flatpak lists
+        // 3–4) Flatpak lists. Same decision as GNOME Software: a ref is included
+        // when its commit changed or a related extension still needs installing.
         emit_backend_check(
             &tx,
             UpdateSource::FlatpakUser,
-            run_flatpak_remote_ls(&tx, true).map_err(|e| format!("flatpak user: {e}")),
+            run_flatpak_check(&tx, true).map_err(|e| format!("flatpak user: {e}")),
             &mut all,
             &mut soft_errors,
         );
         emit_backend_check(
             &tx,
             UpdateSource::FlatpakSystem,
-            run_flatpak_remote_ls(&tx, false).map_err(|e| format!("flatpak system: {e}")),
+            run_flatpak_check(&tx, false).map_err(|e| format!("flatpak system: {e}")),
             &mut all,
             &mut soft_errors,
         );
@@ -355,67 +362,28 @@ where
     parse(&log, code)
 }
 
-fn run_flatpak_remote_ls(tx: &Sender<WorkerEvent>, user: bool) -> Result<Vec<Package>, String> {
-    let args = flatpak::remote_ls_args(user);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut log = String::new();
+fn run_flatpak_check(tx: &Sender<WorkerEvent>, user: bool) -> Result<Vec<Package>, String> {
     let tag = if user {
         "flatpak-user"
     } else {
         "flatpak-system"
     };
-    let code = run_local_command("flatpak", &arg_refs, |l| {
-        log.push_str(&l);
-        log.push('\n');
-        // Don't flood console with raw JSON; keep a short status line.
-        if !l.trim_start().starts_with('[') && !l.trim_start().starts_with('{') {
-            line(tx, tag, l);
-        }
-    })
-    .map_err(|e| e.to_string())?;
-
-    if code != 0 {
-        let lower = log.to_ascii_lowercase();
-        if lower.contains("not found") || lower.contains("no such file") {
-            return Err("flatpak not installed".into());
-        }
-        if log.trim().is_empty() {
-            return Ok(vec![]);
-        }
-    }
-
-    let source = if user {
-        UpdateSource::FlatpakUser
-    } else {
-        UpdateSource::FlatpakSystem
-    };
-
-    // remote-ls --updates can false-positive on Fedora/OCI remotes when the
-    // remote commit is only an Alt-id of the installed commit. Filter those out
-    // so Check matches what `flatpak update` will actually do.
-    let candidates = flatpak::parse_remote_ls_json(&log, source);
-    let before = candidates.len();
-    let packages = flatpak::filter_actionable_candidates(candidates);
-    if before > packages.len() {
-        line(
-            tx,
-            tag,
-            format!(
-                "Filtered {} phantom update(s) (already current / Alt-id match)",
-                before - packages.len()
-            ),
-        );
+    let scope = if user { "user" } else { "system" };
+    let check = flatpak::query_updates(user)?;
+    if let Some(warning) = check.warning {
+        line(tx, tag, warning);
     }
     line(
         tx,
         tag,
-        format!(
-            "{} actionable update(s) ({})",
-            packages.len(),
-            if user { "user" } else { "system" }
-        ),
+        format!("{} update(s) ({scope})", check.packages.len()),
     );
-    Ok(packages)
+    for package in &check.packages {
+        if let Some((_, installs)) = package.detail.split_once("installs ") {
+            line(tx, tag, format!("{} installs {installs}", package.name));
+        }
+    }
+    Ok(check.packages)
 }
 
 /// Apply all pending sources sequentially. Reuses the shared helper session
