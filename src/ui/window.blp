@@ -66,23 +66,39 @@ Adw.ApplicationWindow window {
             spacing: 12;
             margin-start: 14;
             margin-end: 12;
-            margin-top: 8;
-            margin-bottom: 8;
+            margin-top: 10;
+            margin-bottom: 10;
 
-            Gtk.Label upgrade_title {
-              label: "A new Fedora Linux release is available";
+            Gtk.Box {
+              orientation: vertical;
+              spacing: 2;
               hexpand: true;
-              xalign: 0;
-              halign: start;
-              ellipsize: end;
+              valign: center;
+
+              Gtk.Label upgrade_title {
+                label: "A new Fedora Linux release is available";
+                xalign: 0;
+                halign: start;
+                ellipsize: end;
+              }
+
+              Gtk.Label upgrade_age {
+                visible: false;
+                xalign: 0;
+                halign: start;
+                ellipsize: end;
+                styles ["dimmed", "caption"]
+              }
             }
 
             Gtk.Label {
               label: "How to upgrade";
+              valign: center;
             }
 
             Gtk.Image {
               icon-name: "go-next-symbolic";
+              valign: center;
             }
           };
         }

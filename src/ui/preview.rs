@@ -58,6 +58,7 @@ pub fn state_for(phase: &str) -> AppState {
         updates_listed_at: None,
         apply_when_ready: false,
         release_upgrade: None,
+        release_age_days: None,
     };
 
     state.phase = match phase {

@@ -184,6 +184,7 @@ struct Widgets {
     upgrade_notice: gtk::Box,
     upgrade_action: Button,
     upgrade_title: Label,
+    upgrade_age: Label,
     stack: Stack,
     toast: ToastOverlay,
     idle_page: StatusPage,
@@ -268,6 +269,7 @@ pub fn build(app: &Application) {
         upgrade_notice: obj(&builder, "upgrade_notice"),
         upgrade_action: obj(&builder, "upgrade_action"),
         upgrade_title: obj(&builder, "upgrade_title"),
+        upgrade_age: obj(&builder, "upgrade_age"),
         stack: obj(&builder, "stack"),
         toast: obj(&builder, "toast"),
         idle_page: obj(&builder, "idle_page"),
@@ -1388,7 +1390,7 @@ fn clear_idle_check_focus(w: &Widgets) {
     }
 }
 
-fn paint_release_upgrade(w: &Widgets, version: Option<u32>) {
+fn paint_release_upgrade(w: &Widgets, version: Option<u32>, days: Option<u32>) {
     let Some(version) = version else {
         w.upgrade_notice.set_visible(false);
         return;
@@ -1399,32 +1401,37 @@ fn paint_release_upgrade(w: &Widgets, version: Option<u32>) {
     w.upgrade_action.set_tooltip_text(Some(&name));
     w.upgrade_action
         .update_property(&[gtk::accessible::Property::Label(&name)]);
+    match days.map(fedora_updater::release_upgrade::release_age_caption) {
+        Some(caption) => {
+            w.upgrade_age.set_label(&caption);
+            w.upgrade_age.set_visible(true);
+        }
+        None => w.upgrade_age.set_visible(false),
+    }
     w.upgrade_notice.set_visible(true);
 }
 
 fn present_upgrade_dialog(parent: &impl IsA<gtk::Widget>, version: u32) {
     use fedora_updater::release_upgrade::{
-        upgrade_commands, upgrade_dialog_body, UPGRADE_DIALOG_HEADING,
+        upgrade_command_lines, upgrade_dialog_body, UPGRADE_DIALOG_HEADING,
     };
 
     let body = Label::new(Some(upgrade_dialog_body()));
     body.set_wrap(true);
     body.set_xalign(0.0);
     body.set_halign(gtk::Align::Start);
-    body.set_max_width_chars(48);
 
-    let commands = Label::new(Some(&upgrade_commands(version)));
-    commands.set_selectable(true);
-    commands.set_wrap(true);
-    commands.set_xalign(0.0);
-    commands.set_halign(gtk::Align::Start);
-    commands.add_css_class("monospace");
-    commands.set_margin_top(12);
+    let commands = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    commands.set_margin_top(18);
+    let copy_names = ["Copy download command", "Copy reboot command"];
+    for (command, copy_name) in upgrade_command_lines(version).into_iter().zip(copy_names) {
+        commands.append(&command_row(&command, copy_name));
+    }
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_margin_start(24);
     content.set_margin_end(24);
-    content.set_margin_top(12);
+    content.set_margin_top(6);
     content.set_margin_bottom(24);
     content.append(&body);
     content.append(&commands);
@@ -1435,23 +1442,78 @@ fn present_upgrade_dialog(parent: &impl IsA<gtk::Widget>, version: u32) {
 
     let dialog = libadwaita::Dialog::new();
     dialog.set_title(UPGRADE_DIALOG_HEADING);
-    dialog.set_content_width(440);
+    dialog.set_content_width(560);
     dialog.set_follows_content_size(true);
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(parent));
 }
 
+/// One command, padded, with its own copy button.
+/// The clipboard text has no trailing newline, so pasting does not run it.
+fn command_row(command: &str, copy_name: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("upgrade-command");
+
+    let label = Label::new(Some(command));
+    label.set_selectable(true);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_margin_top(14);
+    label.set_margin_bottom(14);
+    label.set_margin_start(14);
+    label.set_can_focus(false);
+    label.select_region(0, 0);
+    label.add_css_class("monospace");
+
+    let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy.set_tooltip_text(Some(copy_name));
+    copy.add_css_class("flat");
+    copy.set_valign(gtk::Align::Center);
+    copy.set_margin_top(4);
+    copy.set_margin_bottom(4);
+    copy.set_margin_end(6);
+    copy.update_property(&[gtk::accessible::Property::Label(copy_name)]);
+
+    let text = command.to_string();
+    let idle_tip = copy_name.to_string();
+    copy.connect_clicked(move |btn| {
+        btn.clipboard().set_text(&text);
+        btn.set_icon_name("emblem-ok-symbolic");
+        btn.set_tooltip_text(Some("Copied"));
+        let btn = btn.clone();
+        let idle_tip = idle_tip.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1600), move || {
+            btn.set_icon_name("edit-copy-symbolic");
+            btn.set_tooltip_text(Some(&idle_tip));
+        });
+    });
+
+    row.append(&label);
+    row.append(&copy);
+    row
+}
+
 fn spawn_release_lookup(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>) {
-    let (tx, rx) = async_channel::bounded::<Option<u32>>(1);
+    let (tx, rx) =
+        async_channel::bounded::<Option<fedora_updater::release_upgrade::ReleaseOffer>>(1);
     std::thread::spawn(move || {
-        let version = fedora_updater::release_upgrade::lookup_installed();
-        let _ = tx.send_blocking(version);
+        let offer = fedora_updater::release_upgrade::lookup_installed();
+        let _ = tx.send_blocking(offer);
     });
     let state = state.clone();
     let widgets = widgets.clone();
     glib::spawn_future_local(async move {
-        if let Ok(version) = rx.recv().await {
-            dispatch(&state, &widgets, Event::ReleaseNoted { version });
+        if let Ok(offer) = rx.recv().await {
+            dispatch(
+                &state,
+                &widgets,
+                Event::ReleaseNoted {
+                    version: offer.as_ref().map(|offer| offer.version),
+                    days_since_release: offer.and_then(|offer| offer.days_since_release),
+                },
+            );
         }
     });
 }
@@ -1460,7 +1522,7 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     w.run_stall.set_revealed(false);
     clear_idle_check_focus(w);
     let s = state.borrow();
-    paint_release_upgrade(w, s.release_upgrade);
+    paint_release_upgrade(w, s.release_upgrade, s.release_age_days);
     let last_console = s.console.last_line().to_string();
     let full_console = s.console.full_text();
     let elapsed = s
@@ -1711,6 +1773,7 @@ mod tests {
             "upgrade_notice",
             "upgrade_action",
             "upgrade_title",
+            "upgrade_age",
             "idle_page",
             "auth_page",
             "check_group",
@@ -1768,6 +1831,13 @@ mod tests {
         );
         assert!(xml.contains("How to upgrade"));
         assert!(xml.contains("go-next-symbolic"));
+        let blp_src = include_str!("window.blp");
+        let age_at = blp_src.find("Gtk.Label upgrade_age").expect("upgrade_age");
+        let age_chunk = &blp_src[age_at..age_at + 220];
+        assert!(
+            age_chunk.contains("dimmed") && age_chunk.contains("caption"),
+            "the release age is a quiet caption under the title"
+        );
         let action_at = xml.find("id=\"upgrade_action\"").expect("upgrade_action");
         let header_at = xml.find("id=\"header_menu\"").expect("header_menu");
         let stack_at = xml.find("id=\"stack\"").expect("stack");

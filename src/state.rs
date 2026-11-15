@@ -90,6 +90,9 @@ pub struct AppState {
     /// Newer Active Fedora release, when the collections list names one.
     /// Independent of [`Phase`]. A check does not clear it.
     pub release_upgrade: Option<u32>,
+    /// Calendar days since that release was marked Active.
+    /// `None` leaves the reminder up and hides the age line.
+    pub release_age_days: Option<u32>,
 }
 
 impl Default for AppState {
@@ -101,6 +104,7 @@ impl Default for AppState {
             updates_listed_at: None,
             apply_when_ready: false,
             release_upgrade: None,
+            release_age_days: None,
         }
     }
 }
@@ -238,15 +242,21 @@ pub enum Event {
     RecoveryProbeSettled,
     /// A newer Fedora release was looked up. `None` hides the reminder.
     /// Valid in every phase. Does not start a check or an apply.
+    /// A missing age hides only the "(N days since release)" line.
     ReleaseNoted {
         version: Option<u32>,
+        days_since_release: Option<u32>,
     },
 }
 
 pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionError> {
     match event {
-        Event::ReleaseNoted { version } => {
+        Event::ReleaseNoted {
+            version,
+            days_since_release,
+        } => {
             state.release_upgrade = version;
+            state.release_age_days = version.and(days_since_release);
             Ok(state)
         }
         Event::StartCheck { then_apply } => {
@@ -806,16 +816,44 @@ mod tests {
     #[test]
     fn a_release_note_stays_across_a_check_and_does_not_change_phase() {
         let s = AppState::default();
-        let s = reduce(s, Event::ReleaseNoted { version: Some(45) }).unwrap();
+        let s = reduce(
+            s,
+            Event::ReleaseNoted {
+                version: Some(45),
+                days_since_release: Some(12),
+            },
+        )
+        .unwrap();
         assert_eq!(s.release_upgrade, Some(45));
+        assert_eq!(s.release_age_days, Some(12));
         assert!(matches!(s.phase, Phase::Idle(_)));
 
         let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
         assert_eq!(s.release_upgrade, Some(45));
+        assert_eq!(s.release_age_days, Some(12));
         assert!(matches!(s.phase, Phase::Authenticating { .. }));
 
-        let s = reduce(s, Event::ReleaseNoted { version: None }).unwrap();
+        let s = reduce(
+            s,
+            Event::ReleaseNoted {
+                version: Some(45),
+                days_since_release: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.release_upgrade, Some(45));
+        assert_eq!(s.release_age_days, None);
+
+        let s = reduce(
+            s,
+            Event::ReleaseNoted {
+                version: None,
+                days_since_release: Some(12),
+            },
+        )
+        .unwrap();
         assert_eq!(s.release_upgrade, None);
+        assert_eq!(s.release_age_days, None);
         assert!(matches!(s.phase, Phase::Authenticating { .. }));
     }
 
