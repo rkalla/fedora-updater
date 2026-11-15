@@ -87,6 +87,9 @@ pub struct AppState {
     /// After a check, start apply when the list is non-empty.
     /// Set only by the stale-list dialog's Yes (`StartCheck { then_apply: true }`).
     pub apply_when_ready: bool,
+    /// Newer Active Fedora release, when the collections list names one.
+    /// Independent of [`Phase`]. A check does not clear it.
+    pub release_upgrade: Option<u32>,
 }
 
 impl Default for AppState {
@@ -97,6 +100,7 @@ impl Default for AppState {
             stopwatch: None,
             updates_listed_at: None,
             apply_when_ready: false,
+            release_upgrade: None,
         }
     }
 }
@@ -232,10 +236,19 @@ pub enum Event {
     RecoveryProbeUnknown,
     /// The planned dnf versions are installed and a later source still has work.
     RecoveryProbeSettled,
+    /// A newer Fedora release was looked up. `None` hides the reminder.
+    /// Valid in every phase. Does not start a check or an apply.
+    ReleaseNoted {
+        version: Option<u32>,
+    },
 }
 
 pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionError> {
     match event {
+        Event::ReleaseNoted { version } => {
+            state.release_upgrade = version;
+            Ok(state)
+        }
         Event::StartCheck { then_apply } => {
             let last_checked = match &state.phase {
                 Phase::Idle(screen) => idle_checked_at(screen),
@@ -788,6 +801,22 @@ mod tests {
             p.id = format!("{source:?}:{name}");
         }
         p
+    }
+
+    #[test]
+    fn a_release_note_stays_across_a_check_and_does_not_change_phase() {
+        let s = AppState::default();
+        let s = reduce(s, Event::ReleaseNoted { version: Some(45) }).unwrap();
+        assert_eq!(s.release_upgrade, Some(45));
+        assert!(matches!(s.phase, Phase::Idle(_)));
+
+        let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
+        assert_eq!(s.release_upgrade, Some(45));
+        assert!(matches!(s.phase, Phase::Authenticating { .. }));
+
+        let s = reduce(s, Event::ReleaseNoted { version: None }).unwrap();
+        assert_eq!(s.release_upgrade, None);
+        assert!(matches!(s.phase, Phase::Authenticating { .. }));
     }
 
     #[test]

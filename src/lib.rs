@@ -10,6 +10,7 @@ pub mod helper_protocol;
 pub mod model;
 pub mod orchestrator;
 pub mod privilege;
+pub mod release_upgrade;
 pub mod state;
 
 pub use model::*;

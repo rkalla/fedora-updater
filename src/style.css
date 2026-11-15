@@ -1,5 +1,18 @@
 /* Adwaita tokens, matching mockups/boards.css */
 
+/* Inset control, not a second header bar. The toolbar slot would otherwise
+   paint this strip like window chrome. */
+.upgrade-notice {
+  background: none;
+  box-shadow: none;
+}
+
+button.upgrade-offer {
+  border-radius: 12px;
+  background-color: @card_bg_color;
+  border: 1px solid alpha(@window_fg_color, 0.18);
+}
+
 .progress-block {
   margin: 0 12px 12px;
 }

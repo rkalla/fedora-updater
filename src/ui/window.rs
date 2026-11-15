@@ -181,6 +181,9 @@ struct Widgets {
     header_subtitle: RefCell<String>,
     narrow: Cell<bool>,
     header_refresh: Button,
+    upgrade_notice: gtk::Box,
+    upgrade_action: Button,
+    upgrade_title: Label,
     stack: Stack,
     toast: ToastOverlay,
     idle_page: StatusPage,
@@ -262,6 +265,9 @@ pub fn build(app: &Application) {
         header_subtitle: RefCell::new(String::new()),
         narrow: Cell::new(false),
         header_refresh: obj(&builder, "header_refresh"),
+        upgrade_notice: obj(&builder, "upgrade_notice"),
+        upgrade_action: obj(&builder, "upgrade_action"),
+        upgrade_title: obj(&builder, "upgrade_title"),
         stack: obj(&builder, "stack"),
         toast: obj(&builder, "toast"),
         idle_page: obj(&builder, "idle_page"),
@@ -389,6 +395,16 @@ pub fn build(app: &Application) {
         let tx = tx.clone();
         header_refresh.connect_clicked(move |_| {
             start_check(&state, &widgets, tx.clone(), false);
+        });
+    }
+    {
+        let state = state.clone();
+        let window = widgets.window.clone();
+        widgets.upgrade_action.connect_clicked(move |_| {
+            let Some(version) = state.borrow().release_upgrade else {
+                return;
+            };
+            present_upgrade_dialog(&window, version);
         });
     }
     {
@@ -540,6 +556,7 @@ pub fn build(app: &Application) {
     }
 
     render(&state, &widgets);
+    spawn_release_lookup(&state, &widgets);
     {
         let hooked = widgets.clone();
         glib::idle_add_local_once(move || {
@@ -755,6 +772,9 @@ fn handle_worker(
     };
     if apply_now {
         begin_apply(state, widgets, tx.clone());
+    }
+    if check_finished {
+        spawn_release_lookup(state, widgets);
     }
 }
 
@@ -1368,10 +1388,79 @@ fn clear_idle_check_focus(w: &Widgets) {
     }
 }
 
+fn paint_release_upgrade(w: &Widgets, version: Option<u32>) {
+    let Some(version) = version else {
+        w.upgrade_notice.set_visible(false);
+        return;
+    };
+    let title = fedora_updater::release_upgrade::banner_title(version);
+    let name = fedora_updater::release_upgrade::upgrade_button_name(version);
+    w.upgrade_title.set_label(&title);
+    w.upgrade_action.set_tooltip_text(Some(&name));
+    w.upgrade_action
+        .update_property(&[gtk::accessible::Property::Label(&name)]);
+    w.upgrade_notice.set_visible(true);
+}
+
+fn present_upgrade_dialog(parent: &impl IsA<gtk::Widget>, version: u32) {
+    use fedora_updater::release_upgrade::{
+        upgrade_commands, upgrade_dialog_body, UPGRADE_DIALOG_HEADING,
+    };
+
+    let body = Label::new(Some(upgrade_dialog_body()));
+    body.set_wrap(true);
+    body.set_xalign(0.0);
+    body.set_halign(gtk::Align::Start);
+    body.set_max_width_chars(48);
+
+    let commands = Label::new(Some(&upgrade_commands(version)));
+    commands.set_selectable(true);
+    commands.set_wrap(true);
+    commands.set_xalign(0.0);
+    commands.set_halign(gtk::Align::Start);
+    commands.add_css_class("monospace");
+    commands.set_margin_top(12);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    content.set_margin_top(12);
+    content.set_margin_bottom(24);
+    content.append(&body);
+    content.append(&commands);
+
+    let toolbar = libadwaita::ToolbarView::new();
+    toolbar.add_top_bar(&libadwaita::HeaderBar::new());
+    toolbar.set_content(Some(&content));
+
+    let dialog = libadwaita::Dialog::new();
+    dialog.set_title(UPGRADE_DIALOG_HEADING);
+    dialog.set_content_width(440);
+    dialog.set_follows_content_size(true);
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(parent));
+}
+
+fn spawn_release_lookup(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>) {
+    let (tx, rx) = async_channel::bounded::<Option<u32>>(1);
+    std::thread::spawn(move || {
+        let version = fedora_updater::release_upgrade::lookup_installed();
+        let _ = tx.send_blocking(version);
+    });
+    let state = state.clone();
+    let widgets = widgets.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(version) = rx.recv().await {
+            dispatch(&state, &widgets, Event::ReleaseNoted { version });
+        }
+    });
+}
+
 fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     w.run_stall.set_revealed(false);
     clear_idle_check_focus(w);
     let s = state.borrow();
+    paint_release_upgrade(w, s.release_upgrade);
     let last_console = s.console.last_line().to_string();
     let full_console = s.console.full_text();
     let elapsed = s
@@ -1619,6 +1708,9 @@ mod tests {
             "window_title",
             "header_menu",
             "header_refresh",
+            "upgrade_notice",
+            "upgrade_action",
+            "upgrade_title",
             "idle_page",
             "auth_page",
             "check_group",
@@ -1655,6 +1747,8 @@ mod tests {
             "close_btn",
             "fail_back",
             "idle_hint",
+            "upgrade_info",
+            "upgrade_banner",
         ] {
             assert!(
                 !xml.contains(&format!("id=\"{gone}\"")),
@@ -1668,6 +1762,19 @@ mod tests {
         assert!(xml.contains("max-width: 500px"));
         assert!(xml.contains("About Fedora Updater"));
         assert!(xml.contains("Main Menu"));
+        assert!(
+            !xml.contains("dialog-information-symbolic"),
+            "the release reminder is not a header icon"
+        );
+        assert!(xml.contains("How to upgrade"));
+        assert!(xml.contains("go-next-symbolic"));
+        let action_at = xml.find("id=\"upgrade_action\"").expect("upgrade_action");
+        let header_at = xml.find("id=\"header_menu\"").expect("header_menu");
+        let stack_at = xml.find("id=\"stack\"").expect("stack");
+        assert!(
+            header_at < action_at && action_at < stack_at,
+            "the release offer sits under the header and above the page stack"
+        );
         // AdwHeaderBar.pack_end prepends. The first end child is the trailing
         // app button, so the menu is emitted before Stop.
         let menu_at = xml.find("id=\"header_menu\"").expect("header_menu");

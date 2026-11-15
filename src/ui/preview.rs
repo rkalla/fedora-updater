@@ -57,6 +57,7 @@ pub fn state_for(phase: &str) -> AppState {
         stopwatch: Some(Stopwatch::start()),
         updates_listed_at: None,
         apply_when_ready: false,
+        release_upgrade: None,
     };
 
     state.phase = match phase {

@@ -39,9 +39,15 @@ Usage:
 }
 
 fn run_gui() {
-    let app = libadwaita::Application::builder()
-        .application_id("dev.fedora.Updater")
-        .build();
+    // A preview or screenshot must open its own window. The normal launcher
+    // stays single-instance so a second click focuses the one already open.
+    let preview = std::env::var_os("FEDORA_UPDATER_SCREENSHOT").is_some()
+        || std::env::var_os("FEDORA_UPDATER_PREVIEW").is_some();
+    let mut builder = libadwaita::Application::builder().application_id("dev.fedora.Updater");
+    if preview {
+        builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = builder.build();
 
     app.connect_activate(|app| {
         ui::window::build(app);
