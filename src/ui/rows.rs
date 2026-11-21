@@ -47,23 +47,52 @@ fn action_row(package: &Package) -> ActionRow {
     row
 }
 
-fn add_status_caption(row: &ActionRow, status: PackageStatus) {
+fn apply_status_style(
+    row: &ActionRow,
+    label: &Label,
+    status: PackageStatus,
+    is_current: bool,
+    fade_done: bool,
+) {
+    for class in ["pending", "active", "done"] {
+        row.remove_css_class(class);
+    }
+    for class in ["dimmed", "accent", "success", "error", "phase-tag"] {
+        label.remove_css_class(class);
+    }
+
     match status {
         PackageStatus::Downloading | PackageStatus::Installing => {
-            row.add_css_class("active");
-            row.add_suffix(&caption_suffix(status.label(), &["accent", "phase-tag"]));
+            if is_current {
+                row.add_css_class("active");
+            }
+            label.add_css_class("accent");
+            label.add_css_class("phase-tag");
+            label.set_text(status.label());
         }
         PackageStatus::Pending => {
             row.add_css_class("pending");
-            row.add_suffix(&caption_suffix("queued", &["dimmed"]));
+            label.add_css_class("dimmed");
+            label.set_text("queued");
         }
         PackageStatus::Failed => {
-            row.add_suffix(&caption_suffix("failed", &["error"]));
+            label.add_css_class("error");
+            label.set_text("failed");
         }
         PackageStatus::Completed => {
-            row.add_suffix(&caption_suffix("done", &["success"]));
+            if fade_done {
+                row.add_css_class("done");
+            }
+            label.add_css_class("success");
+            label.set_text("done");
         }
     }
+}
+
+fn add_status_caption(row: &ActionRow, status: PackageStatus) {
+    let label = caption_suffix("", &[]);
+    apply_status_style(row, &label, status, true, false);
+    row.add_suffix(&label);
 }
 
 pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
@@ -88,17 +117,7 @@ pub struct ChecklistRow {
 }
 
 pub fn checklist_row(package: &Package) -> ChecklistRow {
-    let subtitle = format!("{} · {}", package.version_line(), package.source.label());
-    let row = ActionRow::builder()
-        .title(&package.name)
-        .subtitle(&subtitle)
-        .title_lines(1)
-        .subtitle_lines(2)
-        .activatable(false)
-        .build();
-    row.add_css_class("pkg-row");
-    row.add_prefix(&leading(package));
-
+    let row = action_row(package);
     let status = caption_suffix("", &[]);
     row.add_suffix(&status);
     let built = ChecklistRow { row, status };
@@ -107,54 +126,7 @@ pub fn checklist_row(package: &Package) -> ChecklistRow {
 }
 
 pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: bool) {
-    row.row.remove_css_class("pending");
-    row.row.remove_css_class("active");
-    row.row.remove_css_class("done");
-    row.status.remove_css_class("dimmed");
-    row.status.remove_css_class("accent");
-    row.status.remove_css_class("success");
-    row.status.remove_css_class("error");
-    row.status.remove_css_class("phase-tag");
-
-    let live = is_current
-        && matches!(
-            package.status,
-            PackageStatus::Downloading | PackageStatus::Installing
-        );
-    if live {
-        row.row.add_css_class("active");
-        row.status.add_css_class("accent");
-        row.status.add_css_class("phase-tag");
-        row.status.set_text(package.status.label());
-        return;
-    }
-
-    match package.status {
-        PackageStatus::Completed => {
-            row.row.add_css_class("done");
-            row.status.add_css_class("success");
-            row.status.set_text("done");
-        }
-        PackageStatus::Failed => {
-            row.status.add_css_class("error");
-            row.status.set_text("failed");
-        }
-        PackageStatus::Installing => {
-            row.status.add_css_class("accent");
-            row.status.add_css_class("phase-tag");
-            row.status.set_text("installing");
-        }
-        PackageStatus::Downloading => {
-            row.status.add_css_class("accent");
-            row.status.add_css_class("phase-tag");
-            row.status.set_text("downloading");
-        }
-        PackageStatus::Pending => {
-            row.row.add_css_class("pending");
-            row.status.add_css_class("dimmed");
-            row.status.set_text("queued");
-        }
-    }
+    apply_status_style(&row.row, &row.status, package.status, is_current, true);
 }
 
 /// Finished package on the Done list and in the running completed expander.

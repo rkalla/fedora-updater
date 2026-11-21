@@ -825,7 +825,7 @@ mod tests {
             }) => {
                 assert_eq!(checked_at, "just now");
                 assert_eq!(
-                    crate::model::idle_chrome(&IdleScreen::Current {
+                    crate::presenter::idle_chrome(&IdleScreen::Current {
                         checked_at,
                         detail: None,
                     })
@@ -1043,7 +1043,7 @@ mod tests {
         else {
             panic!("expected Current, got {:?}", s.phase);
         };
-        let description = crate::model::idle_chrome(&IdleScreen::Current {
+        let description = crate::presenter::idle_chrome(&IdleScreen::Current {
             checked_at: checked_at.clone(),
             detail: None,
         })

@@ -10,6 +10,7 @@ pub mod helper_mode;
 pub mod helper_protocol;
 pub mod model;
 pub mod orchestrator;
+pub mod presenter;
 pub mod privilege;
 pub mod release_upgrade;
 pub mod state;
