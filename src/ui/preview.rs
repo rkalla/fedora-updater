@@ -337,7 +337,7 @@ fn many_running_packages() -> Vec<Package> {
 
 #[cfg(test)]
 mod tests {
-    use fedora_updater::model::{IdleScreen, RetryAction};
+    use fedora_updater::model::{AuthPurpose, IdleScreen, PackageStatus, RetryAction, RunPass, UpdateSource};
     use fedora_updater::state::Phase;
 
     #[test]
@@ -364,6 +364,103 @@ mod tests {
             }
         }
 
+        match super::state_for("idle-warning").phase {
+            Phase::Idle(IdleScreen::Warning { title, detail, checked_at }) => {
+                assert_eq!(title, "Could not check all sources");
+                assert!(detail.contains("dnf check-update failed"));
+                assert_eq!(checked_at.as_deref(), Some("just now"));
+            }
+            other => panic!("expected Warning idle, got {other:?}"),
+        }
+
+        assert!(matches!(
+            super::state_for("auth").phase,
+            Phase::Authenticating {
+                purpose: AuthPurpose::Check,
+                ..
+            }
+        ));
+
+        match super::state_for("checking").phase {
+            Phase::Checking {
+                packages_so_far,
+                checked_sources,
+                soft_errors,
+            } => {
+                assert_eq!(packages_so_far.len(), 6);
+                assert_eq!(checked_sources, vec![UpdateSource::Dnf]);
+                assert!(soft_errors.is_empty());
+            }
+            other => panic!("expected Checking, got {other:?}"),
+        }
+
+        assert!(matches!(
+            &super::state_for("ready").phase,
+            Phase::Ready { packages, soft_errors } if packages.len() == 6 && soft_errors.is_empty()
+        ));
+        assert!(matches!(
+            &super::state_for("ready-many").phase,
+            Phase::Ready { packages, .. }
+                if packages.len() >= 70 && packages.iter().all(|p| p.status == PackageStatus::Pending)
+        ));
+        assert!(matches!(
+            &super::state_for("ready-warn").phase,
+            Phase::Ready { packages, soft_errors }
+                if packages.len() == 6 && soft_errors == &vec!["Firmware metadata refresh failed".to_string()]
+        ));
+
+        match super::state_for("running").phase {
+            Phase::Running(r) => {
+                assert_eq!(r.active_index, Some(3));
+                assert_eq!(r.pass, RunPass::Apply);
+                assert_eq!(r.current_name.as_deref(), Some("gnome-shell"));
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+
+        for name in ["running-many", "running-expanded"] {
+            match super::state_for(name).phase {
+                Phase::Running(r) => {
+                    assert!(r.packages.len() >= 70, "{name}");
+                    assert!(r.active_index.is_some(), "{name}");
+                    assert_eq!(r.current_name.as_deref(), Some("current-package"));
+                }
+                other => panic!("{name} should be Running, got {other:?}"),
+            }
+        }
+
+        match super::state_for("done").phase {
+            Phase::Done {
+                packages,
+                needs_reboot,
+                failed,
+                failure_reasons,
+                ..
+            } => {
+                assert_eq!(failed, 0);
+                assert!(needs_reboot);
+                assert!(failure_reasons.is_empty());
+                assert!(packages.iter().all(|p| p.status == PackageStatus::Completed));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        match super::state_for("done-mixed").phase {
+            Phase::Done {
+                packages,
+                needs_reboot,
+                failed,
+                failure_reasons,
+                ..
+            } => {
+                assert_eq!(failed, 1);
+                assert!(needs_reboot);
+                assert_eq!(failure_reasons.len(), 1);
+                assert_eq!(packages.last().unwrap().status, PackageStatus::Failed);
+            }
+            other => panic!("expected done-mixed, got {other:?}"),
+        }
+
         match super::state_for("failed").phase {
             Phase::Failed {
                 title,
@@ -375,6 +472,11 @@ mod tests {
                 assert_eq!(retry, RetryAction::CheckAgain);
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+
+        if std::env::var_os("FEDORA_UPDATER_PREVIEW").is_none() {
+            assert!(super::initial_state().is_none());
+            assert!(super::initial_console().is_empty());
         }
     }
 

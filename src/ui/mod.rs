@@ -16,16 +16,17 @@ pub(super) fn obj<T: IsA<glib::Object>>(builder: &Builder, id: &str) -> T {
 #[cfg(test)]
 pub(super) fn builder_ids_in_source(src: &str) -> Vec<&str> {
     let body = src.split("#[cfg(test)]").next().unwrap_or(src);
-    let needle = "obj(&builder, \"";
     let mut ids = Vec::new();
-    let mut rest = body;
-    while let Some(pos) = rest.find(needle) {
-        let after = &rest[pos + needle.len()..];
-        let Some(end) = after.find('"') else {
-            break;
-        };
-        ids.push(&after[..end]);
-        rest = &after[end + 1..];
+    for needle in ["obj(&builder, \"", "obj(builder, \""] {
+        let mut rest = body;
+        while let Some(pos) = rest.find(needle) {
+            let after = &rest[pos + needle.len()..];
+            let Some(end) = after.find('"') else {
+                break;
+            };
+            ids.push(&after[..end]);
+            rest = &after[end + 1..];
+        }
     }
     ids
 }

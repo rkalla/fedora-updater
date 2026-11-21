@@ -25,15 +25,11 @@ pub(super) fn present_about(parent: &impl IsA<gtk::Widget>) {
     dialog.present(Some(parent));
 }
 
-pub(super) fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
+pub(super) fn build_log_window(log: &str) -> (AdwWindow, TextView, Button) {
     let builder = Builder::from_string(LOG_WINDOW_UI);
     let win: AdwWindow = obj(&builder, "log_window");
     let view: TextView = obj(&builder, "log_view");
     let copy_btn: Button = obj(&builder, "copy_btn");
-
-    if let Some(parent_win) = parent.root().and_downcast::<gtk::Window>() {
-        win.set_transient_for(Some(&parent_win));
-    }
 
     view.buffer().set_text(log);
     view.set_can_focus(true);
@@ -58,10 +54,18 @@ pub(super) fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
         win.add_controller(key);
     }
 
+    (win, view, copy_btn)
+}
+
+pub(super) fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
+    let (win, _, _) = build_log_window(log);
+    if let Some(parent_win) = parent.root().and_downcast::<gtk::Window>() {
+        win.set_transient_for(Some(&parent_win));
+    }
     win.present();
 }
 
-pub(super) fn present_upgrade_dialog(parent: &impl IsA<gtk::Widget>, version: u32) {
+pub(super) fn build_upgrade_dialog(version: u32) -> (libadwaita::Dialog, Vec<gtk::Box>) {
     use fedora_updater::release_upgrade::{
         upgrade_command_lines, upgrade_dialog_body, UPGRADE_DIALOG_HEADING,
     };
@@ -73,9 +77,12 @@ pub(super) fn present_upgrade_dialog(parent: &impl IsA<gtk::Widget>, version: u3
 
     let commands = gtk::Box::new(gtk::Orientation::Vertical, 10);
     commands.set_margin_top(18);
+    let mut rows = Vec::new();
     let copy_names = ["Copy download command", "Copy reboot command"];
     for (command, copy_name) in upgrade_command_lines(version).into_iter().zip(copy_names) {
-        commands.append(&command_row(&command, copy_name));
+        let row = command_row(&command, copy_name);
+        commands.append(&row);
+        rows.push(row);
     }
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -95,12 +102,17 @@ pub(super) fn present_upgrade_dialog(parent: &impl IsA<gtk::Widget>, version: u3
     dialog.set_content_width(560);
     dialog.set_follows_content_size(true);
     dialog.set_child(Some(&toolbar));
+    (dialog, rows)
+}
+
+pub(super) fn present_upgrade_dialog(parent: &impl IsA<gtk::Widget>, version: u32) {
+    let (dialog, _) = build_upgrade_dialog(version);
     dialog.present(Some(parent));
 }
 
 /// One command, padded, with its own copy button.
 /// The clipboard text has no trailing newline, so pasting does not run it.
-fn command_row(command: &str, copy_name: &str) -> gtk::Box {
+pub(super) fn command_row(command: &str, copy_name: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.add_css_class("upgrade-command");
 
@@ -145,7 +157,7 @@ fn command_row(command: &str, copy_name: &str) -> gtk::Box {
     row
 }
 
-fn build_dialog(copy: &DialogCopy) -> libadwaita::AlertDialog {
+pub(super) fn build_dialog(copy: &DialogCopy) -> libadwaita::AlertDialog {
     let dialog = libadwaita::AlertDialog::new(Some(copy.heading), Some(copy.body));
     dialog.add_response(copy.close_id, copy.close_label);
     dialog.add_response(copy.confirm_id, copy.confirm_label);
@@ -161,11 +173,10 @@ fn build_dialog(copy: &DialogCopy) -> libadwaita::AlertDialog {
     dialog
 }
 
-fn present_confirm(
-    parent: &impl IsA<gtk::Widget>,
+pub(super) fn build_confirm_dialog(
     copy: DialogCopy,
     on_confirm: impl Fn() + 'static,
-) {
+) -> libadwaita::AlertDialog {
     let dialog = build_dialog(&copy);
     let confirm_id = copy.confirm_id;
     dialog.connect_response(None, move |_dialog, response| {
@@ -173,6 +184,15 @@ fn present_confirm(
             on_confirm();
         }
     });
+    dialog
+}
+
+fn present_confirm(
+    parent: &impl IsA<gtk::Widget>,
+    copy: DialogCopy,
+    on_confirm: impl Fn() + 'static,
+) {
+    let dialog = build_confirm_dialog(copy, on_confirm);
     dialog.present(Some(parent));
 }
 

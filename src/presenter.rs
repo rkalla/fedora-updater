@@ -365,6 +365,17 @@ pub fn soft_error_banner_title(count: usize) -> String {
     }
 }
 
+/// Banner title shown on the Ready page when `soft_errors` is non-empty.
+pub fn ready_banner_title(soft_errors: &[String]) -> Option<String> {
+    if soft_errors.is_empty() {
+        return None;
+    }
+    if soft_errors.len() == 1 && soft_errors[0].starts_with("Stopped before install") {
+        return Some(soft_errors[0].clone());
+    }
+    Some(soft_error_banner_title(soft_errors.len()))
+}
+
 pub fn fail_retry_label(retry: RetryAction) -> &'static str {
     match retry {
         RetryAction::CheckAgain => "Check Again",
@@ -1004,6 +1015,22 @@ mod tests {
         assert_eq!(
             soft_error_banner_title(3),
             "3 sources could not be checked"
+        );
+        assert_eq!(ready_banner_title(&[]), None);
+        assert_eq!(
+            ready_banner_title(&["dnf failed".into()]).as_deref(),
+            Some("1 source could not be checked")
+        );
+        assert_eq!(
+            ready_banner_title(&["dnf failed".into(), "fwupd failed".into()]).as_deref(),
+            Some("2 sources could not be checked")
+        );
+        assert_eq!(
+            ready_banner_title(&[
+                "Stopped before install. Downloaded packages were not applied.".into()
+            ])
+            .as_deref(),
+            Some("Stopped before install. Downloaded packages were not applied.")
         );
         assert_eq!(
             ABOUT_COMMENTS,

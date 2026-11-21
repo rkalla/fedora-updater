@@ -116,6 +116,13 @@ pub struct ChecklistRow {
     status: Label,
 }
 
+#[cfg(test)]
+impl ChecklistRow {
+    pub fn status_label(&self) -> &Label {
+        &self.status
+    }
+}
+
 pub fn checklist_row(package: &Package) -> ChecklistRow {
     let row = action_row(package);
     let status = caption_suffix("", &[]);
