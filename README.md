@@ -106,13 +106,25 @@ src/ui/preview.rs         Preview states & screenshot capture (FEDORA_UPDATER_PR
 
 ## Tests
 
+The test suite runs offline in `< 1s` (**229 offline tests + 1 opt-in live-host test**) across four tiers backed by a 31-file deterministic fixture corpus under [`tests/fixtures/`](tests/fixtures/README.md):
+
+- **Unit (`src/`, `tests/unit_fixtures.rs`, `tests/fixture_corpus.rs`, `tests/model_and_protocol.rs`):** Pure parsers (`dnf`, `flatpak`, `fwupd`, `release_upgrade`), `console`, `model`, `presenter`, `helper_protocol` allowlist security bounds, `StreamSplitter` / `drain_child`, and privilege session pooling.
+- **Functional (`tests/state_machine_exhaustive.rs`, `tests/functional_flows.rs`):** Exhaustive `state::reduce` invariants and offline check/apply/reboot/stop/stale/auth-recovery flows via `OrchestratorRuntime`.
+- **Pipeline E2E (`tests/e2e_pipeline.rs`, `tests/helper_session.rs`):** Multi-stage user journeys driven over real OS pipes through `PrivilegedSession::start_direct` and the multi-call `--helper` wire protocol.
+- **GTK4 / Libadwaita E2E (`src/ui/`):** Blueprint ID checks, preview states, and un-presented live `Widgets`, row styling, console delta, `handle_worker_with` replay, and dialog verification (runs headlessly via `gtk4-broadwayd`, never opening visible desktop windows).
+
 ```bash
-# Fast offline test suite
+# Fast offline suite across all 4 tiers
 cargo test
 
-# Live host / network tests (requires dnf and network access)
+# Headless GTK4/Libadwaita widget, row, window, and dialog E2E (no desktop session needed)
+./scripts/test-ui-headless.sh
+
+# Live-host test invoking host /usr/bin/dnf (opt-in)
 cargo test -- --ignored
 ```
+
+See [docs/TEST-SUITE-AUDIT.md](docs/TEST-SUITE-AUDIT.md) for the full coverage matrix, edge-case UX recovery flows, and mutation verification report.
 
 ## License
 
