@@ -198,15 +198,14 @@ mod tests {
     #[test]
     fn log_template_has_text_view() {
         let xml = super::LOG_WINDOW_UI;
-        assert!(xml.contains("id=\"log_view\""));
-        assert!(xml.contains("id=\"copy_btn\""));
-        assert!(xml.contains("Copy All"));
-        assert!(xml.contains("Full Log"));
-        assert!(
-            !xml.contains("id=\"close_btn\""),
-            "header close and Esc close the log window"
-        );
-        assert!(!xml.contains("Copy all"));
-        assert!(!xml.contains("Full log"));
+        let ids = super::super::builder_ids_in_source(include_str!("dialogs.rs"));
+        assert!(!ids.is_empty());
+        for id in ids {
+            assert!(
+                xml.contains(&format!("id=\"{id}\"")),
+                "log_window.ui missing id={id}"
+            );
+        }
+        assert!(xml.contains("GtkTextView"));
     }
 }

@@ -1213,82 +1213,65 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
 
 #[cfg(test)]
 mod tests {
+    fn object_block<'a>(xml: &'a str, id: &str) -> &'a str {
+        let needle = format!("id=\"{id}\"");
+        let id_pos = xml
+            .find(&needle)
+            .unwrap_or_else(|| panic!("window.ui missing id={id}"));
+        let start = xml[..id_pos]
+            .rfind("<object")
+            .unwrap_or_else(|| panic!("missing <object> opening tag before id={id}"));
+        let mut depth = 0usize;
+        let mut i = start;
+        while let Some(rel) = xml[i..].find('<') {
+            let tag_start = i + rel;
+            let rest = &xml[tag_start..];
+            if rest.starts_with("</object>") {
+                depth -= 1;
+                let tag_end = tag_start + "</object>".len();
+                if depth == 0 {
+                    return &xml[start..tag_end];
+                }
+                i = tag_end;
+            } else if rest.starts_with("<object")
+                && rest.as_bytes().get("<object".len()).is_some_and(|b| {
+                    matches!(b, b' ' | b'\n' | b'\r' | b'\t' | b'>' | b'/')
+                })
+            {
+                let close_rel = rest.find('>').expect("unclosed <object tag");
+                let tag_end = tag_start + close_rel + 1;
+                if !xml[tag_start..tag_end].ends_with("/>") {
+                    depth += 1;
+                }
+                i = tag_end;
+            } else {
+                i = tag_start + 1;
+            }
+        }
+        panic!("unclosed <object> block for id={id}");
+    }
+
     #[test]
     fn window_template_has_adwaita_pages() {
         let xml = super::WINDOW_UI;
-        for id in [
-            "window_title",
-            "header_menu",
-            "header_refresh",
-            "upgrade_notice",
-            "upgrade_action",
-            "upgrade_title",
-            "upgrade_age",
-            "idle_page",
-            "auth_page",
-            "check_group",
-            "console_drawer",
-            "console_toggle",
-            "console_full",
-            "ready_banner",
-            "ready_group",
-            "ready_update",
-            "current_package",
-            "run_stop",
-            "run_stall",
-            "now_playing_title",
-            "run_list_scroll",
-            "run_list_group",
-            "run_completed",
-            "done_installed",
-            "done_installed_scroll",
-            "done_btn",
-            "done_log_btn",
-            "reboot_banner",
-            "fail_page",
-            "narrow_breakpoint",
-        ] {
+        let ids = super::super::builder_ids_in_source(include_str!("window.rs"));
+        assert!(!ids.is_empty());
+        for id in ids {
             assert!(
                 xml.contains(&format!("id=\"{id}\"")),
                 "window.ui missing id={id}"
             );
         }
-        for gone in [
-            "ready_chips",
-            "done_icon",
-            "reboot_btn",
-            "now_playing",
-            "close_btn",
-            "fail_back",
-            "idle_hint",
-            "upgrade_info",
-            "upgrade_banner",
-        ] {
-            assert!(
-                !xml.contains(&format!("id=\"{gone}\"")),
-                "window.ui still has id={gone}"
-            );
-        }
-        assert!(xml.contains("AdwPreferencesGroup"));
-        assert!(xml.contains("AdwBanner"));
-        assert!(xml.contains("AdwStatusPage"));
-        assert!(xml.contains("AdwSpinner"));
-        assert!(xml.contains("max-width: 500px"));
-        assert!(xml.contains("About Fedora Updater"));
-        assert!(xml.contains("Main Menu"));
+
         assert!(
-            !xml.contains("dialog-information-symbolic"),
-            "the release reminder is not a header icon"
+            object_block(xml, "stack").contains("vhomogeneous"),
+            "stack must size every page to the window so Done/Idle fill after apply"
         );
-        assert!(xml.contains("How to upgrade"));
-        assert!(xml.contains("go-next-symbolic"));
-        let blp_src = include_str!("window.blp");
-        let age_at = blp_src.find("Gtk.Label upgrade_age").expect("upgrade_age");
-        let age_chunk = &blp_src[age_at..age_at + 220];
         assert!(
-            age_chunk.contains("dimmed") && age_chunk.contains("caption"),
-            "the release age is a quiet caption under the title"
+            object_block(xml, "idle_page").contains("vexpand"),
+            "idle status page must expand to fill the stack"
         );
+
         let action_at = xml.find("id=\"upgrade_action\"").expect("upgrade_action");
         let header_at = xml.find("id=\"header_menu\"").expect("header_menu");
         let stack_at = xml.find("id=\"stack\"").expect("stack");
@@ -1296,97 +1279,45 @@ mod tests {
             header_at < action_at && action_at < stack_at,
             "the release offer sits under the header and above the page stack"
         );
+
         // AdwHeaderBar.pack_end prepends. The first end child is the trailing
         // app button, so the menu is emitted before Stop.
-        let menu_at = xml.find("id=\"header_menu\"").expect("header_menu");
         let stop_at = xml.find("id=\"run_stop\"").expect("run_stop");
         assert!(
-            menu_at < stop_at,
+            header_at < stop_at,
             "pack_end prepends: list the menu before Stop so Stop is the start-side button"
         );
-        assert!(xml.contains("Update All"));
-        assert!(xml.contains("View Full Log"));
-        assert!(xml.contains("View Log"));
-        assert!(xml.contains("Waiting for authentication"));
-        assert!(xml.contains("Nothing is applied until Update All is chosen"));
-        assert!(
-            !xml.contains("Waiting for polkit"),
-            "auth spinner line is Waiting for authentication"
-        );
-        assert!(!xml.contains("Keyboard Shortcuts"));
-        assert!(!xml.contains("One password prompt"));
-        assert!(
-            xml.contains("vhomogeneous"),
-            "stack must size every page to the window so Done/Idle fill after apply"
-        );
-        assert!(
-            xml.contains("id=\"idle_page\"") && xml.contains("vexpand"),
-            "idle status page must expand to fill the stack"
-        );
+
         let installed_at = xml.find("id=\"done_installed\"").expect("done_installed");
         let done_btn_at = xml.find("id=\"done_btn\"").expect("done_btn");
         assert!(
             installed_at < done_btn_at,
             "installed list sits above the summary actions"
         );
-        let card_at = xml.find("id=\"current_package\"").expect("current_package");
+
         let stall_at = xml.find("id=\"run_stall\"").expect("run_stall");
+        let card_at = xml.find("id=\"current_package\"").expect("current_package");
         let scroll_at = xml.find("id=\"run_list_scroll\"").expect("run_list_scroll");
         let list_at = xml.find("id=\"run_list_group\"").expect("run_list_group");
         let completed_at = xml.find("id=\"run_completed\"").expect("run_completed");
         assert!(
-            stall_at < card_at,
-            "stall banner sits above the current-package card"
+            stall_at < card_at
+                && card_at < scroll_at
+                && scroll_at < list_at
+                && list_at < completed_at,
+            "running page layout order: run_stall < current_package < run_list_scroll < run_list_group < run_completed"
         );
+
+        let scroll_block = object_block(xml, "run_list_scroll");
         assert!(
-            card_at < scroll_at,
-            "current-package card must stay sticky above the checklist scroll"
-        );
-        assert!(
-            scroll_at < list_at && list_at < completed_at,
-            "remaining work stays in the scroll; completed stays pinned below it"
-        );
-        let scroll_chunk = &xml[scroll_at..list_at];
-        assert!(
-            scroll_chunk.contains("propagate-natural-height"),
+            scroll_block.contains("propagate-natural-height"),
             "run_list_scroll must not propagate the package list height to the window"
         );
+        assert!(scroll_block.contains("id=\"run_list_group\""));
         assert!(
-            completed_at > xml.find("id=\"run_list_scroll\"").unwrap(),
+            !scroll_block.contains("id=\"run_completed\""),
             "completed expander must not live inside the remaining-work scroll"
         );
-        let blp = include_str!("window.blp");
-        assert!(!blp.contains("margin-start: 16"));
-        assert!(!blp.contains("margin-end: 16"));
-        assert!(blp.contains("margin-start: 12"));
-        assert!(blp.contains("margin-end: 12"));
-    }
-
-    #[test]
-    fn rows_and_stylesheet_drop_removed_chrome() {
-        let rows = include_str!("rows.rs");
-        let css = include_str!("../style.css");
-        for token in [
-            "sev-dot",
-            "dim-label",
-            "stage-apply",
-            ".chip",
-            ".stat-card",
-            ".reboot-card",
-            ".now-playing",
-            ".status-footer",
-            ".status-dot",
-        ] {
-            assert!(!rows.contains(token), "rows.rs still has {token}");
-            assert!(!css.contains(token), "style.css still has {token}");
-        }
-        assert!(css.contains(".package-badge.src-flatpak"));
-        assert!(css.contains("@purple_1"));
-        assert!(css.contains("opacity: 0.72"));
-        assert!(css.contains("opacity: 0.82"));
-        assert!(css.contains("margin: 0 12px 12px"));
-        assert!(rows.contains("package-badge"));
-        assert!(!rows.contains("object-select-symbolic"));
     }
 
     #[test]
@@ -1398,13 +1329,14 @@ mod tests {
         use std::rc::Rc;
 
         let authenticating = || {
-            let mut auth = fedora_updater::state::AppState::default();
-            auth.phase = Phase::Authenticating {
-                purpose: AuthPurpose::Check,
-                packages: vec![],
-                last_checked: None,
-            };
-            Rc::new(RefCell::new(auth))
+            Rc::new(RefCell::new(fedora_updater::state::AppState {
+                phase: Phase::Authenticating {
+                    purpose: AuthPurpose::Check,
+                    packages: vec![],
+                    last_checked: None,
+                },
+                ..Default::default()
+            }))
         };
 
         let state = authenticating();

@@ -4,6 +4,7 @@
 //! every Check and Apply until the GUI exits or the helper dies. Closed only
 //! on window close / explicit `close_session` — not after each check/apply.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use super::session::{kill_recorded_helper, PrivilegedSession, SessionError};
@@ -32,6 +33,24 @@ pub fn with_session<F, R>(f: F) -> Result<R, SessionError>
 where
     F: FnOnce(&mut PrivilegedSession) -> Result<R, SessionError>,
 {
+    with_session_using(PrivilegedSession::start, f)
+}
+
+/// Run `f` with the shared session, starting `path` directly without `pkexec` (for tests).
+pub fn with_direct_session_for_test<F, R>(path: &Path, f: F) -> Result<R, SessionError>
+where
+    F: FnOnce(&mut PrivilegedSession) -> Result<R, SessionError>,
+{
+    with_session_using(|| PrivilegedSession::start_direct(path), f)
+}
+
+fn with_session_using<F, R>(
+    start: impl FnOnce() -> Result<PrivilegedSession, SessionError>,
+    f: F,
+) -> Result<R, SessionError>
+where
+    F: FnOnce(&mut PrivilegedSession) -> Result<R, SessionError>,
+{
     let mut guard = SESSION
         .lock()
         .map_err(|_| SessionError::Io("session lock poisoned".into()))?;
@@ -44,7 +63,7 @@ where
     }
 
     if guard.is_none() {
-        *guard = Some(PrivilegedSession::start()?);
+        *guard = Some(start()?);
     }
 
     // Temporarily take ownership so a panic inside `f` does not leave a half-used session.

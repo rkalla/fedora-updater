@@ -95,14 +95,22 @@ impl PrivilegedSession {
         let path = helper_path();
         let direct = std::env::var_os("FEDORA_UPDATER_HELPER_DIRECT").is_some()
             || std::env::var_os("FEDORA_UPDATER_TEST_MODE").is_some();
+        Self::start_with(&path, direct)
+    }
 
+    /// Start a helper binary or script directly without `pkexec` (for tests).
+    pub fn start_direct(path: &Path) -> Result<Self, SessionError> {
+        Self::start_with(path, true)
+    }
+
+    fn start_with(path: &Path, direct: bool) -> Result<Self, SessionError> {
         let mut child = if direct {
-            let mut cmd = Command::new(&path);
+            let mut cmd = Command::new(path);
             cmd.arg(HELPER_FLAG);
             configure_helper_command(&mut cmd).spawn()
         } else {
             let mut cmd = Command::new("pkexec");
-            cmd.arg(&path).arg(HELPER_FLAG);
+            cmd.arg(path).arg(HELPER_FLAG);
             configure_helper_command(&mut cmd).spawn()
         }
         .map_err(|e| {

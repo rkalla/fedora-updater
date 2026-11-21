@@ -79,6 +79,7 @@ fn helper_rejects_unknown_command() {
 }
 
 #[test]
+#[ignore = "requires live dnf and network"]
 fn helper_runs_check_dnf_if_present() {
     if Command::new("dnf").arg("--version").output().is_err() {
         return;
@@ -109,8 +110,9 @@ fn helper_runs_check_dnf_if_present() {
         }
     }
     assert!(saw_end, "expected __END__ from check-dnf");
-    writeln!(stdin, "QUIT").unwrap();
+    let _ = writeln!(stdin, "QUIT");
     let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Window close runs `close_session` on the GTK thread. If a helper command is
@@ -121,7 +123,7 @@ fn close_session_does_not_block_when_helper_command_hangs() {
     use std::sync::mpsc;
     use std::thread;
 
-    use fedora_updater::privilege::{close_session, with_session};
+    use fedora_updater::privilege::{close_session, with_direct_session_for_test, SessionEvent};
 
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("hung-helper");
@@ -148,14 +150,21 @@ done
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
 
-    std::env::set_var("FEDORA_UPDATER_HELPER", &script);
-    std::env::set_var("FEDORA_UPDATER_HELPER_DIRECT", "1");
-
-    let worker = thread::spawn(|| {
-        let _ = with_session(|session| session.run_command(HelperCommand::CheckDnf, |_| {}));
+    let (started_tx, started_rx) = mpsc::channel();
+    let script_for_worker = script.clone();
+    let worker = thread::spawn(move || {
+        let _ = with_direct_session_for_test(&script_for_worker, |session| {
+            session.run_command(HelperCommand::CheckDnf, |ev| {
+                if matches!(ev, SessionEvent::Line(_)) {
+                    let _ = started_tx.send(());
+                }
+            })
+        });
     });
 
-    thread::sleep(Duration::from_millis(300));
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("hung-helper did not start running the command");
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {

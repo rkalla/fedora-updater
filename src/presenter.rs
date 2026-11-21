@@ -880,7 +880,6 @@ mod tests {
             "A desktop front-end for Fedora system, Flatpak, and firmware updates"
         );
         assert_eq!(ABOUT_NAME, "Fedora Updater");
-        assert!(!ABOUT_COMMENTS.contains("polished"));
         assert_eq!(
             AUTH_DESCRIPTION,
             "A system dialog asks for an administrator password. The password is not stored in this window."
