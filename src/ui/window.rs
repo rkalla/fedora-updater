@@ -16,30 +16,35 @@ use libadwaita::{
     ToolbarStyle, ToolbarView, WindowTitle,
 };
 
-use fedora_updater::backend::dnf;
+use fedora_updater::backend::{dnf, dnf_dbus, fwupd_dbus};
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
-    count_by_source, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus, RetryAction,
-    RunPass, UpdateSource,
+    count_by_source, ApplyMode, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus,
+    RetryAction, RunPass, UpdateSource,
 };
 use fedora_updater::orchestrator::{
-    can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
-    run_systemctl_reboot, session_started_event, WorkerMsg,
+    can_skip_apply_auth_ui, can_skip_check_auth_ui, cancel_background_work, load_history_system,
+    release_privileges, run_apply_all_with_mode, run_check_all, run_systemctl_reboot,
+    session_started_event, WorkerMsg,
 };
 use fedora_updater::presenter::{
-    about_time_left, activity_log_subtitle, cache_activity_note, check_progress, checking_footnote,
-    done_clean_summary, done_header_subtitle, fail_retry_label, idle_chrome,
-    now_playing_subtitle, now_playing_title, phase_completion_notification, pipeline_stage,
-    quiet_ui, ready_banner_title, reboot_trigger_summary, run_heading,
-    running_progress_captions, source_summary_line, window_header, DesktopNotification,
-    HeaderView, PipelineStage, QuietInput, AUTH_DESCRIPTION, COMPLETION_NOTIFICATION_ID,
+    about_time_left, activity_log_subtitle, apply_cta_label, cache_activity_note, check_progress,
+    checking_footnote, done_clean_summary, done_header_subtitle, fail_retry_label,
+    history_subtitle, idle_chrome, now_playing_subtitle, now_playing_title,
+    phase_completion_notification, pipeline_stage, quiet_ui, ready_banner_title,
+    reboot_trigger_summary, run_heading, running_progress_captions, selection_summary_text,
+    source_summary_line, window_header, DesktopNotification, HeaderView, PipelineStage, QuietInput,
+    AUTH_DESCRIPTION, COMPLETION_NOTIFICATION_ID,
 };
 use fedora_updater::privilege::{
     dnf_daemon_is_running, kill_recorded_helper, kill_recorded_local_command,
 };
 use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RunningState};
 
-use super::{activity_log, charts, dialogs, inspector, obj, prefs, preview, queue_list, rows, sidebar};
+use super::{
+    activity_log, charts, dialogs, history, inspector, obj, prefs, preview, queue_list, rows,
+    sidebar,
+};
 
 const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
 
@@ -54,6 +59,12 @@ struct Widgets {
     inspector: inspector::PackageInspector,
     inspected_id: RefCell<Option<String>>,
     activity_log: activity_log::ActivityLogView,
+    history_view: history::HistoryView,
+    history_loaded: Cell<bool>,
+    native_dnf_available: Cell<bool>,
+    native_fwupd_available: Cell<bool>,
+    apply_mode: Cell<ApplyMode>,
+    ignore_select_all: Cell<bool>,
     source_filter: Cell<sidebar::SourceFilter>,
     #[cfg_attr(not(test), allow(dead_code))] // Verified by headless widget E2E tests.
     ready_toolbar: ToolbarView,
@@ -100,6 +111,9 @@ struct Widgets {
     check_queue: queue_list::QueueList,
     ready_banner: Banner,
     ready_filter_clamp: libadwaita::Clamp,
+    ready_selection_bar: libadwaita::Clamp,
+    ready_select_all: gtk::CheckButton,
+    ready_selection_summary: Label,
     ready_search: gtk::SearchEntry,
     ready_filter_status: Label,
     ready_clear_filter: Button,
@@ -107,7 +121,6 @@ struct Widgets {
     ready_list_stack: Stack,
     ready_queue: queue_list::QueueList,
     ready_update: Button,
-    #[cfg_attr(not(test), allow(dead_code))] // Kept hidden until Phase 2 (#35) enables ApplyMode menu.
     ready_split_update: libadwaita::SplitButton,
     run_stop: Button,
     stage_download: Label,
@@ -180,6 +193,10 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
     let activity_log = activity_log::ActivityLogView::new();
     activity_log_host.append(activity_log.root());
 
+    let history_host: gtk::Box = obj(builder, "history_host");
+    let history_view = history::HistoryView::new();
+    history_host.append(history_view.root());
+
     let check_queue = queue_list::QueueList::new(queue_list::QueueRowMode::Review);
     let check_list_clamp: libadwaita::ClampScrollable = obj(builder, "check_list_clamp");
     check_list_clamp.set_child(Some(check_queue.list_view()));
@@ -241,6 +258,12 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         inspector,
         inspected_id: RefCell::new(None),
         activity_log,
+        history_view,
+        history_loaded: Cell::new(false),
+        native_dnf_available: Cell::new(false),
+        native_fwupd_available: Cell::new(false),
+        apply_mode: Cell::new(ApplyMode::Live),
+        ignore_select_all: Cell::new(false),
         source_filter: Cell::new(sidebar::SourceFilter::All),
         ready_toolbar: obj(builder, "ready_toolbar"),
         done_toolbar: obj(builder, "done_toolbar"),
@@ -283,6 +306,9 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         check_queue,
         ready_banner: obj(builder, "ready_banner"),
         ready_filter_clamp: obj(builder, "ready_filter_clamp"),
+        ready_selection_bar: obj(builder, "ready_selection_bar"),
+        ready_select_all: obj(builder, "ready_select_all"),
+        ready_selection_summary: obj(builder, "ready_selection_summary"),
         ready_search: obj(builder, "ready_search"),
         ready_filter_status: obj(builder, "ready_filter_status"),
         ready_clear_filter: obj(builder, "ready_clear_filter"),
@@ -491,6 +517,19 @@ fn apply_preview_config(cfg: &preview::PreviewConfig, w: &Widgets) {
     w.sidebar_open.set(cfg.sidebar_open);
     w.detail_view.set(cfg.detail_view);
     w.sidebar.select_view(cfg.detail_view);
+    if cfg.enable_native_capabilities {
+        w.native_dnf_available.set(true);
+        w.native_fwupd_available.set(true);
+        w.sidebar.set_history_available(true);
+    }
+    if !cfg.sample_history.is_empty() {
+        w.history_view.set_entries(cfg.sample_history.clone());
+        w.history_loaded.set(true);
+    }
+    for (bps, done, total) in &cfg.sample_throughput {
+        w.sidebar
+            .push_throughput_sample(*bps, Some((*done, *total)));
+    }
     if cfg.expand_completed {
         w.ignore_expand.set(true);
         w.run_completed_user_open.set(true);
@@ -651,17 +690,16 @@ pub fn build(app: &Application) {
         let widgets = widgets.clone();
         let tx = tx.clone();
         ready_update.connect_clicked(move |_| {
-            if state.borrow().update_list_needs_refresh(SystemTime::now()) {
-                let state = state.clone();
-                let console = console.clone();
-                let widgets_for_cb = widgets.clone();
-                let tx = tx.clone();
-                dialogs::prompt_stale_update_list(&widgets.window, move || {
-                    start_check(&state, &console, &widgets_for_cb, tx.clone(), true);
-                });
-                return;
-            }
-            begin_apply(&state, &console, &widgets, tx.clone());
+            trigger_apply_from_ready(&state, &console, &widgets, tx.clone());
+        });
+    }
+    {
+        let state = state.clone();
+        let console = console.clone();
+        let w_cb = widgets.clone();
+        let tx = tx.clone();
+        widgets.ready_split_update.connect_clicked(move |_| {
+            trigger_apply_from_ready(&state, &console, &w_cb, tx.clone());
         });
     }
     {
@@ -804,6 +842,7 @@ pub fn build(app: &Application) {
     render(&state.borrow(), &console.borrow(), &widgets);
     if !is_preview {
         spawn_release_lookup(&state, &console, &widgets);
+        spawn_native_capability_probe(&state, &console, &widgets);
     }
     {
         let hooked = widgets.clone();
@@ -858,7 +897,10 @@ fn focus_active_search(state: &AppState, w: &Widgets) {
         DetailView::ActivityLog => {
             w.activity_log.search_entry().grab_focus();
         }
-        DetailView::Updates | DetailView::History => {
+        DetailView::History => {
+            w.history_view.search_entry().grab_focus();
+        }
+        DetailView::Updates => {
             if matches!(&state.phase, Phase::Ready { packages, .. } if !packages.is_empty()) {
                 w.ready_search.grab_focus();
             }
@@ -954,6 +996,32 @@ fn update_ready_filter_chrome(w: &Widgets, total_packages: usize) {
     });
 }
 
+fn update_ready_selection_chrome(w: &Widgets) {
+    if !w.native_dnf_available.get() {
+        w.ready_selection_bar.set_visible(false);
+        w.ready_split_update.set_visible(false);
+        w.ready_update.set_visible(true);
+        return;
+    }
+    let (selected, total, bytes) = w.ready_queue.selection_stats();
+    let has_packages = total > 0;
+    w.ready_selection_bar.set_visible(has_packages);
+    w.ready_update.set_visible(false);
+    w.ready_split_update.set_visible(true);
+    w.ready_split_update.set_sensitive(selected > 0);
+    w.ready_split_update
+        .set_label(&apply_cta_label(w.apply_mode.get(), selected, total, bytes));
+    w.ready_selection_summary
+        .set_text(&selection_summary_text(selected, total, bytes));
+
+    w.ignore_select_all.set(true);
+    w.ready_select_all
+        .set_inconsistent(selected > 0 && selected < total);
+    w.ready_select_all
+        .set_active(total > 0 && selected == total);
+    w.ignore_select_all.set(false);
+}
+
 fn paint_activity_log_chrome(w: &Widgets, matched: usize, total: usize) {
     let sub = activity_log_subtitle(matched, total);
     w.detail_toolbar.set_top_bar_style(ToolbarStyle::Raised);
@@ -965,26 +1033,86 @@ fn paint_activity_log_chrome(w: &Widgets, matched: usize, total: usize) {
     paint_header(w, HeaderView::ActivityLog { subtitle: &sub });
 }
 
+fn paint_history_chrome(w: &Widgets, matched: usize, total: usize) {
+    let sub = history_subtitle(matched, total);
+    w.detail_toolbar.set_top_bar_style(ToolbarStyle::Raised);
+    w.detail_toolbar.set_bottom_bar_style(ToolbarStyle::Flat);
+    w.back_to_updates_btn.set_visible(true);
+    w.header_refresh.set_visible(false);
+    w.run_stop.set_visible(false);
+    sync_console_drawer(w, false);
+    paint_header(w, HeaderView::History { subtitle: &sub });
+}
+
+fn spawn_history_load(widgets: &Rc<Widgets>) {
+    if cfg!(test) || preview::initial_config().is_some() {
+        return;
+    }
+    widgets.history_view.set_loading(true);
+    paint_history_chrome(widgets, 0, 0);
+    let (tx, rx) = async_channel::bounded::<Vec<dnf_dbus::HistoryEntry>>(1);
+    std::thread::spawn(move || {
+        let entries = load_history_system(50);
+        let _ = tx.send_blocking(entries);
+    });
+    let widgets = widgets.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(entries) = rx.recv().await {
+            widgets.history_loaded.set(true);
+            let (matched, total) = widgets.history_view.set_entries(entries);
+            if widgets.detail_view.get() == DetailView::History {
+                paint_history_chrome(&widgets, matched, total);
+            }
+        }
+    });
+}
+
+fn spawn_native_capability_probe(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+) {
+    let (tx, rx) = async_channel::bounded::<(bool, bool)>(1);
+    std::thread::spawn(move || {
+        let dnf = dnf_dbus::is_available();
+        let fwupd = fwupd_dbus::is_available();
+        let _ = tx.send_blocking((dnf, fwupd));
+    });
+    let state = state.clone();
+    let console = console.clone();
+    let widgets = widgets.clone();
+    glib::spawn_future_local(async move {
+        if let Ok((dnf, fwupd)) = rx.recv().await {
+            widgets.native_dnf_available.set(dnf);
+            widgets.native_fwupd_available.set(fwupd);
+            widgets.sidebar.set_history_available(dnf || fwupd);
+            render(&state.borrow(), &console.borrow(), &widgets);
+        }
+    });
+}
+
 fn switch_detail_view(
     state: &Rc<RefCell<AppState>>,
     console: &Rc<RefCell<ConsoleBuffer>>,
     w: &Widgets,
     view: DetailView,
 ) {
-    let target = match view {
-        DetailView::ActivityLog => DetailView::ActivityLog,
-        DetailView::Updates | DetailView::History => DetailView::Updates,
-    };
-    w.detail_view.set(target);
-    w.sidebar.select_view(target);
-    match target {
+    w.detail_view.set(view);
+    w.sidebar.select_view(view);
+    match view {
         DetailView::ActivityLog => {
             close_inspector(w);
             w.detail_view_stack.set_visible_child_name("activity-log");
             let (matched, total) = w.activity_log.sync_full(&console.borrow());
             paint_activity_log_chrome(w, matched, total);
         }
-        DetailView::Updates | DetailView::History => {
+        DetailView::History => {
+            close_inspector(w);
+            w.detail_view_stack.set_visible_child_name("history");
+            let (matched, total) = w.history_view.counts();
+            paint_history_chrome(w, matched, total);
+        }
+        DetailView::Updates => {
             w.detail_view_stack.set_visible_child_name("updates");
             render(&state.borrow(), &console.borrow(), w);
         }
@@ -1050,7 +1178,7 @@ fn wire_shell_controls(widgets: &Rc<Widgets>) {
     }
 }
 
-fn register_view_log_action(
+fn register_view_actions(
     widgets: &Rc<Widgets>,
     state: &Rc<RefCell<AppState>>,
     console: &Rc<RefCell<ConsoleBuffer>>,
@@ -1065,6 +1193,39 @@ fn register_view_log_action(
         });
     }
     widgets.window.add_action(&view_log);
+
+    let view_history = gio::SimpleAction::new("view-history", None);
+    {
+        let state = state.clone();
+        let console = console.clone();
+        let widgets = widgets.clone();
+        view_history.connect_activate(move |_, _| {
+            switch_detail_view(&state, &console, &widgets, DetailView::History);
+            if !widgets.history_loaded.get() {
+                spawn_history_load(&widgets);
+            }
+        });
+    }
+    widgets.window.add_action(&view_history);
+
+    let apply_mode_action = gio::SimpleAction::new("apply-mode", Some(glib::VariantTy::STRING));
+    {
+        let widgets = widgets.clone();
+        apply_mode_action.connect_activate(move |_, param| {
+            let Some(name) = param.and_then(|v| v.str()) else {
+                return;
+            };
+            let mode = match name {
+                "live-reboot" => ApplyMode::LiveAndReboot,
+                "offline" => ApplyMode::OfflineOnReboot,
+                "download-only" => ApplyMode::DownloadOnly,
+                _ => ApplyMode::Live,
+            };
+            widgets.apply_mode.set(mode);
+            update_ready_selection_chrome(&widgets);
+        });
+    }
+    widgets.window.add_action(&apply_mode_action);
 }
 
 fn wire_observatory_views(
@@ -1072,7 +1233,7 @@ fn wire_observatory_views(
     state: &Rc<RefCell<AppState>>,
     console: &Rc<RefCell<ConsoleBuffer>>,
 ) {
-    register_view_log_action(widgets, state, console);
+    register_view_actions(widgets, state, console);
     wire_shell_controls(widgets);
 
     let close_compact_drawer = |w: &Rc<Widgets>| {
@@ -1105,6 +1266,18 @@ fn wire_observatory_views(
                 switch_detail_view(&state, &console, &widgets, DetailView::Updates);
             }
         };
+        let on_history = {
+            let state = state.clone();
+            let console = console.clone();
+            let widgets = widgets.clone();
+            move || {
+                close_compact_drawer(&widgets);
+                switch_detail_view(&state, &console, &widgets, DetailView::History);
+                if !widgets.history_loaded.get() {
+                    spawn_history_load(&widgets);
+                }
+            }
+        };
         let on_activity_log = {
             let state = state.clone();
             let console = console.clone();
@@ -1116,7 +1289,23 @@ fn wire_observatory_views(
         };
         widgets
             .sidebar
-            .wire_navigation(on_source, on_updates, on_activity_log);
+            .wire_navigation(on_source, on_updates, on_history, on_activity_log);
+    }
+
+    {
+        let w_cb = widgets.clone();
+        widgets.ready_queue.connect_selection_changed(move || {
+            update_ready_selection_chrome(&w_cb);
+        });
+    }
+    {
+        let w_cb = widgets.clone();
+        widgets.ready_select_all.connect_toggled(move |btn| {
+            if w_cb.ignore_select_all.get() {
+                return;
+            }
+            w_cb.ready_queue.set_all_selected(btn.is_active());
+        });
     }
 
     {
@@ -1195,6 +1384,18 @@ fn wire_observatory_views(
             }
         });
     }
+    {
+        let w_refresh = widgets.clone();
+        let w_filter = widgets.clone();
+        widgets.history_view.wire(
+            move || spawn_history_load(&w_refresh),
+            move |matched, total| {
+                if w_filter.detail_view.get() == DetailView::History {
+                    paint_history_chrome(&w_filter, matched, total);
+                }
+            },
+        );
+    }
 }
 
 fn wire_upgrade_buttons(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppState>>) {
@@ -1237,7 +1438,7 @@ fn start_check(
 ) {
     prepare_for_operation(console, widgets);
     dispatch(state, console, widgets, Event::StartCheck { then_apply }, true);
-    if can_skip_auth_ui() {
+    if can_skip_check_auth_ui(widgets.native_dnf_available.get()) {
         dispatch(
             state,
             console,
@@ -1249,18 +1450,59 @@ fn start_check(
     run_check_all(tx);
 }
 
+fn trigger_apply_from_ready(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+    tx: async_channel::Sender<WorkerMsg>,
+) {
+    if state.borrow().update_list_needs_refresh(SystemTime::now()) {
+        let state = state.clone();
+        let console = console.clone();
+        let widgets_for_cb = widgets.clone();
+        dialogs::prompt_stale_update_list(&widgets.window, move || {
+            start_check(&state, &console, &widgets_for_cb, tx.clone(), true);
+        });
+        return;
+    }
+    if widgets.native_dnf_available.get() {
+        let selected_ids = widgets.ready_queue.selected_ids();
+        if selected_ids.is_empty() {
+            return;
+        }
+        let mode = widgets.apply_mode.get();
+        begin_apply_selected(state, console, widgets, tx, selected_ids, mode);
+    } else {
+        begin_apply(state, console, widgets, tx);
+    }
+}
+
 fn begin_apply(
     state: &Rc<RefCell<AppState>>,
     console: &Rc<RefCell<ConsoleBuffer>>,
     widgets: &Rc<Widgets>,
     tx: async_channel::Sender<WorkerMsg>,
 ) {
+    let mode = widgets.apply_mode.get();
+    if mode != ApplyMode::Live {
+        let ids: Vec<String> = state
+            .borrow()
+            .packages()
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        if !ids.is_empty() {
+            begin_apply_selected(state, console, widgets, tx, ids, mode);
+            return;
+        }
+    }
     widgets.last_output.set(None);
     *widgets.cache_cursor.borrow_mut() = None;
+    widgets.sidebar.reset_throughput();
     prepare_for_operation(console, widgets);
     let packages = state.borrow().packages().to_vec();
     dispatch(state, console, widgets, Event::StartApply, true);
-    if can_skip_auth_ui() {
+    if can_skip_apply_auth_ui(widgets.native_dnf_available.get()) {
         dispatch(
             state,
             console,
@@ -1269,7 +1511,39 @@ fn begin_apply(
             true,
         );
     }
-    run_apply_all(tx, packages);
+    run_apply_all_with_mode(tx, packages, ApplyMode::Live);
+}
+
+fn begin_apply_selected(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+    tx: async_channel::Sender<WorkerMsg>,
+    selected_ids: Vec<String>,
+    mode: ApplyMode,
+) {
+    widgets.last_output.set(None);
+    *widgets.cache_cursor.borrow_mut() = None;
+    widgets.sidebar.reset_throughput();
+    prepare_for_operation(console, widgets);
+    dispatch(
+        state,
+        console,
+        widgets,
+        Event::StartSelectiveApply { selected_ids, mode },
+        true,
+    );
+    let packages = state.borrow().packages().to_vec();
+    if can_skip_apply_auth_ui(widgets.native_dnf_available.get()) {
+        dispatch(
+            state,
+            console,
+            widgets,
+            session_started_event(AuthPurpose::Apply),
+            true,
+        );
+    }
+    run_apply_all_with_mode(tx, packages, mode);
 }
 
 fn can_start_apply(state: &AppState) -> bool {
@@ -1381,7 +1655,7 @@ fn handle_worker(
     tx: &async_channel::Sender<WorkerMsg>,
     msg: WorkerMsg,
 ) {
-    handle_worker_with(
+    handle_worker_with_reboot(
         state,
         console,
         widgets,
@@ -1389,9 +1663,16 @@ fn handle_worker(
         || begin_apply(state, console, widgets, tx.clone()),
         || spawn_release_lookup(state, console, widgets),
         || spawn_reboot_preflight(state, console, widgets),
+        || {
+            widgets
+                .toast
+                .add_toast(Toast::new("Updates installed. Rebooting…"));
+            run_systemctl_reboot(tx.clone());
+        },
     );
 }
 
+#[cfg(test)]
 fn handle_worker_with(
     state: &Rc<RefCell<AppState>>,
     console: &Rc<RefCell<ConsoleBuffer>>,
@@ -1400,6 +1681,29 @@ fn handle_worker_with(
     on_auto_apply: impl FnOnce(),
     on_release_lookup: impl FnOnce(),
     on_reboot_preflight: impl FnOnce(),
+) {
+    handle_worker_with_reboot(
+        state,
+        console,
+        widgets,
+        msg,
+        on_auto_apply,
+        on_release_lookup,
+        on_reboot_preflight,
+        || {},
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_worker_with_reboot(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+    msg: WorkerMsg,
+    on_auto_apply: impl FnOnce(),
+    on_release_lookup: impl FnOnce(),
+    on_reboot_preflight: impl FnOnce(),
+    on_auto_reboot: impl FnOnce(),
 ) {
     let ev = match msg {
         WorkerMsg::SessionStarted => {
@@ -1416,6 +1720,16 @@ fn handle_worker_with(
         }
         WorkerMsg::ConsoleDraw { tag, text } => {
             record_console_output(console, widgets, &tag, &text, true);
+            return;
+        }
+        WorkerMsg::Throughput {
+            bytes_per_sec,
+            downloaded_bytes,
+            total_bytes,
+        } => {
+            widgets
+                .sidebar
+                .push_throughput_sample(bytes_per_sec, Some((downloaded_bytes, total_bytes)));
             return;
         }
         WorkerMsg::Event(ev) => ev,
@@ -1449,7 +1763,12 @@ fn handle_worker_with(
     if check_finished {
         on_release_lookup();
     }
-    if apply_finished
+    let auto_reboot = apply_finished
+        && state.borrow().apply_mode == ApplyMode::LiveAndReboot
+        && matches!(state.borrow().phase, Phase::Done { failed: 0, .. });
+    if auto_reboot {
+        on_auto_reboot();
+    } else if apply_finished
         && matches!(
             state.borrow().phase,
             Phase::Done {
@@ -1636,6 +1955,7 @@ fn finished_row(package: &Package) -> libadwaita::ActionRow {
 }
 
 fn clear_running_lists(w: &Widgets) {
+    w.sidebar.reset_throughput();
     if w.run_queue.total_count() == 0 && w.run_completed_rows.borrow().is_empty() {
         return;
     }
@@ -2152,8 +2472,10 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 w.ready_banner.set_revealed(false);
             }
             w.ready_update.set_sensitive(!packages.is_empty());
+            w.ready_queue.set_selectable(w.native_dnf_available.get());
             w.ready_queue.sync(packages, None, None);
             update_ready_filter_chrome(w, packages.len());
+            update_ready_selection_chrome(w);
             sync_inspector_from_packages(w, packages, &w.ready_queue);
         }
         Phase::Running(running) => {
@@ -2252,13 +2574,21 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
         }
     }
 
-    if w.detail_view.get() == DetailView::ActivityLog {
-        w.detail_view_stack.set_visible_child_name("activity-log");
-        let (matched, total) = w.activity_log.sync_full(console);
-        paint_activity_log_chrome(w, matched, total);
-    } else {
-        w.back_to_updates_btn.set_visible(false);
-        w.detail_view_stack.set_visible_child_name("updates");
+    match w.detail_view.get() {
+        DetailView::ActivityLog => {
+            w.detail_view_stack.set_visible_child_name("activity-log");
+            let (matched, total) = w.activity_log.sync_full(console);
+            paint_activity_log_chrome(w, matched, total);
+        }
+        DetailView::History => {
+            w.detail_view_stack.set_visible_child_name("history");
+            let (matched, total) = w.history_view.counts();
+            paint_history_chrome(w, matched, total);
+        }
+        DetailView::Updates => {
+            w.back_to_updates_btn.set_visible(false);
+            w.detail_view_stack.set_visible_child_name("updates");
+        }
     }
 }
 
@@ -2398,8 +2728,11 @@ mod tests {
             "completed expander must live inside run_list_scroll alongside remaining work"
         );
 
-        // Observatory 1.2 & 1.3 additions: BottomSheet console, status stack, stage breadcrumbs, Done closure cards.
+        // Observatory 1.2, 1.3 & 2.3 additions: BottomSheet console, status stack, stage breadcrumbs, Done closure, History & selective UI.
         assert!(object_block(xml, "detail_view_stack").contains("activity-log"));
+        assert!(object_block(xml, "detail_view_stack").contains("history"));
+        assert!(xml.contains("id=\"ready_selection_bar\""));
+        assert!(object_block(xml, "ready_select_all").contains("GtkCheckButton"));
         let sheet_block = object_block(xml, "console_sheet");
         assert!(sheet_block.contains("AdwBottomSheet"));
         assert!(sheet_block.contains("id=\"console_toggle\""));
@@ -3736,7 +4069,7 @@ mod tests {
         assert!(!widgets.inspector_split.is_collapsed());
 
         // 5) Sidebar source navigation and sparkline scaffold API work cleanly.
-        if let Some(apps_row) = widgets.sidebar.sources_list().row_at_index(2) {
+        if let Some(apps_row) = widgets.sidebar.sources_list().row_at_index(3) {
             apps_row.activate();
             assert_eq!(widgets.sidebar.selected_source(), SourceFilter::Apps);
         }
@@ -3902,7 +4235,7 @@ mod tests {
         widgets
             .sidebar
             .sources_list()
-            .row_at_index(2)
+            .row_at_index(3)
             .expect("Apps row")
             .activate();
         assert_eq!(widgets.sidebar.selected_source(), SourceFilter::Apps);
@@ -4118,15 +4451,18 @@ mod tests {
             "auth",
             "checking",
             "ready",
+            "ready-native",
             "ready-lumen",
             "ready-warn",
             "running",
             "running-expanded",
+            "running-sparkline",
             "done",
             "done-reboot",
             "done-partial",
             "failed",
             "log",
+            "history",
         ];
 
         for preset in presets {
@@ -4143,6 +4479,14 @@ mod tests {
             super::render(&cfg.state, &console, &widgets);
 
             match preset {
+                "ready-native" => {
+                    assert!(widgets.native_dnf_available.get());
+                    assert!(widgets.ready_split_update.get_visible());
+                    assert!(widgets.ready_selection_bar.get_visible());
+                    assert!(!widgets.ready_update.get_visible());
+                    assert!(widgets.sidebar.row_security().get_visible());
+                    assert!(widgets.sidebar.view_history_row().get_visible());
+                }
                 "ready-lumen" => {
                     assert!(!widgets.sidebar_open.get());
                     assert!(widgets.split_view.is_collapsed());
@@ -4151,6 +4495,10 @@ mod tests {
                 "running-expanded" => {
                     assert!(widgets.run_completed.is_expanded());
                     assert!(widgets.run_list_scroll.get_visible());
+                }
+                "running-sparkline" => {
+                    assert!(widgets.sidebar.sparkline_card().get_visible());
+                    assert!(widgets.sidebar.sparkline().widget().get_visible());
                 }
                 "done" => {
                     assert!(widgets.done_summary_clamp.get_visible());
@@ -4174,11 +4522,305 @@ mod tests {
                         Some("activity-log")
                     );
                 }
+                "history" => {
+                    assert_eq!(widgets.detail_view.get(), DetailView::History);
+                    assert_eq!(
+                        widgets.detail_view_stack.visible_child_name().as_deref(),
+                        Some("history")
+                    );
+                    assert!(widgets.history_view.counts().1 > 0);
+                }
                 _ => {}
             }
 
             gtk::prelude::GtkWindowExt::destroy(&widgets.window);
         }
+    }
+
+    fn verify_phase2_native_controls_and_history() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        use fedora_updater::backend::dnf_dbus::{
+            HistoryEntry, HistoryPackageChange, HistorySource,
+        };
+        use fedora_updater::console::ConsoleBuffer;
+        use fedora_updater::model::{
+            AdvisoryKind, ApplyMode, DetailView, Package, PackageAdvisory, PackageStatus,
+            StageCount, UpdateSource,
+        };
+        use fedora_updater::orchestrator::WorkerMsg;
+        use fedora_updater::presenter::format_size_delta;
+        use fedora_updater::state::{AppState, Event, Phase, RunningState};
+        use gtk::prelude::*;
+
+        use super::super::history::HistorySourceFilter;
+        use super::super::queue_list::QueueList;
+        use super::super::sidebar::SourceFilter;
+
+        let widgets = super::Widgets::for_test();
+        let state = Rc::new(RefCell::new(AppState::default()));
+        let console = Rc::new(RefCell::new(ConsoleBuffer::new(200)));
+        widgets.history_loaded.set(true);
+        super::wire_observatory_views(&widgets, &state, &console);
+
+        let mut openssl = Package::new_dnf("openssl", "x86_64", "3.2.2-3.fc44", "updates");
+        openssl.old_version = Some("3.2.2-1.fc44".into());
+        openssl.size_bytes = Some(2_457_600);
+        openssl.install_size_delta = Some(400_000);
+        openssl.summary = Some("Utilities from the general purpose cryptography library".into());
+        openssl.advisories = vec![PackageAdvisory {
+            id: "FEDORA-2026-84a1b2c3".into(),
+            kind: AdvisoryKind::Security,
+            severity: Some("Important".into()),
+            cves: vec!["CVE-2026-2401".into()],
+            bugzillas: vec!["RHBZ#2458001".into()],
+            description: Some("Fixes TLS 1.3 buffer over-read.".into()),
+        }];
+
+        let mut kernel = Package::new_dnf("kernel-core", "x86_64", "6.14.12-300.fc44", "updates");
+        kernel.old_version = Some("6.14.11-300.fc44".into());
+        kernel.size_bytes = Some(18_874_368);
+
+        let mut fp = Package::new_dnf("Thunderbird", "x86_64", "128.3.0", "flathub");
+        fp.id = "flatpak:user:app/org.mozilla.Thunderbird/x86_64/stable".into();
+        fp.source = UpdateSource::FlatpakUser;
+        fp.size_bytes = Some(8_388_608);
+
+        *state.borrow_mut() = AppState {
+            phase: Phase::Ready {
+                packages: vec![openssl.clone(), kernel.clone(), fp.clone()],
+                soft_errors: vec![],
+            },
+            ..Default::default()
+        };
+
+        // 1) CLI fallback invariants (native capabilities disabled).
+        super::render(&state.borrow(), &console.borrow(), &widgets);
+        assert!(!widgets.ready_selection_bar.get_visible());
+        assert!(!widgets.ready_split_update.get_visible());
+        assert!(widgets.ready_update.get_visible());
+        assert!(!widgets.ready_queue.is_selectable());
+        assert!(!widgets.sidebar.view_history_row().get_visible());
+        let fallback_row = QueueList::build_row_for_test(
+            &openssl,
+            super::super::queue_list::QueueRowMode::Review,
+            false,
+            None,
+        );
+        assert!(!fallback_row.check_btn().get_visible());
+
+        // 2) Enable native dnf5daemon + fwupd D-Bus capabilities.
+        widgets.native_dnf_available.set(true);
+        widgets.native_fwupd_available.set(true);
+        widgets.sidebar.set_history_available(true);
+        super::render(&state.borrow(), &console.borrow(), &widgets);
+
+        assert!(widgets.ready_selection_bar.get_visible());
+        assert!(widgets.ready_split_update.get_visible());
+        assert!(!widgets.ready_update.get_visible());
+        assert!(widgets.ready_queue.is_selectable());
+        assert!(widgets.sidebar.view_history_row().get_visible());
+        assert!(widgets.sidebar.row_security().get_visible());
+        assert_eq!(widgets.sidebar.count_security_text(), "1");
+
+        let sel_row = QueueList::build_selectable_row_for_test(&openssl, true);
+        assert!(sel_row.check_btn().get_visible());
+        assert!(sel_row.check_btn().is_active());
+        assert!(sel_row.sec_tag().get_visible());
+        assert_eq!(sel_row.sec_tag().label().as_str(), "CVE-2026-2401");
+
+        // 3) Selective checkboxes, indeterminate Toggle All Selected, empty selection gating, and SplitButton modes.
+        assert!(widgets.ready_queue.set_selected_by_id(&kernel.id, false));
+        assert!(widgets.ready_select_all.is_inconsistent());
+        assert_eq!(widgets.ready_queue.selected_ids().len(), 2);
+        assert!(widgets
+            .ready_selection_summary
+            .text()
+            .as_str()
+            .contains("2 of 3 selected"));
+        assert!(widgets
+            .ready_split_update
+            .label()
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("Update 2 of 3"));
+
+        widgets.ready_queue.set_all_selected(false);
+        assert!(!widgets.ready_split_update.get_sensitive());
+        widgets.ready_queue.set_all_selected(true);
+        assert!(widgets.ready_split_update.get_sensitive());
+        assert!(!widgets.ready_select_all.is_inconsistent());
+        assert!(widgets.ready_select_all.is_active());
+
+        for (mode_str, expected_mode, expected_prefix) in [
+            ("offline", ApplyMode::OfflineOnReboot, "Prepare Offline Update"),
+            ("download-only", ApplyMode::DownloadOnly, "Download Only"),
+            ("live-reboot", ApplyMode::LiveAndReboot, "Update & Restart"),
+            ("live", ApplyMode::Live, "Update All"),
+        ] {
+            assert!(WidgetExt::activate_action(
+                &widgets.window,
+                "win.apply-mode",
+                Some(&mode_str.to_variant()),
+            )
+            .is_ok());
+            assert_eq!(widgets.apply_mode.get(), expected_mode);
+            let label = widgets
+                .ready_split_update
+                .label()
+                .map(|g| g.to_string())
+                .unwrap_or_default();
+            assert!(
+                label.starts_with(expected_prefix),
+                "mode {mode_str}: expected prefix {expected_prefix}, got {label}"
+            );
+        }
+
+        // 4) Sidebar Security Fixes filter + Inspector CVE / RHBZ / disk-delta cards.
+        widgets.sidebar.row_security().activate();
+        assert_eq!(widgets.sidebar.selected_source(), SourceFilter::Security);
+        assert_eq!(widgets.ready_queue.filtered_count(), 1);
+        widgets.ready_queue.activate_filtered(0);
+        assert!(widgets.inspector_split.shows_sidebar());
+        assert!(widgets.inspector.advisories_card_visible());
+        let adv_text = widgets.inspector.advisory_summary_text();
+        assert!(adv_text.contains("CVE-2026-2401"), "{adv_text}");
+        assert!(adv_text.contains("RHBZ#2458001"), "{adv_text}");
+        assert!(adv_text.contains("Important"), "{adv_text}");
+        assert_eq!(
+            widgets.inspector.disk_delta_value(),
+            Some(format_size_delta(400_000))
+        );
+
+        // 5) ThroughputSparkline + ApplyMode::LiveAndReboot auto-reboot via handle_worker_with_reboot.
+        *state.borrow_mut() = AppState {
+            phase: Phase::Running(RunningState {
+                packages: vec![Package {
+                    status: PackageStatus::Downloading,
+                    ..openssl.clone()
+                }],
+                active_index: Some(0),
+                overall_progress: 0.25,
+                phase_label: "Downloading packages".into(),
+                current_source: Some(UpdateSource::Dnf),
+                current_name: Some("openssl".into()),
+                work_progress: Some(0.25),
+                pass: fedora_updater::model::RunPass::Download,
+                stage: Some(StageCount {
+                    current: 1,
+                    total: 4,
+                }),
+                needs_reboot: false,
+                failed_sources: vec![],
+                failure_reasons: vec![],
+            }),
+            apply_mode: ApplyMode::LiveAndReboot,
+            ..Default::default()
+        };
+        super::render(&state.borrow(), &console.borrow(), &widgets);
+        assert!(!widgets.sidebar.sparkline_card().get_visible());
+
+        super::handle_worker_with_reboot(
+            &state,
+            &console,
+            &widgets,
+            WorkerMsg::Throughput {
+                bytes_per_sec: 12_500_000.0,
+                downloaded_bytes: 12_500_000,
+                total_bytes: 50_000_000,
+            },
+            || {},
+            || {},
+            || {},
+            || {},
+        );
+        assert!(widgets.sidebar.sparkline_card().get_visible());
+        assert!(widgets.sidebar.sparkline().widget().get_visible());
+
+        let auto_reboot_fired = Rc::new(Cell::new(false));
+        let flag = auto_reboot_fired.clone();
+        super::handle_worker_with_reboot(
+            &state,
+            &console,
+            &widgets,
+            WorkerMsg::Event(Event::ApplyComplete {
+                needs_reboot: false,
+            }),
+            || {},
+            || {},
+            || {},
+            move || flag.set(true),
+        );
+        assert!(auto_reboot_fired.get());
+
+        // 6) Update History page (`DetailView::History`), source toggles & search filtering.
+        widgets.history_view.set_entries(vec![
+            HistoryEntry {
+                id: "dnf-txn-203".into(),
+                source: HistorySource::Dnf,
+                timestamp: 1_795_224_552,
+                title: "openssl + 1 more".into(),
+                description: "dnf update -y".into(),
+                status: "Ok".into(),
+                succeeded: true,
+                changes: vec![HistoryPackageChange {
+                    name: "openssl".into(),
+                    arch: "x86_64".into(),
+                    evr: "3.2.2-3.fc44".into(),
+                    original_evr: Some("3.2.2-1.fc44".into()),
+                    action: "Upgraded".into(),
+                }],
+            },
+            HistoryEntry {
+                id: "fwupd-uefi-2026".into(),
+                source: HistorySource::Firmware,
+                timestamp: 1_795_150_000,
+                title: "System Firmware".into(),
+                description: "uefi_capsule".into(),
+                status: "Restart Required".into(),
+                succeeded: true,
+                changes: vec![],
+            },
+        ]);
+
+        assert!(WidgetExt::activate_action(&widgets.window, "win.view-history", None).is_ok());
+        assert_eq!(widgets.detail_view.get(), DetailView::History);
+        assert_eq!(
+            widgets.detail_view_stack.visible_child_name().as_deref(),
+            Some("history")
+        );
+        assert_eq!(
+            widgets.history_view.visible_child_name().as_deref(),
+            Some("list")
+        );
+        assert_eq!(widgets.history_view.counts(), (2, 2));
+        assert!(widgets.history_view.refresh_btn().get_sensitive());
+
+        widgets.history_view.select_source_for_test("dnf");
+        assert_eq!(widgets.history_view.active_filter(), HistorySourceFilter::System);
+        assert_eq!(widgets.history_view.counts(), (1, 2));
+        widgets.history_view.select_source_for_test("fwupd");
+        assert_eq!(widgets.history_view.active_filter(), HistorySourceFilter::Firmware);
+        assert_eq!(widgets.history_view.counts(), (1, 2));
+        widgets.history_view.select_source_for_test("all");
+        assert_eq!(widgets.history_view.active_filter(), HistorySourceFilter::All);
+        assert_eq!(widgets.history_view.counts(), (2, 2));
+
+        widgets.history_view.set_search_for_test("no-such-package");
+        assert_eq!(widgets.history_view.counts(), (0, 2));
+        assert_eq!(
+            widgets.history_view.visible_child_name().as_deref(),
+            Some("empty")
+        );
+        widgets.history_view.set_search_for_test("openssl");
+        assert_eq!(widgets.history_view.counts(), (1, 2));
+        assert_eq!(
+            widgets.history_view.visible_child_name().as_deref(),
+            Some("list")
+        );
+
+        gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
 
     /// Serialized on a single thread because GTK4/Libadwaita asserts main-thread ownership.
@@ -4204,5 +4846,6 @@ mod tests {
         verify_observatory_shell_theme_and_charts();
         verify_queue_inspector_and_activity_log();
         verify_preview_presets_render_cleanly();
+        verify_phase2_native_controls_and_history();
     }
 }

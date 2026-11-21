@@ -18,6 +18,11 @@ pub const ALL_FIXTURES: &[&str] = &[
     "dnf/apply_happy_kernel.txt",
     "dnf/apply_dep_conflict.txt",
     "dnf/apply_rpm_lock_error.txt",
+    // dnf_dbus/
+    "dnf_dbus/list_fd_stream.ndjson",
+    "dnf_dbus/check_upgrades_and_advisories.json",
+    "dnf_dbus/apply_signals_happy.json",
+    "dnf_dbus/history_transactions.json",
     // flatpak/
     "flatpak/check_user_normal.json",
     "flatpak/check_system_nvidia_extension.json",

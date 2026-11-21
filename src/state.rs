@@ -6,8 +6,9 @@
 use std::time::{Duration, SystemTime};
 
 use crate::model::{
-    apply_progress_hint, finalize_source, overall_progress, sort_for_apply, AuthPurpose,
-    IdleScreen, Package, PackageStatus, RetryAction, RunPass, StageCount, Stopwatch, UpdateSource,
+    apply_progress_hint, finalize_source, overall_progress, sort_for_apply, ApplyMode,
+    AuthPurpose, IdleScreen, Package, PackageStatus, RetryAction, RunPass, StageCount, Stopwatch,
+    UpdateSource,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,6 +141,8 @@ pub struct AppState {
     pub release_age_days: Option<u32>,
     /// Preserved Ready packages when Apply authentication fails so Retry Update can resume.
     pub retry_apply_packages: Vec<Package>,
+    /// Execution mode selected for the active or next apply transaction.
+    pub apply_mode: ApplyMode,
 }
 
 impl Default for AppState {
@@ -152,6 +155,7 @@ impl Default for AppState {
             release_upgrade: None,
             release_age_days: None,
             retry_apply_packages: Vec::new(),
+            apply_mode: ApplyMode::Live,
         }
     }
 }
@@ -220,6 +224,11 @@ pub enum Event {
     },
     /// User clicked Update All.
     StartApply,
+    /// User initiated Apply with explicit selection and execution mode.
+    StartSelectiveApply {
+        selected_ids: Vec<String>,
+        mode: ApplyMode,
+    },
     /// polkit session is live.
     SessionReady {
         purpose: AuthPurpose,
@@ -318,6 +327,53 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
                 }
                 _ => return Err(invalid(state, "StartApply")),
             };
+            state.apply_mode = ApplyMode::Live;
+            state.apply_when_ready = false;
+            state.stopwatch = Some(Stopwatch::start());
+            state.phase = Phase::Authenticating {
+                purpose: AuthPurpose::Apply,
+                packages,
+                last_checked: None,
+            };
+            Ok(())
+        }
+        Event::StartSelectiveApply { selected_ids, mode } => {
+            let packages = match &mut state.phase {
+                Phase::Ready { packages, .. } => {
+                    let chosen: Vec<Package> = packages
+                        .iter()
+                        .filter(|p| selected_ids.iter().any(|id| id == &p.id))
+                        .cloned()
+                        .collect();
+                    if chosen.is_empty() {
+                        return Err(invalid(state, "StartSelectiveApply"));
+                    }
+                    state.retry_apply_packages.clear();
+                    chosen
+                }
+                Phase::Failed {
+                    retry: RetryAction::RetryApply,
+                    ..
+                } if !state.retry_apply_packages.is_empty() => {
+                    if selected_ids.is_empty() {
+                        std::mem::take(&mut state.retry_apply_packages)
+                    } else {
+                        let chosen: Vec<Package> = state
+                            .retry_apply_packages
+                            .iter()
+                            .filter(|p| selected_ids.iter().any(|id| id == &p.id))
+                            .cloned()
+                            .collect();
+                        if chosen.is_empty() {
+                            return Err(invalid(state, "StartSelectiveApply"));
+                        }
+                        state.retry_apply_packages.clear();
+                        chosen
+                    }
+                }
+                _ => return Err(invalid(state, "StartSelectiveApply")),
+            };
+            state.apply_mode = mode;
             state.apply_when_ready = false;
             state.stopwatch = Some(Stopwatch::start());
             state.phase = Phase::Authenticating {
@@ -874,5 +930,78 @@ mod tests {
         assert_eq!(packages[1].status, PackageStatus::Failed);
         assert_eq!(packages[2].status, PackageStatus::Pending);
         assert_eq!(packages[3].status, PackageStatus::Pending);
+    }
+
+    #[test]
+    fn selective_apply_filters_ready_subset_tracks_mode_and_rejects_empty() {
+        let openssl = Package::new_dnf("openssl", "x86_64", "3.2.2-3", "updates");
+        let vim = Package::new_dnf("vim-enhanced", "x86_64", "9.1.0-1", "updates");
+        let mut state = AppState {
+            phase: Phase::Ready {
+                packages: vec![openssl.clone(), vim.clone()],
+                soft_errors: vec![],
+            },
+            ..Default::default()
+        };
+
+        // Empty selection must be rejected cleanly.
+        assert!(reduce(
+            &mut state,
+            Event::StartSelectiveApply {
+                selected_ids: vec![],
+                mode: ApplyMode::OfflineOnReboot,
+            }
+        )
+        .is_err());
+
+        reduce(
+            &mut state,
+            Event::StartSelectiveApply {
+                selected_ids: vec![openssl.id.clone()],
+                mode: ApplyMode::OfflineOnReboot,
+            },
+        )
+        .expect("selective apply transitions");
+        assert_eq!(state.apply_mode, ApplyMode::OfflineOnReboot);
+        match &state.phase {
+            Phase::Authenticating {
+                purpose: AuthPurpose::Apply,
+                packages,
+                ..
+            } => {
+                assert_eq!(packages.len(), 1);
+                assert_eq!(packages[0].id, openssl.id);
+            }
+            other => panic!("unexpected phase: {other:?}"),
+        }
+
+        // Recovery via CancelAuth keeps only the previously selected subset if cancelled in Auth?
+        // Wait: StartSelectiveApply preserves only selected items into Authenticating.
+        // Advancing into Running and cancelling before transaction restores Ready safely.
+        reduce(
+            &mut state,
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+        )
+        .expect("session ready");
+        reduce(
+            &mut state,
+            Event::StopApply {
+                during_transaction: false,
+            },
+        )
+        .expect("stop before install");
+        match &state.phase {
+            Phase::Ready {
+                packages,
+                soft_errors,
+            } => {
+                assert_eq!(packages.len(), 1);
+                assert_eq!(packages[0].id, openssl.id);
+                assert!(soft_errors[0].starts_with("Stopped before install"));
+            }
+            other => panic!("unexpected phase: {other:?}"),
+        }
     }
 }

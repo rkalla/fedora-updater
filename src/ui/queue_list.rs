@@ -101,7 +101,7 @@ pub fn running_status_label(
 /// True when `source` matches the active sidebar `SourceFilter`.
 pub fn matches_source_filter(source: UpdateSource, filter: SourceFilter) -> bool {
     match filter {
-        SourceFilter::All => true,
+        SourceFilter::All | SourceFilter::Security => true,
         SourceFilter::System => source == UpdateSource::Dnf,
         SourceFilter::Apps => {
             matches!(source, UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem)
@@ -151,7 +151,11 @@ pub fn matches_package_filter(
     source_filter: SourceFilter,
     query: &str,
 ) -> bool {
-    matches_source_filter(package.source, source_filter) && matches_package_query(package, query)
+    let source_ok = match source_filter {
+        SourceFilter::Security => package.has_security_advisory(),
+        other => matches_source_filter(package.source, other),
+    };
+    source_ok && matches_package_query(package, query)
 }
 
 fn normalized_progress(progress: Option<f64>) -> f64 {
@@ -242,8 +246,15 @@ impl Default for PackageObject {
 impl PackageObject {
     pub fn from_package(pkg: &Package, is_current: bool, item_progress: Option<f64>) -> Self {
         let obj: Self = glib::Object::new();
+        obj.set_selected(true);
         obj.apply_snapshot(pkg, is_current, item_progress);
         obj
+    }
+
+    pub fn bump_revision(&self) {
+        let rev = self.imp().revision.get().wrapping_add(1);
+        self.imp().revision.set(rev);
+        self.notify_revision();
     }
 
     fn apply_snapshot(&self, pkg: &Package, is_current: bool, item_progress: Option<f64>) {
@@ -262,7 +273,6 @@ impl PackageObject {
             extension_micro_tag(&pkg.related_extensions()).unwrap_or_default(),
         );
         self.set_advisory_summary(pkg.advisory_summary());
-        self.set_selected(true);
         *self.imp().package.borrow_mut() = Some(pkg.clone());
     }
 
@@ -293,9 +303,7 @@ impl PackageObject {
         };
 
         self.apply_snapshot(pkg, is_current, item_progress);
-        let rev = self.imp().revision.get().wrapping_add(1);
-        self.imp().revision.set(rev);
-        self.notify_revision();
+        self.bump_revision();
         (true, filter_changed)
     }
 
@@ -304,12 +312,14 @@ impl PackageObject {
     }
 }
 
+type SelectionChangedCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
 /// Reusable widget tree inside a virtualized `Gtk.ListItem`.
 #[derive(Clone)]
 pub struct QueueRowWidgets {
     root: gtk::Box,
-    #[cfg_attr(not(test), allow(dead_code))] // Hidden until Phase 2 (#35) enables selective updates.
     check_btn: gtk::CheckButton,
+    ignore_check: Rc<Cell<bool>>,
     source_badge: gtk::Label,
     name_label: gtk::Label,
     sec_tag: gtk::Label,
@@ -328,12 +338,12 @@ impl QueueRowWidgets {
         root.set_margin_start(14);
         root.set_margin_end(14);
 
-        // Hidden until Phase 2 (#35) enables selective updates.
         let check_btn = gtk::CheckButton::builder()
             .visible(false)
             .active(true)
             .valign(gtk::Align::Center)
             .build();
+        check_btn.update_property(&[gtk::accessible::Property::Label("Select package for update")]);
 
         let source_badge = gtk::Label::builder()
             .width_chars(3)
@@ -403,6 +413,7 @@ impl QueueRowWidgets {
         Self {
             root,
             check_btn,
+            ignore_check: Rc::new(Cell::new(false)),
             source_badge,
             name_label,
             sec_tag,
@@ -413,11 +424,18 @@ impl QueueRowWidgets {
         }
     }
 
-    fn paint_from_object(&self, obj: &PackageObject, mode: QueueRowMode) {
+    fn paint_from_object(&self, obj: &PackageObject, mode: QueueRowMode, selectable: bool) {
         let Some(pkg) = obj.package() else {
             return;
         };
-        self.paint_package(&pkg, mode, obj.is_current(), progress_from_raw(obj.item_progress()));
+        self.paint_package(
+            &pkg,
+            mode,
+            obj.is_current(),
+            progress_from_raw(obj.item_progress()),
+            obj.selected(),
+            selectable,
+        );
     }
 
     fn paint_package(
@@ -426,7 +444,14 @@ impl QueueRowWidgets {
         mode: QueueRowMode,
         is_current: bool,
         item_progress: Option<f64>,
+        is_selected: bool,
+        selectable: bool,
     ) {
+        let show_check = selectable && mode == QueueRowMode::Review;
+        self.ignore_check.set(true);
+        self.check_btn.set_active(is_selected);
+        self.check_btn.set_visible(show_check);
+        self.ignore_check.set(false);
         for cls in ["src-dnf", "src-flatpak", "src-firmware"] {
             self.source_badge.remove_css_class(cls);
         }
@@ -563,6 +588,7 @@ impl QueueRowWidgets {
 
 struct RowSlot {
     widgets: QueueRowWidgets,
+    bound_obj: Rc<RefCell<Option<PackageObject>>>,
     bound: Option<(PackageObject, glib::SignalHandlerId)>,
 }
 
@@ -575,6 +601,8 @@ pub struct QueueList {
     list_view: gtk::ListView,
     source_filter: Rc<Cell<SourceFilter>>,
     query: Rc<RefCell<String>>,
+    selectable: Rc<Cell<bool>>,
+    on_selection_changed: SelectionChangedCb,
 }
 
 impl QueueList {
@@ -582,6 +610,8 @@ impl QueueList {
         let store = gio::ListStore::new::<PackageObject>();
         let source_filter = Rc::new(Cell::new(SourceFilter::All));
         let query = Rc::new(RefCell::new(String::new()));
+        let selectable = Rc::new(Cell::new(false));
+        let on_selection_changed: SelectionChangedCb = Rc::new(RefCell::new(None));
 
         let filter = {
             let source_filter = source_filter.clone();
@@ -609,17 +639,39 @@ impl QueueList {
 
         {
             let slots = slots.clone();
+            let cb = on_selection_changed.clone();
             factory.connect_setup(move |_, obj| {
                 let Some(list_item) = obj.downcast_ref::<gtk::ListItem>() else {
                     return;
                 };
                 let row = QueueRowWidgets::new();
+                let bound_obj: Rc<RefCell<Option<PackageObject>>> = Rc::new(RefCell::new(None));
+                {
+                    let ignore = row.ignore_check.clone();
+                    let bound_for_toggle = bound_obj.clone();
+                    let cb_for_toggle = cb.clone();
+                    row.check_btn.connect_toggled(move |btn| {
+                        if ignore.get() {
+                            return;
+                        }
+                        if let Some(pkg_obj) = bound_for_toggle.borrow().as_ref() {
+                            let active = btn.is_active();
+                            if pkg_obj.selected() != active {
+                                pkg_obj.set_selected(active);
+                                if let Some(handler) = cb_for_toggle.borrow().as_ref() {
+                                    handler();
+                                }
+                            }
+                        }
+                    });
+                }
                 list_item.set_child(Some(&row.root));
                 let key = list_item.as_ptr() as usize;
                 slots.borrow_mut().insert(
                     key,
                     RowSlot {
                         widgets: row,
+                        bound_obj,
                         bound: None,
                     },
                 );
@@ -628,6 +680,7 @@ impl QueueList {
 
         {
             let slots = slots.clone();
+            let selectable_bind = selectable.clone();
             factory.connect_bind(move |_, obj| {
                 let Some(list_item) = obj.downcast_ref::<gtk::ListItem>() else {
                     return;
@@ -643,10 +696,13 @@ impl QueueList {
                 if let Some((prev_obj, prev_id)) = slot.bound.take() {
                     prev_obj.disconnect(prev_id);
                 }
-                slot.widgets.paint_from_object(&pkg_obj, mode);
+                *slot.bound_obj.borrow_mut() = Some(pkg_obj.clone());
+                slot.widgets
+                    .paint_from_object(&pkg_obj, mode, selectable_bind.get());
                 let row_clone = slot.widgets.clone();
+                let sel_flag = selectable_bind.clone();
                 let handler_id = pkg_obj.connect_revision_notify(move |item| {
-                    row_clone.paint_from_object(item, mode);
+                    row_clone.paint_from_object(item, mode, sel_flag.get());
                 });
                 slot.bound = Some((pkg_obj, handler_id));
             });
@@ -660,6 +716,7 @@ impl QueueList {
                 };
                 let key = list_item.as_ptr() as usize;
                 if let Some(slot) = slots.borrow_mut().get_mut(&key) {
+                    *slot.bound_obj.borrow_mut() = None;
                     if let Some((prev_obj, prev_id)) = slot.bound.take() {
                         prev_obj.disconnect(prev_id);
                     }
@@ -675,6 +732,7 @@ impl QueueList {
                 };
                 let key = list_item.as_ptr() as usize;
                 if let Some(mut slot) = slots.borrow_mut().remove(&key) {
+                    *slot.bound_obj.borrow_mut() = None;
                     if let Some((prev_obj, prev_id)) = slot.bound.take() {
                         prev_obj.disconnect(prev_id);
                     }
@@ -698,11 +756,100 @@ impl QueueList {
             list_view,
             source_filter,
             query,
+            selectable,
+            on_selection_changed,
         }
     }
 
     pub fn list_view(&self) -> &gtk::ListView {
         &self.list_view
+    }
+
+    pub fn set_selectable(&self, selectable: bool) {
+        if self.selectable.get() == selectable {
+            return;
+        }
+        self.selectable.set(selectable);
+        for pos in 0..self.store.n_items() {
+            if let Some(obj) = self.store.item(pos).and_downcast::<PackageObject>() {
+                obj.bump_revision();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_selectable(&self) -> bool {
+        self.selectable.get()
+    }
+
+    pub fn connect_selection_changed(&self, on_change: impl Fn() + 'static) {
+        *self.on_selection_changed.borrow_mut() = Some(Box::new(on_change));
+    }
+
+    fn notify_selection_changed(&self) {
+        if let Some(cb) = self.on_selection_changed.borrow().as_ref() {
+            cb();
+        }
+    }
+
+    pub fn set_all_selected(&self, selected: bool) {
+        for pos in 0..self.store.n_items() {
+            if let Some(obj) = self.store.item(pos).and_downcast::<PackageObject>() {
+                if obj.selected() != selected {
+                    obj.set_selected(selected);
+                    obj.bump_revision();
+                }
+            }
+        }
+        self.notify_selection_changed();
+    }
+
+    #[cfg(test)]
+    pub fn set_selected_by_id(&self, id: &str, selected: bool) -> bool {
+        for pos in 0..self.store.n_items() {
+            let Some(obj) = self.store.item(pos).and_downcast::<PackageObject>() else {
+                continue;
+            };
+            if obj.id() == id {
+                if obj.selected() != selected {
+                    obj.set_selected(selected);
+                    obj.bump_revision();
+                    self.notify_selection_changed();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn selected_ids(&self) -> Vec<String> {
+        (0..self.store.n_items())
+            .filter_map(|pos| self.store.item(pos).and_downcast::<PackageObject>())
+            .filter(|obj| obj.selected())
+            .map(|obj| obj.id().to_string())
+            .collect()
+    }
+
+    pub fn selection_stats(&self) -> (usize, usize, Option<u64>) {
+        let total = self.store.n_items() as usize;
+        let mut selected = 0usize;
+        let mut bytes_sum = 0u64;
+        let mut any_bytes = false;
+        for pos in 0..self.store.n_items() {
+            let Some(obj) = self.store.item(pos).and_downcast::<PackageObject>() else {
+                continue;
+            };
+            if obj.selected() {
+                selected += 1;
+                if let Some(pkg) = obj.package() {
+                    if let Some(sz) = pkg.size_bytes {
+                        bytes_sum = bytes_sum.saturating_add(sz);
+                        any_bytes = true;
+                    }
+                }
+            }
+        }
+        (selected, total, any_bytes.then_some(bytes_sum))
     }
 
     pub fn set_source_filter(&self, filter: SourceFilter) {
@@ -897,7 +1044,17 @@ impl QueueList {
         item_progress: Option<f64>,
     ) -> QueueRowWidgets {
         let widgets = QueueRowWidgets::new();
-        widgets.paint_package(pkg, mode, is_current, item_progress);
+        widgets.paint_package(pkg, mode, is_current, item_progress, true, false);
+        widgets
+    }
+
+    #[cfg(test)]
+    pub fn build_selectable_row_for_test(
+        pkg: &Package,
+        is_selected: bool,
+    ) -> QueueRowWidgets {
+        let widgets = QueueRowWidgets::new();
+        widgets.paint_package(pkg, QueueRowMode::Review, false, None, is_selected, true);
         widgets
     }
 }

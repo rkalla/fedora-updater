@@ -382,11 +382,15 @@ fn is_noise_name(name: &str) -> bool {
     )
 }
 
-fn strip_to_package_name(nevra: &str) -> String {
+pub fn strip_to_package_name(nevra: &str) -> String {
     let mut s = nevra.trim_matches(|c| c == ':' || c == ',').to_string();
     if let Some((epoch, rest)) = s.split_once(':') {
         if epoch.chars().all(|c| c.is_ascii_digit()) {
             s = rest.to_string();
+        } else if let Some((prefix, _)) = epoch.rsplit_once('-') {
+            if epoch[prefix.len() + 1..].chars().all(|c| c.is_ascii_digit()) {
+                s = format!("{prefix}-{rest}");
+            }
         }
     }
     if let Some(idx) = s.rfind('.') {

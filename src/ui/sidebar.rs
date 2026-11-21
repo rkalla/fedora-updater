@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
-use fedora_updater::model::{count_by_source, DetailView, PackageStatus, UpdateSource};
+use fedora_updater::model::{count_by_source, count_security, DetailView, PackageStatus, UpdateSource};
 use fedora_updater::presenter::{
     about_time_left, check_progress, format_elapsed, run_heading, QuietUi,
 };
@@ -21,6 +21,7 @@ use super::charts::ThroughputSparkline;
 pub enum SourceFilter {
     #[default]
     All,
+    Security,
     System,
     Apps,
     Firmware,
@@ -480,16 +481,16 @@ pub struct Sidebar {
     pulse_headline: gtk::Label,
     pulse_detail: gtk::Label,
     pulse_timestamp: gtk::Label,
-    #[cfg_attr(not(test), allow(dead_code))] // Kept hidden until Phase 2 (#35) enables throughput samples.
     sparkline_card: gtk::Box,
-    #[allow(dead_code)] // Phase 2 (#35) drives live samples into the sparkline.
     sparkline: ThroughputSparkline,
     sources_list: gtk::ListBox,
     row_all: gtk::ListBoxRow,
+    row_security: gtk::ListBoxRow,
     row_system: gtk::ListBoxRow,
     row_apps: gtk::ListBoxRow,
     row_firmware: gtk::ListBoxRow,
     count_all: gtk::Label,
+    count_security: gtk::Label,
     count_system: gtk::Label,
     count_apps: gtk::Label,
     count_firmware: gtk::Label,
@@ -499,7 +500,6 @@ pub struct Sidebar {
     telemetry_eta: gtk::Label,
     views_list: gtk::ListBox,
     view_updates_row: gtk::ListBoxRow,
-    #[allow(dead_code)] // Kept for Phase 2 (#35) Update History reveal and tests.
     view_history_row: gtk::ListBoxRow,
     view_log_row: gtk::ListBoxRow,
     upgrade_footer: gtk::Box,
@@ -608,6 +608,9 @@ impl Sidebar {
 
         let (row_all, count_all) =
             source_row("source:all", "All Updates", None, Some("view-list-symbolic"));
+        let (row_security, count_security) =
+            source_row("source:security", "Security Fixes", Some("src-sec"), None);
+        row_security.set_visible(false);
         let (row_system, count_system) =
             source_row("source:system", "System · DNF", Some("src-dnf"), None);
         let (row_apps, count_apps) =
@@ -615,6 +618,7 @@ impl Sidebar {
         let (row_firmware, count_firmware) =
             source_row("source:firmware", "Firmware · LVFS", Some("src-firmware"), None);
         sources_list.append(&row_all);
+        sources_list.append(&row_security);
         sources_list.append(&row_system);
         sources_list.append(&row_apps);
         sources_list.append(&row_firmware);
@@ -763,10 +767,12 @@ impl Sidebar {
             sparkline,
             sources_list,
             row_all,
+            row_security,
             row_system,
             row_apps,
             row_firmware,
             count_all,
+            count_security,
             count_system,
             count_apps,
             count_firmware,
@@ -797,6 +803,7 @@ impl Sidebar {
         &self,
         on_source: impl Fn(SourceFilter) + 'static,
         on_updates: impl Fn() + 'static,
+        on_history: impl Fn() + 'static,
         on_activity_log: impl Fn() + 'static,
     ) {
         let selected_source = self.selected_source.clone();
@@ -806,6 +813,7 @@ impl Sidebar {
                 return;
             }
             let filter = match row.widget_name().as_str() {
+                "source:security" => SourceFilter::Security,
                 "source:system" => SourceFilter::System,
                 "source:apps" => SourceFilter::Apps,
                 "source:firmware" => SourceFilter::Firmware,
@@ -821,6 +829,7 @@ impl Sidebar {
                 return;
             }
             match row.widget_name().as_str() {
+                "view:history" => on_history(),
                 "view:log" => on_activity_log(),
                 _ => on_updates(),
             }
@@ -831,6 +840,7 @@ impl Sidebar {
         self.selected_source.set(filter);
         let row = match filter {
             SourceFilter::All => &self.row_all,
+            SourceFilter::Security => &self.row_security,
             SourceFilter::System => &self.row_system,
             SourceFilter::Apps => &self.row_apps,
             SourceFilter::Firmware => &self.row_firmware,
@@ -838,6 +848,22 @@ impl Sidebar {
         self.ignore_nav.set(true);
         self.sources_list.select_row(Some(row));
         self.ignore_nav.set(false);
+    }
+
+    pub fn set_history_available(&self, available: bool) {
+        self.view_history_row.set_visible(available);
+    }
+
+    pub fn push_throughput_sample(&self, bytes_per_sec: f64, transferred: Option<(u64, u64)>) {
+        self.sparkline.set_visible(true);
+        self.sparkline_card.set_visible(true);
+        self.sparkline.push_sample(bytes_per_sec, transferred);
+    }
+
+    pub fn reset_throughput(&self) {
+        self.sparkline.clear();
+        self.sparkline.set_visible(false);
+        self.sparkline_card.set_visible(false);
     }
 
     pub fn select_view(&self, view: DetailView) {
@@ -876,7 +902,13 @@ impl Sidebar {
 
         let packages = state.packages();
         let (dnf, flatpak, firmware) = count_by_source(packages);
+        let sec = count_security(packages);
         self.count_all.set_text(&packages.len().to_string());
+        self.count_security.set_text(&sec.to_string());
+        self.row_security.set_visible(sec > 0);
+        if sec == 0 && self.selected_source.get() == SourceFilter::Security {
+            self.select_source(SourceFilter::All);
+        }
         self.count_system.set_text(&dnf.to_string());
         self.count_apps.set_text(&flatpak.to_string());
         self.count_firmware.set_text(&firmware.to_string());
@@ -943,6 +975,16 @@ impl Sidebar {
     #[cfg(test)]
     pub fn sparkline(&self) -> &ThroughputSparkline {
         &self.sparkline
+    }
+
+    #[cfg(test)]
+    pub fn row_security(&self) -> &gtk::ListBoxRow {
+        &self.row_security
+    }
+
+    #[cfg(test)]
+    pub fn count_security_text(&self) -> String {
+        self.count_security.text().to_string()
     }
 
     #[cfg(test)]

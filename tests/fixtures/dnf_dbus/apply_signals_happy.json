@@ -1,0 +1,123 @@
+[
+  {
+    "signal": "download_add_new",
+    "download_id": "package:1",
+    "description": "openssl-0:3.2.2-3.fc44.x86_64",
+    "total_to_download": 2457600
+  },
+  {
+    "signal": "download_progress",
+    "download_id": "package:1",
+    "total_to_download": 2457600,
+    "downloaded": 0,
+    "timestamp_ms": 0
+  },
+  {
+    "signal": "download_progress",
+    "download_id": "package:1",
+    "total_to_download": 2457600,
+    "downloaded": 1228800,
+    "timestamp_ms": 1000
+  },
+  {
+    "signal": "download_end",
+    "download_id": "package:1",
+    "transfer_status": 0,
+    "message": "",
+    "timestamp_ms": 2000
+  },
+  {
+    "signal": "download_add_new",
+    "download_id": "package:2",
+    "description": "kernel-core-0:6.14.12-300.fc44.x86_64",
+    "total_to_download": 18874368
+  },
+  {
+    "signal": "download_progress",
+    "download_id": "package:2",
+    "total_to_download": 18874368,
+    "downloaded": 9437184,
+    "timestamp_ms": 3000
+  },
+  {
+    "signal": "download_end",
+    "download_id": "package:2",
+    "transfer_status": 0,
+    "message": "",
+    "timestamp_ms": 4000
+  },
+  {
+    "signal": "transaction_before_begin",
+    "total": 2
+  },
+  {
+    "signal": "transaction_transaction_start",
+    "total": 2
+  },
+  {
+    "signal": "transaction_transaction_progress",
+    "processed": 2,
+    "total": 2
+  },
+  {
+    "signal": "transaction_transaction_stop",
+    "total": 2
+  },
+  {
+    "signal": "transaction_elem_progress",
+    "nevra": "openssl-0:3.2.2-3.fc44.x86_64",
+    "processed": 0,
+    "total": 2
+  },
+  {
+    "signal": "transaction_action_start",
+    "nevra": "openssl-0:3.2.2-3.fc44.x86_64",
+    "action": 2,
+    "total": 5600000
+  },
+  {
+    "signal": "transaction_action_progress",
+    "nevra": "openssl-0:3.2.2-3.fc44.x86_64",
+    "processed": 5600000,
+    "total": 5600000
+  },
+  {
+    "signal": "transaction_action_stop",
+    "nevra": "openssl-0:3.2.2-3.fc44.x86_64",
+    "total": 5600000
+  },
+  {
+    "signal": "transaction_elem_progress",
+    "nevra": "kernel-core-0:6.14.12-300.fc44.x86_64",
+    "processed": 1,
+    "total": 2
+  },
+  {
+    "signal": "transaction_action_start",
+    "nevra": "kernel-core-0:6.14.12-300.fc44.x86_64",
+    "action": 1,
+    "total": 98500000
+  },
+  {
+    "signal": "transaction_action_stop",
+    "nevra": "kernel-core-0:6.14.12-300.fc44.x86_64",
+    "total": 98500000
+  },
+  {
+    "signal": "transaction_verify_start",
+    "total": 2
+  },
+  {
+    "signal": "transaction_verify_progress",
+    "processed": 2,
+    "total": 2
+  },
+  {
+    "signal": "transaction_verify_stop",
+    "total": 2
+  },
+  {
+    "signal": "transaction_after_complete",
+    "success": true
+  }
+]

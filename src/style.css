@@ -193,6 +193,19 @@ window.is-dark .source-dot.src-firmware {
   background-color: #f8c555;
 }
 
+.source-dot.src-sec {
+  background-color: #c01c28;
+}
+
+window.is-dark .source-dot.src-sec {
+  background-color: #ff7b72;
+}
+
+.tag-bz {
+  color: alpha(@window_fg_color, 0.78);
+  background-color: alpha(@window_fg_color, 0.08);
+}
+
 .progress-ring-label {
   font-size: 11px;
   font-weight: 700;

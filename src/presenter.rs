@@ -3,8 +3,8 @@
 use crate::backend::dnf::package_implies_reboot;
 use crate::state::Phase;
 use crate::model::{
-    count_by_source, format_bytes, total_download_bytes, AuthPurpose, IdleScreen, Package,
-    PackageStatus, RetryAction, RunPass, UpdateSource,
+    count_by_source, format_bytes, total_download_bytes, ApplyMode, AuthPurpose, IdleScreen,
+    Package, PackageStatus, RetryAction, RunPass, UpdateSource,
 };
 
 pub const ABOUT_NAME: &str = "Fedora Updater";
@@ -302,6 +302,7 @@ pub enum HeaderView<'a> {
     Done { failed: bool, subtitle: &'a str },
     Failed,
     ActivityLog { subtitle: &'a str },
+    History { subtitle: &'a str },
 }
 
 pub fn window_header(view: HeaderView<'_>, narrow: bool) -> HeaderChrome {
@@ -332,10 +333,100 @@ pub fn window_header(view: HeaderView<'_>, narrow: bool) -> HeaderChrome {
             (title.into(), subtitle.to_string())
         }
         HeaderView::ActivityLog { subtitle } => ("Activity Log".into(), subtitle.to_string()),
+        HeaderView::History { subtitle } => ("Update History".into(), subtitle.to_string()),
     };
     HeaderChrome {
         title,
         subtitle: if narrow { String::new() } else { subtitle },
+    }
+}
+
+pub fn history_subtitle(matched: usize, total: usize) -> String {
+    if total == 0 {
+        "No recorded transactions".into()
+    } else if matched == total {
+        if total == 1 {
+            "1 transaction".into()
+        } else {
+            format!("{total} transactions")
+        }
+    } else {
+        format!("{matched} of {total} transactions")
+    }
+}
+
+/// Primary apply CTA label incorporating execution mode, selected subset, and size.
+pub fn apply_cta_label(
+    mode: ApplyMode,
+    selected: usize,
+    total: usize,
+    selected_bytes: Option<u64>,
+) -> String {
+    let all_selected = selected == total || total == 0;
+    let base = match mode {
+        ApplyMode::Live => {
+            if all_selected {
+                "Update All".to_string()
+            } else {
+                format!("Update {selected} of {total}")
+            }
+        }
+        ApplyMode::LiveAndReboot => {
+            if all_selected {
+                "Update & Restart".to_string()
+            } else {
+                format!("Update {selected} & Restart")
+            }
+        }
+        ApplyMode::OfflineOnReboot => {
+            if all_selected {
+                "Prepare Offline Update".to_string()
+            } else {
+                format!("Prepare {selected} Offline")
+            }
+        }
+        ApplyMode::DownloadOnly => {
+            if all_selected {
+                "Download Only".to_string()
+            } else {
+                format!("Download {selected}")
+            }
+        }
+    };
+    if selected > 0 {
+        if let Some(bytes) = selected_bytes.filter(|b| *b > 0) {
+            return format!("{base} · {}", format_bytes(bytes));
+        }
+    }
+    base
+}
+
+/// Concise selection summary rendered alongside the "Toggle All Selected" control.
+pub fn selection_summary_text(
+    selected: usize,
+    total: usize,
+    selected_bytes: Option<u64>,
+) -> String {
+    if total == 0 {
+        return "0 selected".into();
+    }
+    let base = format!("{selected} of {total} selected");
+    if selected > 0 {
+        if let Some(bytes) = selected_bytes.filter(|b| *b > 0) {
+            return format!("{base} · {}", format_bytes(bytes));
+        }
+    }
+    base
+}
+
+/// Formats signed installed size delta (`+1.4 MB`, `-240 KB`, `0 B`).
+pub fn format_size_delta(delta: i64) -> String {
+    if delta == 0 {
+        "0 B".into()
+    } else if delta > 0 {
+        format!("+{}", format_bytes(delta as u64))
+    } else {
+        format!("-{}", format_bytes(delta.unsigned_abs()))
     }
 }
 
@@ -1573,5 +1664,65 @@ mod tests {
             phase_completion_notification(&failed, false, true).expect("apply failed");
         assert_eq!(fail_notif.title, "Update Failed");
         assert_eq!(fail_notif.body, "System: dependency conflict");
+    }
+
+    #[test]
+    fn phase2_cta_selection_history_and_size_delta_helpers() {
+        assert_eq!(
+            window_header(HeaderView::History { subtitle: "12 transactions" }, false),
+            HeaderChrome {
+                title: "Update History".into(),
+                subtitle: "12 transactions".into(),
+            }
+        );
+        assert_eq!(history_subtitle(0, 0), "No recorded transactions");
+        assert_eq!(history_subtitle(1, 1), "1 transaction");
+        assert_eq!(history_subtitle(12, 12), "12 transactions");
+        assert_eq!(history_subtitle(3, 12), "3 of 12 transactions");
+
+        assert_eq!(apply_cta_label(ApplyMode::Live, 5, 5, None), "Update All");
+        assert_eq!(
+            apply_cta_label(ApplyMode::Live, 5, 5, Some(15 * 1024 * 1024)),
+            "Update All · 15 MB"
+        );
+        assert_eq!(
+            apply_cta_label(ApplyMode::Live, 2, 5, Some(4 * 1024 * 1024)),
+            "Update 2 of 5 · 4.0 MB"
+        );
+        assert_eq!(
+            apply_cta_label(ApplyMode::LiveAndReboot, 5, 5, None),
+            "Update & Restart"
+        );
+        assert_eq!(
+            apply_cta_label(ApplyMode::LiveAndReboot, 3, 5, Some(2 * 1024 * 1024)),
+            "Update 3 & Restart · 2.0 MB"
+        );
+        assert_eq!(
+            apply_cta_label(ApplyMode::OfflineOnReboot, 5, 5, None),
+            "Prepare Offline Update"
+        );
+        assert_eq!(
+            apply_cta_label(ApplyMode::OfflineOnReboot, 1, 4, None),
+            "Prepare 1 Offline"
+        );
+        assert_eq!(
+            apply_cta_label(ApplyMode::DownloadOnly, 5, 5, None),
+            "Download Only"
+        );
+        assert_eq!(
+            apply_cta_label(ApplyMode::DownloadOnly, 0, 5, Some(1024)),
+            "Download 0"
+        );
+
+        assert_eq!(selection_summary_text(0, 0, None), "0 selected");
+        assert_eq!(
+            selection_summary_text(3, 5, Some(2 * 1024 * 1024)),
+            "3 of 5 selected · 2.0 MB"
+        );
+        assert_eq!(selection_summary_text(0, 5, Some(2 * 1024 * 1024)), "0 of 5 selected");
+
+        assert_eq!(format_size_delta(0), "0 B");
+        assert_eq!(format_size_delta(2 * 1024 * 1024), "+2.0 MB");
+        assert_eq!(format_size_delta(-512 * 1024), "-512 KB");
     }
 }

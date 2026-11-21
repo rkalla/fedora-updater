@@ -303,6 +303,13 @@ impl Package {
         parts.join(" ")
     }
 
+    /// True when at least one attached advisory marks a security fix or references a CVE.
+    pub fn has_security_advisory(&self) -> bool {
+        self.advisories
+            .iter()
+            .any(|a| a.kind == AdvisoryKind::Security || !a.cves.is_empty())
+    }
+
     pub fn size_label(&self) -> Option<String> {
         self.size_bytes.map(format_bytes)
     }
@@ -378,6 +385,14 @@ pub fn count_by_source(packages: &[Package]) -> (usize, usize, usize) {
         }
     }
     (dnf, flatpak, firmware)
+}
+
+/// Number of packages carrying at least one security advisory or CVE reference.
+pub fn count_security(packages: &[Package]) -> usize {
+    packages
+        .iter()
+        .filter(|p| p.has_security_advisory())
+        .count()
 }
 
 /// Parse a package size from DNF/Flatpak display text or a raw byte count.
@@ -986,8 +1001,17 @@ mod tests {
             Some("CVE-2026-2401")
         );
         assert_eq!(pkg.advisory_summary(), "FEDORA-2026-84a1 CVE-2026-2401");
+        assert!(pkg.has_security_advisory());
+        assert_eq!(
+            count_security(&[
+                pkg.clone(),
+                Package::new_dnf("zlib", "x86_64", "1.3.1", "updates"),
+            ]),
+            1
+        );
 
         pkg.advisories[0].cves.clear();
         assert_eq!(pkg.primary_security_tag().as_deref(), Some("Security"));
+        assert!(pkg.has_security_advisory());
     }
 }

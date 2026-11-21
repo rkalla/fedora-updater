@@ -1,6 +1,7 @@
 mod activity_log;
 mod charts;
 mod dialogs;
+mod history;
 mod inspector;
 mod prefs;
 mod preview;

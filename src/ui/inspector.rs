@@ -2,7 +2,8 @@
 
 use gtk::prelude::*;
 
-use fedora_updater::model::{Package, PackageAdvisory, PackageStatus, UpdateSource};
+use fedora_updater::model::{AdvisoryKind, Package, PackageAdvisory, PackageStatus, UpdateSource};
+use fedora_updater::presenter::format_size_delta;
 
 use super::queue_list::package_needs_reboot;
 
@@ -20,6 +21,7 @@ pub struct InspectorViewModel {
     pub version: String,
     pub version_display: String,
     pub size_label: Option<String>,
+    pub install_size_delta: Option<String>,
     pub status_label: Option<&'static str>,
     pub needs_reboot: bool,
     pub reboot_reason: Option<String>,
@@ -79,6 +81,10 @@ impl InspectorViewModel {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToString::to_string);
+        let install_size_delta = package
+            .install_size_delta
+            .filter(|delta| *delta != 0)
+            .map(format_size_delta);
 
         Self {
             badge: package.source.badge(),
@@ -92,6 +98,7 @@ impl InspectorViewModel {
             version: package.version.clone(),
             version_display,
             size_label: package.size_label(),
+            install_size_delta,
             status_label,
             needs_reboot,
             reboot_reason,
@@ -166,6 +173,7 @@ pub struct PackageInspector {
     old_version_field: MetadataField,
     version_field: MetadataField,
     size_field: MetadataField,
+    disk_delta_field: MetadataField,
     status_field: MetadataField,
     extensions_card: gtk::Box,
     extensions_count: gtk::Label,
@@ -295,6 +303,7 @@ impl PackageInspector {
         let old_version_field = MetadataField::new("Installed");
         let version_field = MetadataField::new("Available");
         let size_field = MetadataField::new("Download Size");
+        let disk_delta_field = MetadataField::new("Disk Change");
         let status_field = MetadataField::new("Status");
 
         for field in [
@@ -304,6 +313,7 @@ impl PackageInspector {
             &old_version_field,
             &version_field,
             &size_field,
+            &disk_delta_field,
             &status_field,
         ] {
             meta_inner.append(&field.row);
@@ -407,6 +417,7 @@ impl PackageInspector {
             old_version_field,
             version_field,
             size_field,
+            disk_delta_field,
             status_field,
             extensions_card,
             extensions_count,
@@ -467,6 +478,8 @@ impl PackageInspector {
             .set_optional(vm.old_version.as_deref());
         self.version_field.set_optional(Some(&vm.version));
         self.size_field.set_optional(vm.size_label.as_deref());
+        self.disk_delta_field
+            .set_optional(vm.install_size_delta.as_deref());
         self.status_field.set_optional(vm.status_label);
 
         clear_box(&self.extensions_list);
@@ -497,19 +510,42 @@ impl PackageInspector {
         } else {
             for adv in &vm.advisories {
                 let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
                 let id_lbl = gtk::Label::builder()
                     .label(&adv.id)
                     .xalign(0.0)
                     .halign(gtk::Align::Start)
+                    .hexpand(true)
                     .css_classes(["monospace", "caption"])
                     .build();
-                row.append(&id_lbl);
-                if !adv.cves.is_empty() {
-                    let tags = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                head.append(&id_lbl);
+
+                if let Some((sev_text, sev_css)) = advisory_severity_chip(adv) {
+                    let sev_lbl = gtk::Label::builder()
+                        .label(sev_text)
+                        .valign(gtk::Align::Center)
+                        .css_classes(["micro-tag", sev_css])
+                        .build();
+                    head.append(&sev_lbl);
+                }
+                row.append(&head);
+
+                if !adv.cves.is_empty() || !adv.bugzillas.is_empty() {
+                    let tags = libadwaita::WrapBox::builder()
+                        .child_spacing(4)
+                        .line_spacing(4)
+                        .build();
                     for cve in &adv.cves {
                         let chip = gtk::Label::builder()
                             .label(cve)
                             .css_classes(["micro-tag", "tag-sec"])
+                            .build();
+                        tags.append(&chip);
+                    }
+                    for bz in &adv.bugzillas {
+                        let chip = gtk::Label::builder()
+                            .label(bz)
+                            .css_classes(["micro-tag", "tag-bz"])
                             .build();
                         tags.append(&chip);
                     }
@@ -629,6 +665,54 @@ impl PackageInspector {
     #[cfg(test)]
     pub fn advisories_card_visible(&self) -> bool {
         self.advisories_card.get_visible()
+    }
+
+    #[cfg(test)]
+    pub fn disk_delta_value(&self) -> Option<String> {
+        self.disk_delta_field
+            .row
+            .get_visible()
+            .then(|| self.disk_delta_field.value.text().to_string())
+    }
+
+    #[cfg(test)]
+    pub fn advisory_summary_text(&self) -> String {
+        let mut parts = Vec::new();
+        collect_label_texts(self.advisories_list.upcast_ref(), &mut parts);
+        parts.join(" ")
+    }
+}
+
+fn advisory_severity_chip(adv: &PackageAdvisory) -> Option<(&str, &'static str)> {
+    if let Some(sev) = adv.severity.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = sev.to_ascii_lowercase();
+        let css = match lower.as_str() {
+            "critical" | "important" => "tag-sec",
+            "moderate" => "tag-reboot",
+            _ => "tag-bz",
+        };
+        return Some((sev, css));
+    }
+    match adv.kind {
+        AdvisoryKind::Security => Some(("Security", "tag-sec")),
+        AdvisoryKind::Bugfix => Some(("Bugfix", "tag-bz")),
+        AdvisoryKind::Enhancement => Some(("Enhancement", "tag-bz")),
+        AdvisoryKind::NewPackage => Some(("New", "tag-bz")),
+    }
+}
+
+#[cfg(test)]
+fn collect_label_texts(widget: &gtk::Widget, out: &mut Vec<String>) {
+    if let Ok(lbl) = widget.clone().downcast::<gtk::Label>() {
+        let t = lbl.text().to_string();
+        if !t.is_empty() {
+            out.push(t);
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        collect_label_texts(&c, out);
+        child = c.next_sibling();
     }
 }
 

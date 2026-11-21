@@ -381,6 +381,38 @@ Adw.ApplicationWindow window {
                           };
                         }
 
+                        Adw.Clamp ready_selection_bar {
+                          maximum-size: 680;
+                          tightening-threshold: 500;
+                          hexpand: true;
+                          margin-start: 14;
+                          margin-end: 14;
+                          margin-top: 2;
+                          margin-bottom: 4;
+                          visible: false;
+
+                          child: Gtk.Box {
+                            orientation: horizontal;
+                            spacing: 10;
+
+                            Gtk.CheckButton ready_select_all {
+                              label: "Toggle All Selected";
+                              active: true;
+                              valign: center;
+                              styles ["caption"]
+                            }
+
+                            Gtk.Label ready_selection_summary {
+                              label: "";
+                              xalign: 1;
+                              halign: end;
+                              hexpand: true;
+                              valign: center;
+                              styles ["dimmed", "caption", "numeric"]
+                            }
+                          };
+                        }
+
                         Gtk.Stack ready_list_stack {
                           vexpand: true;
                           hexpand: true;
@@ -498,6 +530,15 @@ Adw.ApplicationWindow window {
                             visible: false;
                             valign: center;
                             styles ["suggested-action"]
+
+                            menu-model: menu {
+                              section {
+                                item ("Update All", "win.apply-mode::live")
+                                item ("Update & Restart", "win.apply-mode::live-reboot")
+                                item ("Prepare Offline Update", "win.apply-mode::offline")
+                                item ("Download Only", "win.apply-mode::download-only")
+                              }
+                            };
                           }
                         };
                       }
@@ -981,6 +1022,15 @@ Adw.ApplicationWindow window {
             Gtk.StackPage {
               name: "activity-log";
               child: Gtk.Box activity_log_host {
+                orientation: vertical;
+                hexpand: true;
+                vexpand: true;
+              };
+            }
+
+            Gtk.StackPage {
+              name: "history";
+              child: Gtk.Box history_host {
                 orientation: vertical;
                 hexpand: true;
                 vexpand: true;

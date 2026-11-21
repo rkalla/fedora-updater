@@ -1,0 +1,47 @@
+[
+  {
+    "id": 203,
+    "start": 1795224500,
+    "end": 1795224552,
+    "user_id": 1000,
+    "description": "dnf update -y",
+    "status": "Ok",
+    "upgraded": [
+      {
+        "name": "exfatprogs",
+        "arch": "x86_64",
+        "evr": "1.4.4-1.fc44",
+        "original_evr": "1.4.3-1.fc44"
+      },
+      {
+        "name": "mesa-vulkan-drivers",
+        "arch": "x86_64",
+        "evr": "25.0.7-2.fc44",
+        "original_evr": "25.0.6-1.fc44"
+      }
+    ],
+    "installed": [],
+    "removed": [],
+    "downgraded": [],
+    "reinstalled": []
+  },
+  {
+    "id": 202,
+    "start": 1700000000,
+    "end": 1700000015,
+    "user_id": 1000,
+    "description": "dnf install htop",
+    "status": "Ok",
+    "upgraded": [],
+    "installed": [
+      {
+        "name": "htop",
+        "arch": "x86_64",
+        "evr": "3.3.0-1.fc44"
+      }
+    ],
+    "removed": [],
+    "downgraded": [],
+    "reinstalled": []
+  }
+]

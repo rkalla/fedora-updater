@@ -5,10 +5,11 @@ use gtk::gdk::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
 
+use fedora_updater::backend::dnf_dbus::{HistoryEntry, HistoryPackageChange, HistorySource};
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
-    parse_size_bytes, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus, RetryAction,
-    RunPass, Stopwatch, UpdateSource,
+    parse_size_bytes, AdvisoryKind, ApplyMode, AuthPurpose, DetailView, IdleScreen, Package,
+    PackageAdvisory, PackageStatus, RetryAction, RunPass, Stopwatch, UpdateSource,
 };
 use fedora_updater::state::{AppState, Phase, RunningState};
 
@@ -18,6 +19,9 @@ pub struct PreviewConfig {
     pub sidebar_open: bool,
     pub detail_view: DetailView,
     pub expand_completed: bool,
+    pub enable_native_capabilities: bool,
+    pub sample_history: Vec<HistoryEntry>,
+    pub sample_throughput: Vec<(f64, u64, u64)>,
 }
 
 pub fn initial_config() -> Option<PreviewConfig> {
@@ -75,10 +79,14 @@ pub fn config_for(phase: &str) -> PreviewConfig {
         release_upgrade: None,
         release_age_days: None,
         retry_apply_packages: Vec::new(),
+        apply_mode: ApplyMode::Live,
     };
     let mut sidebar_open = true;
     let mut detail_view = DetailView::Updates;
     let mut expand_completed = false;
+    let mut enable_native_capabilities = false;
+    let mut sample_history = Vec::new();
+    let mut sample_throughput = Vec::new();
 
     state.phase = match phase {
         "idle" => Phase::Idle(IdleScreen::Fresh),
@@ -126,6 +134,13 @@ pub fn config_for(phase: &str) -> PreviewConfig {
             packages: sample_packages(false),
             soft_errors: vec!["Firmware metadata refresh failed".into()],
         },
+        "ready-native" => {
+            enable_native_capabilities = true;
+            Phase::Ready {
+                packages: sample_native_packages(),
+                soft_errors: vec![],
+            }
+        }
         "running" => Phase::Running(RunningState {
             packages: sample_packages(true),
             active_index: Some(3),
@@ -140,6 +155,34 @@ pub fn config_for(phase: &str) -> PreviewConfig {
             failed_sources: vec![],
             failure_reasons: vec![],
         }),
+        "running-sparkline" => {
+            enable_native_capabilities = true;
+            sample_throughput = vec![
+                (1_200_000.0, 1_200_000, 16_000_000),
+                (3_400_000.0, 4_600_000, 16_000_000),
+                (5_800_000.0, 10_400_000, 16_000_000),
+                (4_600_000.0, 15_000_000, 16_000_000),
+            ];
+            let mut dl_pkgs = sample_native_packages();
+            dl_pkgs[0].status = PackageStatus::Downloading;
+            Phase::Running(RunningState {
+                packages: dl_pkgs,
+                active_index: Some(0),
+                overall_progress: 0.25,
+                phase_label: "Downloading packages".into(),
+                current_source: Some(UpdateSource::Dnf),
+                current_name: Some("openssl".into()),
+                work_progress: Some(0.85),
+                pass: RunPass::Download,
+                stage: Some(fedora_updater::model::StageCount {
+                    current: 1,
+                    total: 6,
+                }),
+                needs_reboot: false,
+                failed_sources: vec![],
+                failure_reasons: vec![],
+            })
+        }
         "running-many" | "running-expanded" => {
             expand_completed = phase == "running-expanded";
             let packages = many_running_packages();
@@ -221,6 +264,15 @@ pub fn config_for(phase: &str) -> PreviewConfig {
                 soft_errors: vec![],
             }
         }
+        "history" => {
+            enable_native_capabilities = true;
+            detail_view = DetailView::History;
+            sample_history = sample_history_entries();
+            Phase::Ready {
+                packages: sample_native_packages(),
+                soft_errors: vec![],
+            }
+        }
         other => {
             eprintln!("unknown FEDORA_UPDATER_PREVIEW={other}, using idle");
             Phase::Idle(IdleScreen::Fresh)
@@ -232,6 +284,9 @@ pub fn config_for(phase: &str) -> PreviewConfig {
         sidebar_open,
         detail_view,
         expand_completed,
+        enable_native_capabilities,
+        sample_history,
+        sample_throughput,
     }
 }
 
@@ -388,6 +443,70 @@ fn many_running_packages() -> Vec<Package> {
         ));
     }
     packages
+}
+
+fn sample_native_packages() -> Vec<Package> {
+    let mut pkgs = sample_packages(false);
+    if let Some(openssl) = pkgs.first_mut() {
+        openssl.install_size_delta = Some(320 * 1024);
+        openssl.summary =
+            Some("Utilities from the general purpose cryptography library with TLS support".into());
+        openssl.advisories.push(PackageAdvisory {
+            id: "FEDORA-2026-84a1".into(),
+            kind: AdvisoryKind::Security,
+            severity: Some("Important".into()),
+            cves: vec!["CVE-2026-2401".into()],
+            bugzillas: vec!["RHBZ#2458001".into()],
+            description: Some("Fixes TLS 1.3 buffer over-read when decoding session tickets.".into()),
+        });
+    }
+    pkgs
+}
+
+fn sample_history_entries() -> Vec<HistoryEntry> {
+    vec![
+        HistoryEntry {
+            id: "dnf-txn-203".into(),
+            source: HistorySource::Dnf,
+            timestamp: 1_795_224_552,
+            title: "openssl + 1 more".into(),
+            description: "dnf update -y".into(),
+            status: "Ok".into(),
+            succeeded: true,
+            changes: vec![
+                HistoryPackageChange {
+                    name: "openssl".into(),
+                    arch: "x86_64".into(),
+                    evr: "3.2.2-3.fc44".into(),
+                    original_evr: Some("3.2.2-1.fc44".into()),
+                    action: "Upgraded".into(),
+                },
+                HistoryPackageChange {
+                    name: "exfatprogs".into(),
+                    arch: "x86_64".into(),
+                    evr: "1.4.4-1.fc44".into(),
+                    original_evr: Some("1.4.3-1.fc44".into()),
+                    action: "Upgraded".into(),
+                },
+            ],
+        },
+        HistoryEntry {
+            id: "fwupd-uefi-2026".into(),
+            source: HistorySource::Firmware,
+            timestamp: 1_795_150_000,
+            title: "System Firmware".into(),
+            description: "uefi_capsule".into(),
+            status: "Restart Required".into(),
+            succeeded: true,
+            changes: vec![HistoryPackageChange {
+                name: "System Firmware".into(),
+                arch: String::new(),
+                evr: "0.1.33".into(),
+                original_evr: Some("0.1.32".into()),
+                action: "Firmware".into(),
+            }],
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -569,6 +688,19 @@ mod tests {
         assert!(log_cfg.sidebar_open);
         assert_eq!(log_cfg.detail_view, DetailView::ActivityLog);
         assert!(matches!(log_cfg.state.phase, Phase::Ready { .. }));
+
+        let native_cfg = super::config_for("ready-native");
+        assert!(native_cfg.enable_native_capabilities);
+        assert!(matches!(&native_cfg.state.phase, Phase::Ready { packages, .. } if packages[0].has_security_advisory()));
+
+        let spark_cfg = super::config_for("running-sparkline");
+        assert!(spark_cfg.enable_native_capabilities);
+        assert!(!spark_cfg.sample_throughput.is_empty());
+
+        let hist_cfg = super::config_for("history");
+        assert!(hist_cfg.enable_native_capabilities);
+        assert_eq!(hist_cfg.detail_view, DetailView::History);
+        assert_eq!(hist_cfg.sample_history.len(), 2);
 
         if std::env::var_os("FEDORA_UPDATER_PREVIEW").is_none() {
             assert!(super::initial_config().is_none());

@@ -2,7 +2,7 @@
 
 Checked-in, deterministic, offline test inputs for unit, functional, and end-to-end suites ([rkalla/fedora-updater#20](https://github.com/rkalla/fedora-updater/issues/20)).
 
-All 35 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
+All 39 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
 
 ## Usage in Tests
 
@@ -26,6 +26,15 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `dnf/apply_happy_kernel.txt` | `dnf update -y` (exit 0) | Complete dnf5 transaction: `Upgrading:` / `Installing:` preview table, raw `\r` (`0x0d`) live download redraws `[1/4]..[4/4]`, `Running transaction`, `Verify package files`, `Prepare transaction`, `Upgrading` / `Installing kernel-core` (reboot trigger), `Running scriptlet`, `Cleanup / Verifying`, `Complete!` |
 | `dnf/apply_dep_conflict.txt` | `dnf update -y` (exit 1) | Dependency conflict (`Problem 1`, `Problem 2: nothing provides ...`, `--skip-broken` hint) |
 | `dnf/apply_rpm_lock_error.txt` | `dnf update -y` (exit 1) | Concurrent `dnf5daemon-server` lock on `/var/lib/rpm/.rpm.lock`, transaction aborted cleanly |
+
+### `dnf_dbus/` (4 fixtures)
+
+| File | Simulated Call / Signal Stream | Scenario & Edge-Case Signals |
+|---|---|---|
+| `dnf_dbus/list_fd_stream.ndjson` | `org.rpm.dnf.v0.rpm.Rpm.list_fd` | Multi-line NDJSON stream of RPM upgrades (`openssl`, `kernel-core`, `vim-enhanced` with epoch `0:`/`2:`, `download_size`, `install_size`, `summary`) |
+| `dnf_dbus/check_upgrades_and_advisories.json` | `Rpm.list` (`installed`) + `Advisory.list` | Installed baselines for `old → new` & `install_size_delta` cross-ref plus Security/Bugfix advisories (`CVE-2026-2401`, `RHBZ#2458001`, severity) |
+| `dnf_dbus/apply_signals_happy.json` | `Base.download_*` + `Rpm.transaction_*` | Download ticks at 1s intervals (MB/s sparkline samples), `transaction_before_begin` cancel cutoff, `elem_progress`/`action_*`, and `verify_*` |
+| `dnf_dbus/history_transactions.json` | `org.rpm.dnf.v0.History.list` | Multi-package upgraded & single-package installed RPM transactions for chronological timeline merge |
 
 ### `flatpak/` (6 fixtures)
 

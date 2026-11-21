@@ -102,6 +102,7 @@ impl PipelineHarness {
                 self.deltas.push(d);
                 self.draw_count += 1;
             }
+            WorkerMsg::Throughput { .. } => {}
             WorkerMsg::Event(ev) => self.dispatch(ev),
         }
     }

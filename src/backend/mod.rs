@@ -2,6 +2,7 @@
 //! Flatpak discovery and transaction apply call libflatpak natively, with flatpak CLI fallback.
 
 pub mod dnf;
+pub mod dnf_dbus;
 pub mod flatpak;
 pub mod fwupd;
 pub mod fwupd_dbus;

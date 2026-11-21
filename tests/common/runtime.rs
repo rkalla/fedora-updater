@@ -4,14 +4,17 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use fedora_updater::backend::dnf_dbus::{
+    upgrade_specs_from_packages, DnfApplyOutcome, DnfHistoryTransaction, ThroughputSample,
+};
 use fedora_updater::backend::flatpak::{
     packages_from_flatpak_updates, FlatpakApplyOutcome, FlatpakCheck,
 };
-use fedora_updater::backend::fwupd_dbus::FwupdApplyOutcome;
+use fedora_updater::backend::fwupd_dbus::{FwupdApplyOutcome, FwupdHistoryEntry};
 use fedora_updater::backend::logind::RebootPreflight;
 use fedora_updater::backend::{NativeOutcome, ProgressHint};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
-use fedora_updater::model::Package;
+use fedora_updater::model::{ApplyMode, Package};
 use fedora_updater::orchestrator::{OrchestratorRuntime, WorkCancel};
 use fedora_updater::privilege::SessionError;
 
@@ -73,6 +76,17 @@ pub struct FwupdDbusApplyStep {
     pub outcome: NativeOutcome<FwupdApplyOutcome>,
 }
 
+pub type DnfOnStartHook = Box<dyn FnMut(&WorkCancel) + Send>;
+
+pub struct DnfDbusApplyStep {
+    pub lines: Vec<String>,
+    pub draws: Vec<String>,
+    pub hints: Vec<ProgressHint>,
+    pub throughput: Vec<ThroughputSample>,
+    pub on_start: Option<DnfOnStartHook>,
+    pub outcome: NativeOutcome<DnfApplyOutcome>,
+}
+
 pub type FlatpakOnStartHook = Box<dyn FnMut(&WorkCancel) + Send>;
 
 pub struct FlatpakNativeApplyStep {
@@ -106,6 +120,9 @@ struct FakeState {
     local_calls: Vec<(String, Vec<String>)>,
     flatpak_queries: Vec<bool>,
     flatpak_native_apply_calls: Vec<(bool, Vec<String>)>,
+    dnf_dbus_available: bool,
+    dnf_dbus_check_calls: usize,
+    dnf_dbus_apply_calls: Vec<(Vec<String>, ApplyMode)>,
     fwupd_dbus_available: bool,
     fwupd_dbus_check_calls: usize,
     fwupd_dbus_apply_calls: usize,
@@ -118,9 +135,13 @@ struct FakeState {
     flatpak_user_steps: VecDeque<Result<FlatpakCheck, String>>,
     flatpak_system_steps: VecDeque<Result<FlatpakCheck, String>>,
     flatpak_native_apply_steps: VecDeque<FlatpakNativeApplyStep>,
+    dnf_dbus_check_steps: VecDeque<NativeOutcome<Vec<Package>>>,
+    dnf_dbus_apply_steps: VecDeque<DnfDbusApplyStep>,
+    dnf_history_steps: VecDeque<NativeOutcome<Vec<DnfHistoryTransaction>>>,
     fwupd_dbus_check_steps: VecDeque<NativeOutcome<Vec<Package>>>,
     fwupd_dbus_apply_steps: VecDeque<FwupdDbusApplyStep>,
     fwupd_dbus_reboot_steps: VecDeque<NativeOutcome<bool>>,
+    fwupd_history_steps: VecDeque<NativeOutcome<Vec<FwupdHistoryEntry>>>,
     logind_preflight_steps: VecDeque<NativeOutcome<RebootPreflight>>,
     logind_reboot_steps: VecDeque<(Vec<String>, NativeOutcome<()>)>,
 }
@@ -147,6 +168,9 @@ impl FakeRuntime {
                 local_calls: Vec::new(),
                 flatpak_queries: Vec::new(),
                 flatpak_native_apply_calls: Vec::new(),
+                dnf_dbus_available: false,
+                dnf_dbus_check_calls: 0,
+                dnf_dbus_apply_calls: Vec::new(),
                 fwupd_dbus_available: false,
                 fwupd_dbus_check_calls: 0,
                 fwupd_dbus_apply_calls: 0,
@@ -159,9 +183,13 @@ impl FakeRuntime {
                 flatpak_user_steps: VecDeque::new(),
                 flatpak_system_steps: VecDeque::new(),
                 flatpak_native_apply_steps: VecDeque::new(),
+                dnf_dbus_check_steps: VecDeque::new(),
+                dnf_dbus_apply_steps: VecDeque::new(),
+                dnf_history_steps: VecDeque::new(),
                 fwupd_dbus_check_steps: VecDeque::new(),
                 fwupd_dbus_apply_steps: VecDeque::new(),
                 fwupd_dbus_reboot_steps: VecDeque::new(),
+                fwupd_history_steps: VecDeque::new(),
                 logind_preflight_steps: VecDeque::new(),
                 logind_reboot_steps: VecDeque::new(),
             })),
@@ -333,6 +361,50 @@ impl FakeRuntime {
 
     pub fn flatpak_native_apply_calls(&self) -> Vec<(bool, Vec<String>)> {
         self.inner.lock().unwrap().flatpak_native_apply_calls.clone()
+    }
+
+    pub fn set_dnf_dbus_available(&self, available: bool) {
+        self.inner.lock().unwrap().dnf_dbus_available = available;
+    }
+
+    pub fn push_dnf_dbus_check(&self, outcome: NativeOutcome<Vec<Package>>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .dnf_dbus_check_steps
+            .push_back(outcome);
+    }
+
+    pub fn push_dnf_dbus_apply(&self, step: DnfDbusApplyStep) {
+        self.inner
+            .lock()
+            .unwrap()
+            .dnf_dbus_apply_steps
+            .push_back(step);
+    }
+
+    pub fn push_dnf_history(&self, outcome: NativeOutcome<Vec<DnfHistoryTransaction>>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .dnf_history_steps
+            .push_back(outcome);
+    }
+
+    pub fn push_fwupd_history(&self, outcome: NativeOutcome<Vec<FwupdHistoryEntry>>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fwupd_history_steps
+            .push_back(outcome);
+    }
+
+    pub fn dnf_dbus_check_calls(&self) -> usize {
+        self.inner.lock().unwrap().dnf_dbus_check_calls
+    }
+
+    pub fn dnf_dbus_apply_calls(&self) -> Vec<(Vec<String>, ApplyMode)> {
+        self.inner.lock().unwrap().dnf_dbus_apply_calls.clone()
     }
 
     pub fn set_fwupd_dbus_available(&self, available: bool) {
@@ -521,6 +593,73 @@ impl OrchestratorRuntime for FakeRuntime {
             on_progress(h);
         }
         step.outcome
+    }
+
+    fn dnf_dbus_available(&self) -> bool {
+        self.inner.lock().unwrap().dnf_dbus_available
+    }
+
+    fn check_dnf_dbus(&self, _on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        let mut s = self.inner.lock().unwrap();
+        s.dnf_dbus_check_calls += 1;
+        s.dnf_dbus_check_steps
+            .pop_front()
+            .unwrap_or_else(|| NativeOutcome::Unavailable("dnf5daemon check not scripted".into()))
+    }
+
+    fn apply_dnf_dbus(
+        &self,
+        packages: &[Package],
+        mode: ApplyMode,
+        cancel: &WorkCancel,
+        on_line: &mut dyn FnMut(String),
+        on_draw: &mut dyn FnMut(String),
+        on_progress: &mut dyn FnMut(ProgressHint),
+        on_throughput: &mut dyn FnMut(ThroughputSample),
+    ) -> NativeOutcome<DnfApplyOutcome> {
+        let specs = upgrade_specs_from_packages(packages);
+        let step = {
+            let mut s = self.inner.lock().unwrap();
+            s.dnf_dbus_apply_calls.push((specs, mode));
+            s.dnf_dbus_apply_steps.pop_front()
+        };
+        let Some(mut step) = step else {
+            return NativeOutcome::Unavailable("dnf5daemon apply not scripted".into());
+        };
+        if let Some(mut on_start) = step.on_start.take() {
+            on_start(cancel);
+        }
+        for l in step.lines {
+            on_line(l);
+        }
+        for d in step.draws {
+            on_draw(d);
+        }
+        for h in step.hints {
+            on_progress(h);
+        }
+        for tp in step.throughput {
+            on_throughput(tp);
+        }
+        step.outcome
+    }
+
+    fn query_dnf_history(&self, _limit: i64) -> NativeOutcome<Vec<DnfHistoryTransaction>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .dnf_history_steps
+            .pop_front()
+            .unwrap_or_else(|| NativeOutcome::Unavailable("dnf5daemon history not scripted".into()))
+    }
+
+    fn query_fwupd_history(&self) -> NativeOutcome<Vec<FwupdHistoryEntry>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .fwupd_history_steps
+            .pop_front()
+            .unwrap_or_else(|| NativeOutcome::Unavailable("fwupd history not scripted".into()))
     }
 
     fn fwupd_dbus_available(&self) -> bool {

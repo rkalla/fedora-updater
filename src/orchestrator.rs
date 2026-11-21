@@ -7,10 +7,12 @@ use std::time::SystemTime;
 
 use async_channel::Sender;
 
-use crate::backend::{self, dnf, flatpak, fwupd, fwupd_dbus, logind, ProgressHint};
+use crate::backend::{
+    self, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, logind, ProgressHint,
+};
 pub use crate::backend::NativeOutcome;
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
-use crate::model::{AuthPurpose, Package, RetryAction, UpdateSource};
+use crate::model::{ApplyMode, AuthPurpose, Package, RetryAction, UpdateSource};
 use crate::privilege::{
     close_session, kill_recorded_local_command, run_cancellable_local_command, run_local_command,
     session_is_alive, with_session, SessionError, SessionEvent,
@@ -22,6 +24,11 @@ pub enum WorkerMsg {
     SessionStarted,
     ConsoleLine { tag: String, text: String },
     ConsoleDraw { tag: String, text: String },
+    Throughput {
+        bytes_per_sec: f64,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
     Event(StateEvent),
 }
 
@@ -62,6 +69,7 @@ pub fn cancel_background_work() {
         prev_cancel.cancel();
     }
     flatpak::cancel_active_transaction();
+    dnf_dbus::cancel_active_transaction();
 }
 
 fn send(tx: &Sender<WorkerMsg>, msg: WorkerMsg) {
@@ -192,6 +200,31 @@ pub trait OrchestratorRuntime: Send + 'static {
     ) -> NativeOutcome<flatpak::FlatpakApplyOutcome> {
         NativeOutcome::Unavailable("libflatpak transaction apply unavailable in test runtime".into())
     }
+    fn dnf_dbus_available(&self) -> bool {
+        false
+    }
+    fn check_dnf_dbus(&self, _on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        NativeOutcome::Unavailable("dnf5daemon D-Bus unavailable in test runtime".into())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn apply_dnf_dbus(
+        &self,
+        _packages: &[Package],
+        _mode: ApplyMode,
+        _cancel: &WorkCancel,
+        _on_line: &mut dyn FnMut(String),
+        _on_draw: &mut dyn FnMut(String),
+        _on_progress: &mut dyn FnMut(ProgressHint),
+        _on_throughput: &mut dyn FnMut(dnf_dbus::ThroughputSample),
+    ) -> NativeOutcome<dnf_dbus::DnfApplyOutcome> {
+        NativeOutcome::Unavailable("dnf5daemon D-Bus unavailable in test runtime".into())
+    }
+    fn query_dnf_history(&self, _limit: i64) -> NativeOutcome<Vec<dnf_dbus::DnfHistoryTransaction>> {
+        NativeOutcome::Unavailable("dnf5daemon D-Bus unavailable in test runtime".into())
+    }
+    fn query_fwupd_history(&self) -> NativeOutcome<Vec<fwupd_dbus::FwupdHistoryEntry>> {
+        NativeOutcome::Unavailable("fwupd D-Bus unavailable in test runtime".into())
+    }
     fn fwupd_dbus_available(&self) -> bool {
         false
     }
@@ -275,6 +308,43 @@ impl OrchestratorRuntime for SystemRuntime {
         on_progress: &mut dyn FnMut(ProgressHint),
     ) -> NativeOutcome<flatpak::FlatpakApplyOutcome> {
         flatpak::apply_updates(user, refs, cancel, on_line, on_draw, on_progress)
+    }
+
+    fn dnf_dbus_available(&self) -> bool {
+        dnf_dbus::is_available()
+    }
+
+    fn check_dnf_dbus(&self, on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        dnf_dbus::check_updates(on_line)
+    }
+
+    fn apply_dnf_dbus(
+        &self,
+        packages: &[Package],
+        mode: ApplyMode,
+        cancel: &WorkCancel,
+        on_line: &mut dyn FnMut(String),
+        on_draw: &mut dyn FnMut(String),
+        on_progress: &mut dyn FnMut(ProgressHint),
+        on_throughput: &mut dyn FnMut(dnf_dbus::ThroughputSample),
+    ) -> NativeOutcome<dnf_dbus::DnfApplyOutcome> {
+        dnf_dbus::apply_updates(
+            packages,
+            mode,
+            cancel,
+            on_line,
+            on_draw,
+            on_progress,
+            on_throughput,
+        )
+    }
+
+    fn query_dnf_history(&self, limit: i64) -> NativeOutcome<Vec<dnf_dbus::DnfHistoryTransaction>> {
+        dnf_dbus::get_history(limit)
+    }
+
+    fn query_fwupd_history(&self) -> NativeOutcome<Vec<fwupd_dbus::FwupdHistoryEntry>> {
+        fwupd_dbus::get_history()
     }
 
     fn fwupd_dbus_available(&self) -> bool {
@@ -417,14 +487,20 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
     cancel: CancelCheck,
 ) {
     let ch = WorkChannel { tx, cancel };
-    // Ensure session up front so SessionStarted fires before long work
-    let started = runtime.ensure_session();
-    if !ch.is_current() {
-        return;
-    }
-    if let Err(e) = started {
-        map_session_start_err(&ch, e, RetryAction::CheckAgain);
-        return;
+    // Use zero-password dnf5daemon SessionManager.open_session({}) when available;
+    // only elevate the helper session up front when falling back to CLI DNF.
+    let use_native_dnf = runtime.dnf_dbus_available();
+    let mut session_ensured = false;
+    if !use_native_dnf {
+        let started = runtime.ensure_session();
+        if !ch.is_current() {
+            return;
+        }
+        if let Err(e) = started {
+            map_session_start_err(&ch, e, RetryAction::CheckAgain);
+            return;
+        }
+        session_ensured = true;
     }
     ch.send(WorkerMsg::SessionStarted);
 
@@ -435,16 +511,42 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
         return;
     }
 
-    // 1) DNF (privileged)
-    let dnf_res = run_helper_check(&ch, runtime, HelperCommand::CheckDnf, "dnf", |log, code| {
-        let mut pkgs = dnf::parse_check_update(log);
-        if dnf::check_exit_is_hard_error(code, &pkgs) {
-            Err(format!("dnf check-update failed (exit {code})"))
-        } else {
-            attach_dnf_download_sizes(&ch, runtime, &mut pkgs);
-            Ok(pkgs)
+    // 1) DNF — prefer native org.rpm.dnf.v0 (zero-password), falling back to CLI helper.
+    let dnf_res = if use_native_dnf {
+        match runtime.check_dnf_dbus(&mut |l| ch.line("dnf", l)) {
+            NativeOutcome::Handled(res) => res,
+            NativeOutcome::Unavailable(_) => {
+                if !session_ensured {
+                    match runtime.ensure_session() {
+                        Ok(()) => session_ensured = true,
+                        Err(e) => return map_session_start_err(&ch, e, RetryAction::CheckAgain),
+                    }
+                }
+                if !ch.is_current() {
+                    return;
+                }
+                run_helper_check(&ch, runtime, HelperCommand::CheckDnf, "dnf", |log, code| {
+                    let mut pkgs = dnf::parse_check_update(log);
+                    if dnf::check_exit_is_hard_error(code, &pkgs) {
+                        Err(format!("dnf check-update failed (exit {code})"))
+                    } else {
+                        attach_dnf_download_sizes(&ch, runtime, &mut pkgs);
+                        Ok(pkgs)
+                    }
+                })
+            }
         }
-    });
+    } else {
+        run_helper_check(&ch, runtime, HelperCommand::CheckDnf, "dnf", |log, code| {
+            let mut pkgs = dnf::parse_check_update(log);
+            if dnf::check_exit_is_hard_error(code, &pkgs) {
+                Err(format!("dnf check-update failed (exit {code})"))
+            } else {
+                attach_dnf_download_sizes(&ch, runtime, &mut pkgs);
+                Ok(pkgs)
+            }
+        })
+    };
     if !ch.is_current() {
         return;
     }
@@ -510,33 +612,53 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
     let fwupd_res = match runtime.check_fwupd_dbus(&mut |l| ch.line("fwupd", l)) {
         NativeOutcome::Handled(res) => res,
         NativeOutcome::Unavailable(_) => {
-            let _ = run_helper_check(
-                &ch,
-                runtime,
-                HelperCommand::CheckFwupdRefresh,
-                "fwupd",
-                |_log, _code| Ok(Vec::new()),
-            );
-            if !ch.is_current() {
-                return;
-            }
-
-            run_helper_check(&ch, runtime, HelperCommand::CheckFwupd, "fwupd", |log, code| {
-                let pkgs = fwupd::parse_get_updates(log);
-                if code != 0 && pkgs.is_empty() {
-                    let lower = log.to_ascii_lowercase();
-                    if lower.contains("not found") || lower.contains("no such file") {
-                        return Err("fwupd not available".into());
+            let ready = if session_ensured {
+                Ok(())
+            } else {
+                match runtime.ensure_session() {
+                    Ok(()) => {
+                        session_ensured = true;
+                        Ok(())
                     }
-                    if fwupd::check_output_is_no_updates(log, code) {
-                        return Ok(vec![]);
-                    }
-                    return Err(format!("fwupdmgr get-updates exit {code}"));
+                    Err(e) => Err(e.to_string()),
                 }
-                Ok(pkgs)
-            })
+            };
+            match ready {
+                Ok(()) => {
+                    if !ch.is_current() {
+                        return;
+                    }
+                    let _ = run_helper_check(
+                        &ch,
+                        runtime,
+                        HelperCommand::CheckFwupdRefresh,
+                        "fwupd",
+                        |_log, _code| Ok(Vec::new()),
+                    );
+                    if !ch.is_current() {
+                        return;
+                    }
+
+                    run_helper_check(&ch, runtime, HelperCommand::CheckFwupd, "fwupd", |log, code| {
+                        let pkgs = fwupd::parse_get_updates(log);
+                        if code != 0 && pkgs.is_empty() {
+                            let lower = log.to_ascii_lowercase();
+                            if lower.contains("not found") || lower.contains("no such file") {
+                                return Err("fwupd not available".into());
+                            }
+                            if fwupd::check_output_is_no_updates(log, code) {
+                                return Ok(vec![]);
+                            }
+                            return Err(format!("fwupdmgr get-updates exit {code}"));
+                        }
+                        Ok(pkgs)
+                    })
+                }
+                Err(err) => Err(err),
+            }
         }
     };
+    let _ = session_ensured;
     if !ch.is_current() {
         return;
     }
@@ -666,12 +788,23 @@ fn run_flatpak_check<R: OrchestratorRuntime>(
     Ok(check.packages)
 }
 
-/// Apply all pending sources sequentially. Reuses the shared helper session
-/// when still open (no second password).
+/// Apply all pending sources sequentially (`ApplyMode::Live`). Reuses the
+/// shared helper session when still open (no second password).
 pub fn run_apply_all(tx: Sender<WorkerMsg>, packages: Vec<Package>) {
+    run_apply_all_with_mode(tx, packages, ApplyMode::Live);
+}
+
+/// Apply selected packages using the specified execution mode.
+pub fn run_apply_all_with_mode(tx: Sender<WorkerMsg>, packages: Vec<Package>, mode: ApplyMode) {
     let gen = begin_background_work();
     thread::spawn(move || {
-        execute_apply_all_inner(&tx, packages, &SystemRuntime, CancelCheck::GlobalGen(gen));
+        execute_apply_all_inner(
+            &tx,
+            packages,
+            mode,
+            &SystemRuntime,
+            CancelCheck::GlobalGen(gen),
+        );
     });
 }
 
@@ -681,27 +814,49 @@ pub fn run_apply_all_with<R: OrchestratorRuntime>(
     packages: Vec<Package>,
     runtime: R,
 ) -> WorkCancel {
+    run_apply_all_with_runtime_mode(tx, packages, ApplyMode::Live, runtime)
+}
+
+/// Spawn [`execute_apply_all_with_mode`] on a background thread using a custom [`OrchestratorRuntime`].
+pub fn run_apply_all_with_runtime_mode<R: OrchestratorRuntime>(
+    tx: Sender<WorkerMsg>,
+    packages: Vec<Package>,
+    mode: ApplyMode,
+    runtime: R,
+) -> WorkCancel {
     let cancel = WorkCancel::new();
     let worker_cancel = cancel.clone();
     thread::spawn(move || {
-        execute_apply_all_inner(&tx, packages, &runtime, CancelCheck::Token(worker_cancel));
+        execute_apply_all_inner(&tx, packages, mode, &runtime, CancelCheck::Token(worker_cancel));
     });
     cancel
 }
 
-/// Synchronously run the full apply pipeline against `runtime`.
+/// Synchronously run the full live apply pipeline against `runtime`.
 pub fn execute_apply_all<R: OrchestratorRuntime>(
     tx: &Sender<WorkerMsg>,
     packages: Vec<Package>,
     runtime: &R,
     cancel: &WorkCancel,
 ) {
-    execute_apply_all_inner(tx, packages, runtime, CancelCheck::Token(cancel.clone()));
+    execute_apply_all_with_mode(tx, packages, ApplyMode::Live, runtime, cancel);
+}
+
+/// Synchronously run the apply pipeline with explicit [`ApplyMode`] against `runtime`.
+pub fn execute_apply_all_with_mode<R: OrchestratorRuntime>(
+    tx: &Sender<WorkerMsg>,
+    packages: Vec<Package>,
+    mode: ApplyMode,
+    runtime: &R,
+    cancel: &WorkCancel,
+) {
+    execute_apply_all_inner(tx, packages, mode, runtime, CancelCheck::Token(cancel.clone()));
 }
 
 fn execute_apply_all_inner<R: OrchestratorRuntime>(
     tx: &Sender<WorkerMsg>,
     packages: Vec<Package>,
+    mode: ApplyMode,
     runtime: &R,
     cancel: CancelCheck,
 ) {
@@ -716,10 +871,13 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
         return;
     }
 
-    // Flatpak runs as the current user; native fwupd D-Bus uses its own polkit.
-    // Only DNF (and CLI fwupdmgr fallback when fwupd D-Bus is absent) requires our helper.
-    let needs_session = sources.contains(&UpdateSource::Dnf)
-        || (sources.contains(&UpdateSource::Firmware) && !runtime.fwupd_dbus_available());
+    // Native dnf5daemon / fwupd D-Bus handles its own polkit, and Flatpak runs as the user.
+    // Only allocate our helper session up front when CLI DNF or CLI fwupd fallback is needed.
+    let needs_dnf_helper = sources.contains(&UpdateSource::Dnf) && !runtime.dnf_dbus_available();
+    let needs_fw_helper = mode != ApplyMode::DownloadOnly
+        && sources.contains(&UpdateSource::Firmware)
+        && !runtime.fwupd_dbus_available();
+    let needs_session = needs_dnf_helper || needs_fw_helper;
     let mut session_ensured = false;
 
     if needs_session {
@@ -753,81 +911,57 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
             package_hint: None,
             status_hint: None,
             progress: None,
-            phase_label: format!("Updating {}", source.label()),
+            phase_label: if mode == ApplyMode::DownloadOnly && source == UpdateSource::Dnf {
+                "Downloading packages".into()
+            } else {
+                format!("Updating {}", source.label())
+            },
             stage_current: None,
             stage_total: None,
         });
 
         let (code, log, native_reboot) = match source {
             UpdateSource::Dnf => {
-                let (c, l) = run_helper_apply(&ch, runtime, HelperCommand::ApplyDnf, tag, source);
-                (c, l, false)
-            }
-            UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
-                // Apply the exact refs we listed at Check time, as the user.
-                // (Running system flatpak as root via helper can disagree with
-                // the user-session view and report "Nothing to update".)
-                let user = source == UpdateSource::FlatpakUser;
-                let refs: Vec<String> = packages
+                let dnf_pkgs: Vec<Package> = packages
                     .iter()
-                    .filter(|p| p.source == source)
-                    .filter_map(flatpak::update_ref_from_package)
-                    .collect();
-                if refs.is_empty() {
-                    ch.line(tag, "No flatpak refs to update".into());
-                    (0, String::new(), false)
-                } else {
-                    ch.line(
-                        tag,
-                        format!("Updating {} ref(s): {}", refs.len(), refs.join(", ")),
-                    );
-                    let work_cancel = ch.cancel.work_cancel();
-                    let mut native_log = String::new();
-                    let outcome = runtime.apply_flatpak_native(
-                        user,
-                        &refs,
-                        &work_cancel,
-                        &mut |l| {
-                            native_log.push_str(&l);
-                            native_log.push('\n');
-                            ch.line(tag, l);
-                        },
-                        &mut |draw| ch.live_line(tag, draw),
-                        &mut |hint| emit_progress_hint(&ch, source, hint),
-                    );
-                    match outcome {
-                        NativeOutcome::Handled(Ok(_)) => (0, native_log, false),
-                        NativeOutcome::Handled(Err(reason)) => {
-                            if !native_log.contains(&reason) {
-                                native_log.push_str(&reason);
-                                native_log.push('\n');
-                            }
-                            (1, native_log, false)
-                        }
-                        NativeOutcome::Unavailable(_) => {
-                            let args = flatpak::update_args_for_refs(user, &refs);
-                            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                            let (c, l) =
-                                run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source);
-                            (c, l, false)
-                        }
-                    }
-                }
-            }
-            UpdateSource::Firmware => {
-                let fw_pkgs: Vec<Package> = packages
-                    .iter()
-                    .filter(|p| p.source == UpdateSource::Firmware)
+                    .filter(|p| p.source == UpdateSource::Dnf)
                     .cloned()
                     .collect();
-                let outcome = runtime.apply_fwupd_dbus(
-                    &fw_pkgs,
-                    &mut |l| ch.line(tag, l),
+                let work_cancel = ch.cancel.work_cancel();
+                let mut native_log = String::new();
+                let outcome = runtime.apply_dnf_dbus(
+                    &dnf_pkgs,
+                    mode,
+                    &work_cancel,
+                    &mut |l| {
+                        native_log.push_str(&l);
+                        native_log.push('\n');
+                        ch.line(tag, l);
+                    },
+                    &mut |draw| ch.live_line(tag, draw),
                     &mut |hint| emit_progress_hint(&ch, source, hint),
+                    &mut |tp| {
+                        ch.send(WorkerMsg::Throughput {
+                            bytes_per_sec: tp.bytes_per_sec,
+                            downloaded_bytes: tp.downloaded_bytes,
+                            total_bytes: tp.total_bytes,
+                        });
+                    },
                 );
                 match outcome {
-                    NativeOutcome::Handled(Ok(res)) => (0, String::new(), res.needs_reboot),
-                    NativeOutcome::Handled(Err(reason)) => (1, reason, false),
+                    NativeOutcome::Handled(Ok(res)) => {
+                        if res.cancelled || !ch.is_current() {
+                            return;
+                        }
+                        (0, native_log, res.needs_reboot)
+                    }
+                    NativeOutcome::Handled(Err(reason)) => {
+                        if !native_log.contains(&reason) {
+                            native_log.push_str(&reason);
+                            native_log.push('\n');
+                        }
+                        (1, native_log, false)
+                    }
                     NativeOutcome::Unavailable(_) => {
                         let ready = if session_ensured {
                             Ok(())
@@ -842,18 +976,128 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         };
                         match ready {
                             Ok(()) => {
-                                let (c, l) = run_helper_apply(
-                                    &ch,
-                                    runtime,
-                                    HelperCommand::ApplyFwupd,
-                                    tag,
-                                    source,
-                                );
+                                let (c, l) =
+                                    run_helper_apply(&ch, runtime, HelperCommand::ApplyDnf, tag, source);
                                 (c, l, false)
                             }
                             Err(e) => {
                                 ch.line(tag, format!("error: {e}"));
                                 (-1, e.to_string(), false)
+                            }
+                        }
+                    }
+                }
+            }
+            UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
+                if mode == ApplyMode::DownloadOnly {
+                    ch.line(
+                        tag,
+                        format!(
+                            "Skipping {} install during Download Only mode.",
+                            source.label()
+                        ),
+                    );
+                    (0, String::new(), false)
+                } else {
+                    // Apply the exact refs we listed at Check time, as the user.
+                    // (Running system flatpak as root via helper can disagree with
+                    // the user-session view and report "Nothing to update".)
+                    let user = source == UpdateSource::FlatpakUser;
+                    let refs: Vec<String> = packages
+                        .iter()
+                        .filter(|p| p.source == source)
+                        .filter_map(flatpak::update_ref_from_package)
+                        .collect();
+                    if refs.is_empty() {
+                        ch.line(tag, "No flatpak refs to update".into());
+                        (0, String::new(), false)
+                    } else {
+                        ch.line(
+                            tag,
+                            format!("Updating {} ref(s): {}", refs.len(), refs.join(", ")),
+                        );
+                        let work_cancel = ch.cancel.work_cancel();
+                        let mut native_log = String::new();
+                        let outcome = runtime.apply_flatpak_native(
+                            user,
+                            &refs,
+                            &work_cancel,
+                            &mut |l| {
+                                native_log.push_str(&l);
+                                native_log.push('\n');
+                                ch.line(tag, l);
+                            },
+                            &mut |draw| ch.live_line(tag, draw),
+                            &mut |hint| emit_progress_hint(&ch, source, hint),
+                        );
+                        match outcome {
+                            NativeOutcome::Handled(Ok(_)) => (0, native_log, false),
+                            NativeOutcome::Handled(Err(reason)) => {
+                                if !native_log.contains(&reason) {
+                                    native_log.push_str(&reason);
+                                    native_log.push('\n');
+                                }
+                                (1, native_log, false)
+                            }
+                            NativeOutcome::Unavailable(_) => {
+                                let args = flatpak::update_args_for_refs(user, &refs);
+                                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                                let (c, l) =
+                                    run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source);
+                                (c, l, false)
+                            }
+                        }
+                    }
+                }
+            }
+            UpdateSource::Firmware => {
+                if mode == ApplyMode::DownloadOnly {
+                    ch.line(
+                        tag,
+                        "Skipping firmware flash during Download Only mode.".into(),
+                    );
+                    (0, String::new(), false)
+                } else {
+                    let fw_pkgs: Vec<Package> = packages
+                        .iter()
+                        .filter(|p| p.source == UpdateSource::Firmware)
+                        .cloned()
+                        .collect();
+                    let outcome = runtime.apply_fwupd_dbus(
+                        &fw_pkgs,
+                        &mut |l| ch.line(tag, l),
+                        &mut |hint| emit_progress_hint(&ch, source, hint),
+                    );
+                    match outcome {
+                        NativeOutcome::Handled(Ok(res)) => (0, String::new(), res.needs_reboot),
+                        NativeOutcome::Handled(Err(reason)) => (1, reason, false),
+                        NativeOutcome::Unavailable(_) => {
+                            let ready = if session_ensured {
+                                Ok(())
+                            } else {
+                                match runtime.ensure_session() {
+                                    Ok(()) => {
+                                        session_ensured = true;
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            };
+                            match ready {
+                                Ok(()) => {
+                                    let (c, l) = run_helper_apply(
+                                        &ch,
+                                        runtime,
+                                        HelperCommand::ApplyFwupd,
+                                        tag,
+                                        source,
+                                    );
+                                    (c, l, false)
+                                }
+                                Err(e) => {
+                                    ch.line(tag, format!("error: {e}"));
+                                    (-1, e.to_string(), false)
+                                }
                             }
                         }
                     }
@@ -865,7 +1109,12 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
             return;
         }
 
-        let reboot = code == 0 && (native_reboot || backend::detect_reboot(source, &log, &packages));
+        let detect_fallback_reboot = if mode == ApplyMode::DownloadOnly {
+            false
+        } else {
+            backend::detect_reboot(source, &log, &packages)
+        };
+        let reboot = code == 0 && (native_reboot || detect_fallback_reboot);
         if reboot {
             overall_reboot = true;
         }
@@ -887,7 +1136,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
         return;
     }
 
-    if sources.contains(&UpdateSource::Firmware) {
+    if mode != ApplyMode::DownloadOnly && sources.contains(&UpdateSource::Firmware) {
         match runtime.check_fwupd_reboot_dbus() {
             NativeOutcome::Handled(Ok(true)) => {
                 overall_reboot = true;
@@ -1179,6 +1428,7 @@ pub fn session_started_event(purpose: AuthPurpose) -> StateEvent {
 /// Call when the app window is closing — not after individual Check/Apply flows,
 /// so the user is not re-prompted mid-session.
 pub fn release_privileges() {
+    dnf_dbus::cancel_active_transaction();
     flatpak::cancel_active_transaction();
     kill_recorded_local_command();
     close_session();
@@ -1187,6 +1437,37 @@ pub fn release_privileges() {
 /// Whether Check/Apply can skip the polkit wait UI (helper already elevated).
 pub fn can_skip_auth_ui() -> bool {
     session_is_alive()
+}
+
+/// Whether Check can bypass the polkit helper wait screen (`dnf5daemon` is zero-password).
+pub fn can_skip_check_auth_ui(native_dnf: bool) -> bool {
+    native_dnf || session_is_alive()
+}
+
+/// Whether Apply can bypass the helper wait screen (`dnf5daemon` prompts directly via polkit).
+pub fn can_skip_apply_auth_ui(native_dnf: bool) -> bool {
+    native_dnf || session_is_alive()
+}
+
+/// Load merged chronological update history across `org.rpm.dnf.v0.History` and `fwupd`.
+pub fn execute_load_history<R: OrchestratorRuntime>(
+    runtime: &R,
+    limit: i64,
+) -> Vec<dnf_dbus::HistoryEntry> {
+    let dnf_txns = match runtime.query_dnf_history(limit) {
+        NativeOutcome::Handled(Ok(list)) => list,
+        _ => Vec::new(),
+    };
+    let fwupd_entries = match runtime.query_fwupd_history() {
+        NativeOutcome::Handled(Ok(list)) => list,
+        _ => Vec::new(),
+    };
+    dnf_dbus::merge_history(&dnf_txns, &fwupd_entries)
+}
+
+/// Load merged update history using [`SystemRuntime`].
+pub fn load_history_system(limit: i64) -> Vec<dnf_dbus::HistoryEntry> {
+    execute_load_history(&SystemRuntime, limit)
 }
 
 #[cfg(test)]

@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 35, "expected 35 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 39, "expected 39 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(

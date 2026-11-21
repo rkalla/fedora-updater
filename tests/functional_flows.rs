@@ -10,8 +10,13 @@ use std::time::{Duration, SystemTime};
 use async_channel::Receiver;
 use common::fixtures::{read_fixture, read_fixture_value};
 use common::runtime::{
-    fixture_to_helper_lines, flatpak_check_from_fixture, FakeRuntime, FlatpakNativeApplyStep,
-    FwupdDbusApplyStep, HelperStep,
+    fixture_to_helper_lines, flatpak_check_from_fixture, DnfDbusApplyStep, FakeRuntime,
+    FlatpakNativeApplyStep, FwupdDbusApplyStep, HelperStep,
+};
+use fedora_updater::backend::dnf_dbus::{
+    merge_history, packages_from_dnf_dbus, parse_list_fd_ndjson, DnfAdvisoryRecord,
+    DnfApplyOutcome, DnfDbusSignal, DnfHistoryTransaction, DnfRpmRecord, DnfSignalTracker,
+    HistorySource,
 };
 use fedora_updater::backend::flatpak::{
     FlatpakCancellable, FlatpakOperationMeta, FlatpakProgressSnapshot,
@@ -27,12 +32,13 @@ use fedora_updater::backend::{dnf, NativeOutcome};
 use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
 use fedora_updater::model::{
-    format_bytes, total_download_bytes, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
-    UpdateSource,
+    count_security, format_bytes, total_download_bytes, AdvisoryKind, ApplyMode, IdleScreen,
+    Package, PackageStatus, RetryAction, RunPass, UpdateSource,
 };
 use fedora_updater::orchestrator::{
-    execute_apply_all, execute_check_all, execute_systemctl_reboot, run_apply_all_with,
-    run_check_all_with, run_systemctl_reboot_with, session_started_event, WorkerMsg, WorkCancel,
+    can_skip_apply_auth_ui, can_skip_check_auth_ui, execute_apply_all, execute_apply_all_with_mode,
+    execute_check_all, execute_load_history, execute_systemctl_reboot, run_apply_all_with,
+    run_check_all_with, run_systemctl_reboot_with, session_started_event, WorkCancel, WorkerMsg,
     REBOOT_FAILED_TITLE, REBOOT_SPAWN_FAILED_TITLE,
 };
 use fedora_updater::presenter::{
@@ -50,6 +56,7 @@ struct FlowHarness {
     state: AppState,
     console: ConsoleBuffer,
     deltas: Vec<ConsoleDelta>,
+    throughput_samples: Vec<(f64, u64, u64)>,
     phases: Vec<&'static str>,
     check_snapshots: Vec<(Vec<UpdateSource>, f64, u32, &'static str)>,
     draw_count: usize,
@@ -76,6 +83,7 @@ impl FlowHarness {
             state,
             console: ConsoleBuffer::new(2_000),
             deltas: Vec::new(),
+            throughput_samples: Vec::new(),
             phases: vec![initial_phase],
             check_snapshots: Vec::new(),
             draw_count: 0,
@@ -146,6 +154,14 @@ impl FlowHarness {
                     self.deltas.push(d);
                     self.draw_count += 1;
                 }
+                WorkerMsg::Throughput {
+                    bytes_per_sec,
+                    downloaded_bytes,
+                    total_bytes,
+                } => {
+                    self.throughput_samples
+                        .push((bytes_per_sec, downloaded_bytes, total_bytes));
+                }
                 WorkerMsg::Event(ev) => self.dispatch(ev),
             }
         }
@@ -168,6 +184,17 @@ impl FlowHarness {
         let (tx, rx) = async_channel::unbounded();
         let cancel = WorkCancel::new();
         execute_apply_all(&tx, packages, rt, &cancel);
+        drop(tx);
+        self.drain(&rx);
+    }
+
+    fn run_apply_mode(&mut self, rt: &FakeRuntime, selected_ids: Vec<String>, mode: ApplyMode) {
+        self.console.clear();
+        self.dispatch(Event::StartSelectiveApply { selected_ids, mode });
+        let packages = self.state.packages().to_vec();
+        let (tx, rx) = async_channel::unbounded();
+        let cancel = WorkCancel::new();
+        execute_apply_all_with_mode(&tx, packages, mode, rt, &cancel);
         drop(tx);
         self.drain(&rx);
     }
@@ -196,6 +223,14 @@ fn wait_until_rx_closed(h: &mut FlowHarness, rx: &Receiver<WorkerMsg>) {
                 let d = h.console.push_live_tagged(&tag, &text);
                 h.deltas.push(d);
                 h.draw_count += 1;
+            }
+            WorkerMsg::Throughput {
+                bytes_per_sec,
+                downloaded_bytes,
+                total_bytes,
+            } => {
+                h.throughput_samples
+                    .push((bytes_per_sec, downloaded_bytes, total_bytes));
             }
             WorkerMsg::Event(ev) => h.dispatch(ev),
         }
@@ -1996,4 +2031,373 @@ fn native_flatpak_transaction_cancel_and_cli_fallback() {
         Phase::Failed { title, detail, retry: RetryAction::CheckAgain }
             if title == "All updates failed" && detail.contains("Socket I/O timed out")
     ));
+}
+
+#[derive(serde::Deserialize)]
+struct DnfDbusCheckFixture {
+    installed: Vec<DnfRpmRecord>,
+    advisories: Vec<DnfAdvisoryRecord>,
+}
+
+fn packages_from_dnf_dbus_fixtures() -> Vec<Package> {
+    let upgrades = parse_list_fd_ndjson(&read_fixture("dnf_dbus/list_fd_stream.ndjson"))
+        .expect("parse list_fd_stream.ndjson");
+    let extra: DnfDbusCheckFixture =
+        serde_json::from_value(read_fixture_value("dnf_dbus/check_upgrades_and_advisories.json"))
+            .expect("parse check_upgrades_and_advisories.json");
+    packages_from_dnf_dbus(&upgrades, &extra.installed, &extra.advisories)
+}
+
+#[test]
+fn native_dnf5daemon_zero_auth_check_cves_and_selective_apply() {
+    let pkgs = packages_from_dnf_dbus_fixtures();
+    assert_eq!(pkgs.len(), 3);
+    assert_eq!(count_security(&pkgs), 1);
+
+    let openssl = pkgs.iter().find(|p| p.name == "openssl").unwrap();
+    assert_eq!(openssl.old_version.as_deref(), Some("3.2.2-1.fc44"));
+    assert_eq!(openssl.version, "3.2.2-3.fc44");
+    assert_eq!(openssl.install_size_delta, Some(400_000));
+    assert_eq!(
+        openssl.summary.as_deref(),
+        Some("Utilities from the general purpose cryptography library")
+    );
+    assert!(openssl.has_security_advisory());
+    assert!(openssl.advisories.iter().any(|a| {
+        a.kind == AdvisoryKind::Security
+            && a.severity.as_deref() == Some("Important")
+            && a.cves.iter().any(|c| c == "CVE-2026-2401")
+            && a.bugzillas.iter().any(|b| b == "RHBZ#2458001")
+    }));
+
+    let kernel = pkgs
+        .iter()
+        .find(|p| p.name == "kernel-core")
+        .unwrap();
+    assert!(dnf::package_implies_reboot(&kernel.name));
+
+    let rt = FakeRuntime::new();
+    rt.set_dnf_dbus_available(true);
+    rt.push_dnf_dbus_check(NativeOutcome::Handled(Ok(pkgs)));
+    rt.push_flatpak_appstream_ok();
+    rt.push_flatpak_empty(true);
+    rt.push_flatpak_empty(false);
+    rt.push_fwupd_dbus_check(NativeOutcome::Handled(Ok(Vec::new())));
+
+    assert!(can_skip_check_auth_ui(true));
+    assert!(can_skip_apply_auth_ui(true));
+
+    let mut h = FlowHarness::new();
+    h.run_check(&rt, false);
+    assert_eq!(rt.dnf_dbus_check_calls(), 1);
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+
+    let ready_pkgs = h.state.packages().to_vec();
+    assert_eq!(ready_pkgs.len(), 3);
+    let selected_ids: Vec<String> = ready_pkgs
+        .iter()
+        .filter(|p| p.name == "openssl" || p.name == "kernel-core")
+        .map(|p| p.id.clone())
+        .collect();
+    assert_eq!(selected_ids.len(), 2);
+
+    let signals: Vec<DnfDbusSignal> =
+        serde_json::from_value(read_fixture_value("dnf_dbus/apply_signals_happy.json"))
+            .expect("parse apply_signals_happy.json");
+    let mut tracker = DnfSignalTracker::new(2_457_600 + 18_874_368);
+    let mut lines = Vec::new();
+    let mut draws = Vec::new();
+    let mut hints = Vec::new();
+    let mut throughput = Vec::new();
+    let mut entered_txn = false;
+    let mut txn_done = None;
+
+    for sig in signals {
+        let step = tracker.apply(sig);
+        if step.entered_transaction {
+            entered_txn = true;
+        }
+        if let Some(done) = step.transaction_finished {
+            txn_done = Some(done);
+        }
+        if let Some(l) = step.log_line {
+            lines.push(l);
+        }
+        if let Some(d) = step.draw_line {
+            draws.push(d);
+        }
+        if let Some(hint) = step.hint {
+            hints.push(hint);
+        }
+        if let Some(tp) = step.throughput {
+            throughput.push(tp);
+        }
+    }
+    assert!(entered_txn);
+    assert_eq!(txn_done, Some(true));
+    assert!(!throughput.is_empty());
+    assert!(hints
+        .iter()
+        .any(|h| h.phase_label.as_deref() == Some("Downloading packages")));
+    assert!(hints
+        .iter()
+        .any(|h| h.phase_label.as_deref() == Some("Preparing transaction")));
+    assert!(hints
+        .iter()
+        .any(|h| h.phase_label.as_deref() == Some("Installing packages")));
+    assert!(hints
+        .iter()
+        .any(|h| h.phase_label.as_deref() == Some("Verifying packages")));
+
+    rt.push_dnf_dbus_apply(DnfDbusApplyStep {
+        lines,
+        draws,
+        hints,
+        throughput,
+        on_start: None,
+        outcome: NativeOutcome::Handled(Ok(DnfApplyOutcome {
+            needs_reboot: true,
+            offline_scheduled: false,
+            download_only: false,
+            cancelled: false,
+        })),
+    });
+
+    h.run_apply_mode(&rt, selected_ids, ApplyMode::Live);
+
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+    let calls = rt.dnf_dbus_apply_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, ApplyMode::Live);
+    assert_eq!(calls[0].0.len(), 2);
+    assert!(calls[0].0.iter().any(|s| s == "openssl.x86_64"));
+    assert!(calls[0].0.iter().any(|s| s == "kernel-core.x86_64"));
+    assert!(!calls[0].0.iter().any(|s| s.starts_with("vim-enhanced")));
+
+    assert!(h.saw_download_pass);
+    assert!(h.saw_verifying_heading);
+    assert!(!h.throughput_samples.is_empty());
+    assert!(h.throughput_samples.iter().any(|(bps, _, _)| *bps > 0.0));
+    assert!(matches!(
+        &h.state.phase,
+        Phase::Done {
+            packages,
+            failed: 0,
+            needs_reboot: true,
+            ..
+        } if packages.len() == 2
+    ));
+}
+
+#[test]
+fn native_dnf5daemon_offline_on_reboot_and_download_only_modes() {
+    let dnf_pkgs = packages_from_dnf_dbus_fixtures();
+    let sel_ids: Vec<String> = dnf_pkgs.iter().take(2).map(|p| p.id.clone()).collect();
+
+    // 1) OfflineOnReboot schedules offline upgrade and sets needs_reboot = true.
+    let rt_offline = FakeRuntime::new();
+    rt_offline.set_dnf_dbus_available(true);
+    rt_offline.push_dnf_dbus_apply(DnfDbusApplyStep {
+        lines: vec!["Scheduled offline update for next reboot.".into()],
+        draws: vec![],
+        hints: vec![],
+        throughput: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Handled(Ok(DnfApplyOutcome {
+            needs_reboot: true,
+            offline_scheduled: true,
+            download_only: false,
+            cancelled: false,
+        })),
+    });
+
+    let mut h_off = FlowHarness::ready(dnf_pkgs.clone());
+    h_off.run_apply_mode(&rt_offline, sel_ids.clone(), ApplyMode::OfflineOnReboot);
+    let calls = rt_offline.dnf_dbus_apply_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, ApplyMode::OfflineOnReboot);
+    assert_eq!(rt_offline.ensure_session_calls(), 0);
+    assert!(matches!(
+        &h_off.state.phase,
+        Phase::Done {
+            packages,
+            failed: 0,
+            needs_reboot: true,
+            ..
+        } if packages.len() == 2
+    ));
+
+    // 2) DownloadOnly skips Flatpak & Firmware apply steps and does not ask to reboot.
+    let mut mixed = vec![dnf_pkgs[0].clone()];
+    mixed.extend(flatpak_check_from_fixture("flatpak/check_user_normal.json", None).packages);
+    mixed.push(Package {
+        id: "fw:dev-1".into(),
+        name: "System Firmware".into(),
+        arch: "firmware".into(),
+        version: "0.1.32".into(),
+        old_version: Some("0.1.31".into()),
+        source: UpdateSource::Firmware,
+        repo: "lvfs".into(),
+        size_bytes: Some(1_048_576),
+        install_size_delta: None,
+        summary: None,
+        advisories: Vec::new(),
+        preflight_warning: None,
+        detail: "Firmware update".into(),
+        status: PackageStatus::Pending,
+    });
+    let all_ids: Vec<String> = mixed.iter().map(|p| p.id.clone()).collect();
+
+    let rt_dl = FakeRuntime::new();
+    rt_dl.set_dnf_dbus_available(true);
+    rt_dl.push_dnf_dbus_apply(DnfDbusApplyStep {
+        lines: vec!["Downloaded 1 RPM package(s); skipped install (Download Only).".into()],
+        draws: vec![],
+        hints: vec![],
+        throughput: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Handled(Ok(DnfApplyOutcome {
+            needs_reboot: false,
+            offline_scheduled: false,
+            download_only: true,
+            cancelled: false,
+        })),
+    });
+
+    let mut h_dl = FlowHarness::ready(mixed);
+    h_dl.run_apply_mode(&rt_dl, all_ids, ApplyMode::DownloadOnly);
+    let dl_calls = rt_dl.dnf_dbus_apply_calls();
+    assert_eq!(dl_calls.len(), 1);
+    assert_eq!(dl_calls[0].1, ApplyMode::DownloadOnly);
+    assert!(rt_dl.local_calls().is_empty());
+    assert!(rt_dl.helper_calls().is_empty());
+    assert!(h_dl
+        .console
+        .lines()
+        .any(|l| l.contains("Download Only")));
+    assert!(matches!(
+        &h_dl.state.phase,
+        Phase::Done {
+            failed: 0,
+            needs_reboot: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn native_dnf5daemon_goal_cancel_during_download_and_cli_fallback() {
+    let dnf_pkgs = packages_from_dnf_dbus_fixtures();
+    let one_dnf = vec![dnf_pkgs[0].clone()];
+
+    // 1) Goal.cancel() fires during download stage before transaction begins.
+    let goal_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let goal_flag = goal_cancelled.clone();
+
+    let rt_cancel = FakeRuntime::new();
+    rt_cancel.set_dnf_dbus_available(true);
+    rt_cancel.push_dnf_dbus_apply(DnfDbusApplyStep {
+        lines: vec!["Downloading openssl-0:3.2.2-3.fc44.x86_64".into()],
+        draws: vec![],
+        hints: vec![],
+        throughput: vec![],
+        on_start: Some(Box::new(move |cancel| {
+            let flag = goal_flag.clone();
+            cancel.on_cancel(move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            cancel.cancel();
+        })),
+        outcome: NativeOutcome::Handled(Ok(DnfApplyOutcome {
+            needs_reboot: false,
+            offline_scheduled: false,
+            download_only: false,
+            cancelled: true,
+        })),
+    });
+
+    let mut h_cancel = FlowHarness::ready(one_dnf.clone());
+    h_cancel.console.clear();
+    h_cancel.dispatch(Event::StartApply);
+    let (tx, rx) = async_channel::unbounded();
+    let cancel_token = WorkCancel::new();
+    execute_apply_all_with_mode(&tx, one_dnf.clone(), ApplyMode::Live, &rt_cancel, &cancel_token);
+    drop(tx);
+    h_cancel.drain(&rx);
+
+    assert!(goal_cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(rt_cancel.helper_calls().is_empty());
+    assert_eq!(phase_name(&h_cancel.state.phase), "Running");
+    h_cancel.dispatch(Event::StopApply {
+        during_transaction: false,
+    });
+    assert!(matches!(
+        &h_cancel.state.phase,
+        Phase::Ready { soft_errors, .. }
+            if soft_errors
+                == &vec!["Stopped before install. Downloaded packages were not applied.".to_string()]
+    ));
+
+    // 2) When dnf5daemon is Unavailable, apply transparently falls back to PrivilegedSession CLI helper.
+    let rt_fb = FakeRuntime::new();
+    rt_fb.set_dnf_dbus_available(false);
+    rt_fb.push_ensure_session(Ok(()));
+    rt_fb.push_helper_fixture(HelperCommand::ApplyDnf, "dnf/apply_happy_kernel.txt", 0);
+
+    let mut h_fb = FlowHarness::ready(one_dnf);
+    h_fb.run_apply(&rt_fb);
+
+    assert_eq!(rt_fb.ensure_session_calls(), 1);
+    assert_eq!(rt_fb.helper_calls(), vec![HelperCommand::ApplyDnf]);
+    assert!(matches!(
+        &h_fb.state.phase,
+        Phase::Done {
+            packages,
+            failed: 0,
+            ..
+        } if packages.len() == 1
+    ));
+}
+
+#[test]
+fn native_merged_dnf_and_fwupd_history_timeline() {
+    let dnf_txns: Vec<DnfHistoryTransaction> =
+        serde_json::from_value(read_fixture_value("dnf_dbus/history_transactions.json"))
+            .expect("parse dnf history_transactions.json");
+    let fwupd_entries: Vec<FwupdHistoryEntry> =
+        serde_json::from_value(read_fixture_value("fwupd/dbus_history.json"))
+            .expect("parse fwupd dbus_history.json");
+
+    let rt = FakeRuntime::new();
+    rt.push_dnf_history(NativeOutcome::Handled(Ok(dnf_txns.clone())));
+    rt.push_fwupd_history(NativeOutcome::Handled(Ok(fwupd_entries.clone())));
+
+    let merged = execute_load_history(&rt, 50);
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert_eq!(merged.len(), 4);
+
+    // Chronological newest-first order across DNF and fwupd:
+    // 1795224552 (DNF #203) -> 1789080623 (fwupd UEFI dbx Failed) ->
+    // 1788900320 (fwupd System Firmware Success) -> 1700000015 (DNF #202)
+    assert_eq!(merged[0].source, HistorySource::Dnf);
+    assert_eq!(merged[0].id, "dnf-txn-203");
+    assert!(merged[0].succeeded);
+    assert_eq!(merged[0].changes.len(), 2);
+
+    assert_eq!(merged[1].source, HistorySource::Firmware);
+    assert!(!merged[1].succeeded);
+    assert!(merged[1].title.contains("UEFI dbx"));
+
+    assert_eq!(merged[2].source, HistorySource::Firmware);
+    assert!(merged[2].succeeded);
+    assert!(merged[2].title.contains("System Firmware"));
+
+    assert_eq!(merged[3].source, HistorySource::Dnf);
+    assert_eq!(merged[3].id, "dnf-txn-202");
+    assert!(merged[3].succeeded);
+
+    let direct = merge_history(&dnf_txns, &fwupd_entries);
+    assert_eq!(merged, direct);
 }

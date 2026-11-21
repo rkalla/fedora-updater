@@ -1,0 +1,3 @@
+{"id":501,"name":"openssl","epoch":"0","version":"3.2.2","release":"3.fc44","arch":"x86_64","repo_id":"updates","download_size":2457600,"install_size":5600000,"summary":"Utilities from the general purpose cryptography library","evr":"0:3.2.2-3.fc44"}
+{"id":502,"name":"kernel-core","epoch":"0","version":"6.14.12","release":"300.fc44","arch":"x86_64","repo_id":"updates","download_size":18874368,"install_size":98500000,"summary":"The Linux kernel","evr":"0:6.14.12-300.fc44"}
+{"id":503,"name":"vim-enhanced","epoch":"2","version":"9.1.1100","release":"1.fc44","arch":"x86_64","repo_id":"updates","download_size":1966080,"install_size":4800000,"summary":"A version of the VIM editor enhanced with features","evr":"2:9.1.1100-1.fc44"}
