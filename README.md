@@ -58,7 +58,7 @@ export FEDORA_UPDATER_HELPER=/path/to/fedora-updater
 
 - **Check → review → Update All**
 - Sequential backends: **DNF → Flatpak user → Flatpak system → Firmware**
-- Source badges on every row (DNF / FP / FW); severity chips when advisory kind is known
+- Source badges on every row (DNF / FP / FW)
 - Determinate check/apply progress with remaining-work text and incoming package list
 - Expandable console (one live line when collapsed)
 - Idle title matches check state; Failed is a StatusPage with Retry
@@ -84,22 +84,34 @@ sudo dnf install gtk4-devel libadwaita-devel gcc pkgconf-pkg-config blueprint-co
 fedora-updater (GUI)
        │
        ├── privilege session ── pkexec ──► fedora-updater --helper
-       │                                      └── allowlisted dnf/fwupd/flatpak-system
-       └── local commands ─────────────────── flatpak check via libflatpak, apply via flatpak(1)
+       │                                      └── allowlisted dnf / fwupd
+       └── local commands ─────────────────── flatpak check via libflatpak, apply via flatpak(1) (user + system)
 
-state.rs                Pure state machine (heavily tested)
-backend/*               dnf/fwupd parsers, flatpak libflatpak check + stdout progress
-orchestrator.rs         Sequential check/apply pipelines
-helper_protocol.rs      RUN <id> / __END__ <code> wire format
-helper_mode.rs          Privileged allowlist implementation
-src/ui/*.blp            Declarative Adwaita layout (Blueprint → GtkBuilder)
-src/ui/window.rs        Bind + render over the state machine
+console.rs                Bounded console log buffer + incremental UI deltas
+model.rs                  Shared domain types (packages, sources, sizes, errors)
+presenter.rs              Pure UI copy, labels, and state-to-chrome helpers
+state.rs                  Pure state machine (AppState, Phase, RunningState, reduce)
+backend/*                 dnf/fwupd parsers, flatpak libflatpak check + stdout progress
+orchestrator.rs           Sequential check/apply pipelines and worker cancellation
+release_upgrade.rs        Fedora release upgrade availability detection
+helper_protocol.rs        RUN <id> / __END__ <code> wire format
+helper_mode.rs            Privileged allowlist implementation (dnf / fwupd)
+privilege/*               Pooled pkexec helper session lifecycle
+src/ui/*.blp              Declarative Adwaita layout (Blueprint → GtkBuilder)
+src/ui/window.rs          Bind + pure render over state and console buffer
+src/ui/dialogs.rs         About, Full Log, Release Upgrade, and confirmation dialogs
+src/ui/rows.rs            Package row widgets and status styling
+src/ui/preview.rs         Preview states & screenshot capture (FEDORA_UPDATER_PREVIEW)
 ```
 
 ## Tests
 
 ```bash
+# Fast offline test suite
 cargo test
+
+# Live host / network tests (requires dnf and network access)
+cargo test -- --ignored
 ```
 
 ## License

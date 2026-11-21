@@ -1,8 +1,9 @@
 //! Fedora Updater core library — pure logic, parsers, privilege protocol, orchestration.
 //!
-//! The GUI (`fedora-updater`) and the polkit helper (`fedora-updater-helper`) both
-//! link against this crate. Host mutations always go through CLI tools; privileged
-//! commands are allowlisted and executed only by the helper.
+//! Both modes of the multi-call binary — the GNOME GUI (`fedora-updater`) and the
+//! polkit helper (`fedora-updater --helper`) — link against this crate. Host mutations
+//! always go through CLI tools; privileged commands are allowlisted and executed only
+//! by the helper.
 
 pub mod backend;
 pub mod console;
