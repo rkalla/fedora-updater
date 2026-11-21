@@ -86,11 +86,17 @@ impl fmt::Display for AuthPurpose {
 pub enum IdleScreen {
     /// Never checked in this session.
     Fresh,
-    /// A check finished with nothing to install, or the user left the Done page.
-    /// `detail` is set only when a backend reported a soft error.
+    /// A check finished with nothing to install, or the user left a clean Done page.
     Current {
         checked_at: String,
         detail: Option<String>,
+    },
+    /// Check failed on one or more sources (with 0 updates found), or the user
+    /// left a Done screen that had failed updates. Never claims "System is up to date".
+    Warning {
+        title: &'static str,
+        detail: String,
+        checked_at: Option<String>,
     },
 }
 
@@ -98,6 +104,7 @@ pub enum IdleScreen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryAction {
     CheckAgain,
+    RetryApply,
     Reboot,
 }
 

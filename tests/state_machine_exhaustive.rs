@@ -284,6 +284,7 @@ fn happy_path_multi_source() {
                 source,
                 success: true,
                 needs_reboot: source == UpdateSource::Dnf || source == UpdateSource::Firmware,
+                error: None,
             },
         )
         .unwrap();
@@ -340,7 +341,8 @@ fn illegal_transitions() {
         Event::BackendApplyDone {
             source: UpdateSource::Dnf,
             success: true,
-            needs_reboot: false
+            needs_reboot: false,
+            error: None,
         }
     )
     .is_err());
@@ -509,6 +511,7 @@ fn verify_pass_does_not_move_current_back_to_completed() {
             stage: None,
             needs_reboot: false,
             failed_sources: Vec::new(),
+            failure_reasons: Vec::new(),
         }),
         ..Default::default()
     };
@@ -594,14 +597,16 @@ fn soft_errors_on_empty_check_surface_message() {
         },
     )
     .unwrap();
-    match s.phase {
-        Phase::Idle(fedora_updater::IdleScreen::Current {
-            detail: Some(m), ..
-        }) => {
-            assert!(m.starts_with("No updates available ("), "{m}");
-            assert!(m.contains("fwupd not available"), "{m}");
+    match &s.phase {
+        Phase::Idle(screen @ fedora_updater::IdleScreen::Warning { title, detail, .. }) => {
+            assert_eq!(*title, "Could not check all sources");
+            assert!(detail.contains("fwupd not available"), "{detail}");
+            let chrome = idle_chrome(screen);
+            assert_ne!(chrome.title, "System is up to date");
+            assert_eq!(chrome.icon, "dialog-warning-symbolic");
+            assert!(chrome.show_view_log);
         }
-        other => panic!("expected idle with soft-error detail, got {other:?}"),
+        other => panic!("expected warning idle with soft-error detail, got {other:?}"),
     }
 }
 
@@ -622,6 +627,7 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
             source: UpdateSource::Dnf,
             success: false,
             needs_reboot: false,
+            error: Some("System: RPM database is locked".into()),
         },
     )
     .unwrap();
@@ -631,6 +637,7 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
             source: UpdateSource::FlatpakUser,
             success: true,
             needs_reboot: false,
+            error: None,
         },
     )
     .unwrap();
@@ -770,6 +777,7 @@ fn all_failed_goes_to_failed_phase() {
             source: UpdateSource::Dnf,
             success: false,
             needs_reboot: false,
+            error: None,
         },
     )
     .unwrap();
@@ -800,6 +808,7 @@ fn done_resets_to_current_idle() {
             duration: "1s".into(),
             needs_reboot: false,
             failed: 0,
+            failure_reasons: vec![],
         },
         ..Default::default()
     };
@@ -1784,6 +1793,7 @@ fn session_started_purpose_follows_the_phase() {
             duration: "1s".into(),
             needs_reboot: false,
             failed: 0,
+            failure_reasons: vec![],
         }),
         None
     );
@@ -1956,4 +1966,159 @@ fn failed_transition_leaves_state_unchanged() {
     .is_err());
     assert_eq!(checking.phase, checking_phase);
     assert!(checking.apply_when_ready);
+}
+
+#[test]
+fn all_failed_surfaces_backend_failure_reasons_inline() {
+    let s = started_apply(vec![dnf("kernel")]);
+    let s = apply(
+        s,
+        Event::BackendApplyDone {
+            source: UpdateSource::Dnf,
+            success: false,
+            needs_reboot: false,
+            error: Some("System: RPM database is locked by another process.".into()),
+        },
+    )
+    .unwrap();
+    let s = apply(
+        s,
+        Event::ApplyComplete {
+            needs_reboot: false,
+        },
+    )
+    .unwrap();
+    match s.phase {
+        Phase::Failed {
+            title,
+            detail,
+            retry: RetryAction::CheckAgain,
+        } => {
+            assert_eq!(title, "All updates failed");
+            assert!(detail.contains("RPM database is locked"), "{detail}");
+            assert!(detail.contains("Open View Log"), "{detail}");
+        }
+        other => panic!("expected Failed with inline reason, got {other:?}"),
+    }
+}
+
+#[test]
+fn partial_failure_done_preserves_failure_reasons_and_resets_to_warning_idle() {
+    let s = started_apply(vec![dnf("kernel"), flatpak("org.app.Foo")]);
+    let s = apply(
+        s,
+        Event::BackendApplyDone {
+            source: UpdateSource::Dnf,
+            success: false,
+            needs_reboot: false,
+            error: Some("System: dependency conflict — Problem 1: foo".into()),
+        },
+    )
+    .unwrap();
+    let s = apply(
+        s,
+        Event::BackendApplyDone {
+            source: UpdateSource::FlatpakUser,
+            success: true,
+            needs_reboot: false,
+            error: None,
+        },
+    )
+    .unwrap();
+    let s = apply(
+        s,
+        Event::ApplyComplete {
+            needs_reboot: false,
+        },
+    )
+    .unwrap();
+    match &s.phase {
+        Phase::Done {
+            failed,
+            failure_reasons,
+            ..
+        } => {
+            assert_eq!(*failed, 1);
+            assert_eq!(
+                failure_reasons,
+                &vec!["System: dependency conflict — Problem 1: foo".to_string()]
+            );
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+
+    let idle = apply(s, Event::ResetToIdle).unwrap();
+    match &idle.phase {
+        Phase::Idle(screen @ IdleScreen::Warning { title, detail, .. }) => {
+            assert_eq!(*title, "Some updates failed");
+            assert!(detail.contains("Problem 1: foo"), "{detail}");
+            let chrome = idle_chrome(screen);
+            assert_ne!(chrome.title, "System is up to date");
+            assert_eq!(chrome.icon, "dialog-warning-symbolic");
+            assert!(chrome.show_view_log);
+        }
+        other => panic!("expected Warning idle, got {other:?}"),
+    }
+}
+
+#[test]
+fn cancel_auth_during_apply_restores_ready_list() {
+    let listed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(12_345);
+    let mut s = ready_state(vec![dnf("firefox"), flatpak("org.app.Foo")]);
+    s.updates_listed_at = Some(listed_at);
+
+    let s = apply(s, Event::StartApply).unwrap();
+    assert_phase(&s, "Authenticating");
+
+    let s = apply(s, Event::CancelAuth).unwrap();
+    assert_phase(&s, "Ready");
+    assert_eq!(s.updates_listed_at, Some(listed_at));
+    assert_eq!(s.packages().len(), 2);
+}
+
+#[test]
+fn apply_auth_denied_preserves_packages_for_retry_apply() {
+    let s = ready_state(vec![dnf("kernel"), flatpak("org.app.Foo")]);
+    let s = apply(s, Event::StartApply).unwrap();
+    let s = apply(
+        s,
+        Event::Fail {
+            title: "Authentication cancelled".into(),
+            detail: "polkit denied".into(),
+            retry: RetryAction::RetryApply,
+        },
+    )
+    .unwrap();
+    assert_phase(&s, "Failed");
+    assert_eq!(s.packages().len(), 2);
+
+    let retried = apply(s, Event::StartApply).unwrap();
+    assert_phase(&retried, "Authenticating");
+    assert_eq!(retried.packages().len(), 2);
+    assert!(retried.retry_apply_packages.is_empty());
+
+    let running = apply(
+        retried,
+        Event::SessionReady {
+            purpose: AuthPurpose::Apply,
+        },
+    )
+    .unwrap();
+    assert_phase(&running, "Running");
+    assert_eq!(running.packages().len(), 2);
+}
+
+#[test]
+fn cancel_auth_from_warning_idle_returns_fresh_not_up_to_date() {
+    let s = AppState {
+        phase: Phase::Idle(IdleScreen::Warning {
+            title: "Could not check all sources",
+            detail: "dnf failed".into(),
+            checked_at: Some("just now".into()),
+        }),
+        ..Default::default()
+    };
+    let auth = apply(s, Event::StartCheck { then_apply: false }).unwrap();
+    let cancelled = apply(auth, Event::CancelAuth).unwrap();
+    assert_eq!(cancelled.phase, Phase::Idle(IdleScreen::Fresh));
 }

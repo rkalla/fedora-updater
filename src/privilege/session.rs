@@ -15,6 +15,8 @@ use crate::helper_protocol::{parse_end_line, HelperCommand, HELLO_LINE};
 
 /// Helper (or pkexec) pid so window close can SIGKILL without the session lock.
 static HELPER_PID: AtomicU32 = AtomicU32::new(0);
+/// Active cancellable unprivileged command pid (e.g. `flatpak update`) so Stop / close can SIGKILL it.
+static LOCAL_CMD_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Flag that selects helper mode on the multi-call binary.
 pub const HELPER_FLAG: &str = "--helper";
@@ -254,6 +256,32 @@ pub fn kill_recorded_helper() {
     }
 }
 
+/// SIGKILL the active cancellable local command's process group (e.g. `flatpak update`).
+/// Safe from the GTK thread: no locks, no wait.
+pub fn kill_recorded_local_command() {
+    let pid = LOCAL_CMD_PID.swap(0, Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    let pid = pid as i32;
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+struct LocalPidGuard(Option<u32>);
+
+impl Drop for LocalPidGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            LOCAL_CMD_PID
+                .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .ok();
+        }
+    }
+}
+
 fn configure_helper_command(cmd: &mut Command) -> &mut Command {
     // Own process group so close can kill helper + fwupdmgr together.
     cmd.process_group(0)
@@ -269,25 +297,56 @@ impl Drop for PrivilegedSession {
 }
 
 fn drain_lines(stream: impl std::io::Read, tx: mpsc::Sender<String>) {
-    for line in BufReader::new(stream).lines().flatten() {
+    for line in BufReader::new(stream).lines().map_while(Result::ok) {
         if tx.send(line).is_err() {
             break;
         }
     }
 }
 
-/// Run an unprivileged host command (Flatpak user ops, etc.), streaming lines.
+/// Run an unprivileged host command (`systemctl reboot`, etc.), streaming lines.
 pub fn run_local_command(
     program: &str,
     args: &[&str],
+    on_line: impl FnMut(String),
+) -> Result<i32, SessionError> {
+    run_local_command_inner(program, args, false, on_line)
+}
+
+/// Run an unprivileged host command whose process group is recorded so `Stop` or
+/// window close can terminate it immediately via [`kill_recorded_local_command`].
+pub fn run_cancellable_local_command(
+    program: &str,
+    args: &[&str],
+    on_line: impl FnMut(String),
+) -> Result<i32, SessionError> {
+    run_local_command_inner(program, args, true, on_line)
+}
+
+fn run_local_command_inner(
+    program: &str,
+    args: &[&str],
+    track_for_cancel: bool,
     mut on_line: impl FnMut(String),
 ) -> Result<i32, SessionError> {
-    let mut child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if track_for_cancel {
+        cmd.process_group(0);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| SessionError::Spawn(format!("{program}: {e}")))?;
+
+    let _pid_guard = if track_for_cancel {
+        let pid = child.id();
+        LOCAL_CMD_PID.store(pid, Ordering::SeqCst);
+        Some(LocalPidGuard(Some(pid)))
+    } else {
+        None
+    };
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -382,5 +441,38 @@ printf 'stdout-done\n'
     #[test]
     fn helper_flag_is_stable() {
         assert_eq!(HELPER_FLAG, "--helper");
+    }
+
+    #[test]
+    fn kill_recorded_local_command_terminates_running_local_process() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let res = run_cancellable_local_command(
+                "/bin/sh",
+                &["-c", "printf 'ready\\n'; sleep 60"],
+                |line| {
+                    if line == "ready" {
+                        let _ = started_tx.send(());
+                    }
+                },
+            );
+            let _ = done_tx.send(res);
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("local process did not emit ready");
+
+        kill_recorded_local_command();
+
+        let res = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("kill_recorded_local_command did not stop the local process promptly");
+        assert!(res.is_ok(), "unexpected error: {res:?}");
+        assert_ne!(res.unwrap(), 0);
+        worker.join().expect("worker join");
+        assert_eq!(LOCAL_CMD_PID.load(Ordering::SeqCst), 0);
     }
 }

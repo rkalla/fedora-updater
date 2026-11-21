@@ -64,6 +64,7 @@ pub fn state_for(phase: &str) -> AppState {
         apply_when_ready: false,
         release_upgrade: None,
         release_age_days: None,
+        retry_apply_packages: Vec::new(),
     };
 
     state.phase = match phase {
@@ -71,6 +72,11 @@ pub fn state_for(phase: &str) -> AppState {
         "idle-current" | "up-to-date" => Phase::Idle(IdleScreen::Current {
             checked_at: "just now".into(),
             detail: None,
+        }),
+        "idle-warning" => Phase::Idle(IdleScreen::Warning {
+            title: "Could not check all sources",
+            detail: "Some sources could not be checked: dnf check-update failed (exit 1)".into(),
+            checked_at: Some("just now".into()),
         }),
         "auth" => Phase::Authenticating {
             purpose: AuthPurpose::Check,
@@ -112,6 +118,7 @@ pub fn state_for(phase: &str) -> AppState {
             stage: None,
             needs_reboot: false,
             failed_sources: vec![],
+            failure_reasons: vec![],
         }),
         "running-many" | "running-expanded" => {
             let packages = many_running_packages();
@@ -135,6 +142,7 @@ pub fn state_for(phase: &str) -> AppState {
                 stage: None,
                 needs_reboot: false,
                 failed_sources: vec![],
+                failure_reasons: vec![],
             })
         }
         "done" => Phase::Done {
@@ -148,6 +156,7 @@ pub fn state_for(phase: &str) -> AppState {
             duration: "6m 42s".into(),
             needs_reboot: true,
             failed: 0,
+            failure_reasons: vec![],
         },
         "done-mixed" => Phase::Done {
             packages: {
@@ -163,6 +172,7 @@ pub fn state_for(phase: &str) -> AppState {
             duration: "6m 42s".into(),
             needs_reboot: true,
             failed: 1,
+            failure_reasons: vec!["Firmware: Connect AC power and try again (battery too low).".into()],
         },
         "failed" => Phase::Failed {
             title: "All updates failed".into(),

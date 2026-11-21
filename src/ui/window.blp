@@ -129,6 +129,14 @@ Adw.ApplicationWindow window {
                 styles ["suggested-action", "pill"]
                 halign: center;
               }
+
+              Gtk.Button idle_log {
+                label: "View Log";
+                action-name: "win.view-log";
+                visible: false;
+                styles ["flat"]
+                halign: center;
+              }
             };
           };
         }
@@ -474,6 +482,11 @@ Adw.ApplicationWindow window {
                 revealed: false;
               }
 
+              Adw.Banner done_problem_banner {
+                revealed: false;
+                button-label: "View Log";
+              }
+
               Gtk.ScrolledWindow done_installed_scroll {
                 vexpand: true;
                 hexpand: true;
@@ -510,6 +523,11 @@ Adw.ApplicationWindow window {
                 label: "View Full Log";
                 action-name: "win.view-log";
                 styles ["flat"]
+              }
+
+              Gtk.Button done_retry_btn {
+                label: "Check Again";
+                visible: false;
               }
 
               Gtk.Button done_btn {

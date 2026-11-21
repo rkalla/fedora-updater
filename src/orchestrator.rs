@@ -10,7 +10,8 @@ use crate::backend::{self, dnf, flatpak, fwupd};
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
 use crate::model::{AuthPurpose, Package, RetryAction, UpdateSource};
 use crate::privilege::{
-    close_session, run_local_command, session_is_alive, with_session, SessionError, SessionEvent,
+    close_session, kill_recorded_local_command, run_cancellable_local_command, run_local_command,
+    session_is_alive, with_session, SessionError, SessionEvent,
 };
 use crate::state::Event as StateEvent;
 
@@ -107,17 +108,17 @@ fn accept_helper_line(ch: &WorkChannel, tag: &str, log: &mut String, raw: &str) 
     }
 }
 
-fn map_session_start_err(ch: &WorkChannel, e: SessionError) {
+fn map_session_start_err(ch: &WorkChannel, e: SessionError, retry: RetryAction) {
     match e {
         SessionError::AuthDenied => ch.event(StateEvent::Fail {
             title: "Authentication cancelled".into(),
             detail: "polkit did not grant permission for the update helper.".into(),
-            retry: RetryAction::CheckAgain,
+            retry,
         }),
         other => ch.event(StateEvent::Fail {
             title: "Could not start privileged helper".into(),
             detail: other.to_string(),
-            retry: RetryAction::CheckAgain,
+            retry,
         }),
     }
 }
@@ -134,7 +135,7 @@ pub fn run_check_all(tx: Sender<WorkerMsg>) {
             return;
         }
         if let Err(e) = started {
-            map_session_start_err(&ch, e);
+            map_session_start_err(&ch, e, RetryAction::CheckAgain);
             return;
         }
         ch.send(WorkerMsg::SessionStarted);
@@ -166,7 +167,7 @@ pub fn run_check_all(tx: Sender<WorkerMsg>) {
         if !ch.is_current() {
             return;
         }
-        let _ = run_local_command(
+        let _ = run_cancellable_local_command(
             "flatpak",
             &["update", "--user", "--appstream", "--noninteractive"],
             |l| ch.line("flatpak-user", l),
@@ -174,7 +175,7 @@ pub fn run_check_all(tx: Sender<WorkerMsg>) {
         if !ch.is_current() {
             return;
         }
-        let _ = run_local_command(
+        let _ = run_cancellable_local_command(
             "flatpak",
             &["update", "--system", "--appstream", "--noninteractive"],
             |l| ch.line("flatpak-system", l),
@@ -300,7 +301,7 @@ fn attach_dnf_download_sizes(ch: &WorkChannel, pkgs: &mut [Package]) {
         return;
     }
     let mut log = String::new();
-    match run_local_command("dnf", dnf::REPOQUERY_UPGRADES_ARGS, |l| {
+    match run_cancellable_local_command("dnf", dnf::REPOQUERY_UPGRADES_ARGS, |l| {
         log.push_str(&l);
         log.push('\n');
     }) {
@@ -388,7 +389,7 @@ pub fn run_apply_all(tx: Sender<WorkerMsg>, packages: Vec<Package>) {
 
         if needs_session {
             if let Err(e) = with_session(|_s| Ok(())) {
-                map_session_start_err(&ch, e);
+                map_session_start_err(&ch, e, RetryAction::RetryApply);
                 return;
             }
         }
@@ -459,11 +460,17 @@ pub fn run_apply_all(tx: Sender<WorkerMsg>, packages: Vec<Package>) {
             if reboot {
                 overall_reboot = true;
             }
+            let error = if code == 0 {
+                None
+            } else {
+                Some(summarize_apply_failure(source, &log, code))
+            };
 
             ch.event(StateEvent::BackendApplyDone {
                 source,
                 success: code == 0,
                 needs_reboot: reboot,
+                error,
             });
         }
 
@@ -550,7 +557,7 @@ fn run_local_apply(
     source: UpdateSource,
 ) -> (i32, String) {
     let mut log = String::new();
-    match run_local_command(program, args, |l| {
+    match run_cancellable_local_command(program, args, |l| {
         log.push_str(&l);
         log.push('\n');
         ch.line(tag, l.clone());
@@ -565,6 +572,100 @@ fn run_local_apply(
             (-1, e.to_string())
         }
     }
+}
+
+fn truncate_summary(s: &str, max_chars: usize) -> String {
+    let clean: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = clean.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
+/// Extract a concise, user-facing failure reason from a backend apply log.
+pub fn summarize_apply_failure(source: UpdateSource, log: &str, exit_code: i32) -> String {
+    let lower_full = log.to_ascii_lowercase();
+    if source == UpdateSource::Dnf
+        && (lower_full.contains("/var/lib/rpm/.rpm.lock")
+            || lower_full.contains("rpm database is locked")
+            || lower_full.contains("could not acquire lock"))
+    {
+        return "System: RPM database is locked by another process. Wait a moment and try again."
+            .into();
+    }
+
+    if source == UpdateSource::Dnf {
+        if let Some(problem) = log.lines().map(str::trim).find(|line| {
+            let l = line.to_ascii_lowercase();
+            l.starts_with("problem ")
+                || l.starts_with("problem:")
+                || l.contains("nothing provides")
+                || l.contains("cannot install")
+        }) {
+            return format!(
+                "System: dependency conflict — {}",
+                truncate_summary(problem, 140)
+            );
+        }
+        if let Some(resolve) = log
+            .lines()
+            .map(str::trim)
+            .find(|line| line.to_ascii_lowercase().contains("failed to resolve"))
+        {
+            return format!(
+                "System: dependency conflict — {}",
+                truncate_summary(resolve, 140)
+            );
+        }
+    }
+
+    if source == UpdateSource::Firmware {
+        if let Some(batt) = log.lines().map(str::trim).find(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("battery")
+                && (l.contains("ac power") || l.contains("threshold") || l.contains("too low"))
+        }) {
+            return format!("Firmware: {}", truncate_summary(batt, 160));
+        }
+        if lower_full.contains("battery")
+            && (lower_full.contains("ac power")
+                || lower_full.contains("threshold")
+                || lower_full.contains("too low"))
+        {
+            return "Firmware: Connect AC power and try again (battery too low).".into();
+        }
+    }
+
+    for line in log.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = strip_prefix_ascii_ci(line, "error:") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return format!("{}: {}", source.label(), truncate_summary(rest, 160));
+            }
+        }
+    }
+
+    if let Some(line) = log.lines().map(str::trim).find(|line| {
+        let l = line.to_ascii_lowercase();
+        l.starts_with("failed") || l.starts_with("cannot ")
+    }) {
+        return format!("{}: {}", source.label(), truncate_summary(line, 160));
+    }
+
+    if let Some(last) = log.lines().map(str::trim).rfind(|l| !l.is_empty()) {
+        return format!("{}: {}", source.label(), truncate_summary(last, 160));
+    }
+
+    format!("{} update failed (exit {exit_code})", source.label())
 }
 
 pub const REBOOT_FAILED_TITLE: &str = "Reboot failed";
@@ -623,9 +724,11 @@ pub fn session_started_event(purpose: AuthPurpose) -> StateEvent {
     StateEvent::SessionReady { purpose }
 }
 
-/// Close elevated helper. Call when the app window is closing — not after
-/// individual Check/Apply flows, so the user is not re-prompted mid-session.
+/// Close elevated helper and terminate any active cancellable local apply command.
+/// Call when the app window is closing — not after individual Check/Apply flows,
+/// so the user is not re-prompted mid-session.
 pub fn release_privileges() {
+    kill_recorded_local_command();
     close_session();
 }
 
@@ -728,7 +831,7 @@ mod tests {
         let (tx, rx) = async_channel::unbounded();
         let gen = begin_background_work();
         let ch = WorkChannel { tx: &tx, gen };
-        map_session_start_err(&ch, SessionError::AuthDenied);
+        map_session_start_err(&ch, SessionError::AuthDenied, RetryAction::CheckAgain);
         assert!(matches!(
             rx.try_recv(),
             Ok(WorkerMsg::Event(StateEvent::Fail {
@@ -736,6 +839,53 @@ mod tests {
                 ..
             }))
         ));
+
+        map_session_start_err(&ch, SessionError::AuthDenied, RetryAction::RetryApply);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkerMsg::Event(StateEvent::Fail {
+                retry: RetryAction::RetryApply,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn summarize_apply_failure_extracts_actionable_causes() {
+        let rpm_lock = summarize_apply_failure(
+            UpdateSource::Dnf,
+            "Waiting for process\nError: Could not acquire lock on /var/lib/rpm/.rpm.lock",
+            1,
+        );
+        assert!(rpm_lock.contains("RPM database is locked"), "{rpm_lock}");
+
+        let dep_conflict = summarize_apply_failure(
+            UpdateSource::Dnf,
+            "Failed to resolve the transaction:\nProblem 1: package foo requires bar\n",
+            1,
+        );
+        assert!(dep_conflict.contains("dependency conflict"), "{dep_conflict}");
+        assert!(dep_conflict.contains("Problem 1: package foo"), "{dep_conflict}");
+
+        let battery = summarize_apply_failure(
+            UpdateSource::Firmware,
+            "Downloading…: 100.0%\nCannot update firmware while on battery power (battery level 18% < 25%); connect AC power and try again.\n",
+            1,
+        );
+        assert!(battery.starts_with("Firmware:"), "{battery}");
+        assert!(battery.contains("AC power"), "{battery}");
+
+        let flatpak_err = summarize_apply_failure(
+            UpdateSource::FlatpakUser,
+            "Looking for updates…\nerror: Failed to update org.signal.Signal: Socket I/O timed out\n",
+            1,
+        );
+        assert!(flatpak_err.starts_with("Apps:"), "{flatpak_err}");
+        assert!(flatpak_err.contains("Socket I/O timed out"), "{flatpak_err}");
+        assert!(!flatpak_err.starts_with("Apps: error:"), "{flatpak_err}");
+
+        let empty = summarize_apply_failure(UpdateSource::Dnf, "  \n", 137);
+        assert_eq!(empty, "System update failed (exit 137)");
     }
 
     #[test]

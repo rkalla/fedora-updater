@@ -27,6 +27,7 @@ pub struct RunningState {
     pub stage: Option<StageCount>,
     pub needs_reboot: bool,
     pub failed_sources: Vec<UpdateSource>,
+    pub failure_reasons: Vec<String>,
 }
 
 impl RunningState {
@@ -43,6 +44,7 @@ impl RunningState {
             stage: None,
             needs_reboot: false,
             failed_sources: Vec::new(),
+            failure_reasons: Vec::new(),
         }
     }
 
@@ -106,6 +108,7 @@ pub enum Phase {
         duration: String,
         needs_reboot: bool,
         failed: usize,
+        failure_reasons: Vec<String>,
     },
     Failed {
         title: String,
@@ -135,6 +138,8 @@ pub struct AppState {
     /// Calendar days since that release was marked Active.
     /// `None` leaves the reminder up and hides the age line.
     pub release_age_days: Option<u32>,
+    /// Preserved Ready packages when Apply authentication fails so Retry Update can resume.
+    pub retry_apply_packages: Vec<Package>,
 }
 
 impl Default for AppState {
@@ -146,6 +151,7 @@ impl Default for AppState {
             apply_when_ready: false,
             release_upgrade: None,
             release_age_days: None,
+            retry_apply_packages: Vec::new(),
         }
     }
 }
@@ -179,6 +185,10 @@ impl AppState {
             Phase::Ready { packages, .. } => packages,
             Phase::Running(running) => &running.packages,
             Phase::Done { packages, .. } => packages,
+            Phase::Failed {
+                retry: RetryAction::RetryApply,
+                ..
+            } => &self.retry_apply_packages,
             _ => &[],
         }
     }
@@ -241,6 +251,7 @@ pub enum Event {
         source: UpdateSource,
         success: bool,
         needs_reboot: bool,
+        error: Option<String>,
     },
     ApplyComplete {
         needs_reboot: bool,
@@ -284,6 +295,7 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             };
             state.apply_when_ready = then_apply;
             state.updates_listed_at = None;
+            state.retry_apply_packages.clear();
             state.stopwatch = Some(Stopwatch::start());
             state.phase = Phase::Authenticating {
                 purpose: AuthPurpose::Check,
@@ -293,12 +305,18 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             Ok(())
         }
         Event::StartApply => {
-            if !matches!(&state.phase, Phase::Ready { packages, .. } if !packages.is_empty()) {
-                return Err(invalid(state, "StartApply"));
-            }
             let packages = match &mut state.phase {
-                Phase::Ready { packages, .. } => std::mem::take(packages),
-                _ => unreachable!(),
+                Phase::Ready { packages, .. } if !packages.is_empty() => {
+                    state.retry_apply_packages.clear();
+                    std::mem::take(packages)
+                }
+                Phase::Failed {
+                    retry: RetryAction::RetryApply,
+                    ..
+                } if !state.retry_apply_packages.is_empty() => {
+                    std::mem::take(&mut state.retry_apply_packages)
+                }
+                _ => return Err(invalid(state, "StartApply")),
             };
             state.apply_when_ready = false;
             state.stopwatch = Some(Stopwatch::start());
@@ -366,17 +384,24 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
                 return Err(invalid(state, "CheckComplete"));
             }
             if packages.is_empty() {
-                let detail = if soft_errors.is_empty() {
-                    None
-                } else {
-                    Some(format!("No updates available ({})", soft_errors.join("; ")))
-                };
                 state.apply_when_ready = false;
                 state.updates_listed_at = None;
-                state.phase = Phase::Idle(IdleScreen::Current {
-                    checked_at: "just now".into(),
-                    detail,
-                });
+                state.retry_apply_packages.clear();
+                if soft_errors.is_empty() {
+                    state.phase = Phase::Idle(IdleScreen::Current {
+                        checked_at: "just now".into(),
+                        detail: None,
+                    });
+                } else {
+                    state.phase = Phase::Idle(IdleScreen::Warning {
+                        title: "Could not check all sources",
+                        detail: format!(
+                            "Some sources could not be checked: {}",
+                            soft_errors.join("; ")
+                        ),
+                        checked_at: Some("just now".into()),
+                    });
+                }
             } else {
                 let mut packages = packages;
                 sort_for_apply(&mut packages);
@@ -479,14 +504,22 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             source,
             success,
             needs_reboot,
+            error,
         } => match &mut state.phase {
             Phase::Running(running) => {
                 finalize_source(&mut running.packages, source, success);
                 if needs_reboot {
                     running.needs_reboot = true;
                 }
-                if !success && !running.failed_sources.contains(&source) {
-                    running.failed_sources.push(source);
+                if !success {
+                    if !running.failed_sources.contains(&source) {
+                        running.failed_sources.push(source);
+                    }
+                    if let Some(msg) = error.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                        if !running.failure_reasons.contains(&msg) {
+                            running.failure_reasons.push(msg);
+                        }
+                    }
                 }
                 running.stage = None;
                 running.overall_progress = overall_progress(&running.packages);
@@ -498,9 +531,11 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             let Phase::Running(running) = &mut state.phase else {
                 return Err(invalid(state, "ApplyComplete"));
             };
+            state.retry_apply_packages.clear();
             let mut packages = std::mem::take(&mut running.packages);
             let nr = running.needs_reboot;
             let failed_sources = std::mem::take(&mut running.failed_sources);
+            let failure_reasons = std::mem::take(&mut running.failure_reasons);
             let duration = state
                 .stopwatch
                 .as_ref()
@@ -522,9 +557,17 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             let hard_fail = failed == packages.len() && !packages.is_empty();
             if hard_fail {
                 state.apply_when_ready = false;
+                let detail = if failure_reasons.is_empty() {
+                    "All updates failed. Open View Log for details.".into()
+                } else {
+                    format!(
+                        "{}\n\nOpen View Log for details.",
+                        failure_reasons.join("\n")
+                    )
+                };
                 state.phase = Phase::Failed {
                     title: "All updates failed".into(),
-                    detail: "All updates failed. Open View Log for details.".into(),
+                    detail,
                     retry: RetryAction::CheckAgain,
                 };
             } else {
@@ -533,6 +576,7 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
                     duration,
                     needs_reboot: nr || needs_reboot,
                     failed,
+                    failure_reasons,
                 };
             }
             Ok(())
@@ -542,6 +586,23 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             detail,
             retry,
         } => {
+            let preserved = if retry == RetryAction::RetryApply {
+                match &mut state.phase {
+                    Phase::Authenticating {
+                        purpose: AuthPurpose::Apply,
+                        packages,
+                        ..
+                    } if !packages.is_empty() => std::mem::take(packages),
+                    Phase::Failed {
+                        retry: RetryAction::RetryApply,
+                        ..
+                    } => std::mem::take(&mut state.retry_apply_packages),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            state.retry_apply_packages = preserved;
             state.apply_when_ready = false;
             state.phase = Phase::Failed {
                 title,
@@ -551,11 +612,41 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             Ok(())
         }
         Event::ResetToIdle => {
+            state.retry_apply_packages.clear();
             let screen = match &state.phase {
-                Phase::Done { .. } => IdleScreen::Current {
-                    checked_at: "just now".into(),
-                    detail: None,
-                },
+                Phase::Done {
+                    failed,
+                    failure_reasons,
+                    ..
+                } => {
+                    if *failed == 0 {
+                        IdleScreen::Current {
+                            checked_at: "just now".into(),
+                            detail: None,
+                        }
+                    } else {
+                        let detail = if !failure_reasons.is_empty() {
+                            let summary = failure_reasons.join("; ");
+                            if *failed == 1 {
+                                format!("1 update did not finish: {summary}")
+                            } else {
+                                format!("{failed} updates did not finish: {summary}")
+                            }
+                        } else if *failed == 1 {
+                            "1 update did not finish. Open View Log for details or check again."
+                                .into()
+                        } else {
+                            format!(
+                                "{failed} updates did not finish. Open View Log for details or check again."
+                            )
+                        };
+                        IdleScreen::Warning {
+                            title: "Some updates failed",
+                            detail,
+                            checked_at: Some("just now".into()),
+                        }
+                    }
+                }
                 Phase::Idle(screen) => screen.clone(),
                 _ => IdleScreen::Fresh,
             };
@@ -570,6 +661,7 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             };
             let mut packages = std::mem::take(&mut running.packages);
             state.apply_when_ready = false;
+            state.retry_apply_packages.clear();
             if during_transaction {
                 state.phase = Phase::Failed {
                     title: "Update stopped during install".into(),
@@ -590,19 +682,34 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             Ok(())
         }
         Event::CancelAuth => {
-            let Phase::Authenticating { last_checked, .. } = &mut state.phase else {
+            let Phase::Authenticating {
+                purpose,
+                packages,
+                last_checked,
+            } = &mut state.phase
+            else {
                 return Err(invalid(state, "CancelAuth"));
             };
+            let purpose = *purpose;
+            let packages = std::mem::take(packages);
             let last_checked = last_checked.take();
             state.apply_when_ready = false;
             state.stopwatch = None;
-            state.phase = Phase::Idle(match last_checked {
-                Some(checked_at) => IdleScreen::Current {
-                    checked_at,
-                    detail: None,
-                },
-                None => IdleScreen::Fresh,
-            });
+            state.retry_apply_packages.clear();
+            if purpose == AuthPurpose::Apply && !packages.is_empty() {
+                state.phase = Phase::Ready {
+                    packages,
+                    soft_errors: Vec::new(),
+                };
+            } else {
+                state.phase = Phase::Idle(match last_checked {
+                    Some(checked_at) => IdleScreen::Current {
+                        checked_at,
+                        detail: None,
+                    },
+                    None => IdleScreen::Fresh,
+                });
+            }
             Ok(())
         }
     }
@@ -610,7 +717,7 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
 
 fn idle_checked_at(screen: &IdleScreen) -> Option<String> {
     match screen {
-        IdleScreen::Fresh => None,
+        IdleScreen::Fresh | IdleScreen::Warning { .. } => None,
         IdleScreen::Current { checked_at, .. } => Some(checked_at.clone()),
     }
 }

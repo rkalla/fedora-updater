@@ -30,7 +30,9 @@ use fedora_updater::presenter::{
     running_progress_captions, soft_error_banner_title, source_summary_line, window_header,
     HeaderView, QuietInput, AUTH_DESCRIPTION,
 };
-use fedora_updater::privilege::{dnf_daemon_is_running, kill_recorded_helper};
+use fedora_updater::privilege::{
+    dnf_daemon_is_running, kill_recorded_helper, kill_recorded_local_command,
+};
 use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RunningState};
 
 use super::{dialogs, obj, preview, rows};
@@ -54,6 +56,7 @@ struct Widgets {
     toast: ToastOverlay,
     idle_page: StatusPage,
     idle_btn: Button,
+    idle_log: Button,
     /// True only on the first-run "Check for Updates" page, so Enter starts a check.
     focus_idle_check: Cell<bool>,
     auth_page: StatusPage,
@@ -93,7 +96,9 @@ struct Widgets {
     console_line: Label,
     console_full: TextView,
     done_btn: Button,
+    done_retry_btn: Button,
     reboot_banner: Banner,
+    done_problem_banner: Banner,
     done_installed_scroll: gtk::ScrolledWindow,
     done_installed: PreferencesGroup,
     done_installed_rows: RefCell<Vec<gtk::Widget>>,
@@ -103,6 +108,73 @@ struct Widgets {
     /// `None` until this run paints the Running page, so auth time is not quiet time.
     last_output: Cell<Option<Instant>>,
     cache_cursor: RefCell<Option<(PathBuf, u64)>>,
+}
+
+fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widgets> {
+    Rc::new(Widgets {
+        window,
+        window_title: obj(builder, "window_title"),
+        header_subtitle: RefCell::new(String::new()),
+        narrow: Cell::new(false),
+        header_refresh: obj(builder, "header_refresh"),
+        upgrade_notice: obj(builder, "upgrade_notice"),
+        upgrade_action: obj(builder, "upgrade_action"),
+        upgrade_title: obj(builder, "upgrade_title"),
+        upgrade_age: obj(builder, "upgrade_age"),
+        stack: obj(builder, "stack"),
+        toast: obj(builder, "toast"),
+        idle_page: obj(builder, "idle_page"),
+        idle_btn: obj(builder, "idle_btn"),
+        idle_log: obj(builder, "idle_log"),
+        focus_idle_check: Cell::new(false),
+        auth_page: obj(builder, "auth_page"),
+        check_progress: obj(builder, "check_progress"),
+        check_progress_meta: obj(builder, "check_progress_meta"),
+        check_progress_pct: obj(builder, "check_progress_pct"),
+        check_group: obj(builder, "check_group"),
+        check_list_scroll: obj(builder, "check_list_scroll"),
+        check_rows: RefCell::new(Vec::new()),
+        ready_banner: obj(builder, "ready_banner"),
+        ready_group: obj(builder, "ready_group"),
+        ready_rows: RefCell::new(Vec::new()),
+        run_stop: obj(builder, "run_stop"),
+        run_stall: obj(builder, "run_stall"),
+        run_progress: obj(builder, "run_progress"),
+        run_progress_meta: obj(builder, "run_progress_meta"),
+        run_progress_pct: obj(builder, "run_progress_pct"),
+        now_playing_badge: obj(builder, "now_playing_badge"),
+        now_playing_title: obj(builder, "now_playing_title"),
+        now_playing_subtitle: obj(builder, "now_playing_subtitle"),
+        now_playing_size: obj(builder, "now_playing_size"),
+        now_playing_pct: obj(builder, "now_playing_pct"),
+        now_playing_spinner: obj(builder, "now_playing_spinner"),
+        run_list_group: obj(builder, "run_list_group"),
+        run_list_rows: RefCell::new(Vec::new()),
+        run_list_ids: RefCell::new(Vec::new()),
+        run_completed_group: obj(builder, "run_completed_group"),
+        run_completed: obj(builder, "run_completed"),
+        run_completed_rows: RefCell::new(Vec::new()),
+        run_completed_keys: RefCell::new(Vec::new()),
+        run_completed_user_open: Cell::new(false),
+        ignore_expand: Cell::new(false),
+        console_drawer: obj(builder, "console_drawer"),
+        console_toggle: obj(builder, "console_toggle"),
+        console_reveal: obj(builder, "console_reveal"),
+        console_chevron: obj(builder, "console_chevron"),
+        console_line: obj(builder, "console_line"),
+        console_full: obj(builder, "console_full"),
+        done_btn: obj(builder, "done_btn"),
+        done_retry_btn: obj(builder, "done_retry_btn"),
+        reboot_banner: obj(builder, "reboot_banner"),
+        done_problem_banner: obj(builder, "done_problem_banner"),
+        done_installed_scroll: obj(builder, "done_installed_scroll"),
+        done_installed: obj(builder, "done_installed"),
+        done_installed_rows: RefCell::new(Vec::new()),
+        fail_page: obj(builder, "fail_page"),
+        fail_retry: obj(builder, "fail_retry"),
+        last_output: Cell::new(None),
+        cache_cursor: RefCell::new(None),
+    })
 }
 
 pub fn build(app: &Application) {
@@ -121,67 +193,7 @@ pub fn build(app: &Application) {
     let window: ApplicationWindow = obj(&builder, "window");
     window.set_application(Some(app));
 
-    let widgets = Rc::new(Widgets {
-        window: window.clone(),
-        window_title: obj(&builder, "window_title"),
-        header_subtitle: RefCell::new(String::new()),
-        narrow: Cell::new(false),
-        header_refresh: obj(&builder, "header_refresh"),
-        upgrade_notice: obj(&builder, "upgrade_notice"),
-        upgrade_action: obj(&builder, "upgrade_action"),
-        upgrade_title: obj(&builder, "upgrade_title"),
-        upgrade_age: obj(&builder, "upgrade_age"),
-        stack: obj(&builder, "stack"),
-        toast: obj(&builder, "toast"),
-        idle_page: obj(&builder, "idle_page"),
-        idle_btn: obj(&builder, "idle_btn"),
-        focus_idle_check: Cell::new(false),
-        auth_page: obj(&builder, "auth_page"),
-        check_progress: obj(&builder, "check_progress"),
-        check_progress_meta: obj(&builder, "check_progress_meta"),
-        check_progress_pct: obj(&builder, "check_progress_pct"),
-        check_group: obj(&builder, "check_group"),
-        check_list_scroll: obj(&builder, "check_list_scroll"),
-        check_rows: RefCell::new(Vec::new()),
-        ready_banner: obj(&builder, "ready_banner"),
-        ready_group: obj(&builder, "ready_group"),
-        ready_rows: RefCell::new(Vec::new()),
-        run_stop: obj(&builder, "run_stop"),
-        run_stall: obj(&builder, "run_stall"),
-        run_progress: obj(&builder, "run_progress"),
-        run_progress_meta: obj(&builder, "run_progress_meta"),
-        run_progress_pct: obj(&builder, "run_progress_pct"),
-        now_playing_badge: obj(&builder, "now_playing_badge"),
-        now_playing_title: obj(&builder, "now_playing_title"),
-        now_playing_subtitle: obj(&builder, "now_playing_subtitle"),
-        now_playing_size: obj(&builder, "now_playing_size"),
-        now_playing_pct: obj(&builder, "now_playing_pct"),
-        now_playing_spinner: obj(&builder, "now_playing_spinner"),
-        run_list_group: obj(&builder, "run_list_group"),
-        run_list_rows: RefCell::new(Vec::new()),
-        run_list_ids: RefCell::new(Vec::new()),
-        run_completed_group: obj(&builder, "run_completed_group"),
-        run_completed: obj(&builder, "run_completed"),
-        run_completed_rows: RefCell::new(Vec::new()),
-        run_completed_keys: RefCell::new(Vec::new()),
-        run_completed_user_open: Cell::new(false),
-        ignore_expand: Cell::new(false),
-        console_drawer: obj(&builder, "console_drawer"),
-        console_toggle: obj(&builder, "console_toggle"),
-        console_reveal: obj(&builder, "console_reveal"),
-        console_chevron: obj(&builder, "console_chevron"),
-        console_line: obj(&builder, "console_line"),
-        console_full: obj(&builder, "console_full"),
-        done_btn: obj(&builder, "done_btn"),
-        reboot_banner: obj(&builder, "reboot_banner"),
-        done_installed_scroll: obj(&builder, "done_installed_scroll"),
-        done_installed: obj(&builder, "done_installed"),
-        done_installed_rows: RefCell::new(Vec::new()),
-        fail_page: obj(&builder, "fail_page"),
-        fail_retry: obj(&builder, "fail_retry"),
-        last_output: Cell::new(None),
-        cache_cursor: RefCell::new(None),
-    });
+    let widgets = widgets_from_builder(&builder, window.clone());
 
     let about = gio::SimpleAction::new("about", None);
     {
@@ -222,6 +234,7 @@ pub fn build(app: &Application) {
     let ready_update: Button = obj(&builder, "ready_update");
     let auth_cancel: Button = obj(&builder, "auth_cancel");
     let done_btn = widgets.done_btn.clone();
+    let done_retry_btn = widgets.done_retry_btn.clone();
     let fail_retry = widgets.fail_retry.clone();
 
     wire_console(&widgets, &console);
@@ -276,11 +289,26 @@ pub fn build(app: &Application) {
                 Phase::Failed { retry, .. } => *retry,
                 _ => return,
             };
-            if retry == RetryAction::Reboot {
-                widgets.toast.add_toast(Toast::new("Rebooting…"));
-                run_systemctl_reboot(tx.clone());
-                return;
+            match retry {
+                RetryAction::Reboot => {
+                    widgets.toast.add_toast(Toast::new("Rebooting…"));
+                    run_systemctl_reboot(tx.clone());
+                }
+                RetryAction::RetryApply => {
+                    begin_apply(&state, &console, &widgets, tx.clone());
+                }
+                RetryAction::CheckAgain => {
+                    start_check(&state, &console, &widgets, tx.clone(), false);
+                }
             }
+        });
+    }
+    {
+        let state = state.clone();
+        let console = console.clone();
+        let widgets = widgets.clone();
+        let tx = tx.clone();
+        done_retry_btn.connect_clicked(move |_| {
             start_check(&state, &console, &widgets, tx.clone(), false);
         });
     }
@@ -347,8 +375,17 @@ pub fn build(app: &Application) {
         let console = console.clone();
         let widgets = widgets.clone();
         done_btn.connect_clicked(move |_| {
-            clear_console(&console, &widgets);
+            let clean_done = matches!(state.borrow().phase, Phase::Done { failed: 0, .. });
+            if clean_done {
+                clear_console(&console, &widgets);
+            }
             dispatch(&state, &console, &widgets, Event::ResetToIdle, true);
+        });
+    }
+    {
+        let window = widgets.window.clone();
+        widgets.done_problem_banner.connect_button_clicked(move |_| {
+            let _ = WidgetExt::activate_action(&window, "win.view-log", None);
         });
     }
     {
@@ -842,6 +879,7 @@ fn stop_apply(
 ) {
     cancel_background_work();
     kill_recorded_helper();
+    kill_recorded_local_command();
     dispatch(
         state,
         console,
@@ -1073,6 +1111,7 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 w.idle_btn.remove_css_class("flat");
             }
             w.idle_page.set_description(chrome.description.as_deref());
+            w.idle_log.set_visible(chrome.show_view_log);
             paint_header(w, HeaderView::Idle);
             if matches!(screen, IdleScreen::Fresh) {
                 arm_idle_check_focus(w);
@@ -1145,6 +1184,7 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             duration,
             needs_reboot,
             failed,
+            failure_reasons,
         } => {
             clear_running_lists(w);
             restore_default_window_size(&w.window);
@@ -1164,18 +1204,30 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                     subtitle: &subtitle,
                 },
             );
+            if *failed > 0 && !failure_reasons.is_empty() {
+                w.done_problem_banner
+                    .set_title(&failure_reasons.join(" · "));
+                w.done_problem_banner.set_revealed(true);
+            } else {
+                w.done_problem_banner.set_revealed(false);
+            }
+            w.done_retry_btn.set_visible(*failed > 0);
+            w.done_retry_btn.remove_css_class("suggested-action");
+            w.done_btn.remove_css_class("suggested-action");
+            w.done_btn.remove_css_class("pill");
             if *needs_reboot {
                 w.reboot_banner
                     .set_button_style(libadwaita::BannerButtonStyle::Suggested);
                 w.reboot_banner.set_revealed(true);
-                w.done_btn.remove_css_class("suggested-action");
-                w.done_btn.remove_css_class("pill");
             } else {
                 w.reboot_banner
                     .set_button_style(libadwaita::BannerButtonStyle::Default);
                 w.reboot_banner.set_revealed(false);
-                w.done_btn.add_css_class("suggested-action");
-                w.done_btn.remove_css_class("pill");
+                if *failed > 0 {
+                    w.done_retry_btn.add_css_class("suggested-action");
+                } else {
+                    w.done_btn.add_css_class("suggested-action");
+                }
             }
             w.done_installed
                 .set_title(if *failed > 0 { "Finished" } else { "Installed" });
@@ -1369,5 +1421,99 @@ mod tests {
             ),
             "the panicked write must leave the phase on Authenticating"
         );
+    }
+
+    #[test]
+    fn render_ux_recovery_states_for_check_and_apply_failures() {
+        use fedora_updater::console::ConsoleBuffer;
+        use fedora_updater::model::{IdleScreen, Package, PackageStatus, RetryAction};
+        use fedora_updater::state::{AppState, Phase};
+        use gtk::prelude::*;
+
+        libadwaita::init().expect("init libadwaita");
+        let builder = gtk::Builder::from_string(super::WINDOW_UI);
+        let window: libadwaita::ApplicationWindow = super::super::obj(&builder, "window");
+        let widgets = super::widgets_from_builder(&builder, window);
+        let console = ConsoleBuffer::new(100);
+
+        let warning_state = AppState {
+            phase: Phase::Idle(IdleScreen::Warning {
+                title: "Could not check all sources",
+                detail: "Some sources could not be checked: dnf check-update failed (exit 1)".into(),
+                checked_at: Some("just now".into()),
+            }),
+            ..Default::default()
+        };
+        super::render(&warning_state, &console, &widgets);
+        assert_eq!(
+            widgets.idle_page.title().as_str(),
+            "Could not check all sources"
+        );
+        assert_eq!(
+            widgets.idle_page.icon_name().as_deref(),
+            Some("dialog-warning-symbolic")
+        );
+        assert_eq!(widgets.idle_btn.label().as_deref(), Some("Check Again"));
+        assert!(widgets.idle_log.get_visible());
+
+        let current_state = AppState {
+            phase: Phase::Idle(IdleScreen::Current {
+                checked_at: "just now".into(),
+                detail: None,
+            }),
+            ..Default::default()
+        };
+        super::render(&current_state, &console, &widgets);
+        assert_eq!(widgets.idle_page.title().as_str(), "System is up to date");
+        assert!(!widgets.idle_log.get_visible());
+
+        let mut dnf_failed = Package::new_dnf("kernel", "x86_64", "1", "updates");
+        dnf_failed.status = PackageStatus::Failed;
+        let done_partial = AppState {
+            phase: Phase::Done {
+                packages: vec![dnf_failed.clone()],
+                duration: "4s".into(),
+                needs_reboot: false,
+                failed: 1,
+                failure_reasons: vec!["System: RPM database is locked".into()],
+            },
+            ..Default::default()
+        };
+        super::render(&done_partial, &console, &widgets);
+        assert!(widgets.done_problem_banner.is_revealed());
+        assert!(widgets
+            .done_problem_banner
+            .title()
+            .contains("RPM database is locked"));
+        assert!(widgets.done_retry_btn.get_visible());
+        assert!(widgets.done_retry_btn.has_css_class("suggested-action"));
+        assert!(!widgets.done_btn.has_css_class("suggested-action"));
+
+        let done_partial_reboot = AppState {
+            phase: Phase::Done {
+                packages: vec![dnf_failed],
+                duration: "4s".into(),
+                needs_reboot: true,
+                failed: 1,
+                failure_reasons: vec!["Firmware: battery too low".into()],
+            },
+            ..Default::default()
+        };
+        super::render(&done_partial_reboot, &console, &widgets);
+        assert!(widgets.reboot_banner.is_revealed());
+        assert!(widgets.done_retry_btn.get_visible());
+        assert!(!widgets.done_retry_btn.has_css_class("suggested-action"));
+        assert!(!widgets.done_btn.has_css_class("suggested-action"));
+
+        let failed_retry_apply = AppState {
+            phase: Phase::Failed {
+                title: "Authentication cancelled".into(),
+                detail: "polkit denied".into(),
+                retry: RetryAction::RetryApply,
+            },
+            ..Default::default()
+        };
+        super::render(&failed_retry_apply, &console, &widgets);
+        assert_eq!(widgets.fail_retry.label().as_deref(), Some("Retry Update"));
     }
 }

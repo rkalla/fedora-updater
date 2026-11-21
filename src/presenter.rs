@@ -21,6 +21,7 @@ pub struct IdleChrome {
     pub suggested: bool,
     pub pill: bool,
     pub flat: bool,
+    pub show_view_log: bool,
     pub description: Option<String>,
 }
 
@@ -33,6 +34,7 @@ pub fn idle_chrome(screen: &IdleScreen) -> IdleChrome {
             suggested: true,
             pill: true,
             flat: false,
+            show_view_log: false,
             description: Some(
                 "System packages, apps, and firmware. Nothing changes until the list is reviewed."
                     .into(),
@@ -41,6 +43,16 @@ pub fn idle_chrome(screen: &IdleScreen) -> IdleChrome {
         IdleScreen::Current { checked_at, detail } => {
             up_to_date_chrome(checked_at, detail.clone())
         }
+        IdleScreen::Warning { title, detail, .. } => IdleChrome {
+            title,
+            icon: "dialog-warning-symbolic",
+            button: "Check Again",
+            suggested: true,
+            pill: true,
+            flat: false,
+            show_view_log: true,
+            description: Some(detail.clone()),
+        },
     }
 }
 
@@ -52,6 +64,7 @@ fn up_to_date_chrome(checked_at: &str, detail: Option<String>) -> IdleChrome {
         suggested: false,
         pill: false,
         flat: true,
+        show_view_log: false,
         description: Some(detail.unwrap_or_else(|| format!("Last checked {checked_at}"))),
     }
 }
@@ -355,6 +368,7 @@ pub fn soft_error_banner_title(count: usize) -> String {
 pub fn fail_retry_label(retry: RetryAction) -> &'static str {
     match retry {
         RetryAction::CheckAgain => "Check Again",
+        RetryAction::RetryApply => "Retry Update",
         RetryAction::Reboot => "Restart",
     }
 }
@@ -412,6 +426,7 @@ mod tests {
         assert!(!chrome.suggested);
         assert!(!chrome.pill);
         assert!(chrome.flat);
+        assert!(!chrome.show_view_log);
         assert_eq!(chrome.description.as_deref(), Some(description));
     }
 
@@ -424,11 +439,33 @@ mod tests {
         assert!(chrome.suggested);
         assert!(chrome.pill);
         assert!(!chrome.flat);
+        assert!(!chrome.show_view_log);
         assert_eq!(
             chrome.description.as_deref(),
             Some(
                 "System packages, apps, and firmware. Nothing changes until the list is reviewed."
             )
+        );
+    }
+
+    #[test]
+    fn idle_chrome_warning_surfaces_problems_and_view_log() {
+        let chrome = idle_chrome(&IdleScreen::Warning {
+            title: "Could not check all sources",
+            detail: "Some sources could not be checked: dnf failed".into(),
+            checked_at: Some("just now".into()),
+        });
+        assert_ne!(chrome.title, "System is up to date");
+        assert_eq!(chrome.title, "Could not check all sources");
+        assert_eq!(chrome.icon, "dialog-warning-symbolic");
+        assert_eq!(chrome.button, "Check Again");
+        assert!(chrome.suggested);
+        assert!(chrome.pill);
+        assert!(!chrome.flat);
+        assert!(chrome.show_view_log);
+        assert_eq!(
+            chrome.description.as_deref(),
+            Some("Some sources could not be checked: dnf failed")
         );
     }
 
@@ -928,6 +965,7 @@ mod tests {
     #[test]
     fn fail_retry_label_follows_the_action() {
         assert_eq!(fail_retry_label(RetryAction::CheckAgain), "Check Again");
+        assert_eq!(fail_retry_label(RetryAction::RetryApply), "Retry Update");
         assert_eq!(fail_retry_label(RetryAction::Reboot), "Restart");
     }
 }
