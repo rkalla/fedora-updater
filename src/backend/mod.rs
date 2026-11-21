@@ -37,3 +37,16 @@ pub fn detect_reboot(source: UpdateSource, log: &str, packages: &[Package]) -> b
         UpdateSource::Firmware => fwupd::detect_reboot_needed(log),
     }
 }
+
+pub(super) fn extract_percent(line: &str) -> Option<f64> {
+    for token in line.split_whitespace() {
+        if let Some(num) = token.strip_suffix('%') {
+            if let Ok(v) = num.parse::<f64>() {
+                if (0.0..=100.0).contains(&v) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}

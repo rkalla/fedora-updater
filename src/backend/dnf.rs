@@ -223,7 +223,7 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
         hint.package_name = Some(name);
     }
 
-    if let Some(pct) = extract_percent(trimmed) {
+    if let Some(pct) = super::extract_percent(trimmed) {
         hint.progress = Some((pct / 100.0).clamp(0.0, 1.0));
     }
 
@@ -404,27 +404,23 @@ fn split_name_from_vr(s: &str) -> Option<String> {
     }
 }
 
-fn extract_percent(line: &str) -> Option<f64> {
-    for token in line.split_whitespace() {
-        if let Some(num) = token.strip_suffix('%') {
-            if let Ok(v) = num.parse::<f64>() {
-                if (0.0..=100.0).contains(&v) {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
-}
-
 pub fn detect_reboot_needed(log: &str, packages: &[Package]) -> bool {
-    let lower = log.to_ascii_lowercase();
-    if lower.contains("reboot") || lower.contains("restart your system") {
-        return true;
-    }
-    packages
+    if packages
         .iter()
         .any(|p| p.source == UpdateSource::Dnf && package_implies_reboot(&p.name))
+    {
+        return true;
+    }
+    let lower = log.to_ascii_lowercase();
+    if lower.contains("no reboot") {
+        return false;
+    }
+    lower.contains("requires a reboot")
+        || lower.contains("reboot to apply")
+        || lower.contains("reboot to complete")
+        || lower.contains("reboot required")
+        || lower.contains("restart your system")
+        || lower.contains("needs-restarting")
 }
 
 /// Running kernel/modules images and a small set of core userspace that cannot
@@ -827,6 +823,22 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
     }
 
     #[test]
+    fn dnf_log_negative_and_package_name_reboot_phrases_do_not_false_positive() {
+        let firefox = Package::new_dnf("firefox", "x86_64", "1", "updates");
+        assert!(!detect_reboot_needed(
+            "No reboot required",
+            std::slice::from_ref(&firefox)
+        ));
+        assert!(!detect_reboot_needed(
+            "Upgrading: dracut-config-reboot",
+            &[firefox]
+        ));
+
+        let kernel = Package::new_dnf("kernel", "x86_64", "6.14.11-300.fc42", "updates");
+        assert!(detect_reboot_needed("No reboot required", &[kernel]));
+    }
+
+    #[test]
     fn repoquery_format_separates_packages_with_newlines() {
         let qf = REPOQUERY_UPGRADES_ARGS
             .iter()
@@ -939,27 +951,20 @@ package mesa-dri-drivers is not installed
 
     #[test]
     fn cache_growth_reports_the_newest_rpm_and_whether_it_grew() {
-        let root = std::env::temp_dir().join(format!(
-            "fedora-updater-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let packages = root.join("grok-bot-deadbeef").join("packages");
         std::fs::create_dir_all(&packages).unwrap();
         let rpm = packages.join("grok-bot-0.79.2-1.x86_64.rpm");
         std::fs::write(&rpm, vec![0u8; 1000]).unwrap();
         let mut cursor = None;
-        let first = poll_cache_growth(&root, &mut cursor).expect("fresh rpm");
+        let first = poll_cache_growth(root, &mut cursor).expect("fresh rpm");
         assert_eq!(first.package, "grok-bot");
         assert!(!first.rising);
         assert_eq!(first.bytes, 1000);
         std::fs::write(&rpm, vec![0u8; 2500]).unwrap();
-        let second = poll_cache_growth(&root, &mut cursor).expect("grew");
+        let second = poll_cache_growth(root, &mut cursor).expect("grew");
         assert!(second.rising);
         assert_eq!(second.bytes, 2500);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

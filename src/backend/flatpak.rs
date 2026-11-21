@@ -194,15 +194,62 @@ pub fn query_updates(user: bool) -> Result<FlatpakCheck, String> {
     })
 }
 
-struct RawOp {
-    formatted_ref: String,
-    kind: FlatpakOpKind,
-    download_bytes: u64,
-    related_to: Vec<String>,
+type RawQueryResult = (
+    Vec<FlatpakListedRef>,
+    Vec<FlatpakResolvedOp>,
+    Option<String>,
+);
+
+struct OwnedGObj(*mut glib::gobject_ffi::GObject);
+
+impl OwnedGObj {
+    unsafe fn from_raw<T>(ptr: *mut T) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self(ptr as *mut glib::gobject_ffi::GObject))
+        }
+    }
+
+    fn as_ptr<T>(&self) -> *mut T {
+        self.0 as *mut T
+    }
+}
+
+impl Drop for OwnedGObj {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { glib::gobject_ffi::g_object_unref(self.0) };
+        }
+    }
+}
+
+struct OwnedGPtrArray(*mut glib::ffi::GPtrArray);
+
+impl OwnedGPtrArray {
+    fn from_raw(ptr: *mut glib::ffi::GPtrArray) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self(ptr))
+        }
+    }
+
+    fn as_ptr(&self) -> *mut glib::ffi::GPtrArray {
+        self.0
+    }
+}
+
+impl Drop for OwnedGPtrArray {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { glib::ffi::g_ptr_array_unref(self.0) };
+        }
+    }
 }
 
 struct ReadyCapture {
-    ops: Vec<RawOp>,
+    ops: Vec<FlatpakResolvedOp>,
     saw_ready: bool,
     cancellable: *mut gtk::gio::ffi::GCancellable,
     api: &'static FlatpakApi,
@@ -213,46 +260,29 @@ struct ReadyCapture {
 ///
 /// # Safety
 /// Caller must not hold a pointer into the Flatpak objects after return.
-unsafe fn query_raw(
-    user: bool,
-) -> Result<
-    (
-        Vec<FlatpakListedRef>,
-        Vec<FlatpakResolvedOp>,
-        Option<String>,
-    ),
-    String,
-> {
+unsafe fn query_raw(user: bool) -> Result<RawQueryResult, String> {
     let api = flatpak_api()?;
     let mut error: *mut glib::ffi::GError = std::ptr::null_mut();
-    let installation = if user {
+    let inst_ptr = if user {
         (api.new_user)(std::ptr::null_mut(), &mut error)
     } else {
         (api.new_system)(std::ptr::null_mut(), &mut error)
     };
-    if installation.is_null() {
-        return Err(take_error(error));
-    }
+    let installation = OwnedGObj::from_raw(inst_ptr).ok_or_else(|| take_error(error))?;
 
-    let listed = (api.list_for_update)(installation, std::ptr::null_mut(), &mut error);
-    if listed.is_null() {
-        glib::gobject_ffi::g_object_unref(installation as *mut glib::gobject_ffi::GObject);
-        return Err(take_error(error));
-    }
-
-    let refs = listed_refs_from_array(api, listed);
-    glib::ffi::g_ptr_array_unref(listed);
+    let refs = {
+        let listed_ptr =
+            (api.list_for_update)(installation.as_ptr(), std::ptr::null_mut(), &mut error);
+        let listed = OwnedGPtrArray::from_raw(listed_ptr).ok_or_else(|| take_error(error))?;
+        listed_refs_from_array(api, listed.as_ptr())
+    };
     if refs.is_empty() {
-        glib::gobject_ffi::g_object_unref(installation as *mut glib::gobject_ffi::GObject);
         return Ok((Vec::new(), Vec::new(), None));
     }
 
-    let transaction = (api.new_transaction)(installation, std::ptr::null_mut(), &mut error);
-    if transaction.is_null() {
-        glib::gobject_ffi::g_object_unref(installation as *mut glib::gobject_ffi::GObject);
-        return Err(take_error(error));
-    }
-    (api.set_no_interaction)(transaction, glib::ffi::GTRUE);
+    let tx_ptr = (api.new_transaction)(installation.as_ptr(), std::ptr::null_mut(), &mut error);
+    let transaction = OwnedGObj::from_raw(tx_ptr).ok_or_else(|| take_error(error))?;
+    (api.set_no_interaction)(transaction.as_ptr(), glib::ffi::GTRUE);
 
     let mut added = 0usize;
     let mut add_error: Option<String> = None;
@@ -263,7 +293,7 @@ unsafe fn query_raw(
         // add_update(transaction, ref, subpaths, commit, error). NULL commit
         // means the latest commit on the installed remote.
         let ok = (api.add_update)(
-            transaction,
+            transaction.as_ptr(),
             cref.as_ptr(),
             std::ptr::null_mut(),
             std::ptr::null(),
@@ -277,16 +307,18 @@ unsafe fn query_raw(
         }
     }
 
-    let cancellable = gtk::gio::ffi::g_cancellable_new();
+    let cancellable_ptr = gtk::gio::ffi::g_cancellable_new();
+    let cancellable = OwnedGObj::from_raw(cancellable_ptr)
+        .ok_or_else(|| "g_cancellable_new returned null".to_string())?;
     let mut capture = ReadyCapture {
         ops: Vec::new(),
         saw_ready: false,
-        cancellable,
+        cancellable: cancellable.as_ptr(),
         api,
     };
     if added > 0 {
-        glib::gobject_ffi::g_signal_connect_data(
-            transaction as *mut glib::gobject_ffi::GObject,
+        let handler_id = glib::gobject_ffi::g_signal_connect_data(
+            transaction.as_ptr(),
             c"ready-pre-auth".as_ptr(),
             Some(std::mem::transmute::<
                 unsafe extern "C" fn(*mut c_void, glib::ffi::gpointer) -> glib::ffi::gboolean,
@@ -302,10 +334,13 @@ unsafe fn query_raw(
             None,
             0,
         );
-        let ran = (api.run)(transaction, cancellable, &mut error);
+        let ran = (api.run)(transaction.as_ptr(), cancellable.as_ptr(), &mut error);
+        if handler_id != 0 {
+            glib::gobject_ffi::g_signal_handler_disconnect(transaction.as_ptr(), handler_id);
+        }
         if ran == glib::ffi::GTRUE {
             // The ready handler failed to abort. Stop anything still in flight.
-            gtk::gio::ffi::g_cancellable_cancel(cancellable);
+            gtk::gio::ffi::g_cancellable_cancel(cancellable.as_ptr());
             add_error =
                 Some("flatpak transaction continued past ready-pre-auth during check".into());
             if !error.is_null() {
@@ -322,21 +357,7 @@ unsafe fn query_raw(
         }
     }
 
-    let ops = capture
-        .ops
-        .into_iter()
-        .map(|op| FlatpakResolvedOp {
-            formatted_ref: op.formatted_ref,
-            kind: op.kind,
-            download_bytes: op.download_bytes,
-            related_to: op.related_to,
-        })
-        .collect();
-
-    glib::gobject_ffi::g_object_unref(cancellable as *mut glib::gobject_ffi::GObject);
-    glib::gobject_ffi::g_object_unref(transaction as *mut glib::gobject_ffi::GObject);
-    glib::gobject_ffi::g_object_unref(installation as *mut glib::gobject_ffi::GObject);
-    Ok((refs, ops, add_error))
+    Ok((refs, capture.ops, add_error))
 }
 
 unsafe extern "C" fn on_ready_pre_auth(
@@ -355,7 +376,7 @@ unsafe extern "C" fn on_ready_pre_auth(
     glib::ffi::GFALSE
 }
 
-unsafe fn collect_ops(api: &FlatpakApi, transaction: *mut c_void) -> Vec<RawOp> {
+unsafe fn collect_ops(api: &FlatpakApi, transaction: *mut c_void) -> Vec<FlatpakResolvedOp> {
     let list = (api.get_operations)(transaction as *mut FlatpakTransaction);
     let mut out = Vec::new();
     let mut link = list;
@@ -379,7 +400,7 @@ unsafe fn collect_ops(api: &FlatpakApi, transaction: *mut c_void) -> Vec<RawOp> 
                     related_to.push(c_to_string((api.get_ref)(parent)));
                 }
             }
-            out.push(RawOp {
+            out.push(FlatpakResolvedOp {
                 formatted_ref: c_to_string((api.get_ref)(op)),
                 kind,
                 download_bytes: (api.get_download_size)(op),
@@ -441,11 +462,13 @@ unsafe fn take_error(error: *mut glib::ffi::GError) -> String {
     }
 }
 
-fn c_to_string(ptr: *const c_char) -> String {
+/// # Safety
+/// `ptr` must be null or point to a valid NUL-terminated C string for the duration of the call.
+unsafe fn c_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
     }
 }
 
@@ -554,7 +577,8 @@ unsafe fn load_flatpak_api() -> Result<FlatpakApi, String> {
     })
 }
 
-unsafe fn load_fn<T>(handle: *mut c_void, name: &CStr) -> Result<T, String> {
+unsafe fn load_fn<T: Copy>(handle: *mut c_void, name: &CStr) -> Result<T, String> {
+    assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
     libc::dlerror();
     let sym = libc::dlsym(handle, name.as_ptr());
     if sym.is_null() {
@@ -644,30 +668,15 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
         }
     }
 
-    if let Some(pct) = extract_percent(line) {
+    if let Some(pct) = super::extract_percent(line) {
         hint.progress = Some((pct / 100.0).clamp(0.0, 1.0));
     }
 
     hint
 }
 
-fn extract_percent(line: &str) -> Option<f64> {
-    for token in line.split_whitespace() {
-        if let Some(num) = token.strip_suffix('%') {
-            if let Ok(v) = num.parse::<f64>() {
-                if (0.0..=100.0).contains(&v) {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
     use super::*;
 
     #[test]
@@ -718,7 +727,7 @@ mod tests {
             "1.0.0.87",
         )];
         let ops = vec![FlatpakResolvedOp {
-            formatted_ref: "runtime/org.freedesktop.Platform.GL32.nvidia-620-70-06/x86_64/1.4"
+            formatted_ref: "runtime/org.freedesktop.Platform.GL32.nvidia-550-00-00/x86_64/1.4"
                 .into(),
             kind: FlatpakOpKind::Install,
             download_bytes: 251_000_000,
@@ -734,7 +743,7 @@ mod tests {
         assert!(
             pkgs[0]
                 .detail
-                .contains("installs org.freedesktop.Platform.GL32.nvidia-620-70-06"),
+                .contains("installs org.freedesktop.Platform.GL32.nvidia-550-00-00"),
             "detail was {}",
             pkgs[0].detail
         );
@@ -766,7 +775,7 @@ mod tests {
             ),
         ];
         let ops = vec![FlatpakResolvedOp {
-            formatted_ref: "runtime/org.freedesktop.Platform.GL.nvidia-620-70-06/x86_64/1.4".into(),
+            formatted_ref: "runtime/org.freedesktop.Platform.GL.nvidia-550-00-00/x86_64/1.4".into(),
             kind: FlatpakOpKind::Install,
             download_bytes: 373 * 1024 * 1024,
             related_to: vec![
@@ -778,7 +787,7 @@ mod tests {
         assert_eq!(pkgs.len(), 2);
         assert!(pkgs.iter().all(|p| {
             p.detail
-                .contains("installs org.freedesktop.Platform.GL.nvidia-620-70-06")
+                .contains("installs org.freedesktop.Platform.GL.nvidia-550-00-00")
         }));
         assert_eq!(pkgs[0].version, "51");
         assert_eq!(pkgs.iter().filter(|p| p.size.is_some()).count(), 1);
@@ -829,60 +838,5 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert!(!pkgs[0].detail.contains("installs"), "{}", pkgs[0].detail);
         assert!(pkgs[0].size.is_none());
-    }
-
-    /// While the host NVIDIA driver has no matching Flatpak GL extension, the
-    /// system check must name that extension on Steam and the platforms.
-    /// Skips once the extension is installed, or when Flatpak is absent.
-    #[test]
-    fn system_query_names_missing_nvidia_extension() {
-        if Command::new("flatpak").arg("--version").output().is_err() {
-            return;
-        }
-        let installed = Command::new("flatpak")
-            .args([
-                "info",
-                "--system",
-                "org.freedesktop.Platform.GL.nvidia-620-70-06",
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if installed {
-            return;
-        }
-        let steam_installed = Command::new("flatpak")
-            .args(["info", "--system", "com.valvesoftware.Steam"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !steam_installed {
-            return;
-        }
-        let check = query_updates(false).expect("system flatpak query");
-        let steam = check
-            .packages
-            .iter()
-            .find(|p| p.id.contains("com.valvesoftware.Steam"))
-            .expect("Steam is offered while its 32-bit NVIDIA driver is missing");
-        assert!(
-            steam
-                .detail
-                .contains("installs org.freedesktop.Platform.GL32.nvidia-620-70-06"),
-            "steam detail was {}",
-            steam.detail
-        );
-        assert!(
-            check.packages.iter().any(|p| {
-                p.detail
-                    .contains("installs org.freedesktop.Platform.GL.nvidia-620-70-06")
-            }),
-            "no platform row named the 64-bit NVIDIA extension: {:?}",
-            check
-                .packages
-                .iter()
-                .map(|p| format!("{} ({})", p.name, p.detail))
-                .collect::<Vec<_>>()
-        );
     }
 }

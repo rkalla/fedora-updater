@@ -225,31 +225,20 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
         hint.phase_label = Some("Waiting".into());
     }
     if hint.progress.is_none() {
-        if let Some(pct) = extract_percent(line) {
+        if let Some(pct) = super::extract_percent(line).or_else(|| parse_percentage_field(line)) {
             hint.progress = Some((pct / 100.0).clamp(0.0, 1.0));
         }
     }
     hint
 }
 
-fn extract_percent(line: &str) -> Option<f64> {
-    for token in line.split_whitespace() {
-        if let Some(num) = token.strip_suffix('%') {
-            if let Ok(v) = num.parse::<f64>() {
-                if (0.0..=100.0).contains(&v) {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    // Percentage=45 style
-    if let Some(idx) = lower_find(line, "percentage") {
-        let rest = &line[idx..];
-        for token in rest.split(|c: char| !c.is_ascii_digit() && c != '.') {
-            if let Ok(v) = token.parse::<f64>() {
-                if (0.0..=100.0).contains(&v) {
-                    return Some(v);
-                }
+fn parse_percentage_field(line: &str) -> Option<f64> {
+    let idx = lower_find(line, "percentage")?;
+    let rest = &line[idx..];
+    for token in rest.split(|c: char| !c.is_ascii_digit() && c != '.') {
+        if let Ok(v) = token.parse::<f64>() {
+            if (0.0..=100.0).contains(&v) {
+                return Some(v);
             }
         }
     }
@@ -369,6 +358,9 @@ mod tests {
         let waiting = parse_progress_line("Waiting…: 100.0%");
         assert_eq!(waiting.phase_label.as_deref(), Some("Waiting"));
         assert_eq!(waiting.progress, Some(1.0));
+
+        let pct_field = parse_progress_line("Downloading… Percentage=45");
+        assert_eq!(pct_field.progress, Some(0.45));
     }
 
     #[test]

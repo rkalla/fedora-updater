@@ -18,6 +18,8 @@ struct CollectionsDoc {
 
 #[derive(Debug, Deserialize)]
 struct Collection {
+    #[serde(default)]
+    name: String,
     status: String,
     version: String,
     #[serde(default)]
@@ -34,18 +36,38 @@ pub struct ReleaseOffer {
     pub days_since_release: Option<u32>,
 }
 
+fn is_active_fedora_linux(item: &Collection) -> bool {
+    item.name == "Fedora Linux" && item.status == "Active"
+}
+
+fn newest_active_in_doc(doc: &CollectionsDoc, current: u32) -> Option<u32> {
+    doc.collections
+        .iter()
+        .filter(|item| is_active_fedora_linux(item))
+        .filter_map(|item| item.version.parse::<u32>().ok())
+        .filter(|version| *version > current)
+        .max()
+}
+
+fn days_since_active_in_doc(doc: &CollectionsDoc, version: u32, today: &str) -> Option<u32> {
+    let stamp = doc
+        .collections
+        .iter()
+        .find(|item| {
+            is_active_fedora_linux(item) && item.version.parse::<u32>().ok() == Some(version)
+        })?
+        .date_updated
+        .as_deref()?;
+    days_between(stamp, today)
+}
+
 /// Highest `Active` release number strictly above `current`.
 ///
 /// `devel`, `EOL`, and any version that is not a number are ignored.
 /// A document that cannot be read offers nothing.
 pub fn newest_active_newer_than(json: &str, current: u32) -> Option<u32> {
     let doc: CollectionsDoc = serde_json::from_str(json).ok()?;
-    doc.collections
-        .iter()
-        .filter(|item| item.status == "Active")
-        .filter_map(|item| item.version.parse::<u32>().ok())
-        .filter(|version| *version > current)
-        .max()
+    newest_active_in_doc(&doc, current)
 }
 
 /// `VERSION_ID` from an os-release document. Quotes are optional.
@@ -67,13 +89,7 @@ pub fn os_release_version(text: &str) -> Option<u32> {
 /// A missing date, a date in the future, or a version that is not Active yields nothing.
 pub fn days_since_active(json: &str, version: u32, today: &str) -> Option<u32> {
     let doc: CollectionsDoc = serde_json::from_str(json).ok()?;
-    let stamp = doc
-        .collections
-        .iter()
-        .find(|item| item.status == "Active" && item.version.parse::<u32>().ok() == Some(version))?
-        .date_updated
-        .as_deref()?;
-    days_between(stamp, today)
+    days_since_active_in_doc(&doc, version, today)
 }
 
 /// Whole calendar days from `release_stamp` to `today`.
@@ -123,10 +139,11 @@ fn days_from_civil(mut year: i32, month: u32, day: u32) -> i64 {
 }
 
 pub fn offer_from_collections(json: &str, current: u32, today: &str) -> Option<ReleaseOffer> {
-    let version = newest_active_newer_than(json, current)?;
+    let doc: CollectionsDoc = serde_json::from_str(json).ok()?;
+    let version = newest_active_in_doc(&doc, current)?;
     Some(ReleaseOffer {
         version,
-        days_since_release: days_since_active(json, version, today),
+        days_since_release: days_since_active_in_doc(&doc, version, today),
     })
 }
 
@@ -175,20 +192,10 @@ pub fn lookup_installed() -> Option<ReleaseOffer> {
 }
 
 fn today_local() -> Option<String> {
-    let now = unsafe { libc::time(std::ptr::null_mut()) };
-    if now == -1 {
-        return None;
-    }
-    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
-    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
-        return None;
-    }
-    Some(format!(
-        "{:04}-{:02}-{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday
-    ))
+    glib::DateTime::now_local()
+        .ok()
+        .and_then(|dt| dt.format("%Y-%m-%d").ok())
+        .map(|s| s.to_string())
 }
 
 fn fetch_collections() -> Option<String> {
@@ -323,5 +330,38 @@ mod tests {
                 days_since_release: None,
             })
         );
+    }
+
+    #[test]
+    fn active_non_fedora_linux_entries_are_ignored() {
+        let epel_only = r#"{
+          "collections": [
+            {"status": "Active", "version": "99", "name": "Fedora EPEL", "date_updated": "2026-11-03 14:30:00"}
+          ]
+        }"#;
+        assert_eq!(newest_active_newer_than(epel_only, 44), None);
+        assert_eq!(offer_from_collections(epel_only, 44, "2026-11-15"), None);
+
+        let mixed = r#"{
+          "collections": [
+            {"status": "Active", "version": "99", "name": "Fedora EPEL", "date_updated": "2026-11-03 14:30:00"},
+            {"status": "Active", "version": "45", "name": "Fedora Linux", "date_updated": "2026-11-03 14:30:00"}
+          ]
+        }"#;
+        assert_eq!(newest_active_newer_than(mixed, 44), Some(45));
+        assert_eq!(
+            offer_from_collections(mixed, 44, "2026-11-15"),
+            Some(ReleaseOffer {
+                version: 45,
+                days_since_release: Some(12),
+            })
+        );
+    }
+
+    #[test]
+    fn today_local_formats_a_valid_calendar_date() {
+        let today = today_local().expect("today_local should succeed");
+        assert_eq!(today.len(), 10);
+        assert!(civil_days(&today).is_some(), "invalid date {today}");
     }
 }
