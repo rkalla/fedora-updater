@@ -6,7 +6,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use fedora_updater::model::{
-    AdvisoryKind, AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction,
+    parse_size_bytes, AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction,
     RunPass, Stopwatch, UpdateSource,
 };
 use fedora_updater::state::{AppState, Phase};
@@ -63,8 +63,9 @@ pub fn state_for(phase: &str) -> AppState {
 
     state.phase = match phase {
         "idle" => Phase::Idle(IdleScreen::Fresh),
-        "idle-current" | "up-to-date" => Phase::Idle(IdleScreen::Updated {
+        "idle-current" | "up-to-date" => Phase::Idle(IdleScreen::Current {
             checked_at: "just now".into(),
+            detail: None,
         }),
         "auth" => Phase::Authenticating {
             purpose: AuthPurpose::Check,
@@ -85,7 +86,6 @@ pub fn state_for(phase: &str) -> AppState {
                 .into_iter()
                 .map(|mut p| {
                     p.status = PackageStatus::Pending;
-                    p.progress = 0.0;
                     p
                 })
                 .collect(),
@@ -180,9 +180,7 @@ fn pkg(
     version: &str,
     old: &str,
     size: &str,
-    kind: AdvisoryKind,
     status: PackageStatus,
-    progress: f64,
 ) -> Package {
     let mut p = match source {
         UpdateSource::Dnf => Package::new_dnf(name, "x86_64", version, "updates"),
@@ -198,10 +196,8 @@ fn pkg(
         }
     };
     p.old_version = Some(old.into());
-    p.size = Some(size.into());
-    p.kind = kind;
+    p.size_bytes = parse_size_bytes(size);
     p.status = status;
-    p.progress = progress;
     p
 }
 
@@ -213,13 +209,11 @@ fn sample_packages(running: bool) -> Vec<Package> {
             "1:3.2.2-3.fc42",
             "1:3.2.2-1.fc42",
             "2.1 MB",
-            AdvisoryKind::Security,
             if running {
                 PackageStatus::Completed
             } else {
                 PackageStatus::Pending
             },
-            if running { 1.0 } else { 0.0 },
         ),
         pkg(
             "kernel",
@@ -227,13 +221,11 @@ fn sample_packages(running: bool) -> Vec<Package> {
             "6.14.11-300.fc42",
             "6.14.9-300.fc42",
             "98 MB",
-            AdvisoryKind::Security,
             if running {
                 PackageStatus::Completed
             } else {
                 PackageStatus::Pending
             },
-            if running { 1.0 } else { 0.0 },
         ),
         pkg(
             "firefox",
@@ -241,13 +233,11 @@ fn sample_packages(running: bool) -> Vec<Package> {
             "140.0-1.fc42",
             "139.0-1.fc42",
             "112 MB",
-            AdvisoryKind::Security,
             if running {
                 PackageStatus::Completed
             } else {
                 PackageStatus::Pending
             },
-            if running { 1.0 } else { 0.0 },
         ),
         pkg(
             "gnome-shell",
@@ -255,13 +245,11 @@ fn sample_packages(running: bool) -> Vec<Package> {
             "48.2-1.fc42",
             "48.1-1.fc42",
             "8.7 MB",
-            AdvisoryKind::Enhancement,
             if running {
                 PackageStatus::Installing
             } else {
                 PackageStatus::Pending
             },
-            if running { 0.72 } else { 0.0 },
         ),
         pkg(
             "Thunderbird",
@@ -269,9 +257,7 @@ fn sample_packages(running: bool) -> Vec<Package> {
             "128.2.0",
             "128.0.1",
             "94 MB",
-            AdvisoryKind::Bugfix,
             PackageStatus::Pending,
-            0.0,
         ),
         pkg(
             "UEFI dbx",
@@ -279,9 +265,7 @@ fn sample_packages(running: bool) -> Vec<Package> {
             "20241101",
             "20240101",
             "18 KB",
-            AdvisoryKind::Bugfix,
             PackageStatus::Pending,
-            0.0,
         ),
     ]
 }
@@ -298,9 +282,7 @@ fn many_running_packages() -> Vec<Package> {
             "1.0-1.fc44",
             "0.9-1.fc44",
             "1 MB",
-            AdvisoryKind::Unknown,
             PackageStatus::Completed,
-            1.0,
         ));
     }
     packages.push(pkg(
@@ -309,9 +291,7 @@ fn many_running_packages() -> Vec<Package> {
         "2.0-1.fc44",
         "1.9-1.fc44",
         "8 MB",
-        AdvisoryKind::Enhancement,
         PackageStatus::Installing,
-        0.42,
     ));
     packages.push(pkg(
         "Thunderbird",
@@ -319,9 +299,7 @@ fn many_running_packages() -> Vec<Package> {
         "2.0-1.fc44",
         "1.9-1.fc44",
         "4 MB",
-        AdvisoryKind::Unknown,
         PackageStatus::Pending,
-        0.0,
     ));
     packages.push(pkg(
         "UEFI dbx",
@@ -329,9 +307,7 @@ fn many_running_packages() -> Vec<Package> {
         "2.0-1.fc44",
         "1.9-1.fc44",
         "4 MB",
-        AdvisoryKind::Unknown,
         PackageStatus::Pending,
-        0.0,
     ));
     for i in 2..QUEUED {
         packages.push(pkg(
@@ -340,9 +316,7 @@ fn many_running_packages() -> Vec<Package> {
             "2.0-1.fc44",
             "1.9-1.fc44",
             "4 MB",
-            AdvisoryKind::Unknown,
             PackageStatus::Pending,
-            0.0,
         ));
     }
     packages
@@ -367,10 +341,13 @@ mod tests {
             let state = super::state_for(name);
             assert!(!state.apply_when_ready);
             match state.phase {
-                Phase::Idle(IdleScreen::Updated { checked_at }) => {
+                Phase::Idle(IdleScreen::Current {
+                    checked_at,
+                    detail: None,
+                }) => {
                     assert_eq!(checked_at, "just now");
                 }
-                other => panic!("{name} should be Updated, got {other:?}"),
+                other => panic!("{name} should be Current, got {other:?}"),
             }
         }
 

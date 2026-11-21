@@ -86,14 +86,12 @@ impl fmt::Display for AuthPurpose {
 pub enum IdleScreen {
     /// Never checked in this session.
     Fresh,
-    /// A check finished with nothing to install.
+    /// A check finished with nothing to install, or the user left the Done page.
     /// `detail` is set only when a backend reported a soft error.
     Current {
         checked_at: String,
         detail: Option<String>,
     },
-    /// The user left the Done page after an apply.
-    Updated { checked_at: String },
 }
 
 /// What the Failed page's Retry button does.
@@ -145,15 +143,9 @@ pub fn idle_chrome(screen: &IdleScreen) -> IdleChrome {
                     .into(),
             ),
         },
-        IdleScreen::Current {
-            checked_at,
-            detail: Some(text),
-        } => up_to_date_chrome(checked_at, Some(text.clone())),
-        IdleScreen::Current {
-            checked_at,
-            detail: None,
+        IdleScreen::Current { checked_at, detail } => {
+            up_to_date_chrome(checked_at, detail.clone())
         }
-        | IdleScreen::Updated { checked_at } => up_to_date_chrome(checked_at, None),
     }
 }
 
@@ -176,16 +168,11 @@ pub enum PackageStatus {
     Installing,
     Completed,
     Failed,
-    /// Backend skipped because a prior backend failed hard (optional policy).
-    Skipped,
 }
 
 impl PackageStatus {
     pub fn is_done(self) -> bool {
-        matches!(
-            self,
-            PackageStatus::Completed | PackageStatus::Failed | PackageStatus::Skipped
-        )
+        matches!(self, PackageStatus::Completed | PackageStatus::Failed)
     }
 
     pub fn label(self) -> &'static str {
@@ -195,35 +182,6 @@ impl PackageStatus {
             PackageStatus::Installing => "installing",
             PackageStatus::Completed => "done",
             PackageStatus::Failed => "failed",
-            PackageStatus::Skipped => "skipped",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdvisoryKind {
-    Security,
-    Bugfix,
-    Enhancement,
-    Unknown,
-}
-
-impl AdvisoryKind {
-    pub fn short(self) -> &'static str {
-        match self {
-            AdvisoryKind::Security => "S",
-            AdvisoryKind::Bugfix => "B",
-            AdvisoryKind::Enhancement => "E",
-            AdvisoryKind::Unknown => "P",
-        }
-    }
-
-    pub fn css_class(self) -> &'static str {
-        match self {
-            AdvisoryKind::Security => "security",
-            AdvisoryKind::Bugfix => "bugfix",
-            AdvisoryKind::Enhancement => "enhance",
-            AdvisoryKind::Unknown => "unknown",
         }
     }
 }
@@ -236,11 +194,9 @@ pub struct Package {
     pub arch: String,
     pub version: String,
     pub repo: String,
-    pub size: Option<String>,
+    pub size_bytes: Option<u64>,
     pub old_version: Option<String>,
     pub status: PackageStatus,
-    pub progress: f64,
-    pub kind: AdvisoryKind,
     pub source: UpdateSource,
     pub detail: String,
 }
@@ -263,14 +219,16 @@ impl Package {
             arch,
             version: version.clone(),
             repo: repo.clone(),
-            size: None,
+            size_bytes: None,
             old_version: None,
             status: PackageStatus::Pending,
-            progress: 0.0,
-            kind: AdvisoryKind::Unknown,
             source: UpdateSource::Dnf,
             detail: format!("{version} · {repo}"),
         }
+    }
+
+    pub fn size_label(&self) -> Option<String> {
+        self.size_bytes.map(format_bytes)
     }
 
     pub fn version_line(&self) -> String {
@@ -304,60 +262,6 @@ impl Package {
     }
 }
 
-/// Events from background workers → UI / state machine.
-#[derive(Debug, Clone)]
-pub enum WorkerEvent {
-    /// Privileged session started (polkit accepted).
-    SessionStarted,
-    /// Newline-terminated backend output.
-    Line {
-        source_tag: String,
-        text: String,
-    },
-    /// Carriage-return progress. Replaces the open console line.
-    Draw {
-        source_tag: String,
-        text: String,
-    },
-    BackendCheckFinished {
-        source: UpdateSource,
-        packages: Vec<Package>,
-        exit_code: i32,
-        log: String,
-        /// Soft failure: backend missing or non-fatal error; continue others.
-        soft_error: Option<String>,
-    },
-    /// All check backends finished (orchestrator complete).
-    CheckAllFinished {
-        packages: Vec<Package>,
-        soft_errors: Vec<String>,
-    },
-    ApplyProgress {
-        source: UpdateSource,
-        package_hint: Option<String>,
-        status_hint: Option<PackageStatus>,
-        progress: Option<f64>,
-        phase_label: String,
-        stage_current: Option<u32>,
-        stage_total: Option<u32>,
-    },
-    BackendApplyFinished {
-        source: UpdateSource,
-        exit_code: i32,
-        log: String,
-        needs_reboot: bool,
-    },
-    ApplyAllFinished {
-        exit_code: i32,
-        needs_reboot: bool,
-        failed_sources: Vec<UpdateSource>,
-    },
-    Failed {
-        message: String,
-        detail: String,
-    },
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct ConsoleBuffer {
     lines: Vec<String>,
@@ -382,10 +286,6 @@ impl ConsoleBuffer {
             let excess = self.lines.len() - self.max_lines;
             self.lines.drain(0..excess);
         }
-    }
-
-    pub fn push_tagged(&mut self, tag: &str, line: &str) {
-        self.push_committed_tagged(tag, line);
     }
 
     /// Carriage-return progress. Replaces the open line instead of appending.
@@ -474,10 +374,6 @@ impl Stopwatch {
     }
 }
 
-pub fn format_relative_now() -> String {
-    "just now".into()
-}
-
 pub fn count_by_source(packages: &[Package]) -> (usize, usize, usize) {
     let mut dnf = 0;
     let mut flatpak = 0;
@@ -546,7 +442,7 @@ pub fn total_download_bytes(packages: &[Package]) -> Option<u64> {
     let mut total = 0u64;
     let mut any = false;
     for p in packages {
-        if let Some(n) = p.size.as_deref().and_then(parse_size_bytes) {
+        if let Some(n) = p.size_bytes {
             total = total.saturating_add(n);
             any = true;
         }
@@ -568,39 +464,9 @@ pub fn source_summary_line(packages: &[Package]) -> String {
     }
 }
 
-/// Counts of known advisory kinds. `Unknown` is omitted so empty chips stay hidden.
-pub fn count_by_kind(packages: &[Package]) -> (usize, usize, usize) {
-    let mut security = 0;
-    let mut bugfix = 0;
-    let mut enhancement = 0;
-    for p in packages {
-        match p.kind {
-            AdvisoryKind::Security => security += 1,
-            AdvisoryKind::Bugfix => bugfix += 1,
-            AdvisoryKind::Enhancement => enhancement += 1,
-            AdvisoryKind::Unknown => {}
-        }
-    }
-    (security, bugfix, enhancement)
-}
-
-/// Check-page cursor. Chosen from which sources have finished, then matched
-/// to the status sentence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckStep {
-    /// Dnf is not in the checked list yet.
-    System,
-    /// Dnf is in. Flatpak user and Flatpak system are not both in.
-    Apps,
-    /// Both Flatpak sides are in. Firmware is not.
-    Firmware,
-    /// All three groups are in.
-    Done,
-}
-
 /// Check progress from finished backends. Three user-facing groups:
 /// System (DNF), Apps (both Flatpak scopes), Firmware.
-pub fn check_progress(checked: &[UpdateSource]) -> (CheckStep, f64, u32, &'static str) {
+pub fn check_progress(checked: &[UpdateSource]) -> (f64, u32, &'static str) {
     let sys = checked.contains(&UpdateSource::Dnf);
     let fp_user = checked.contains(&UpdateSource::FlatpakUser);
     let fp_sys = checked.contains(&UpdateSource::FlatpakSystem);
@@ -612,19 +478,13 @@ pub fn check_progress(checked: &[UpdateSource]) -> (CheckStep, f64, u32, &'stati
     // Keep the bar off empty so the view never looks frozen at 0%.
     let fraction = (backends as f64 / 4.0).clamp(0.05, 1.0);
 
-    let step = match (sys, apps, fw) {
-        (false, _, _) => CheckStep::System,
-        (true, false, _) => CheckStep::Apps,
-        (true, true, false) => CheckStep::Firmware,
-        (true, true, true) => CheckStep::Done,
+    let status = match (sys, apps, fw) {
+        (false, _, _) => "System in progress · Apps queued · Firmware queued",
+        (true, false, _) => "System done · Apps in progress · Firmware queued",
+        (true, true, false) => "System done · Apps done · Firmware in progress",
+        (true, true, true) => "System · Apps · Firmware done",
     };
-    let status = match step {
-        CheckStep::System => "System in progress · Apps queued · Firmware queued",
-        CheckStep::Apps => "System done · Apps in progress · Firmware queued",
-        CheckStep::Firmware => "System done · Apps done · Firmware in progress",
-        CheckStep::Done => "System · Apps · Firmware done",
-    };
-    (step, fraction, groups_done, status)
+    (fraction, groups_done, status)
 }
 
 /// HIG remaining-work text once progress is trustworthy.
@@ -668,93 +528,11 @@ pub fn finalize_source(packages: &mut [Package], source: UpdateSource, ok: bool)
         if p.status.is_done() {
             continue;
         }
-        if ok {
-            p.status = PackageStatus::Completed;
-            p.progress = 1.0;
+        p.status = if ok {
+            PackageStatus::Completed
         } else {
-            p.status = PackageStatus::Failed;
-        }
-    }
-}
-
-/// What one progress hint does to the package rows. Decided before any write.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ProgressEffect {
-    /// No row changes. Return None.
-    Ignore,
-    /// Unnamed Completed. First not-done row of this source becomes Completed.
-    CompleteFirstOpen { progress: f64 },
-    /// Named Downloading. Other Downloading rows of this source go back to Pending.
-    FocusDownloading { index: usize },
-    /// Named Installing. Other Installing rows of this source become Completed.
-    /// Other Downloading rows of this source go back to Pending.
-    FocusInstalling { index: usize },
-    /// Named hint with no status and no fraction. Return Some(index). Write nothing.
-    Touch { index: usize },
-    /// Named hint with no status, with a fraction. Status stays.
-    FractionOnly { index: usize, progress: f64 },
-    /// Named Completed, Failed, Skipped, or Pending.
-    SetStatus {
-        index: usize,
-        status: PackageStatus,
-        progress: Option<f64>,
-    },
-}
-
-fn clamp_unit(progress: f64) -> f64 {
-    progress.clamp(0.0, 1.0)
-}
-
-/// Choose the row effect from the current packages and the hint. Does not write.
-///
-/// The Running reducer coerces Downloading to Installing when the pass is
-/// already Apply, and it does that before `apply_progress_hint`. A Downloading
-/// hint that reaches this function is a download-pass hint.
-pub fn progress_effect(
-    packages: &[Package],
-    source: UpdateSource,
-    package_hint: Option<&str>,
-    status_hint: Option<PackageStatus>,
-    progress: Option<f64>,
-) -> ProgressEffect {
-    let hint = package_hint.map(str::trim).filter(|s| !s.is_empty());
-    let Some(hint) = hint else {
-        if status_hint != Some(PackageStatus::Completed) {
-            return ProgressEffect::Ignore;
-        }
-        if !packages
-            .iter()
-            .any(|p| p.source == source && !p.status.is_done())
-        {
-            return ProgressEffect::Ignore;
-        }
-        return ProgressEffect::CompleteFirstOpen {
-            progress: progress.map(clamp_unit).unwrap_or(1.0),
+            PackageStatus::Failed
         };
-    };
-    // Same RPM name can be i686 and x86_64. The first row may already be done
-    // from the other arch; keep looking so the twin still updates.
-    let Some(index) = packages
-        .iter()
-        .position(|p| p.source == source && !p.status.is_done() && p.matches_progress_name(hint))
-    else {
-        return ProgressEffect::Ignore;
-    };
-    match status_hint {
-        Some(PackageStatus::Downloading) => ProgressEffect::FocusDownloading { index },
-        Some(PackageStatus::Installing) => ProgressEffect::FocusInstalling { index },
-        None => match progress {
-            Some(progress) => ProgressEffect::FractionOnly {
-                index,
-                progress: clamp_unit(progress),
-            },
-            None => ProgressEffect::Touch { index },
-        },
-        Some(status) => ProgressEffect::SetStatus {
-            index,
-            status,
-            progress: progress.map(clamp_unit),
-        },
     }
 }
 
@@ -764,75 +542,58 @@ pub fn progress_effect(
 ///
 /// Download name-chasing does not complete packages (DNF names every RPM
 /// once per download, then again per install/verify). Installing name-switch
-/// completes the previous *installing* item only. A hint with no status only
-/// updates that package's fraction — it must not invent an install.
+/// completes the previous *installing* item only. A hint with no status leaves
+/// the package status untouched and returns `Some(index)`.
 /// Already-done packages are ignored so verify passes cannot resurrect them.
 pub fn apply_progress_hint(
     packages: &mut [Package],
     source: UpdateSource,
     package_hint: Option<&str>,
     status_hint: Option<PackageStatus>,
-    progress: Option<f64>,
 ) -> Option<usize> {
-    match progress_effect(packages, source, package_hint, status_hint, progress) {
-        ProgressEffect::Ignore => None,
-        ProgressEffect::CompleteFirstOpen { progress } => {
-            let idx = packages
-                .iter()
-                .position(|p| p.source == source && !p.status.is_done())?;
-            packages[idx].status = PackageStatus::Completed;
-            packages[idx].progress = progress;
-            Some(idx)
+    let Some(hint) = package_hint.map(str::trim).filter(|s| !s.is_empty()) else {
+        if status_hint != Some(PackageStatus::Completed) {
+            return None;
         }
-        ProgressEffect::FocusDownloading { index } => {
+        let idx = packages
+            .iter()
+            .position(|p| p.source == source && !p.status.is_done())?;
+        packages[idx].status = PackageStatus::Completed;
+        return Some(idx);
+    };
+    // Same RPM name can be i686 and x86_64. The first row may already be done
+    // from the other arch; keep looking so the twin still updates.
+    let index = packages
+        .iter()
+        .position(|p| p.source == source && !p.status.is_done() && p.matches_progress_name(hint))?;
+    match status_hint {
+        Some(PackageStatus::Downloading) => {
             for (i, p) in packages.iter_mut().enumerate() {
                 if i != index && p.source == source && p.status == PackageStatus::Downloading {
                     p.status = PackageStatus::Pending;
-                    p.progress = 0.0;
                 }
             }
             packages[index].status = PackageStatus::Downloading;
-            if let Some(pr) = progress {
-                packages[index].progress = clamp_unit(pr);
-            }
-            Some(index)
         }
-        ProgressEffect::FocusInstalling { index } => {
+        Some(PackageStatus::Installing) => {
             for (i, p) in packages.iter_mut().enumerate() {
                 if i == index || p.source != source {
                     continue;
                 }
                 if p.status == PackageStatus::Installing {
                     p.status = PackageStatus::Completed;
-                    p.progress = 1.0;
                 } else if p.status == PackageStatus::Downloading {
                     p.status = PackageStatus::Pending;
-                    p.progress = 0.0;
                 }
             }
             packages[index].status = PackageStatus::Installing;
-            if let Some(pr) = progress {
-                packages[index].progress = clamp_unit(pr);
-            }
-            Some(index)
         }
-        ProgressEffect::Touch { index } => Some(index),
-        ProgressEffect::FractionOnly { index, progress } => {
-            packages[index].progress = progress;
-            Some(index)
-        }
-        ProgressEffect::SetStatus {
-            index,
-            status,
-            progress: fraction,
-        } => {
+        None => {}
+        Some(status) => {
             packages[index].status = status;
-            if let Some(fraction) = fraction {
-                packages[index].progress = fraction;
-            }
-            Some(index)
         }
     }
+    Some(index)
 }
 
 /// Title for the sticky now-playing card: named package, else last hint, else phase.
@@ -950,7 +711,6 @@ pub fn quiet_ui(
     cache_note: Option<&str>,
     tool_alive: bool,
     watching_dnf: bool,
-    last_line: &str,
     daemon_running: bool,
 ) -> QuietUi {
     let cache = cache_note.filter(|s| !s.is_empty());
@@ -983,9 +743,6 @@ pub fn quiet_ui(
     } else {
         None
     };
-    // `last_line` stays in the signature. The stall banner does not quote it.
-    // The running page shows that line in the console bar instead.
-    let _ = last_line;
     let banner = if exited {
         Some("dnf has exited. Checking whether the packages were installed.".into())
     } else if stalled {
@@ -1069,32 +826,13 @@ mod tests {
     }
 
     #[test]
-    fn idle_chrome_updated() {
-        let checked_at = "just now";
-        let chrome = idle_chrome(&IdleScreen::Updated {
-            checked_at: checked_at.into(),
-        });
-        assert_up_to_date(&chrome, checked_at, "Last checked just now");
-    }
-
-    #[test]
-    fn count_by_kind_skips_unknown() {
-        let mut sec = Package::new_dnf("openssl", "x86_64", "1", "updates");
-        sec.kind = AdvisoryKind::Security;
-        let mut bug = Package::new_dnf("mesa", "x86_64", "1", "updates");
-        bug.kind = AdvisoryKind::Bugfix;
-        let unk = Package::new_dnf("foo", "x86_64", "1", "updates");
-        assert_eq!(count_by_kind(&[sec, bug, unk]), (1, 1, 0));
-    }
-
-    #[test]
     fn check_progress_groups_flatpak() {
-        let (_step, frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
+        let (frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
         assert!(frac > 0.0 && frac < 1.0);
         assert_eq!(groups, 1);
         assert!(status.contains("Apps in progress"));
 
-        let (_, _, groups, status) = check_progress(&[
+        let (_, groups, status) = check_progress(&[
             UpdateSource::Dnf,
             UpdateSource::FlatpakUser,
             UpdateSource::FlatpakSystem,
@@ -1105,49 +843,43 @@ mod tests {
 
     #[test]
     fn check_step_names_the_cursor() {
-        let (step, frac, groups, status) = check_progress(&[]);
-        assert_eq!(step, CheckStep::System);
+        let (frac, groups, status) = check_progress(&[]);
         assert!((frac - 0.05).abs() < 1e-9);
         assert_eq!(groups, 0);
         assert_eq!(status, "System in progress · Apps queued · Firmware queued");
 
-        let (step, frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
-        assert_eq!(step, CheckStep::Apps);
+        let (frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
         assert!((frac - 0.25).abs() < 1e-9);
         assert_eq!(groups, 1);
         assert_eq!(status, "System done · Apps in progress · Firmware queued");
 
-        let (step, frac, groups, status) =
+        let (frac, groups, status) =
             check_progress(&[UpdateSource::Dnf, UpdateSource::FlatpakUser]);
-        assert_eq!(step, CheckStep::Apps);
         assert!((frac - 0.5).abs() < 1e-9);
         assert_eq!(groups, 1);
         assert_eq!(status, "System done · Apps in progress · Firmware queued");
 
-        let (step, frac, groups, status) = check_progress(&[
+        let (frac, groups, status) = check_progress(&[
             UpdateSource::Dnf,
             UpdateSource::FlatpakUser,
             UpdateSource::FlatpakSystem,
         ]);
-        assert_eq!(step, CheckStep::Firmware);
         assert!((frac - 0.75).abs() < 1e-9);
         assert_eq!(groups, 2);
         assert_eq!(status, "System done · Apps done · Firmware in progress");
 
-        let (step, frac, groups, status) = check_progress(&[
+        let (frac, groups, status) = check_progress(&[
             UpdateSource::Dnf,
             UpdateSource::FlatpakUser,
             UpdateSource::FlatpakSystem,
             UpdateSource::Firmware,
         ]);
-        assert_eq!(step, CheckStep::Done);
         assert!((frac - 1.0).abs() < 1e-9);
         assert_eq!(groups, 3);
         assert_eq!(status, "System · Apps · Firmware done");
 
-        let (step, frac, groups, status) =
+        let (frac, groups, status) =
             check_progress(&[UpdateSource::Dnf, UpdateSource::Firmware]);
-        assert_eq!(step, CheckStep::Apps);
         assert!((frac - 0.5).abs() < 1e-9);
         assert_eq!(groups, 2);
         assert_eq!(status, "System done · Apps in progress · Firmware queued");
@@ -1177,11 +909,9 @@ mod tests {
             arch: "x86_64".into(),
             version: "1".into(),
             repo: "flathub".into(),
-            size: None,
+            size_bytes: None,
             old_version: None,
             status: PackageStatus::Pending,
-            progress: 0.0,
-            kind: AdvisoryKind::Unknown,
             source: UpdateSource::FlatpakUser,
             detail: String::new(),
         };
@@ -1196,17 +926,19 @@ mod tests {
             Package::new_dnf("abrt", "x86_64", "1", "updates"),
             Package::new_dnf("kernel", "x86_64", "1", "updates"),
         ];
-        assert!(apply_progress_hint(
-            &mut pkgs,
-            UpdateSource::Dnf,
-            None,
+        let untouched = pkgs.clone();
+        for status in [
+            Some(PackageStatus::Pending),
+            Some(PackageStatus::Downloading),
             Some(PackageStatus::Installing),
-            Some(0.4),
-        )
-        .is_none());
-        assert!(pkgs
-            .iter()
-            .all(|p| p.status == PackageStatus::Pending && p.progress == 0.0));
+            Some(PackageStatus::Failed),
+            None,
+        ] {
+            for hint in [None, Some(""), Some("   ")] {
+                assert!(apply_progress_hint(&mut pkgs, UpdateSource::Dnf, hint, status).is_none());
+            }
+        }
+        assert_eq!(pkgs, untouched);
     }
 
     fn firmware_pkg(name: &str) -> Package {
@@ -1216,30 +948,38 @@ mod tests {
             arch: String::new(),
             version: "1".into(),
             repo: "LVFS".into(),
-            size: None,
+            size_bytes: None,
             old_version: None,
             status: PackageStatus::Pending,
-            progress: 0.0,
-            kind: AdvisoryKind::Security,
             source: UpdateSource::Firmware,
             detail: String::new(),
         }
     }
 
     #[test]
-    fn unnamed_completed_hint_finishes_current_firmware_item() {
-        let mut pkgs = vec![firmware_pkg("System Firmware"), firmware_pkg("UEFI CA")];
+    fn unnamed_completed_hint_finishes_first_open_row_for_source() {
+        let dnf = Package::new_dnf("firefox", "x86_64", "1", "updates");
+        let mut pkgs = vec![dnf, firmware_pkg("System Firmware"), firmware_pkg("UEFI CA")];
+        pkgs[1].status = PackageStatus::Failed;
+
         let idx = apply_progress_hint(
             &mut pkgs,
             UpdateSource::Firmware,
             None,
             Some(PackageStatus::Completed),
-            Some(1.0),
         );
-        assert_eq!(idx, Some(0));
-        assert_eq!(pkgs[0].status, PackageStatus::Completed);
-        assert_eq!(pkgs[0].progress, 1.0);
-        assert_eq!(pkgs[1].status, PackageStatus::Pending);
+        assert_eq!(idx, Some(2));
+        assert_eq!(pkgs[0].status, PackageStatus::Pending);
+        assert_eq!(pkgs[1].status, PackageStatus::Failed);
+        assert_eq!(pkgs[2].status, PackageStatus::Completed);
+
+        assert!(apply_progress_hint(
+            &mut pkgs,
+            UpdateSource::Firmware,
+            Some("   "),
+            Some(PackageStatus::Completed),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1276,18 +1016,15 @@ mod tests {
             Package::new_dnf("mesa-dri-drivers", "x86_64", "1", "updates"),
         ];
         pkgs[0].status = PackageStatus::Completed;
-        pkgs[0].progress = 1.0;
         let idx = apply_progress_hint(
             &mut pkgs,
             UpdateSource::Dnf,
             Some("mesa-dri-drivers"),
             Some(PackageStatus::Installing),
-            Some(0.4),
         );
         assert_eq!(idx, Some(1));
         assert_eq!(pkgs[0].status, PackageStatus::Completed);
         assert_eq!(pkgs[1].status, PackageStatus::Installing);
-        assert!((pkgs[1].progress - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1307,14 +1044,14 @@ mod tests {
 
     #[test]
     fn quiet_download_hides_eta_and_names_a_growing_cache_file() {
-        let fresh = quiet_ui(2, false, None, true, true, "", false);
+        let fresh = quiet_ui(2, false, None, true, true, false);
         assert_eq!(fresh.mode, QuietMode::Flowing);
         assert!(fresh.show_eta);
         assert!(!fresh.show_spinner);
         assert!(fresh.banner.is_none());
         assert!(!fresh.reconcile);
 
-        let stuck_full = quiet_ui(8, true, None, true, true, "[25/26] tzdata-java 100%", false);
+        let stuck_full = quiet_ui(8, true, None, true, true, false);
         assert_eq!(stuck_full.mode, QuietMode::ItemAtFull);
         assert!(stuck_full.show_spinner);
         assert!(stuck_full.show_eta);
@@ -1325,7 +1062,6 @@ mod tests {
             Some("Downloading grok-bot — 85 MB and rising"),
             true,
             true,
-            "[25/26] tzdata-java 100%",
             false,
         );
         assert_eq!(growing.mode, QuietMode::CacheGrowing);
@@ -1338,32 +1074,15 @@ mod tests {
         assert!(growing.banner.is_none());
         assert!(!growing.reconcile);
 
-        let stalled = quiet_ui(
-            180,
-            true,
-            None,
-            true,
-            true,
-            "[25/26] tzdata-java 100%",
-            false,
-        );
+        let stalled = quiet_ui(180, true, None, true, true, false);
         assert_eq!(stalled.mode, QuietMode::Stalled);
         assert!(!stalled.show_eta);
         let stalled_banner = stalled.banner.expect("stalled banner");
         assert_eq!(stalled_banner, "No output for 3 minutes.");
-        assert!(!stalled_banner.contains("tzdata-java"));
         assert!(!stalled_banner.contains("Last line:"));
         assert!(!stalled.reconcile);
 
-        let exited = quiet_ui(
-            25,
-            true,
-            None,
-            false,
-            true,
-            "[25/26] tzdata-java 100%",
-            false,
-        );
+        let exited = quiet_ui(25, true, None, false, true, false);
         assert_eq!(exited.mode, QuietMode::Exited);
         assert!(exited.reconcile);
         assert!(exited.banner.unwrap().contains("Checking whether"));
@@ -1374,7 +1093,6 @@ mod tests {
             Some("Downloading grok-bot — 85 MB and rising"),
             false,
             true,
-            "[25/26] tzdata-java 100%",
             false,
         );
         assert_eq!(overlap.mode, QuietMode::Exited);
@@ -1388,22 +1106,14 @@ mod tests {
             Some("dnf has exited. Checking whether the packages were installed.")
         );
 
-        let flatpak = quiet_ui(30, false, None, false, false, "", false);
+        let flatpak = quiet_ui(30, false, None, false, false, false);
         assert_eq!(flatpak.mode, QuietMode::Flowing);
         assert!(!flatpak.reconcile);
     }
 
     #[test]
     fn stalled_banner_names_the_daemon_only_when_asked() {
-        let on = quiet_ui(
-            180,
-            true,
-            None,
-            true,
-            true,
-            "[25/26] tzdata-java 100%",
-            true,
-        );
+        let on = quiet_ui(180, true, None, true, true, true);
         let on_banner = on.banner.expect("stalled banner");
         assert_eq!(
             on_banner,
@@ -1415,17 +1125,8 @@ mod tests {
         );
         assert!(!on_banner.contains("dnf daemon"), "{on_banner}");
         assert!(!on_banner.contains("Last line:"), "{on_banner}");
-        assert!(!on_banner.contains("tzdata-java"), "{on_banner}");
 
-        let off = quiet_ui(
-            180,
-            true,
-            None,
-            true,
-            true,
-            "[25/26] tzdata-java 100%",
-            false,
-        );
+        let off = quiet_ui(180, true, None, true, true, false);
         let off_banner = off.banner.expect("stalled banner");
         assert_eq!(off_banner, "No output for 3 minutes.");
         assert!(
@@ -1434,12 +1135,11 @@ mod tests {
         );
         assert!(!off_banner.contains("dnf daemon"), "{off_banner}");
         assert!(!off_banner.contains("Last line:"), "{off_banner}");
-        assert!(!off_banner.contains("tzdata-java"), "{off_banner}");
     }
 
     #[test]
     fn absent_helper_does_not_look_like_exited() {
-        let quiet = quiet_ui(25, true, None, true, true, "", false);
+        let quiet = quiet_ui(25, true, None, true, true, false);
         assert!(!quiet.reconcile);
     }
 
@@ -1466,21 +1166,19 @@ mod tests {
             UpdateSource::Dnf,
             Some("firefox"),
             Some(PackageStatus::Installing),
-            Some(0.2),
         );
         apply_progress_hint(
             &mut pkgs,
             UpdateSource::Dnf,
             Some("kernel"),
             Some(PackageStatus::Installing),
-            Some(0.1),
         );
         assert_eq!(pkgs[0].status, PackageStatus::Completed);
         assert_eq!(pkgs[1].status, PackageStatus::Installing);
     }
 
     #[test]
-    fn progress_only_hint_does_not_complete_previous() {
+    fn statusless_hint_returns_index_without_changing_rows() {
         let mut pkgs = vec![
             Package::new_dnf("firefox", "x86_64", "1", "updates"),
             Package::new_dnf("kernel", "x86_64", "1", "updates"),
@@ -1490,42 +1188,73 @@ mod tests {
             UpdateSource::Dnf,
             Some("firefox"),
             Some(PackageStatus::Installing),
-            Some(0.2),
         );
-        apply_progress_hint(
-            &mut pkgs,
-            UpdateSource::Dnf,
-            Some("kernel"),
-            None,
-            Some(0.4),
-        );
+        let idx = apply_progress_hint(&mut pkgs, UpdateSource::Dnf, Some("kernel"), None);
+        assert_eq!(idx, Some(1));
         assert_eq!(pkgs[0].status, PackageStatus::Installing);
         assert_eq!(pkgs[1].status, PackageStatus::Pending);
-        assert!((pkgs[1].progress - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn download_name_switch_does_not_complete_previous() {
+    fn download_and_install_hints_isolate_sources_and_reset_siblings() {
+        let mut flatpak = Package::new_dnf("Thunderbird", "", "128", "flathub");
+        flatpak.source = UpdateSource::FlatpakUser;
+        flatpak.status = PackageStatus::Downloading;
+
         let mut pkgs = vec![
             Package::new_dnf("firefox", "x86_64", "1", "updates"),
+            Package::new_dnf("wget", "x86_64", "1", "updates"),
             Package::new_dnf("kernel", "x86_64", "1", "updates"),
+            flatpak,
         ];
-        apply_progress_hint(
-            &mut pkgs,
-            UpdateSource::Dnf,
-            Some("firefox"),
-            Some(PackageStatus::Downloading),
-            Some(0.2),
+        assert_eq!(
+            apply_progress_hint(
+                &mut pkgs,
+                UpdateSource::Dnf,
+                Some("firefox"),
+                Some(PackageStatus::Downloading),
+            ),
+            Some(0)
         );
-        apply_progress_hint(
-            &mut pkgs,
-            UpdateSource::Dnf,
-            Some("kernel"),
-            Some(PackageStatus::Downloading),
-            Some(0.4),
+        assert_eq!(pkgs[0].status, PackageStatus::Downloading);
+        assert_eq!(pkgs[3].status, PackageStatus::Downloading);
+
+        assert_eq!(
+            apply_progress_hint(
+                &mut pkgs,
+                UpdateSource::Dnf,
+                Some("wget"),
+                Some(PackageStatus::Downloading),
+            ),
+            Some(1)
         );
         assert_eq!(pkgs[0].status, PackageStatus::Pending);
         assert_eq!(pkgs[1].status, PackageStatus::Downloading);
+        assert_eq!(pkgs[3].status, PackageStatus::Downloading);
+
+        assert_eq!(
+            apply_progress_hint(
+                &mut pkgs,
+                UpdateSource::Dnf,
+                Some("firefox"),
+                Some(PackageStatus::Installing),
+            ),
+            Some(0)
+        );
+        assert_eq!(pkgs[0].status, PackageStatus::Installing);
+        assert_eq!(pkgs[1].status, PackageStatus::Pending);
+        assert_eq!(pkgs[3].status, PackageStatus::Downloading);
+
+        assert_eq!(
+            apply_progress_hint(
+                &mut pkgs,
+                UpdateSource::Dnf,
+                Some("kernel"),
+                Some(PackageStatus::Failed),
+            ),
+            Some(2)
+        );
+        assert_eq!(pkgs[2].status, PackageStatus::Failed);
     }
 
     #[test]
@@ -1535,13 +1264,11 @@ mod tests {
             Package::new_dnf("kernel", "x86_64", "1", "updates"),
         ];
         pkgs[0].status = PackageStatus::Completed;
-        pkgs[0].progress = 1.0;
         assert!(apply_progress_hint(
             &mut pkgs,
             UpdateSource::Dnf,
             Some("firefox"),
             Some(PackageStatus::Installing),
-            Some(0.9),
         )
         .is_none());
         assert_eq!(pkgs[0].status, PackageStatus::Completed);
@@ -1549,488 +1276,14 @@ mod tests {
     }
 
     #[test]
-    fn progress_effect_table_covers_each_row() {
-        let dnf = |name: &str| Package::new_dnf(name, "x86_64", "1", "updates");
-        let flatpak_downloading = |name: &str, progress: f64| {
-            let mut pkg = dnf(name);
-            pkg.source = UpdateSource::FlatpakUser;
-            pkg.status = PackageStatus::Downloading;
-            pkg.progress = progress;
-            pkg
-        };
-
-        // Empty name, anything except Completed: Ignore, and no row changes.
-        let mut open = vec![dnf("firefox"), dnf("kernel")];
-        let untouched = open.clone();
-        for status in [
-            Some(PackageStatus::Pending),
-            Some(PackageStatus::Downloading),
-            Some(PackageStatus::Installing),
-            Some(PackageStatus::Failed),
-            Some(PackageStatus::Skipped),
-            None,
-        ] {
-            for hint in [None, Some(""), Some("   ")] {
-                assert_eq!(
-                    progress_effect(&open, UpdateSource::Dnf, hint, status, Some(0.4)),
-                    ProgressEffect::Ignore,
-                );
-                assert!(
-                    apply_progress_hint(&mut open, UpdateSource::Dnf, hint, status, Some(0.4),)
-                        .is_none()
-                );
-            }
-        }
-        assert_eq!(open, untouched);
-
-        // Empty Completed: first not-done row of that source. Clamp, or 1.0.
-        let mut mixed = vec![dnf("firefox"), firmware_pkg("System Firmware")];
-        mixed[1].status = PackageStatus::Failed;
-        mixed.push(firmware_pkg("UEFI CA"));
-        assert_eq!(
-            progress_effect(
-                &mixed,
-                UpdateSource::Firmware,
-                None,
-                Some(PackageStatus::Completed),
-                Some(1.5),
-            ),
-            ProgressEffect::CompleteFirstOpen { progress: 1.0 },
-        );
-        assert_eq!(
-            progress_effect(
-                &mixed,
-                UpdateSource::Firmware,
-                Some("  "),
-                Some(PackageStatus::Completed),
-                Some(-0.2),
-            ),
-            ProgressEffect::CompleteFirstOpen { progress: 0.0 },
-        );
-        assert_eq!(
-            progress_effect(
-                &mixed,
-                UpdateSource::Firmware,
-                None,
-                Some(PackageStatus::Completed),
-                None,
-            ),
-            ProgressEffect::CompleteFirstOpen { progress: 1.0 },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut mixed,
-                UpdateSource::Firmware,
-                None,
-                Some(PackageStatus::Completed),
-                Some(0.25),
-            ),
-            Some(2),
-        );
-        assert_eq!(mixed[0].status, PackageStatus::Pending);
-        assert_eq!(mixed[1].status, PackageStatus::Failed);
-        assert_eq!(mixed[2].status, PackageStatus::Completed);
-        assert!((mixed[2].progress - 0.25).abs() < f64::EPSILON);
-
-        let mut all_done = vec![dnf("firefox")];
-        all_done[0].status = PackageStatus::Completed;
-        all_done[0].progress = 1.0;
-        let done_snap = all_done.clone();
-        assert_eq!(
-            progress_effect(
-                &all_done,
-                UpdateSource::Dnf,
-                None,
-                Some(PackageStatus::Completed),
-                Some(1.0),
-            ),
-            ProgressEffect::Ignore,
-        );
-        assert!(apply_progress_hint(
-            &mut all_done,
-            UpdateSource::Dnf,
-            None,
-            Some(PackageStatus::Completed),
-            Some(1.0),
-        )
-        .is_none());
-        assert_eq!(all_done, done_snap);
-
-        // Named hint with no open target leaves every row alone.
-        let mut no_target = vec![dnf("firefox"), dnf("kernel-core")];
-        no_target[0].status = PackageStatus::Completed;
-        no_target[0].progress = 1.0;
-        let no_target_snap = no_target.clone();
-        for hint in ["firefox", "kernel", "not-a-package"] {
-            assert_eq!(
-                progress_effect(
-                    &no_target,
-                    UpdateSource::Dnf,
-                    Some(hint),
-                    Some(PackageStatus::Installing),
-                    Some(0.9),
-                ),
-                ProgressEffect::Ignore,
-            );
-            assert!(apply_progress_hint(
-                &mut no_target,
-                UpdateSource::Dnf,
-                Some(hint),
-                Some(PackageStatus::Installing),
-                Some(0.9),
-            )
-            .is_none());
-        }
-        assert_eq!(no_target, no_target_snap);
-
-        // The second arch is the target once the first copy is done.
-        let mut arches = vec![
-            Package::new_dnf("mesa-dri-drivers", "i686", "1", "updates"),
-            Package::new_dnf("mesa-dri-drivers", "x86_64", "1", "updates"),
-        ];
-        arches[0].status = PackageStatus::Completed;
-        arches[0].progress = 1.0;
-        assert_eq!(
-            progress_effect(
-                &arches,
-                UpdateSource::Dnf,
-                Some("mesa-dri-drivers"),
-                Some(PackageStatus::Installing),
-                Some(0.4),
-            ),
-            ProgressEffect::FocusInstalling { index: 1 },
-        );
-
-        // Download name switch is FocusDownloading. The previous row goes
-        // Pending, and another source's Downloading row stays.
-        let mut downloads = vec![
-            dnf("firefox"),
-            dnf("kernel"),
-            flatpak_downloading("Thunderbird", 0.8),
-        ];
-        assert_eq!(
-            progress_effect(
-                &downloads,
-                UpdateSource::Dnf,
-                Some("firefox"),
-                Some(PackageStatus::Downloading),
-                Some(0.2),
-            ),
-            ProgressEffect::FocusDownloading { index: 0 },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut downloads,
-                UpdateSource::Dnf,
-                Some("firefox"),
-                Some(PackageStatus::Downloading),
-                Some(0.2),
-            ),
-            Some(0),
-        );
-        assert_eq!(downloads[0].status, PackageStatus::Downloading);
-        assert!((downloads[0].progress - 0.2).abs() < f64::EPSILON);
-        assert_eq!(downloads[2].status, PackageStatus::Downloading);
-        assert!((downloads[2].progress - 0.8).abs() < f64::EPSILON);
-
-        assert_eq!(
-            progress_effect(
-                &downloads,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Downloading),
-                Some(0.4),
-            ),
-            ProgressEffect::FocusDownloading { index: 1 },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut downloads,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Downloading),
-                Some(0.4),
-            ),
-            Some(1),
-        );
-        assert_eq!(downloads[0].status, PackageStatus::Pending);
-        assert_eq!(downloads[0].progress, 0.0);
-        assert_eq!(downloads[1].status, PackageStatus::Downloading);
-        assert!((downloads[1].progress - 0.4).abs() < f64::EPSILON);
-        assert_eq!(downloads[2].status, PackageStatus::Downloading);
-        assert!((downloads[2].progress - 0.8).abs() < f64::EPSILON);
-
-        // A Downloading hint with no fraction still leaves the target Downloading.
-        let mut bare = vec![dnf("firefox")];
-        bare[0].progress = 0.33;
-        assert_eq!(
-            progress_effect(
-                &bare,
-                UpdateSource::Dnf,
-                Some("firefox"),
-                Some(PackageStatus::Downloading),
-                None,
-            ),
-            ProgressEffect::FocusDownloading { index: 0 },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut bare,
-                UpdateSource::Dnf,
-                Some("firefox"),
-                Some(PackageStatus::Downloading),
-                None,
-            ),
-            Some(0),
-        );
-        assert_eq!(bare[0].status, PackageStatus::Downloading);
-        assert!((bare[0].progress - 0.33).abs() < f64::EPSILON);
-
-        // Install name switch is FocusInstalling. Same-source Downloading
-        // siblings reset; another source's Downloading row stays.
-        let mut installs = vec![
-            dnf("firefox"),
-            dnf("wget"),
-            dnf("kernel"),
-            flatpak_downloading("App", 0.3),
-        ];
-        installs[1].status = PackageStatus::Downloading;
-        installs[1].progress = 0.7;
-        assert_eq!(
-            progress_effect(
-                &installs,
-                UpdateSource::Dnf,
-                Some("firefox"),
-                Some(PackageStatus::Installing),
-                Some(0.2),
-            ),
-            ProgressEffect::FocusInstalling { index: 0 },
-        );
-        apply_progress_hint(
-            &mut installs,
-            UpdateSource::Dnf,
-            Some("firefox"),
-            Some(PackageStatus::Installing),
-            Some(0.2),
-        );
-        installs[1].status = PackageStatus::Downloading;
-        installs[1].progress = 0.7;
-        assert_eq!(
-            progress_effect(
-                &installs,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Installing),
-                Some(0.1),
-            ),
-            ProgressEffect::FocusInstalling { index: 2 },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut installs,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Installing),
-                Some(0.1),
-            ),
-            Some(2),
-        );
-        assert_eq!(installs[0].status, PackageStatus::Completed);
-        assert_eq!(installs[0].progress, 1.0);
-        assert_eq!(installs[1].status, PackageStatus::Pending);
-        assert_eq!(installs[1].progress, 0.0);
-        assert_eq!(installs[2].status, PackageStatus::Installing);
-        assert!((installs[2].progress - 0.1).abs() < f64::EPSILON);
-        assert_eq!(installs[3].status, PackageStatus::Downloading);
-        assert!((installs[3].progress - 0.3).abs() < f64::EPSILON);
-
-        // Status-less fraction keeps status, including a previous Installing row.
-        let mut fractions = vec![dnf("firefox"), dnf("kernel")];
-        apply_progress_hint(
-            &mut fractions,
-            UpdateSource::Dnf,
-            Some("firefox"),
-            Some(PackageStatus::Installing),
-            Some(0.2),
-        );
-        assert_eq!(
-            progress_effect(
-                &fractions,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                None,
-                Some(1.4),
-            ),
-            ProgressEffect::FractionOnly {
-                index: 1,
-                progress: 1.0,
-            },
-        );
-        assert_eq!(
-            progress_effect(
-                &fractions,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                None,
-                Some(0.4),
-            ),
-            ProgressEffect::FractionOnly {
-                index: 1,
-                progress: 0.4,
-            },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut fractions,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                None,
-                Some(0.4),
-            ),
-            Some(1),
-        );
-        assert_eq!(fractions[0].status, PackageStatus::Installing);
-        assert!((fractions[0].progress - 0.2).abs() < f64::EPSILON);
-        assert_eq!(fractions[1].status, PackageStatus::Pending);
-        assert!((fractions[1].progress - 0.4).abs() < f64::EPSILON);
-
-        // Status-less hint with no fraction writes nothing.
-        let touch_snap = fractions.clone();
-        assert_eq!(
-            progress_effect(&fractions, UpdateSource::Dnf, Some("kernel"), None, None),
-            ProgressEffect::Touch { index: 1 },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut fractions,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                None,
-                None
-            ),
-            Some(1),
-        );
-        assert_eq!(fractions, touch_snap);
-
-        // Named Completed, Failed, Skipped, and Pending are SetStatus.
-        let mut named = vec![dnf("firefox"), dnf("kernel")];
-        named[0].status = PackageStatus::Installing;
-        named[0].progress = 0.2;
-        named[1].progress = 0.55;
-        assert_eq!(
-            progress_effect(
-                &named,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Failed),
-                Some(0.2),
-            ),
-            ProgressEffect::SetStatus {
-                index: 1,
-                status: PackageStatus::Failed,
-                progress: Some(0.2),
-            },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut named,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Failed),
-                Some(0.2),
-            ),
-            Some(1),
-        );
-        assert_eq!(named[0].status, PackageStatus::Installing);
-        assert_eq!(named[1].status, PackageStatus::Failed);
-        assert!((named[1].progress - 0.2).abs() < f64::EPSILON);
-
-        assert_eq!(
-            progress_effect(
-                &named,
-                UpdateSource::Dnf,
-                Some("firefox"),
-                Some(PackageStatus::Completed),
-                Some(1.0),
-            ),
-            ProgressEffect::SetStatus {
-                index: 0,
-                status: PackageStatus::Completed,
-                progress: Some(1.0),
-            },
-        );
-        apply_progress_hint(
-            &mut named,
-            UpdateSource::Dnf,
-            Some("firefox"),
-            Some(PackageStatus::Completed),
-            Some(1.0),
-        );
-        assert_eq!(named[0].status, PackageStatus::Completed);
-        assert_eq!(named[0].progress, 1.0);
-
-        let mut skipped = vec![dnf("kernel")];
-        skipped[0].progress = 0.55;
-        assert_eq!(
-            progress_effect(
-                &skipped,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Skipped),
-                None,
-            ),
-            ProgressEffect::SetStatus {
-                index: 0,
-                status: PackageStatus::Skipped,
-                progress: None,
-            },
-        );
-        assert_eq!(
-            apply_progress_hint(
-                &mut skipped,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Skipped),
-                None,
-            ),
-            Some(0),
-        );
-        assert_eq!(skipped[0].status, PackageStatus::Skipped);
-        assert!((skipped[0].progress - 0.55).abs() < f64::EPSILON);
-
-        skipped[0].status = PackageStatus::Pending;
-        assert_eq!(
-            progress_effect(
-                &skipped,
-                UpdateSource::Dnf,
-                Some("kernel"),
-                Some(PackageStatus::Pending),
-                Some(-0.4),
-            ),
-            ProgressEffect::SetStatus {
-                index: 0,
-                status: PackageStatus::Pending,
-                progress: Some(0.0),
-            },
-        );
-        apply_progress_hint(
-            &mut skipped,
-            UpdateSource::Dnf,
-            Some("kernel"),
-            Some(PackageStatus::Pending),
-            Some(-0.4),
-        );
-        assert_eq!(skipped[0].status, PackageStatus::Pending);
-        assert_eq!(skipped[0].progress, 0.0);
-    }
-
-    #[test]
     fn source_summary_line_appends_rolled_up_download_size() {
         let mut kernel = Package::new_dnf("kernel-core", "x86_64", "1", "updates");
-        kernel.size = Some("21727761".into());
+        kernel.size_bytes = Some(21_727_761);
+        assert_eq!(kernel.size_label().as_deref(), Some("21 MB"));
         let mut fp = Package::new_dnf("Thunderbird", "", "128", "flathub");
         fp.source = UpdateSource::FlatpakUser;
-        fp.size = Some("164.0 MB".into());
+        fp.size_bytes = Some(164 * 1024 * 1024);
+        assert_eq!(fp.size_label().as_deref(), Some("164 MB"));
         let line = source_summary_line(&[kernel, fp]);
         assert!(
             line.starts_with("1 system · 1 apps · 0 firmware · "),
@@ -2045,6 +1298,7 @@ mod tests {
     #[test]
     fn source_summary_line_omits_size_when_unknown() {
         let pkg = Package::new_dnf("firefox", "x86_64", "1", "updates");
+        assert_eq!(total_download_bytes(std::slice::from_ref(&pkg)), None);
         assert_eq!(
             source_summary_line(&[pkg]),
             "1 system · 0 apps · 0 firmware"

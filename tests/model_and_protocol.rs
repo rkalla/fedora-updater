@@ -17,11 +17,9 @@ fn apply_order_is_dnf_flatpak_firmware() {
             arch: String::new(),
             version: "1".into(),
             repo: "LVFS".into(),
-            size: None,
+            size_bytes: None,
             old_version: None,
             status: PackageStatus::Pending,
-            progress: 0.0,
-            kind: fedora_updater::AdvisoryKind::Security,
             source: UpdateSource::Firmware,
             detail: String::new(),
         },
@@ -32,11 +30,9 @@ fn apply_order_is_dnf_flatpak_firmware() {
             arch: String::new(),
             version: "1".into(),
             repo: "flathub".into(),
-            size: None,
+            size_bytes: None,
             old_version: None,
             status: PackageStatus::Pending,
-            progress: 0.0,
-            kind: fedora_updater::AdvisoryKind::Unknown,
             source: UpdateSource::FlatpakUser,
             detail: String::new(),
         },
@@ -68,7 +64,6 @@ fn finalize_and_progress_helpers() {
         UpdateSource::Dnf,
         Some("a"),
         Some(PackageStatus::Installing),
-        Some(0.4),
     );
     assert_eq!(pkgs[0].status, PackageStatus::Installing);
     finalize_source(&mut pkgs, UpdateSource::Dnf, true);

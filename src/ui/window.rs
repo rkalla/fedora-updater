@@ -21,11 +21,11 @@ use fedora_updater::model::{
     about_time_left, cache_activity_note, check_progress, count_by_source, idle_chrome,
     now_playing_subtitle, now_playing_title, quiet_ui, run_heading, running_progress_captions,
     source_summary_line, AuthPurpose, IdleScreen, Package, RetryAction, RunPass, StageCount,
-    UpdateSource, WorkerEvent,
+    UpdateSource,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
-    run_systemctl_reboot, session_started_event, worker_to_state_events,
+    run_systemctl_reboot, session_started_event, WorkerMsg,
 };
 use fedora_updater::privilege::{
     dnf_daemon_is_running, helper_activity, kill_recorded_helper, run_local_command, HelperActivity,
@@ -381,7 +381,7 @@ pub fn build(app: &Application) {
         });
     }
 
-    let (tx, rx) = async_channel::unbounded::<WorkerEvent>();
+    let (tx, rx) = async_channel::unbounded::<WorkerMsg>();
 
     {
         let state = state.clone();
@@ -470,13 +470,7 @@ pub fn build(app: &Application) {
         let state = state.clone();
         let widgets = widgets.clone();
         done_btn.connect_clicked(move |_| {
-            dispatch(
-                &state,
-                &widgets,
-                Event::ResetToIdle {
-                    message: Some("System updated".into()),
-                },
-            );
+            dispatch(&state, &widgets, Event::ResetToIdle);
         });
     }
     {
@@ -575,7 +569,7 @@ pub fn build(app: &Application) {
 fn start_check(
     state: &Rc<RefCell<AppState>>,
     widgets: &Rc<Widgets>,
-    tx: async_channel::Sender<WorkerEvent>,
+    tx: async_channel::Sender<WorkerMsg>,
     then_apply: bool,
 ) {
     dispatch(state, widgets, Event::StartCheck { then_apply });
@@ -588,7 +582,7 @@ fn start_check(
 fn begin_apply(
     state: &Rc<RefCell<AppState>>,
     widgets: &Rc<Widgets>,
-    tx: async_channel::Sender<WorkerEvent>,
+    tx: async_channel::Sender<WorkerMsg>,
 ) {
     widgets.last_output.set(None);
     *widgets.cache_cursor.borrow_mut() = None;
@@ -610,7 +604,7 @@ fn can_start_apply(state: &AppState) -> bool {
 fn prompt_stale_update_list(
     widgets: &Rc<Widgets>,
     state: &Rc<RefCell<AppState>>,
-    tx: async_channel::Sender<WorkerEvent>,
+    tx: async_channel::Sender<WorkerMsg>,
 ) {
     let copy = stale_update_dialog();
     let dialog = build_dialog(&copy);
@@ -722,19 +716,11 @@ fn commit_session_started(state: &Rc<RefCell<AppState>>) -> Result<bool, state::
 fn handle_worker(
     state: &Rc<RefCell<AppState>>,
     widgets: &Rc<Widgets>,
-    tx: &async_channel::Sender<WorkerEvent>,
-    ev: WorkerEvent,
+    tx: &async_channel::Sender<WorkerMsg>,
+    msg: WorkerMsg,
 ) {
-    let check_finished = matches!(ev, WorkerEvent::CheckAllFinished { .. });
-    if matches!(
-        ev,
-        WorkerEvent::Line { .. } | WorkerEvent::Draw { .. } | WorkerEvent::ApplyProgress { .. }
-    ) {
-        widgets.last_output.set(Some(Instant::now()));
-    }
-
-    match &ev {
-        WorkerEvent::SessionStarted => {
+    let ev = match msg {
+        WorkerMsg::SessionStarted => {
             match commit_session_started(state) {
                 Ok(true) => render(state, widgets),
                 Ok(false) => {}
@@ -742,29 +728,34 @@ fn handle_worker(
             }
             return;
         }
-        WorkerEvent::Line { .. } | WorkerEvent::Draw { .. } => {
-            for e in worker_to_state_events(ev) {
-                let current = state.borrow().clone();
-                if let Ok(next) = state::reduce(current, e) {
-                    *state.borrow_mut() = next;
-                }
-            }
-            let s = state.borrow();
-            let last = s.console.last_line().to_string();
-            let full = s.console.full_text();
-            drop(s);
-            widgets.check_console_line.set_text(&last);
-            widgets.check_console_full.set_text(&full);
-            widgets.run_console_line.set_text(&last);
-            widgets.run_console_full.set_text(&full);
-            return;
-        }
-        _ => {}
+        WorkerMsg::Event(ev) => ev,
+    };
+
+    let check_finished = matches!(ev, Event::CheckComplete { .. });
+    if matches!(
+        ev,
+        Event::ConsoleLine { .. } | Event::ConsoleDraw { .. } | Event::ApplyProgress { .. }
+    ) {
+        widgets.last_output.set(Some(Instant::now()));
     }
 
-    for e in worker_to_state_events(ev) {
-        dispatch_worker(state, widgets, e);
+    if matches!(ev, Event::ConsoleLine { .. } | Event::ConsoleDraw { .. }) {
+        let current = state.borrow().clone();
+        if let Ok(next) = state::reduce(current, ev) {
+            *state.borrow_mut() = next;
+        }
+        let s = state.borrow();
+        let last = s.console.last_line().to_string();
+        let full = s.console.full_text();
+        drop(s);
+        widgets.check_console_line.set_text(&last);
+        widgets.check_console_full.set_text(&full);
+        widgets.run_console_line.set_text(&last);
+        widgets.run_console_full.set_text(&full);
+        return;
     }
+
+    dispatch_worker(state, widgets, ev);
 
     let apply_now = if check_finished {
         let borrowed = state.borrow();
@@ -947,7 +938,6 @@ fn paint_quiet_chrome(
     applying: bool,
     work_progress: Option<f64>,
     current_source: Option<UpdateSource>,
-    last_line: &str,
     elapsed: u64,
     overall_progress: f64,
     packages: &[Package],
@@ -973,7 +963,6 @@ fn paint_quiet_chrome(
         cache_note.as_deref(),
         tool_alive,
         watching_dnf,
-        last_line,
         dnf_daemon_is_running(),
     );
 
@@ -1033,7 +1022,6 @@ fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         .as_ref()
         .map(|sw| sw.elapsed_secs())
         .unwrap_or(0);
-    let last = s.console.last_line().to_string();
     let package_done = packages.iter().filter(|p| p.status.is_done()).count();
     let (done, total) = match *stage {
         Some(StageCount { current, total }) if total > 0 => (current as usize, total as usize),
@@ -1053,7 +1041,6 @@ fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         applying,
         work_progress,
         current_source,
-        &last,
         elapsed,
         overall_progress,
         &packages,
@@ -1283,8 +1270,8 @@ fn render_running(
     w.now_playing_subtitle.set_visible(true);
     let playing = current_package(packages, active_index, current_name);
     paint_source_badge(&w.now_playing_badge, playing);
-    if let Some(size) = playing.and_then(|package| package.size.as_deref()) {
-        w.now_playing_size.set_text(size);
+    if let Some(size) = playing.and_then(Package::size_label) {
+        w.now_playing_size.set_text(&size);
         w.now_playing_size.set_visible(true);
     } else {
         w.now_playing_size.set_visible(false);
@@ -1370,7 +1357,6 @@ fn render_running(
         pass == RunPass::Apply,
         work_progress,
         current_source,
-        last_console,
         elapsed,
         overall_progress,
         packages,
@@ -1638,7 +1624,7 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             ..
         } => {
             w.stack.set_visible_child_name("checking");
-            let (_step, frac, groups_done, status) = check_progress(checked_sources);
+            let (frac, groups_done, status) = check_progress(checked_sources);
             let eta = about_time_left(elapsed, frac);
             let foot = checking_footnote(groups_done, eta.as_deref());
             paint_header(w, HeaderView::Checking { footnote: &foot });

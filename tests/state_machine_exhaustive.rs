@@ -18,11 +18,9 @@ fn flatpak(name: &str) -> Package {
         arch: String::new(),
         version: "1.0".into(),
         repo: "flathub".into(),
-        size: None,
+        size_bytes: None,
         old_version: None,
         status: PackageStatus::Pending,
-        progress: 0.0,
-        kind: fedora_updater::AdvisoryKind::Unknown,
         source: UpdateSource::FlatpakUser,
         detail: "flathub · user".into(),
     }
@@ -35,11 +33,9 @@ fn firmware(name: &str) -> Package {
         arch: String::new(),
         version: "2.0".into(),
         repo: "LVFS".into(),
-        size: None,
+        size_bytes: None,
         old_version: Some("1.0".into()),
         status: PackageStatus::Pending,
-        progress: 0.0,
-        kind: fedora_updater::AdvisoryKind::Security,
         source: UpdateSource::Firmware,
         detail: "1.0 → 2.0".into(),
     }
@@ -147,14 +143,6 @@ fn happy_path_multi_source() {
         (UpdateSource::FlatpakUser, "Apps"),
         (UpdateSource::Firmware, "Firmware"),
     ] {
-        s = reduce(
-            s,
-            Event::ApplySourceStarted {
-                source,
-                label: label.into(),
-            },
-        )
-        .unwrap();
         s = reduce(
             s,
             Event::ApplyProgress {
@@ -275,7 +263,7 @@ fn auth_cancel_style_fail() {
     )
     .unwrap();
     assert_phase(&s, "Failed");
-    let s = reduce(s, Event::ResetToIdle { message: None }).unwrap();
+    let s = reduce(s, Event::ResetToIdle).unwrap();
     assert_phase(&s, "Idle");
 }
 
@@ -431,7 +419,6 @@ fn verify_pass_does_not_move_current_back_to_completed() {
     match &mut s.phase {
         Phase::Running { packages, .. } => {
             packages[0].status = PackageStatus::Completed;
-            packages[0].progress = 1.0;
             packages[1].status = PackageStatus::Installing;
         }
         _ => unreachable!(),
@@ -466,7 +453,7 @@ fn verify_pass_does_not_move_current_back_to_completed() {
 }
 
 #[test]
-fn apply_source_started_does_not_mark_first_package() {
+fn source_switch_progress_does_not_mark_first_package() {
     let mut s = AppState::default();
     s.phase = Phase::Running {
         packages: vec![dnf("abrt"), dnf("kernel")],
@@ -484,9 +471,14 @@ fn apply_source_started_does_not_mark_first_package() {
     };
     let s = reduce(
         s,
-        Event::ApplySourceStarted {
+        Event::ApplyProgress {
             source: UpdateSource::Dnf,
-            label: "Updating System".into(),
+            package_hint: None,
+            status_hint: None,
+            progress: None,
+            phase_label: "Updating System".into(),
+            stage_current: None,
+            stage_total: None,
         },
     )
     .unwrap();

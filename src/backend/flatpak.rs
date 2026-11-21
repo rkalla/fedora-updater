@@ -11,7 +11,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 
-use crate::model::{format_bytes, AdvisoryKind, Package, PackageStatus, UpdateSource};
+use crate::model::{Package, PackageStatus, UpdateSource};
 
 use super::ProgressHint;
 
@@ -141,11 +141,9 @@ pub fn packages_from_flatpak_updates(
             } else {
                 r.origin.clone()
             },
-            size: (bytes > 0).then(|| format_bytes(bytes)),
+            size_bytes: (bytes > 0).then_some(bytes),
             old_version: None,
             status: PackageStatus::Pending,
-            progress: 0.0,
-            kind: AdvisoryKind::Unknown,
             source,
             detail,
         });
@@ -687,11 +685,9 @@ mod tests {
             arch: "x86_64".into(),
             version: "3.0.23".into(),
             repo: "fedora".into(),
-            size: None,
+            size_bytes: None,
             old_version: None,
             status: PackageStatus::Pending,
-            progress: 0.0,
-            kind: AdvisoryKind::Unknown,
             source: UpdateSource::FlatpakSystem,
             detail: String::new(),
         };
@@ -757,7 +753,7 @@ mod tests {
             update_ref_from_package(&pkgs[0]).as_deref(),
             Some("app/com.valvesoftware.Steam/x86_64/stable")
         );
-        assert!(pkgs[0].size.is_some());
+        assert!(pkgs[0].size_bytes.is_some());
     }
 
     #[test]
@@ -790,7 +786,7 @@ mod tests {
                 .contains("installs org.freedesktop.Platform.GL.nvidia-550-00-00")
         }));
         assert_eq!(pkgs[0].version, "51");
-        assert_eq!(pkgs.iter().filter(|p| p.size.is_some()).count(), 1);
+        assert_eq!(pkgs.iter().filter(|p| p.size_bytes.is_some()).count(), 1);
         assert_eq!(
             crate::model::total_download_bytes(&pkgs),
             Some(373 * 1024 * 1024)
@@ -814,7 +810,8 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert!(!pkgs[0].detail.contains("installs"), "{}", pkgs[0].detail);
         assert!(pkgs[0].detail.contains("8.40.0"));
-        assert_eq!(pkgs[0].size.as_deref(), Some("20 MB"));
+        assert_eq!(pkgs[0].size_bytes, Some(20 * 1024 * 1024));
+        assert_eq!(pkgs[0].size_label().as_deref(), Some("20 MB"));
         assert_eq!(
             pkgs[0].id,
             "flatpak:user:app/org.signal.Signal/x86_64/stable"
@@ -837,6 +834,6 @@ mod tests {
         let pkgs = packages_from_flatpak_updates(UpdateSource::FlatpakSystem, &refs, &ops);
         assert_eq!(pkgs.len(), 1);
         assert!(!pkgs[0].detail.contains("installs"), "{}", pkgs[0].detail);
-        assert!(pkgs[0].size.is_none());
+        assert!(pkgs[0].size_bytes.is_none());
     }
 }

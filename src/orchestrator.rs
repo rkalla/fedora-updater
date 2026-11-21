@@ -8,11 +8,17 @@ use async_channel::Sender;
 
 use crate::backend::{self, dnf, flatpak, fwupd};
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
-use crate::model::{AuthPurpose, Package, RetryAction, UpdateSource, WorkerEvent};
+use crate::model::{AuthPurpose, Package, RetryAction, UpdateSource};
 use crate::privilege::{
     close_session, run_local_command, session_is_alive, with_session, SessionError, SessionEvent,
 };
 use crate::state::Event as StateEvent;
+
+#[derive(Debug, Clone)]
+pub enum WorkerMsg {
+    SessionStarted,
+    Event(StateEvent),
+}
 
 /// Incremented when a Check/Apply starts or the user cancels auth.
 /// In-flight workers compare against the generation they captured at spawn.
@@ -31,98 +37,23 @@ pub fn cancel_background_work() {
     WORK_GEN.fetch_add(1, Ordering::SeqCst);
 }
 
-/// Map orchestrator outcomes into pure state events for the UI reducer.
-pub fn worker_to_state_events(ev: WorkerEvent) -> Vec<StateEvent> {
-    match ev {
-        WorkerEvent::SessionStarted => vec![],
-        WorkerEvent::Line { source_tag, text } => vec![StateEvent::ConsoleLine {
-            tag: source_tag,
-            text,
-        }],
-        WorkerEvent::Draw { source_tag, text } => vec![StateEvent::ConsoleDraw {
-            tag: source_tag,
-            text,
-        }],
-        WorkerEvent::BackendCheckFinished {
-            source,
-            packages,
-            soft_error,
-            ..
-        } => vec![StateEvent::BackendCheckDone {
-            source,
-            packages,
-            soft_error,
-        }],
-        WorkerEvent::CheckAllFinished {
-            packages,
-            soft_errors,
-        } => vec![StateEvent::CheckComplete {
-            packages,
-            soft_errors,
-            listed_at: SystemTime::now(),
-        }],
-        WorkerEvent::ApplyProgress {
-            source,
-            package_hint,
-            status_hint,
-            progress,
-            phase_label,
-            stage_current,
-            stage_total,
-        } => vec![StateEvent::ApplyProgress {
-            source,
-            package_hint,
-            status_hint,
-            progress,
-            phase_label,
-            stage_current,
-            stage_total,
-        }],
-        WorkerEvent::BackendApplyFinished {
-            source,
-            exit_code,
-            needs_reboot,
-            ..
-        } => vec![StateEvent::BackendApplyDone {
-            source,
-            success: exit_code == 0,
-            needs_reboot,
-        }],
-        WorkerEvent::ApplyAllFinished { needs_reboot, .. } => {
-            vec![StateEvent::ApplyComplete { needs_reboot }]
-        }
-        WorkerEvent::Failed { message, detail } => {
-            let retry = if fail_retry_is_reboot(&message) {
-                RetryAction::Reboot
-            } else {
-                RetryAction::CheckAgain
-            };
-            vec![StateEvent::Fail {
-                title: message,
-                detail,
-                retry,
-            }]
-        }
-    }
+fn send(tx: &Sender<WorkerMsg>, msg: WorkerMsg) {
+    let _ = tx.send_blocking(msg);
 }
 
-fn send(tx: &Sender<WorkerEvent>, ev: WorkerEvent) {
-    let _ = tx.send_blocking(ev);
-}
-
-fn line(tx: &Sender<WorkerEvent>, tag: &str, text: String) {
+fn line(tx: &Sender<WorkerMsg>, tag: &str, text: String) {
     send(
         tx,
-        WorkerEvent::Line {
-            source_tag: tag.into(),
+        WorkerMsg::Event(StateEvent::ConsoleLine {
+            tag: tag.into(),
             text,
-        },
+        }),
     );
 }
 
 /// Generation-scoped sender so a cancelled worker stops emitting events as soon as `WORK_GEN` advances.
 struct WorkChannel<'a> {
-    tx: &'a Sender<WorkerEvent>,
+    tx: &'a Sender<WorkerMsg>,
     gen: u64,
 }
 
@@ -131,22 +62,26 @@ impl<'a> WorkChannel<'a> {
         work_is_current(self.gen)
     }
 
-    fn send(&self, ev: WorkerEvent) {
+    fn send(&self, msg: WorkerMsg) {
         if self.is_current() {
-            send(self.tx, ev);
+            send(self.tx, msg);
         }
     }
 
+    fn event(&self, ev: StateEvent) {
+        self.send(WorkerMsg::Event(ev));
+    }
+
     fn line(&self, tag: &str, text: String) {
-        self.send(WorkerEvent::Line {
-            source_tag: tag.into(),
+        self.event(StateEvent::ConsoleLine {
+            tag: tag.into(),
             text,
         });
     }
 
     fn live_line(&self, tag: &str, text: String) {
-        self.send(WorkerEvent::Draw {
-            source_tag: tag.into(),
+        self.event(StateEvent::ConsoleDraw {
+            tag: tag.into(),
             text,
         });
     }
@@ -172,20 +107,22 @@ fn accept_helper_line(ch: &WorkChannel, tag: &str, log: &mut String, raw: &str) 
 
 fn map_session_start_err(ch: &WorkChannel, e: SessionError) {
     match e {
-        SessionError::AuthDenied => ch.send(WorkerEvent::Failed {
-            message: "Authentication cancelled".into(),
+        SessionError::AuthDenied => ch.event(StateEvent::Fail {
+            title: "Authentication cancelled".into(),
             detail: "polkit did not grant permission for the update helper.".into(),
+            retry: RetryAction::CheckAgain,
         }),
-        other => ch.send(WorkerEvent::Failed {
-            message: "Could not start privileged helper".into(),
+        other => ch.event(StateEvent::Fail {
+            title: "Could not start privileged helper".into(),
             detail: other.to_string(),
+            retry: RetryAction::CheckAgain,
         }),
     }
 }
 
 /// Full check pipeline. Reuses the shared helper session when already elevated
 /// (no second password); otherwise starts it once via polkit.
-pub fn run_check_all(tx: Sender<WorkerEvent>) {
+pub fn run_check_all(tx: Sender<WorkerMsg>) {
     let gen = begin_background_work();
     thread::spawn(move || {
         let ch = WorkChannel { tx: &tx, gen };
@@ -198,7 +135,7 @@ pub fn run_check_all(tx: Sender<WorkerEvent>) {
             map_session_start_err(&ch, e);
             return;
         }
-        ch.send(WorkerEvent::SessionStarted);
+        ch.send(WorkerMsg::SessionStarted);
 
         let mut all = Vec::new();
         let mut soft_errors = Vec::new();
@@ -318,9 +255,10 @@ pub fn run_check_all(tx: Sender<WorkerEvent>) {
         }
 
         // Leave session open for Apply and later Checks (app-lifetime elevation).
-        ch.send(WorkerEvent::CheckAllFinished {
+        ch.event(StateEvent::CheckComplete {
             packages: all,
             soft_errors,
+            listed_at: SystemTime::now(),
         });
     });
 }
@@ -337,21 +275,17 @@ fn emit_backend_check(
     }
     match result {
         Ok(pkgs) => {
-            ch.send(WorkerEvent::BackendCheckFinished {
+            ch.event(StateEvent::BackendCheckDone {
                 source,
                 packages: pkgs.clone(),
-                exit_code: 0,
-                log: String::new(),
                 soft_error: None,
             });
             all.extend(pkgs);
         }
         Err(e) => {
-            ch.send(WorkerEvent::BackendCheckFinished {
+            ch.event(StateEvent::BackendCheckDone {
                 source,
                 packages: Vec::new(),
-                exit_code: 1,
-                log: String::new(),
                 soft_error: Some(e.clone()),
             });
             soft_errors.push(e);
@@ -431,15 +365,16 @@ fn run_flatpak_check(ch: &WorkChannel, user: bool) -> Result<Vec<Package>, Strin
 
 /// Apply all pending sources sequentially. Reuses the shared helper session
 /// when still open (no second password).
-pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
+pub fn run_apply_all(tx: Sender<WorkerMsg>, packages: Vec<Package>) {
     let gen = begin_background_work();
     thread::spawn(move || {
         let ch = WorkChannel { tx: &tx, gen };
         let sources = crate::model::sources_present(&packages);
         if sources.is_empty() {
-            ch.send(WorkerEvent::Failed {
-                message: "Nothing to apply".into(),
+            ch.event(StateEvent::Fail {
+                title: "Nothing to apply".into(),
                 detail: "Package list was empty.".into(),
+                retry: RetryAction::CheckAgain,
             });
             return;
         }
@@ -458,11 +393,9 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
         if !ch.is_current() {
             return;
         }
-        ch.send(WorkerEvent::SessionStarted);
+        ch.send(WorkerMsg::SessionStarted);
 
         let mut overall_reboot = false;
-        let mut failed_sources = Vec::new();
-        let mut last_code = 0;
 
         for source in &sources {
             if !ch.is_current() {
@@ -470,16 +403,13 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
             }
             let source = *source;
             let tag = source.console_tag();
-            let source_pkgs: Vec<&Package> =
-                packages.iter().filter(|p| p.source == source).collect();
-            let known_names: Vec<String> = source_pkgs.iter().map(|p| p.name.clone()).collect();
 
             ch.line(
                 "orchestrator",
                 format!("── Applying {} ──", source.label()),
             );
 
-            ch.send(WorkerEvent::ApplyProgress {
+            ch.event(StateEvent::ApplyProgress {
                 source,
                 package_hint: None,
                 status_hint: None,
@@ -490,17 +420,16 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
             });
 
             let (code, log) = match source {
-                UpdateSource::Dnf => {
-                    run_helper_apply(&ch, HelperCommand::ApplyDnf, tag, source, &known_names)
-                }
+                UpdateSource::Dnf => run_helper_apply(&ch, HelperCommand::ApplyDnf, tag, source),
                 UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
                     // Apply the exact refs we listed at Check time, as the user.
                     // (Running system flatpak as root via helper can disagree with
                     // the user-session view and report "Nothing to update".)
                     let user = source == UpdateSource::FlatpakUser;
-                    let refs: Vec<String> = source_pkgs
+                    let refs: Vec<String> = packages
                         .iter()
-                        .filter_map(|p| flatpak::update_ref_from_package(p))
+                        .filter(|p| p.source == source)
+                        .filter_map(flatpak::update_ref_from_package)
                         .collect();
                     if refs.is_empty() {
                         ch.line(tag, "No flatpak refs to update".into());
@@ -512,11 +441,11 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
                         );
                         let args = flatpak::update_args_for_refs(user, &refs);
                         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        run_local_apply(&ch, "flatpak", &arg_refs, tag, source, &known_names)
+                        run_local_apply(&ch, "flatpak", &arg_refs, tag, source)
                     }
                 }
                 UpdateSource::Firmware => {
-                    run_helper_apply(&ch, HelperCommand::ApplyFwupd, tag, source, &known_names)
+                    run_helper_apply(&ch, HelperCommand::ApplyFwupd, tag, source)
                 }
             };
 
@@ -528,15 +457,10 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
             if reboot {
                 overall_reboot = true;
             }
-            if code != 0 {
-                failed_sources.push(source);
-                last_code = code;
-            }
 
-            ch.send(WorkerEvent::BackendApplyFinished {
+            ch.event(StateEvent::BackendApplyDone {
                 source,
-                exit_code: code,
-                log,
+                success: code == 0,
                 needs_reboot: reboot,
             });
         }
@@ -566,20 +490,13 @@ pub fn run_apply_all(tx: Sender<WorkerEvent>, packages: Vec<Package>) {
         }
 
         // Keep elevated helper for further Checks / Applies in this app session.
-        ch.send(WorkerEvent::ApplyAllFinished {
-            exit_code: last_code,
+        ch.event(StateEvent::ApplyComplete {
             needs_reboot: overall_reboot,
-            failed_sources,
         });
     });
 }
 
-fn emit_progress_from_line(
-    ch: &WorkChannel,
-    source: UpdateSource,
-    l: &str,
-    _known_names: &[String],
-) {
+fn emit_progress_from_line(ch: &WorkChannel, source: UpdateSource, l: &str) {
     let hint = backend::parse_progress(source, l);
     if hint.package_name.is_none()
         && hint.status.is_none()
@@ -588,7 +505,7 @@ fn emit_progress_from_line(
     {
         return;
     }
-    ch.send(WorkerEvent::ApplyProgress {
+    ch.event(StateEvent::ApplyProgress {
         source,
         package_hint: hint.package_name,
         status_hint: hint.status,
@@ -604,14 +521,13 @@ fn run_helper_apply(
     cmd: HelperCommand,
     tag: &str,
     source: UpdateSource,
-    known_names: &[String],
 ) -> (i32, String) {
     let mut log = String::new();
     match with_session(|session| {
         session.run_command(cmd, |ev| match ev {
             SessionEvent::Line(l) => {
                 let text = accept_helper_line(ch, tag, &mut log, &l);
-                emit_progress_from_line(ch, source, &text, known_names);
+                emit_progress_from_line(ch, source, &text);
             }
             SessionEvent::Finished { .. } => {}
         })
@@ -630,14 +546,13 @@ fn run_local_apply(
     args: &[&str],
     tag: &str,
     source: UpdateSource,
-    known_names: &[String],
 ) -> (i32, String) {
     let mut log = String::new();
     match run_local_command(program, args, |l| {
         log.push_str(&l);
         log.push('\n');
         ch.line(tag, l.clone());
-        emit_progress_from_line(ch, source, &l, known_names);
+        emit_progress_from_line(ch, source, &l);
     }) {
         Ok(code) => {
             // "Nothing to update" is success (exit 0) — treat as ok even if unexpected.
@@ -665,12 +580,15 @@ pub fn reboot_failure_detail(log: &str, code: i32) -> String {
     }
 }
 
-/// Retry on the Failed page re-runs reboot when the last failure was a reboot.
-pub fn fail_retry_is_reboot(title: &str) -> bool {
-    title == REBOOT_FAILED_TITLE || title == REBOOT_SPAWN_FAILED_TITLE
+fn reboot_fail_event(title: &'static str, detail: String) -> StateEvent {
+    StateEvent::Fail {
+        title: title.into(),
+        detail,
+        retry: RetryAction::Reboot,
+    }
 }
 
-pub fn run_systemctl_reboot(tx: Sender<WorkerEvent>) {
+pub fn run_systemctl_reboot(tx: Sender<WorkerMsg>) {
     thread::spawn(move || {
         let mut log = String::new();
         match run_local_command("systemctl", &["reboot"], |l| {
@@ -683,17 +601,17 @@ pub fn run_systemctl_reboot(tx: Sender<WorkerEvent>) {
             Ok(0) => {}
             Ok(code) => send(
                 &tx,
-                WorkerEvent::Failed {
-                    message: REBOOT_FAILED_TITLE.into(),
-                    detail: reboot_failure_detail(&log, code),
-                },
+                WorkerMsg::Event(reboot_fail_event(
+                    REBOOT_FAILED_TITLE,
+                    reboot_failure_detail(&log, code),
+                )),
             ),
             Err(e) => send(
                 &tx,
-                WorkerEvent::Failed {
-                    message: REBOOT_SPAWN_FAILED_TITLE.into(),
-                    detail: e.to_string(),
-                },
+                WorkerMsg::Event(reboot_fail_event(
+                    REBOOT_SPAWN_FAILED_TITLE,
+                    e.to_string(),
+                )),
             ),
         }
     });
@@ -716,30 +634,50 @@ pub fn can_skip_auth_ui() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+
+    static WORK_GEN_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_work_gen() -> MutexGuard<'static, ()> {
+        WORK_GEN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn live_draw_is_not_a_committed_console_line() {
-        let draw = worker_to_state_events(WorkerEvent::Draw {
-            source_tag: "dnf".into(),
-            text: "[26/26] grok-bot 40%".into(),
-        });
+        use crate::helper_protocol::DRAW_PREFIX;
+
+        let _guard = lock_work_gen();
+        let (tx, rx) = async_channel::unbounded();
+        let gen = begin_background_work();
+        let ch = WorkChannel { tx: &tx, gen };
+        let mut log = String::new();
+
+        accept_helper_line(
+            &ch,
+            "dnf",
+            &mut log,
+            &format!("{DRAW_PREFIX}[26/26] grok-bot 40%"),
+        );
+        let draw = rx.try_recv().expect("draw event");
         assert!(
             matches!(
-                draw.as_slice(),
-                [StateEvent::ConsoleDraw { tag, text }]
+                &draw,
+                WorkerMsg::Event(StateEvent::ConsoleDraw { tag, text })
                     if tag == "dnf" && text == "[26/26] grok-bot 40%"
             ),
             "live draw must stay a console replacement, got {draw:?}"
         );
-        let committed = worker_to_state_events(WorkerEvent::Line {
-            source_tag: "dnf".into(),
-            text: "[26/26] grok-bot 100%".into(),
-        });
+        assert!(log.is_empty(), "live draw must stay out of log: {log:?}");
+
+        accept_helper_line(&ch, "dnf", &mut log, "[26/26] grok-bot 100%");
+        let committed = rx.try_recv().expect("line event");
         assert!(matches!(
-            committed.as_slice(),
-            [StateEvent::ConsoleLine { .. }]
+            committed,
+            WorkerMsg::Event(StateEvent::ConsoleLine { .. })
         ));
+        assert!(log.contains("[26/26] grok-bot 100%"));
     }
 
     #[test]
@@ -772,14 +710,38 @@ mod tests {
 
     #[test]
     fn retry_on_reboot_failed_retries_reboot() {
-        assert!(fail_retry_is_reboot("Reboot failed"));
-        assert!(fail_retry_is_reboot("Could not run systemctl reboot"));
-        assert!(!fail_retry_is_reboot("All updates failed"));
-        assert!(!fail_retry_is_reboot("Authentication cancelled"));
+        assert!(matches!(
+            reboot_fail_event(REBOOT_FAILED_TITLE, "blocked".into()),
+            StateEvent::Fail {
+                retry: RetryAction::Reboot,
+                ..
+            }
+        ));
+        assert!(matches!(
+            reboot_fail_event(REBOOT_SPAWN_FAILED_TITLE, "missing".into()),
+            StateEvent::Fail {
+                retry: RetryAction::Reboot,
+                ..
+            }
+        ));
+
+        let _guard = lock_work_gen();
+        let (tx, rx) = async_channel::unbounded();
+        let gen = begin_background_work();
+        let ch = WorkChannel { tx: &tx, gen };
+        map_session_start_err(&ch, SessionError::AuthDenied);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WorkerMsg::Event(StateEvent::Fail {
+                retry: RetryAction::CheckAgain,
+                ..
+            }))
+        ));
     }
 
     #[test]
     fn work_channel_drops_events_after_cancel() {
+        let _guard = lock_work_gen();
         let (tx, rx) = async_channel::unbounded();
         let gen = begin_background_work();
         let ch = WorkChannel { tx: &tx, gen };
@@ -790,7 +752,6 @@ mod tests {
             &ch,
             UpdateSource::Dnf,
             "[1/2] Upgrading firefox-140.0-1.fc44.x86_64 50%",
-            &[],
         );
 
         cancel_background_work();
@@ -801,22 +762,27 @@ mod tests {
             &ch,
             UpdateSource::Dnf,
             "[2/2] Upgrading kernel-6.14.11-300.fc44.x86_64 100%",
-            &[],
         );
 
         let mut drained = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            drained.push(ev);
+        while let Ok(msg) = rx.try_recv() {
+            drained.push(msg);
         }
         assert_eq!(drained.len(), 3);
-        assert!(matches!(&drained[0], WorkerEvent::Line { text, .. } if text == "line before cancel"));
-        assert!(matches!(&drained[1], WorkerEvent::Draw { text, .. } if text == "draw before cancel"));
+        assert!(matches!(
+            &drained[0],
+            WorkerMsg::Event(StateEvent::ConsoleLine { text, .. }) if text == "line before cancel"
+        ));
+        assert!(matches!(
+            &drained[1],
+            WorkerMsg::Event(StateEvent::ConsoleDraw { text, .. }) if text == "draw before cancel"
+        ));
         assert!(matches!(
             &drained[2],
-            WorkerEvent::ApplyProgress {
+            WorkerMsg::Event(StateEvent::ApplyProgress {
                 package_hint: Some(name),
                 ..
-            } if name == "firefox"
+            }) if name == "firefox"
         ));
     }
 }

@@ -63,10 +63,6 @@ fn add_status_caption(row: &ActionRow, status: PackageStatus) {
         PackageStatus::Completed => {
             row.add_suffix(&caption_suffix("done", &["success"]));
         }
-        PackageStatus::Skipped => {
-            row.add_css_class("pending");
-            row.add_suffix(&caption_suffix("skipped", &["dimmed"]));
-        }
     }
 }
 
@@ -77,8 +73,7 @@ pub fn package_row(package: &Package, show_status: bool) -> ActionRow {
         add_status_caption(&row, package.status);
     } else {
         let trailing = package
-            .size
-            .clone()
+            .size_label()
             .unwrap_or_else(|| package.source.badge().into());
         row.add_suffix(&caption_suffix(&trailing, &["dimmed"]));
     }
@@ -144,11 +139,6 @@ pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: boo
             row.status.add_css_class("error");
             row.status.set_text("failed");
         }
-        PackageStatus::Skipped => {
-            row.row.add_css_class("pending");
-            row.status.add_css_class("dimmed");
-            row.status.set_text("skipped");
-        }
         PackageStatus::Installing => {
             row.status.add_css_class("accent");
             row.status.add_css_class("phase-tag");
@@ -172,15 +162,15 @@ pub fn sync_checklist_row(row: &ChecklistRow, package: &Package, is_current: boo
 ///
 /// `mark_completed` adds the green "done" word. The running expander uses it.
 /// The Installed review does not: the header already says the apply finished,
-/// and the word sits in the middle of a wrapped subtitle. Failed and skipped
-/// rows still name their status.
+/// and the word sits in the middle of a wrapped subtitle. Failed rows still
+/// name their status.
 pub fn finished_row(package: &Package, mark_completed: bool) -> ActionRow {
     let row = action_row(package);
     if mark_completed || package.status != PackageStatus::Completed {
         add_status_caption(&row, package.status);
     }
-    if let Some(size) = package.size.as_deref() {
-        row.add_suffix(&caption_suffix(size, &["dimmed"]));
+    if let Some(size) = package.size_label() {
+        row.add_suffix(&caption_suffix(&size, &["dimmed"]));
     }
     row
 }

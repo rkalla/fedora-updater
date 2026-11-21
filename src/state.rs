@@ -6,9 +6,9 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::model::{
-    apply_progress_hint, finalize_source, format_relative_now, overall_progress, sort_for_apply,
-    AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
-    StageCount, Stopwatch, UpdateSource,
+    apply_progress_hint, finalize_source, overall_progress, sort_for_apply, AuthPurpose,
+    ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction, RunPass, StageCount, Stopwatch,
+    UpdateSource,
 };
 
 /// dnf rpm-reconcile latch. The view owns the clock and the probe thread.
@@ -197,11 +197,6 @@ pub enum Event {
         soft_errors: Vec<String>,
         listed_at: SystemTime,
     },
-    /// Apply pipeline entered a backend.
-    ApplySourceStarted {
-        source: UpdateSource,
-        label: String,
-    },
     ApplyProgress {
         source: UpdateSource,
         package_hint: Option<String>,
@@ -225,9 +220,7 @@ pub enum Event {
         retry: RetryAction,
     },
     /// User dismissed failure or finished Done → Idle.
-    ResetToIdle {
-        message: Option<String>,
-    },
+    ResetToIdle,
     /// User cancelled the in-app auth wait. Does not dismiss the system polkit dialog.
     CancelAuth,
     /// User stopped the running update. `during_transaction` is the apply pass.
@@ -376,7 +369,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                     state.apply_when_ready = false;
                     state.updates_listed_at = None;
                     state.phase = Phase::Idle(IdleScreen::Current {
-                        checked_at: format_relative_now(),
+                        checked_at: "just now".into(),
                         detail,
                     });
                 } else {
@@ -391,30 +384,6 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 Ok(state)
             }
             _ => Err(invalid(&state, "CheckComplete")),
-        },
-        Event::ApplySourceStarted { source, label } => match &mut state.phase {
-            Phase::Running {
-                phase_label,
-                current_source,
-                current_name,
-                work_progress,
-                active_index,
-                pass,
-                stage,
-                overall_progress,
-                ..
-            } => {
-                *phase_label = label;
-                *current_source = Some(source);
-                *current_name = None;
-                *work_progress = None;
-                *active_index = None;
-                *pass = RunPass::Download;
-                *stage = None;
-                *overall_progress = 0.0;
-                Ok(state)
-            }
-            _ => Err(invalid(&state, "ApplySourceStarted")),
         },
         Event::ApplyProgress {
             source,
@@ -484,7 +453,6 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                     source,
                     package_hint.as_deref(),
                     status_hint,
-                    progress,
                 ) {
                     Some(idx) => {
                         *current_name = Some(packages[idx].name.clone());
@@ -569,7 +537,6 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                             p.status = PackageStatus::Failed;
                         } else {
                             p.status = PackageStatus::Completed;
-                            p.progress = 1.0;
                         }
                     }
                 }
@@ -610,10 +577,11 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
             };
             Ok(state)
         }
-        Event::ResetToIdle { message: _ } => {
+        Event::ResetToIdle => {
             let screen = match &state.phase {
-                Phase::Done { .. } => IdleScreen::Updated {
-                    checked_at: format_relative_now(),
+                Phase::Done { .. } => IdleScreen::Current {
+                    checked_at: "just now".into(),
+                    detail: None,
                 },
                 Phase::Idle(screen) => screen.clone(),
                 _ => IdleScreen::Fresh,
@@ -636,7 +604,6 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 } else {
                     for package in packages.iter_mut() {
                         package.status = PackageStatus::Pending;
-                        package.progress = 0.0;
                     }
                     state.phase = Phase::Ready {
                         packages,
@@ -706,9 +673,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
 fn idle_checked_at(screen: &IdleScreen) -> Option<String> {
     match screen {
         IdleScreen::Fresh => None,
-        IdleScreen::Current { checked_at, .. } | IdleScreen::Updated { checked_at } => {
-            Some(checked_at.clone())
-        }
+        IdleScreen::Current { checked_at, .. } => Some(checked_at.clone()),
     }
 }
 
@@ -766,23 +731,13 @@ fn reset_live_packages(packages: &mut [Package]) {
     for package in packages.iter_mut() {
         if !package.status.is_done() {
             package.status = PackageStatus::Pending;
-            package.progress = 0.0;
         }
     }
 }
 
 fn invalid(state: &AppState, event: &str) -> TransitionError {
-    let from = match &state.phase {
-        Phase::Idle(_) => "Idle",
-        Phase::Authenticating { .. } => "Authenticating",
-        Phase::Checking { .. } => "Checking",
-        Phase::Ready { .. } => "Ready",
-        Phase::Running { .. } => "Running",
-        Phase::Done { .. } => "Done",
-        Phase::Failed { .. } => "Failed",
-    };
     TransitionError::Invalid {
-        from: from.into(),
+        from: phase_name(&state.phase).into(),
         event: event.into(),
     }
 }
@@ -925,7 +880,7 @@ mod tests {
                 detail: None,
                 checked_at,
             }) => {
-                assert_eq!(checked_at, format_relative_now());
+                assert_eq!(checked_at, "just now");
                 assert_eq!(
                     crate::model::idle_chrome(&IdleScreen::Current {
                         checked_at,
@@ -933,7 +888,7 @@ mod tests {
                     })
                     .description
                     .as_deref(),
-                    Some(format!("Last checked {}", format_relative_now()).as_str())
+                    Some("Last checked just now")
                 );
             }
             other => panic!("expected Current with no detail, got {other:?}"),
@@ -962,9 +917,14 @@ mod tests {
 
         let s = reduce(
             s,
-            Event::ApplySourceStarted {
+            Event::ApplyProgress {
                 source: UpdateSource::Dnf,
-                label: "System".into(),
+                package_hint: None,
+                status_hint: None,
+                progress: None,
+                phase_label: "Updating System".into(),
+                stage_current: None,
+                stage_total: None,
             },
         )
         .unwrap();
@@ -1136,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn done_resets_to_updated_without_showing_the_event_message() {
+    fn done_resets_to_current_idle() {
         let mut s = AppState::default();
         s.phase = Phase::Done {
             packages: vec![],
@@ -1144,25 +1104,23 @@ mod tests {
             needs_reboot: false,
             failed: 0,
         };
-        let s = reduce(
-            s,
-            Event::ResetToIdle {
-                message: Some("ok".into()),
-            },
-        )
-        .unwrap();
-        let Phase::Idle(IdleScreen::Updated { checked_at }) = &s.phase else {
-            panic!("expected Updated, got {:?}", s.phase);
+        let s = reduce(s, Event::ResetToIdle).unwrap();
+        let Phase::Idle(IdleScreen::Current {
+            checked_at,
+            detail: None,
+        }) = &s.phase
+        else {
+            panic!("expected Current, got {:?}", s.phase);
         };
-        let description = crate::model::idle_chrome(&IdleScreen::Updated {
+        let description = crate::model::idle_chrome(&IdleScreen::Current {
             checked_at: checked_at.clone(),
+            detail: None,
         })
         .description;
         assert_eq!(
             description.as_deref(),
             Some(format!("Last checked {checked_at}").as_str())
         );
-        assert_ne!(description.as_deref(), Some("ok"));
     }
 
     #[test]
@@ -2002,9 +1960,14 @@ mod tests {
         }
         let s = reduce(
             s,
-            Event::ApplySourceStarted {
+            Event::ApplyProgress {
                 source: UpdateSource::FlatpakUser,
-                label: "Updating Apps".into(),
+                package_hint: None,
+                status_hint: None,
+                progress: None,
+                phase_label: "Updating Apps".into(),
+                stage_current: None,
+                stage_total: None,
             },
         )
         .unwrap();
@@ -2058,7 +2021,6 @@ mod tests {
                 soft_errors,
             } => {
                 assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
-                assert!(packages.iter().all(|p| p.progress == 0.0));
                 assert!(soft_errors
                     .iter()
                     .any(|e| e.contains("Stopped before install")));
@@ -2167,7 +2129,7 @@ mod tests {
             Phase::Idle(IdleScreen::Current {
                 checked_at,
                 detail: None,
-            }) => assert_eq!(checked_at, &format_relative_now()),
+            }) => assert_eq!(checked_at, "just now"),
             other => panic!("expected Current with no detail, got {other:?}"),
         }
     }
@@ -2262,20 +2224,15 @@ mod tests {
 
         let mut idle = AppState::default();
         idle.apply_when_ready = true;
-        idle.phase = Phase::Idle(IdleScreen::Updated {
+        idle.phase = Phase::Idle(IdleScreen::Current {
             checked_at: "just now".into(),
+            detail: None,
         });
-        let reset = reduce(
-            idle,
-            Event::ResetToIdle {
-                message: Some("System updated".into()),
-            },
-        )
-        .unwrap();
+        let reset = reduce(idle, Event::ResetToIdle).unwrap();
         assert!(!reset.apply_when_ready);
         assert!(matches!(
             reset.phase,
-            Phase::Idle(IdleScreen::Updated { .. })
+            Phase::Idle(IdleScreen::Current { detail: None, .. })
         ));
 
         let mut running = running_dnf(vec![pkg("kernel", UpdateSource::Dnf)]);
@@ -2378,37 +2335,48 @@ mod tests {
 
     #[test]
     fn reboot_fail_event_retries_reboot() {
-        use crate::model::WorkerEvent;
-        use crate::orchestrator::{worker_to_state_events, REBOOT_FAILED_TITLE};
+        use crate::orchestrator::REBOOT_FAILED_TITLE;
 
-        let reboot = worker_to_state_events(WorkerEvent::Failed {
-            message: REBOOT_FAILED_TITLE.into(),
-            detail: "blocked".into(),
-        });
+        let reboot = reduce(
+            AppState::default(),
+            Event::Fail {
+                title: REBOOT_FAILED_TITLE.into(),
+                detail: "blocked".into(),
+                retry: RetryAction::Reboot,
+            },
+        )
+        .unwrap();
         assert!(
             matches!(
-                reboot.as_slice(),
-                [Event::Fail {
+                &reboot.phase,
+                Phase::Failed {
                     retry: RetryAction::Reboot,
                     title,
                     ..
-                }] if title == REBOOT_FAILED_TITLE
+                } if title == REBOOT_FAILED_TITLE
             ),
-            "got {reboot:?}"
+            "got {:?}",
+            reboot.phase
         );
-        let normal = worker_to_state_events(WorkerEvent::Failed {
-            message: "All updates failed".into(),
-            detail: "dnf exited 1".into(),
-        });
+        let normal = reduce(
+            AppState::default(),
+            Event::Fail {
+                title: "All updates failed".into(),
+                detail: "dnf exited 1".into(),
+                retry: RetryAction::CheckAgain,
+            },
+        )
+        .unwrap();
         assert!(
             matches!(
-                normal.as_slice(),
-                [Event::Fail {
+                &normal.phase,
+                Phase::Failed {
                     retry: RetryAction::CheckAgain,
                     ..
-                }]
+                }
             ),
-            "got {normal:?}"
+            "got {:?}",
+            normal.phase
         );
     }
 
@@ -2476,9 +2444,14 @@ mod tests {
         let s = reduce(s, Event::RecoveryProbeSettled).unwrap();
         let s = reduce(
             s,
-            Event::ApplySourceStarted {
+            Event::ApplyProgress {
                 source: UpdateSource::FlatpakUser,
-                label: "Updating Apps".into(),
+                package_hint: None,
+                status_hint: None,
+                progress: None,
+                phase_label: "Updating Apps".into(),
+                stage_current: None,
+                stage_total: None,
             },
         )
         .unwrap();

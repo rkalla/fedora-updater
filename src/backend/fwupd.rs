@@ -1,6 +1,6 @@
 //! fwupd / `fwupdmgr` parsers.
 
-use crate::model::{AdvisoryKind, Package, PackageStatus, UpdateSource};
+use crate::model::{Package, PackageStatus, UpdateSource};
 
 use super::ProgressHint;
 
@@ -96,11 +96,9 @@ fn parse_json_updates(json: &str) -> Result<Vec<Package>, serde_json::Error> {
             arch: String::new(),
             version,
             repo: "LVFS".into(),
-            size: None,
+            size_bytes: None,
             old_version: current,
             status: PackageStatus::Pending,
-            progress: 0.0,
-            kind: AdvisoryKind::Security, // firmware updates treated as important
             source: UpdateSource::Firmware,
             detail,
         });
@@ -133,11 +131,9 @@ fn parse_text_updates(output: &str) -> Vec<Package> {
                 arch: String::new(),
                 version: version.clone(),
                 repo: "LVFS".into(),
-                size: None,
+                size_bytes: None,
                 old_version: None,
                 status: PackageStatus::Pending,
-                progress: 0.0,
-                kind: AdvisoryKind::Security,
                 source: UpdateSource::Firmware,
                 detail: if version.is_empty() {
                     "firmware update available".into()

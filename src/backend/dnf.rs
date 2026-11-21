@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::model::{format_bytes, Package, PackageStatus, UpdateSource};
+use crate::model::{parse_size_bytes, Package, PackageStatus, UpdateSource};
 
 use super::ProgressHint;
 
@@ -46,19 +46,19 @@ pub fn parse_repoquery_sizes(output: &str) -> HashMap<(String, String, String), 
     out
 }
 
-/// Fill missing `Package.size` from a repoquery download-size map. Returns how many were set.
+/// Fill missing `Package.size_bytes` from a repoquery download-size map. Returns how many were set.
 pub fn apply_download_sizes(
     packages: &mut [Package],
     sizes: &HashMap<(String, String, String), u64>,
 ) -> usize {
     let mut n = 0;
     for p in packages.iter_mut() {
-        if p.size.is_some() {
+        if p.size_bytes.is_some() {
             continue;
         }
         let key = (p.name.clone(), p.arch.clone(), p.version.clone());
         if let Some(&bytes) = sizes.get(&key) {
-            p.size = Some(format_bytes(bytes));
+            p.size_bytes = Some(bytes);
             n += 1;
         }
     }
@@ -111,15 +111,11 @@ fn parse_classic_line(line: &str) -> Option<Package> {
     if version.contains('/') {
         return None;
     }
-    let size = parts.get(3).and_then(|s| {
-        if s.chars().any(|c| c.is_ascii_digit()) {
-            Some(parts[3..].join(" "))
-        } else {
-            None
-        }
-    });
+    let size_bytes = (parts.len() > 3)
+        .then(|| parse_size_bytes(&parts[3..].join(" ")))
+        .flatten();
     let mut pkg = Package::new_dnf(name, arch, version, repo);
-    pkg.size = size;
+    pkg.size_bytes = size_bytes;
     Some(pkg)
 }
 
@@ -141,13 +137,11 @@ fn parse_dnf5_table_line(line: &str) -> Option<Package> {
     if !version.chars().any(|c| c.is_ascii_digit()) || name.eq_ignore_ascii_case("Package") {
         return None;
     }
-    let size = if parts.len() > 4 {
-        Some(parts[4..].join(" "))
-    } else {
-        None
-    };
+    let size_bytes = (parts.len() > 4)
+        .then(|| parse_size_bytes(&parts[4..].join(" ")))
+        .flatten();
     let mut pkg = Package::new_dnf(name, arch, version, repo);
-    pkg.size = size;
+    pkg.size_bytes = size_bytes;
     Some(pkg)
 }
 
@@ -677,6 +671,22 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
     }
 
     #[test]
+    fn parse_check_update_parses_optional_size_bytes() {
+        let out = r#"
+kernel.x86_64                     6.14.11-300.fc42                updates     98.2 MB
+firefox                   x86_64  140.0-1.fc42                    updates     112 MiB
+openssl.x86_64                    1:3.2.2-3.fc42                  updates
+"#;
+        let pkgs = parse_check_update(out);
+        assert_eq!(pkgs.len(), 3);
+        assert_eq!(pkgs[0].size_bytes, parse_size_bytes("98.2 MB"));
+        assert_eq!(pkgs[0].size_label().as_deref(), Some("98 MB"));
+        assert_eq!(pkgs[1].size_bytes, Some(112 * 1024 * 1024));
+        assert_eq!(pkgs[1].size_label().as_deref(), Some("112 MB"));
+        assert_eq!(pkgs[2].size_bytes, None);
+    }
+
+    #[test]
     fn parse_progress_fraction() {
         let h = parse_progress_line("[3/12] Installing gnome-shell-48.2-1.fc42.x86_64");
         assert_eq!(h.package_name.as_deref(), Some("gnome-shell"));
@@ -884,8 +894,9 @@ bind-libs	x86_64	32:9.18.50-2.fc44	1388459
         ];
         let n = apply_download_sizes(&mut pkgs, &sizes);
         assert_eq!(n, 1);
-        assert_eq!(pkgs[0].size.as_deref(), Some("21 MB"));
-        assert!(pkgs[1].size.is_none());
+        assert_eq!(pkgs[0].size_bytes, Some(21_727_761));
+        assert_eq!(pkgs[0].size_label().as_deref(), Some("21 MB"));
+        assert!(pkgs[1].size_bytes.is_none());
     }
 
     #[test]
