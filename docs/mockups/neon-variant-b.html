@@ -1,0 +1,1208 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NEON · Variant B "Observatory" — Fedora Updater Redesign</title>
+  <link rel="stylesheet" href="neon-shared.css" />
+  <style>
+    /* Variant B ("Observatory") — Adw.NavigationSplitView + Adw.OverlaySplitView */
+    .b-split-shell {
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      flex: 1;
+      min-height: 0;
+    }
+    .b-sidebar {
+      background: var(--adw-sidebar-bg);
+      border-right: 1px solid var(--adw-header-border);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .b-sidebar-body {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .b-detail {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      position: relative;
+    }
+    .b-overlay-split {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      position: relative;
+      overflow: hidden;
+    }
+    .b-main-col {
+      flex: 1;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .b-inspector-pane {
+      width: 0;
+      overflow: hidden;
+      background: var(--adw-sidebar-bg);
+      border-left: 0 solid var(--adw-header-border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+    html.neon-ready .b-inspector-pane {
+      transition: width 200ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .b-inspector-pane.open {
+      width: 282px;
+      border-left-width: 1px;
+    }
+    .b-inspector-scroll {
+      padding: 14px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: 268px;
+    }
+
+    /* Sidebar Navigation Items */
+    .b-nav-section-lbl {
+      font-size: 10.5px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--adw-dim-fg);
+      padding: 0 8px 4px;
+    }
+    .b-nav-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .b-nav-item {
+      width: 100%;
+      padding: 7px 10px;
+      border-radius: 8px;
+      border: 0;
+      background: transparent;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: left;
+      color: var(--adw-window-fg);
+    }
+    .b-nav-item:hover {
+      background: var(--adw-btn-bg);
+    }
+    .b-nav-item.active {
+      background: var(--accent-tint);
+      color: var(--accent-color);
+    }
+    .b-nav-pill {
+      font-size: 11px;
+      font-weight: 750;
+      padding: 1px 7px;
+      border-radius: 999px;
+      background: var(--adw-btn-bg);
+      color: var(--adw-dim-fg);
+      font-variant-numeric: tabular-nums;
+    }
+    .b-nav-item.active .b-nav-pill {
+      background: var(--accent-bg);
+      color: #ffffff;
+    }
+    .b-nav-pill.sec {
+      background: var(--error-tint);
+      color: var(--error-color);
+    }
+
+    /* System Pulse Card */
+    .b-pulse-card {
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: var(--adw-card-bg);
+      border: 1px solid var(--adw-card-border);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--success-color);
+      flex-shrink: 0;
+    }
+    .pulse-dot.warn { background: var(--warning-color); }
+    .pulse-dot.err { background: var(--error-color); }
+
+    /* Custom Checkbox */
+    .adw-check {
+      width: 17px;
+      height: 17px;
+      accent-color: var(--accent-bg);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .adw-row.is-selected {
+      background: var(--accent-tint);
+    }
+
+    /* Stage Breadcrumb */
+    .stage-crumbs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      font-size: 11.5px;
+    }
+    .stage-crumb {
+      padding: 3px 9px;
+      border-radius: 6px;
+      background: var(--adw-btn-bg);
+      color: var(--adw-dim-fg);
+      font-weight: 650;
+    }
+    .stage-crumb.done {
+      background: var(--success-tint);
+      color: var(--success-color);
+    }
+    .stage-crumb.active {
+      background: var(--accent-bg);
+      color: #ffffff;
+    }
+
+    /* Throughput Sparkline */
+    .spark-card {
+      padding: 11px 12px;
+      border-radius: 10px;
+      background: var(--adw-card-bg);
+      border: 1px solid var(--adw-card-border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .spark-svg {
+      width: 100%;
+      height: 44px;
+      display: block;
+    }
+
+    /* Narrow Responsive Collapse (Adw.NavigationSplitView collapsed=true) */
+    .b-back-btn {
+      display: none;
+    }
+    .gtk-win.is-narrow .b-split-shell {
+      grid-template-columns: 1fr;
+      position: relative;
+    }
+    .gtk-win.is-narrow .b-sidebar {
+      display: none;
+    }
+    .gtk-win.is-narrow .b-split-shell.show-sidebar .b-sidebar {
+      display: flex;
+      position: absolute;
+      inset: 0;
+      z-index: 35;
+      width: 100%;
+    }
+    .gtk-win.is-narrow .b-back-btn {
+      display: inline-flex;
+    }
+    .gtk-win.is-narrow .b-inspector-pane.open {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      z-index: 30;
+    }
+  </style>
+</head>
+<body>
+  <header class="neon-studio-bar">
+    <div class="neon-studio-inner">
+      <a href="neon-index.html" class="neon-brand">
+        <span class="neon-mark"><span class="neon-mark-dot"></span>NEON</span>
+        <span class="neon-brand-title">Fedora Updater</span>
+        <span class="neon-brand-sub">Variant B · Observatory</span>
+      </a>
+      <nav class="neon-nav" aria-label="NEON Mockup Navigation">
+        <a href="neon-index.html">Hub</a>
+        <a href="neon-variant-a.html">A · Lumen</a>
+        <a href="neon-variant-b.html" class="active">B · Observatory</a>
+        <a href="neon-variant-c.html">C · Cadence</a>
+        <a href="neon-assessment.md">Assessment</a>
+      </nav>
+      <div class="neon-controls">
+        <button type="button" class="studio-btn" data-theme-toggle aria-pressed="false">Theme: Dark</button>
+        <button type="button" class="studio-btn" data-narrow-toggle aria-pressed="false">Viewport: Desktop</button>
+        <button type="button" class="studio-btn" data-xray-toggle aria-pressed="false">GTK4 X-Ray</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="neon-shell">
+    <div class="neon-variant-intro">
+      <div>
+        <h1>Variant B · "Observatory" — Adaptive Split-Pane Workbench</h1>
+        <p>
+          Built natively on <code>Adw.NavigationSplitView</code> + <code>Adw.OverlaySplitView</code> + <code>Adw.SplitButton</code>. Gives Fedora power users selective package checkboxes, inline CVE &amp; changelog inspection, offline update staging, live throughput sparklines, and integrated Update History &amp; Activity Log views.
+        </p>
+      </div>
+    </div>
+
+    <div class="neon-state-rail" role="tablist" aria-label="Application States">
+      <button type="button" class="state-pill" data-state-btn="idle">1 · Idle</button>
+      <button type="button" class="state-pill" data-state-btn="idle-current">1b · Up to Date</button>
+      <button type="button" class="state-pill" data-state-btn="auth">2 · Auth</button>
+      <button type="button" class="state-pill" data-state-btn="checking">3 · Checking</button>
+      <button type="button" class="state-pill active" data-state-btn="ready">4 · Ready Workbench</button>
+      <button type="button" class="state-pill" data-state-btn="running">5 · Running Telemetry</button>
+      <button type="button" class="state-pill" data-state-btn="done">6 · Done (Reboot)</button>
+      <button type="button" class="state-pill" data-state-btn="failed">7 · Failed</button>
+      <button type="button" class="state-pill" data-state-btn="history">View: History</button>
+      <button type="button" class="state-pill" data-state-btn="log">View: Activity Log</button>
+      <span class="rail-group-sep" aria-hidden="true"></span>
+      <button type="button" class="state-pill edge" data-state-btn="ready-warn">Edge: Soft Error</button>
+      <button type="button" class="state-pill edge" data-state-btn="ready-stale">Edge: Stale &gt;24h</button>
+      <button type="button" class="state-pill edge" data-state-btn="running-stall">Edge: Stalled</button>
+      <button type="button" class="state-pill edge" data-state-btn="done-clean">Edge: Clean Done</button>
+      <button type="button" class="state-pill edge" data-state-btn="done-partial">Edge: Partial Fail</button>
+      <button type="button" class="state-pill edge" data-state-btn="failed-reboot">Edge: Reboot Block</button>
+    </div>
+
+    <div class="neon-stage-grid">
+      <div class="neon-window-stage">
+        <div class="gtk-win is-wide" data-gtk="Adw.ApplicationWindow (960px)">
+
+          <!-- ==================== 1. IDLE ==================== -->
+          <section data-state-panel="idle">
+            <div class="b-split-shell" data-gtk="Adw.NavigationSplitView">
+              <aside class="b-sidebar" data-gtk="Adw.NavigationPage (Sidebar)">
+                <header class="adw-headerbar">
+                  <div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div>
+                  <div class="hb-center"></div>
+                  <div class="hb-end"><button type="button" class="btn icon-only flat" data-open-dialog="dialog-b-about" title="About"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 4h12v1.5H2zm0 3.25h12v1.5H2zm0 3.25h12V12H2z"/></svg></button></div>
+                </header>
+                <div class="b-sidebar-body">
+                  <div class="b-pulse-card">
+                    <div class="row-flex"><span class="pulse-dot warn"></span><strong style="font-size:12.5px;">Fedora Linux 44</strong></div>
+                    <span class="cap dim numeric">Kernel 6.14.9-300.fc44</span>
+                    <span class="cap faint">Not checked this session</span>
+                  </div>
+                  <div>
+                    <div class="b-nav-section-lbl">Workbench</div>
+                    <div class="b-nav-list">
+                      <button type="button" class="b-nav-item active" data-goto-state="idle"><span>Updates Overview</span></button>
+                      <button type="button" class="b-nav-item" data-goto-state="history"><span>Update History</span><span class="b-nav-pill">14</span></button>
+                      <button type="button" class="b-nav-item" data-goto-state="log"><span>Activity Log</span></button>
+                    </div>
+                  </div>
+                  <div class="adw-card compact accent-card" style="margin-top:auto;" data-gtk="Adw.Bin (SidebarUpgrade)">
+                    <div style="font-weight:750; font-size:12px;">Fedora 45 Available</div>
+                    <div class="cap dim" style="font-size:11px; margin:2px 0 8px;">Released 12 days ago</div>
+                    <button type="button" class="btn sm" style="width:100%;" data-open-dialog="dialog-b-upgrade">Upgrade Guide</button>
+                  </div>
+                </div>
+              </aside>
+              <div class="b-detail" data-gtk="Adw.NavigationPage (Content)">
+                <header class="adw-headerbar">
+                  <div class="hb-start"><button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar title="Sidebar">☰</button></div>
+                  <div class="hb-center"><span class="adw-win-title">Fedora Updater</span></div>
+                  <div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+                </header>
+                <div class="adw-status-page">
+                  <div class="status-emblem">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.4 6.4M3 12A9 9 0 0 1 18.4 5.6"/><path d="M21 6v6h-6M3 18v-6h6"/></svg>
+                  </div>
+                  <h2 class="status-title">Check for Updates</h2>
+                  <p class="status-desc">Inspect pending RPM advisories, Flatpak runtimes, and LVFS device firmware before deciding what to install.</p>
+                  <button type="button" class="btn suggested pill" data-goto-state="checking">Check for Updates</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 1b. UP TO DATE ==================== -->
+          <section data-state-panel="idle-current">
+            <div class="b-split-shell">
+              <aside class="b-sidebar">
+                <header class="adw-headerbar">
+                  <div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div>
+                  <div class="hb-center"></div><div class="hb-end"></div>
+                </header>
+                <div class="b-sidebar-body">
+                  <div class="b-pulse-card">
+                    <div class="row-flex"><span class="pulse-dot"></span><strong style="font-size:12.5px;">Fedora Linux 44</strong></div>
+                    <span class="cap dim numeric">Kernel 6.14.11-300.fc44</span>
+                    <span class="cap ok-txt">Checked just now</span>
+                  </div>
+                  <div class="b-nav-list">
+                    <button type="button" class="b-nav-item active" data-goto-state="idle-current"><span>Updates Overview</span></button>
+                    <button type="button" class="b-nav-item" data-goto-state="history"><span>Update History</span><span class="b-nav-pill">15</span></button>
+                    <button type="button" class="b-nav-item" data-goto-state="log"><span>Activity Log</span></button>
+                  </div>
+                  <div class="adw-card compact accent-card" style="margin-top:auto;">
+                    <div style="font-weight:750; font-size:12px;">Fedora 45 Available</div>
+                    <div class="cap dim" style="font-size:11px; margin:2px 0 8px;">12 days since release</div>
+                    <button type="button" class="btn sm" style="width:100%;" data-open-dialog="dialog-b-upgrade">Upgrade Guide</button>
+                  </div>
+                </div>
+              </aside>
+              <div class="b-detail">
+                <header class="adw-headerbar">
+                  <div class="hb-start"><button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar>☰</button></div>
+                  <div class="hb-center"><span class="adw-win-title">System Is Up to Date</span></div>
+                  <div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+                </header>
+                <div class="adw-status-page">
+                  <div class="status-emblem ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M20 6L9 17l-5-5"/></svg></div>
+                  <h2 class="status-title">System Is Up to Date</h2>
+                  <p class="status-desc">Last checked just now across System, Flatpak, and LVFS Firmware.</p>
+                  <button type="button" class="btn pill" data-goto-state="checking">Check Again</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 2. AUTH ==================== -->
+          <section data-state-panel="auth">
+            <div class="b-split-shell">
+              <aside class="b-sidebar">
+                <header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header>
+                <div class="b-sidebar-body">
+                  <div class="b-pulse-card">
+                    <div class="row-flex"><span class="pulse-dot warn"></span><strong style="font-size:12.5px;">Authorizing…</strong></div>
+                    <span class="cap dim">Waiting for system polkit dialog</span>
+                  </div>
+                </div>
+              </aside>
+              <div class="b-detail">
+                <header class="adw-headerbar">
+                  <div class="hb-start"><button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar>☰</button></div>
+                  <div class="hb-center"><span class="adw-win-title">Authentication Required</span><span class="adw-win-subtitle hide-narrow">Applying updates</span></div>
+                  <div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+                </header>
+                <div class="adw-status-page">
+                  <div class="status-emblem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+                  <h2 class="status-title">Authentication Required</h2>
+                  <p class="status-desc">Confirm the system administrator prompt to start the privileged transaction.</p>
+                  <div class="adw-card compact row-flex"><span class="adw-spinner sm"></span><span class="cap dim">Waiting for authorization…</span></div>
+                  <button type="button" class="btn flat" data-goto-state="ready">Cancel</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 3. CHECKING ==================== -->
+          <section data-state-panel="checking">
+            <div class="b-split-shell">
+              <aside class="b-sidebar">
+                <header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header>
+                <div class="b-sidebar-body">
+                  <div class="b-pulse-card">
+                    <div class="row-flex"><span class="adw-spinner sm"></span><strong style="font-size:12.5px;">Checking Sources</strong></div>
+                    <span class="cap dim numeric">50% · 1 of 3 complete</span>
+                  </div>
+                  <div class="b-nav-list">
+                    <div class="b-nav-item"><span>System (DNF5)</span><span class="b-nav-pill">4 ✓</span></div>
+                    <div class="b-nav-item active"><span>Apps (Flatpak)</span><span class="b-nav-pill">…</span></div>
+                    <div class="b-nav-item"><span>Firmware (LVFS)</span><span class="b-nav-pill">Queued</span></div>
+                  </div>
+                </div>
+              </aside>
+              <div class="b-detail">
+                <header class="adw-headerbar is-raised">
+                  <div class="hb-start"><button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar>☰</button></div>
+                  <div class="hb-center"><span class="adw-win-title">Checking for Updates</span><span class="adw-win-subtitle hide-narrow">1 of 3 sources · About 20 seconds left</span></div>
+                  <div class="hb-end"><button type="button" class="btn sm" data-goto-state="idle">Cancel</button><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+                </header>
+                <div class="adw-scroll">
+                  <div class="adw-clamp-680">
+                    <div class="adw-card compact col-flex" style="gap:8px;">
+                      <div class="row-between"><span class="cap" style="font-weight:700;">System done · Apps in progress · Firmware queued</span><span class="numeric cap" style="font-weight:800;">50%</span></div>
+                      <div class="adw-progress-bar"><div class="adw-progress-fill" style="width:50%;"></div></div>
+                    </div>
+                    <div class="adw-boxed-list">
+                      <div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">openssl</span><span class="row-sub ver-diff">1:3.2.2-1.fc44 → 1:3.2.2-3.fc44</span></div><span class="cap dim numeric">2.1 MB</span></div>
+                      <div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">kernel</span><span class="row-sub ver-diff">6.14.9-300.fc44 → 6.14.11-300.fc44</span></div><span class="cap dim numeric">98.0 MB</span></div>
+                      <div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">firefox</span><span class="row-sub ver-diff">139.0-1.fc44 → 140.0-1.fc44</span></div><span class="cap dim numeric">112.0 MB</span></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="adw-bottom-sheet" data-log-scope>
+                  <div class="sheet-drawer-body">
+                    <div class="sheet-console-toolbar"><span class="cap" style="color:#fff;font-weight:700;">Live Output</span><button type="button" class="btn sm flat" style="color:#fff;" data-copy-log>Copy</button></div>
+                    <pre class="sheet-console-pre mono">[dnf] Found 4 system package upgrades
+[flatpak-user] Syncing flathub metadata…</pre>
+                  </div>
+                  <button type="button" class="sheet-handle-btn" data-console-toggle>
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 3l6 5-6 5z"/></svg>
+                    <span class="sheet-handle-line mono">[flatpak-user] Syncing flathub metadata…</span>
+                    <span class="cap accent-txt">Console</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 4. READY WORKBENCH ==================== -->
+          <section data-state-panel="ready" class="active" data-filter-scope data-select-scope>
+            <div class="b-split-shell" data-gtk="Adw.NavigationSplitView">
+              <!-- Tonal Sidebar -->
+              <aside class="b-sidebar" data-gtk="Adw.NavigationPage (Sidebar)">
+                <header class="adw-headerbar">
+                  <div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div>
+                  <div class="hb-center"></div>
+                  <div class="hb-end"><button type="button" class="btn icon-only flat" data-open-dialog="dialog-b-about" title="About"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 4h12v1.5H2zm0 3.25h12v1.5H2zm0 3.25h12V12H2z"/></svg></button></div>
+                </header>
+                <div class="b-sidebar-body">
+                  <div class="b-pulse-card" data-gtk="Gtk.Box.card (Pulse)">
+                    <div class="row-flex"><span class="pulse-dot warn"></span><strong style="font-size:12.5px;">Fedora Linux 44</strong></div>
+                    <span class="cap dim numeric">6 updates · 314.8 MB</span>
+                    <span class="cap faint">Checked 2m ago · 0 errors</span>
+                  </div>
+
+                  <div>
+                    <div class="b-nav-section-lbl">Sources</div>
+                    <div class="b-nav-list" data-gtk="Gtk.ListBox.navigation-sidebar">
+                      <button type="button" class="b-nav-item active" data-filter-btn="all"><span>All Updates</span><span class="b-nav-pill numeric">6</span></button>
+                      <button type="button" class="b-nav-item" data-filter-btn="sec"><span>Security Fixes</span><span class="b-nav-pill sec numeric">2</span></button>
+                      <button type="button" class="b-nav-item" data-filter-btn="dnf"><span>System · DNF5</span><span class="b-nav-pill numeric">4</span></button>
+                      <button type="button" class="b-nav-item" data-filter-btn="fp"><span>Apps · Flatpak</span><span class="b-nav-pill numeric">1</span></button>
+                      <button type="button" class="b-nav-item" data-filter-btn="fw"><span>Firmware · LVFS</span><span class="b-nav-pill numeric">1</span></button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div class="b-nav-section-lbl">Views</div>
+                    <div class="b-nav-list">
+                      <button type="button" class="b-nav-item" data-goto-state="history"><span>Update History</span><span class="b-nav-pill numeric">14</span></button>
+                      <button type="button" class="b-nav-item" data-goto-state="log"><span>Activity Log</span></button>
+                    </div>
+                  </div>
+
+                  <!-- Fedora 45 Card cleanly anchored in Sidebar Footer -->
+                  <div class="adw-card compact accent-card" style="margin-top:auto;" data-gtk="Adw.Bin (SidebarUpgrade)">
+                    <div style="font-weight:750; font-size:12px;">Fedora 45 Available</div>
+                    <div class="cap dim" style="font-size:11px; margin:2px 0 8px;">Released 12 days ago</div>
+                    <button type="button" class="btn sm" style="width:100%;" data-open-dialog="dialog-b-upgrade">How to Upgrade →</button>
+                  </div>
+                </div>
+              </aside>
+
+              <!-- Detail Pane + Overlay Inspector -->
+              <div class="b-detail" data-gtk="Adw.NavigationPage (Detail)">
+                <header class="adw-headerbar is-raised" data-gtk="Adw.HeaderBar">
+                  <div class="hb-start">
+                    <button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar title="Navigation">☰</button>
+                    <button type="button" class="btn icon-only flat" title="Refresh" data-goto-state="checking"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 8a5.5 5.5 0 1 1-1.4-3.7L10 6h4.5V1.5l-1.3 1.4A7 7 0 1 0 15 8z"/></svg></button>
+                    <label class="adw-search-entry hide-narrow" data-gtk="Gtk.SearchEntry">
+                      <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="opacity:0.6"><path d="M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0zm-.8 4.8a6 6 0 1 1 1.1-1.1l3.3 3.3-1.1 1.1-3.3-3.3z"/></svg>
+                      <input type="search" placeholder="Search packages or CVEs…" data-search-input />
+                    </label>
+                  </div>
+                  <div class="hb-center">
+                    <span class="adw-win-title">6 Updates</span>
+                    <span class="adw-win-subtitle hide-narrow numeric" data-selected-summary>6 of 6 selected · 314.8 MB</span>
+                  </div>
+                  <div class="hb-end">
+                    <div class="adw-split-btn" data-gtk="Adw.SplitButton">
+                      <button type="button" class="btn suggested sm split-main" data-selected-cta data-goto-state="running">Update All</button>
+                      <span class="split-sep"></span>
+                      <button type="button" class="btn suggested sm split-arrow" data-split-toggle aria-label="Update options">▾</button>
+                      <div class="split-menu" role="menu">
+                        <button type="button" data-split-label="Update All"><strong>Update Now (Live)</strong><small>Apply immediately while keeping session open</small></button>
+                        <button type="button" data-split-label="Update &amp; Restart"><strong>Update &amp; Restart</strong><small>Automatically reboot when complete</small></button>
+                        <button type="button" data-split-label="Stage Offline"><strong>Prepare Offline Update</strong><small>Stage via dnf5daemon Offline for next reboot</small></button>
+                        <button type="button" data-split-label="Download Only"><strong>Download Only</strong><small>Cache packages without installing yet</small></button>
+                      </div>
+                    </div>
+                    <span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span>
+                  </div>
+                </header>
+
+                <div class="b-overlay-split" data-gtk="Adw.OverlaySplitView">
+                  <div class="b-main-col">
+                    <div class="adw-scroll" style="padding:12px 14px;">
+                      <div class="row-between" style="margin-bottom:8px;">
+                        <button type="button" class="btn sm flat" data-select-all>Toggle All Selected</button>
+                        <span class="cap dim">Click row for CVE &amp; changelog inspector</span>
+                      </div>
+
+                      <div class="adw-boxed-list" data-pkg-group data-gtk="Gtk.ListView">
+                        <div class="adw-row is-clickable is-selected" data-pkg-row data-tags="dnf sec" data-pkg-id="openssl">
+                          <input type="checkbox" class="adw-check" checked data-pkg-check data-mb="2.1" aria-label="Select openssl" />
+                          <span class="src-badge dnf">DNF</span>
+                          <div class="row-main">
+                            <div class="row-title-line"><span class="row-title">openssl</span><span class="micro-tag sec">CVE-2026-2401</span></div>
+                            <span class="row-sub ver-diff">1:3.2.2-1.fc44 → <span class="ver-new">1:3.2.2-3.fc44</span></span>
+                          </div>
+                          <span class="cap dim numeric">2.1 MB</span>
+                        </div>
+                        <div class="adw-row is-clickable" data-pkg-row data-tags="dnf sec" data-pkg-id="kernel">
+                          <input type="checkbox" class="adw-check" checked data-pkg-check data-mb="98" aria-label="Select kernel" />
+                          <span class="src-badge dnf">DNF</span>
+                          <div class="row-main">
+                            <div class="row-title-line"><span class="row-title">kernel</span><span class="micro-tag sec">Security</span><span class="micro-tag reboot">Restart</span></div>
+                            <span class="row-sub ver-diff">6.14.9-300.fc44 → <span class="ver-new">6.14.11-300.fc44</span></span>
+                          </div>
+                          <span class="cap dim numeric">98.0 MB</span>
+                        </div>
+                        <div class="adw-row is-clickable" data-pkg-row data-tags="dnf" data-pkg-id="firefox">
+                          <input type="checkbox" class="adw-check" checked data-pkg-check data-mb="112" aria-label="Select firefox" />
+                          <span class="src-badge dnf">DNF</span>
+                          <div class="row-main">
+                            <div class="row-title-line"><span class="row-title">firefox</span></div>
+                            <span class="row-sub ver-diff">139.0-1.fc44 → <span class="ver-new">140.0-1.fc44</span></span>
+                          </div>
+                          <span class="cap dim numeric">112.0 MB</span>
+                        </div>
+                        <div class="adw-row is-clickable" data-pkg-row data-tags="dnf" data-pkg-id="gnome-shell">
+                          <input type="checkbox" class="adw-check" checked data-pkg-check data-mb="8.7" aria-label="Select gnome-shell" />
+                          <span class="src-badge dnf">DNF</span>
+                          <div class="row-main">
+                            <div class="row-title-line"><span class="row-title">gnome-shell</span></div>
+                            <span class="row-sub ver-diff">48.1-1.fc44 → <span class="ver-new">48.2-1.fc44</span></span>
+                          </div>
+                          <span class="cap dim numeric">8.7 MB</span>
+                        </div>
+                        <div class="adw-row is-clickable" data-pkg-row data-tags="fp" data-pkg-id="thunderbird">
+                          <input type="checkbox" class="adw-check" checked data-pkg-check data-mb="94" aria-label="Select Thunderbird" />
+                          <span class="src-badge fp">FP</span>
+                          <div class="row-main">
+                            <div class="row-title-line"><span class="row-title">Thunderbird</span><span class="micro-tag ext">+ NVIDIA GL</span></div>
+                            <span class="row-sub ver-diff">128.0.1 → <span class="ver-new">128.2.0</span> · flathub</span>
+                          </div>
+                          <span class="cap dim numeric">94.0 MB</span>
+                        </div>
+                        <div class="adw-row is-clickable" data-pkg-row data-tags="fw" data-pkg-id="uefi-dbx">
+                          <input type="checkbox" class="adw-check" checked data-pkg-check data-mb="0.018" aria-label="Select UEFI dbx" />
+                          <span class="src-badge fw">FW</span>
+                          <div class="row-main">
+                            <div class="row-title-line"><span class="row-title">UEFI dbx</span><span class="micro-tag reboot">Restart</span></div>
+                            <span class="row-sub ver-diff">20240101 → <span class="ver-new">20241101</span> · LVFS</span>
+                          </div>
+                          <span class="cap dim numeric">18 KB</span>
+                        </div>
+                      </div>
+                      <div class="adw-card compact hidden" data-empty-filter style="margin-top:10px; text-align:center;">
+                        <span class="cap dim">No matching packages.</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- Slide-out OverlaySplitView Package Inspector -->
+                  <aside class="b-inspector-pane open" id="b-inspector-wrap" data-gtk="Adw.OverlaySplitView [sidebar]">
+                    <div class="adw-sheet-head" style="padding:10px 14px;">
+                      <h3 style="font-size:12.5px;">Package Inspector</h3>
+                      <button type="button" class="btn icon-only flat sm" id="b-inspector-close" aria-label="Close inspector">✕</button>
+                    </div>
+                    <div class="b-inspector-scroll" id="b-inspector-body">
+                      <div class="row-flex" style="align-items:flex-start; justify-content:space-between;">
+                        <div class="row-flex">
+                          <span class="src-badge dnf">DNF</span>
+                          <div>
+                            <div style="font-size:15px; font-weight:800;">openssl</div>
+                            <div class="cap dim">System Package · updates</div>
+                          </div>
+                        </div>
+                        <span class="micro-tag ok">Live Safe</span>
+                      </div>
+                      <p class="cap" style="margin:0; line-height:1.45;">Cryptography and SSL/TLS toolkit libraries and command-line utilities.</p>
+                      <div class="adw-boxed-list">
+                        <div class="adw-row"><div class="row-main"><span class="cap dim">Version</span></div><div class="ver-diff">1:3.2.2-1 → <span class="ver-new">1:3.2.2-3</span></div></div>
+                        <div class="adw-row"><div class="row-main"><span class="cap dim">Advisory</span></div><div class="mono cap">FEDORA-2026-84a1</div></div>
+                        <div class="adw-row"><div class="row-main"><span class="cap dim">CVEs</span></div><div class="row-flex"><span class="micro-tag sec">CVE-2026-2401</span></div></div>
+                      </div>
+                      <div class="adw-card compact">
+                        <div class="cap dim" style="font-weight:700; margin-bottom:4px;">Advisory Notes</div>
+                        <ul class="spec-list" style="margin:0; padding-left:15px; font-size:11.5px;">
+                          <li>Fixes TLS 1.3 ALPN out-of-bounds read (CVE-2026-2401).</li>
+                          <li>Provided directly by dnf5daemon <code>Advisory.list</code>.</li>
+                        </ul>
+                      </div>
+                    </div>
+                  </aside>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 5. RUNNING TELEMETRY ==================== -->
+          <section data-state-panel="running">
+            <div class="b-split-shell">
+              <aside class="b-sidebar" data-gtk="Adw.NavigationPage (Telemetry)">
+                <header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Pipeline Telemetry</span></div></header>
+                <div class="b-sidebar-body">
+                  <div class="spark-card" data-gtk="Gtk.DrawingArea (Sparkline)">
+                    <div class="row-between">
+                      <span class="cap dim" style="font-weight:700;">Throughput</span>
+                      <span class="numeric accent-txt cap" data-sim-speed>24.8 MB/s</span>
+                    </div>
+                    <svg class="spark-svg" viewBox="0 0 200 44" preserveAspectRatio="none">
+                      <defs>
+                        <linearGradient id="bSparkFill" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stop-color="#3584e4" stop-opacity="0.32"/>
+                          <stop offset="100%" stop-color="#3584e4" stop-opacity="0.0"/>
+                        </linearGradient>
+                      </defs>
+                      <path d="M0 36 L25 30 L50 22 L75 26 L100 14 L125 18 L150 9 L175 13 L200 7 L200 44 L0 44 Z" fill="url(#bSparkFill)"/>
+                      <polyline points="0,36 25,30 50,22 75,26 100,14 125,18 150,9 175,13 200,7" fill="none" stroke="var(--accent-color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <div class="row-between cap faint numeric" style="font-size:10.5px; white-space:nowrap;"><span>Peak 32 MB/s</span><span>142 / 315 MB</span></div>
+                  </div>
+
+                  <div>
+                    <div class="b-nav-section-lbl">Execution Queue</div>
+                    <div class="b-nav-list">
+                      <div class="b-nav-item active"><span>1. System (DNF5)</span><span class="b-nav-pill numeric">3/4</span></div>
+                      <div class="b-nav-item"><span>2. Apps (Flatpak)</span><span class="b-nav-pill">Queued</span></div>
+                      <div class="b-nav-item"><span>3. Firmware (LVFS)</span><span class="b-nav-pill">Queued</span></div>
+                    </div>
+                  </div>
+
+                  <div class="b-pulse-card" style="margin-top:auto;">
+                    <span class="cap dim">Elapsed: <strong class="numeric">1m 42s</strong></span>
+                    <span class="cap dim" data-sim-eta>About 2 minutes left</span>
+                  </div>
+                </div>
+              </aside>
+
+              <div class="b-detail">
+                <header class="adw-headerbar is-raised">
+                  <div class="hb-start">
+                    <button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar>☰</button>
+                    <button type="button" class="btn sm" data-sim-running>Simulate Live Motion</button>
+                  </div>
+                  <div class="hb-center">
+                    <span class="adw-win-title" data-sim-stage>Applying</span>
+                    <span class="adw-win-subtitle hide-narrow numeric" data-sim-rem>3 done · 3 remaining</span>
+                  </div>
+                  <div class="hb-end">
+                    <button type="button" class="btn destructive sm" data-open-dialog="dialog-b-stop">Stop…</button>
+                    <span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span>
+                  </div>
+                </header>
+
+                <div class="adw-scroll">
+                  <div class="adw-clamp-680">
+                    <!-- Stage Breadcrumb + Progress -->
+                    <div class="adw-card compact col-flex" style="gap:10px;">
+                      <div class="row-between wrap-narrow">
+                        <div class="stage-crumbs">
+                          <span class="stage-crumb done">Download ✓</span>
+                          <span class="stage-crumb done">Prepare ✓</span>
+                          <span class="stage-crumb active">Install</span>
+                          <span class="stage-crumb">Verify</span>
+                        </div>
+                        <span class="numeric" style="font-weight:800;" data-sim-overall-pct>50%</span>
+                      </div>
+                      <div class="adw-progress-bar"><div class="adw-progress-fill" style="width:50%;" data-sim-overall-bar></div></div>
+                    </div>
+
+                    <!-- Active Card -->
+                    <div class="adw-card row-flex" style="gap:14px;">
+                      <div class="gsk-ring-wrap">
+                        <svg viewBox="0 0 48 48">
+                          <circle class="gsk-ring-track" cx="24" cy="24" r="20"></circle>
+                          <circle class="gsk-ring-arc" cx="24" cy="24" r="20" stroke-dasharray="125.6" stroke-dashoffset="62.8" data-sim-ring></circle>
+                        </svg>
+                        <span class="gsk-ring-label numeric" data-sim-item-pct>72%</span>
+                      </div>
+                      <div class="row-main">
+                        <div class="row-title-line">
+                          <span class="src-badge dnf">DNF</span>
+                          <span style="font-size:15px; font-weight:800;" data-sim-item-name>gnome-shell</span>
+                        </div>
+                        <div class="row-sub">Running RPM upgrade scriptlets · 8.7 MB</div>
+                        <div class="adw-progress-bar" style="height:4px; margin-top:7px;"><div class="adw-progress-fill" style="width:72%;" data-sim-item-bar></div></div>
+                      </div>
+                    </div>
+
+                    <div class="adw-boxed-list">
+                      <div class="adw-row is-active"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">gnome-shell</span><span class="row-sub">48.1-1.fc44 → 48.2-1.fc44</span></div><span class="cap accent-txt numeric">72%</span></div>
+                      <div class="adw-row is-pending"><span class="src-badge fp">FP</span><div class="row-main"><span class="row-title">Thunderbird</span><span class="row-sub">128.0.1 → 128.2.0</span></div><span class="cap dim">Queued</span></div>
+                      <div class="adw-row is-pending"><span class="src-badge fw">FW</span><div class="row-main"><span class="row-title">UEFI dbx</span><span class="row-sub">20240101 → 20241101</span></div><span class="cap dim">Queued</span></div>
+                    </div>
+
+                    <div class="adw-boxed-list adw-expander">
+                      <button type="button" class="adw-expander-head" data-expander-btn>
+                        <svg class="exp-chev" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 3l5 5-5 5z"/></svg>
+                        <span class="row-main"><span class="row-title">3 completed</span></span>
+                        <span class="micro-tag ok">Done</span>
+                      </button>
+                      <div class="adw-expander-body">
+                        <div class="adw-row is-done"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">openssl</span></div><span class="cap ok-txt">Done</span></div>
+                        <div class="adw-row is-done"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">kernel</span></div><span class="cap ok-txt">Done</span></div>
+                        <div class="adw-row is-done"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">firefox</span></div><span class="cap ok-txt">Done</span></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="adw-bottom-sheet" data-log-scope>
+                  <div class="sheet-drawer-body">
+                    <div class="sheet-console-toolbar"><span class="cap" style="color:#fff;font-weight:700;">Live Output</span><button type="button" class="btn sm flat" style="color:#fff;" data-copy-log>Copy</button></div>
+                    <pre class="sheet-console-pre mono">[dnf] [4/4] Upgrading gnome-shell-48.2-1.fc44.x86_64 72%</pre>
+                  </div>
+                  <button type="button" class="sheet-handle-btn" data-console-toggle>
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 3l6 5-6 5z"/></svg>
+                    <span class="sheet-handle-line mono" data-sim-console>[dnf] [4/4] Upgrading gnome-shell-48.2-1.fc44.x86_64 72%</span>
+                    <span class="cap accent-txt">Console</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 6. DONE (NEEDS REBOOT) ==================== -->
+          <section data-state-panel="done">
+            <div class="b-split-shell">
+              <aside class="b-sidebar">
+                <header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header>
+                <div class="b-sidebar-body">
+                  <div class="b-pulse-card">
+                    <div class="row-flex"><span class="pulse-dot warn"></span><strong style="font-size:12.5px;">Restart Pending</strong></div>
+                    <span class="cap dim">6 upgraded in 4m 18s</span>
+                  </div>
+                  <div class="b-nav-list">
+                    <button type="button" class="b-nav-item active" data-goto-state="done"><span>Run Summary</span></button>
+                    <button type="button" class="b-nav-item" data-goto-state="history"><span>Update History</span><span class="b-nav-pill">15</span></button>
+                    <button type="button" class="b-nav-item" data-goto-state="log"><span>Activity Log</span></button>
+                  </div>
+                </div>
+              </aside>
+              <div class="b-detail">
+                <header class="adw-headerbar">
+                  <div class="hb-start"><button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar>☰</button></div>
+                  <div class="hb-center"><span class="adw-win-title">All Updates Applied</span><span class="adw-win-subtitle hide-narrow numeric">6 upgraded · 4m 18s</span></div>
+                  <div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+                </header>
+                <div class="adw-scroll">
+                  <div class="adw-clamp-680">
+                    <div class="adw-card warn-card row-between wrap-narrow">
+                      <div>
+                        <div style="font-weight:800; font-size:14.5px;">Restart Recommended</div>
+                        <div class="cap dim">kernel-6.14.11-300.fc44 &amp; UEFI dbx require reboot</div>
+                      </div>
+                      <button type="button" class="btn suggested" data-toast-msg="Scheduling reboot via logind…">Restart Now</button>
+                    </div>
+                    <div class="adw-boxed-list">
+                      <div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><div class="row-title-line"><span class="row-title">kernel</span><span class="micro-tag reboot">Restart</span></div><span class="row-sub ver-diff">6.14.9 → 6.14.11</span></div><span class="cap ok-txt">Done</span></div>
+                      <div class="adw-row"><span class="src-badge fw">FW</span><div class="row-main"><div class="row-title-line"><span class="row-title">UEFI dbx</span><span class="micro-tag reboot">Restart</span></div><span class="row-sub ver-diff">20240101 → 20241101</span></div><span class="cap ok-txt">Done</span></div>
+                      <div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">openssl</span><span class="row-sub ver-diff">1:3.2.2-1 → 1:3.2.2-3</span></div><span class="cap ok-txt">Done</span></div>
+                      <div class="adw-row"><span class="src-badge fp">FP</span><div class="row-main"><span class="row-title">Thunderbird</span><span class="row-sub ver-diff">128.0.1 → 128.2.0</span></div><span class="cap ok-txt">Done</span></div>
+                    </div>
+                  </div>
+                </div>
+                <footer class="adw-bottom-bar">
+                  <div class="adw-bottom-bar-inner">
+                    <button type="button" class="btn flat" data-goto-state="log">Open Activity Log</button>
+                    <button type="button" class="btn" data-goto-state="idle-current">Done</button>
+                  </div>
+                </footer>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 7. FAILED ==================== -->
+          <section data-state-panel="failed">
+            <div class="b-split-shell">
+              <aside class="b-sidebar">
+                <header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header>
+                <div class="b-sidebar-body">
+                  <div class="b-pulse-card">
+                    <div class="row-flex"><span class="pulse-dot err"></span><strong style="font-size:12.5px;">Transaction Failed</strong></div>
+                    <span class="cap dim">No changes committed</span>
+                  </div>
+                  <div class="b-nav-list">
+                    <button type="button" class="b-nav-item active" data-goto-state="failed"><span>Error Summary</span></button>
+                    <button type="button" class="b-nav-item" data-goto-state="log"><span>Activity Log</span></button>
+                  </div>
+                </div>
+              </aside>
+              <div class="b-detail">
+                <header class="adw-headerbar"><div class="hb-start"><button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar>☰</button></div><div class="hb-center"><span class="adw-win-title">Fedora Updater</span></div><div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div></header>
+                <div class="adw-status-page">
+                  <div class="status-emblem err"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5h.01"/></svg></div>
+                  <h2 class="status-title">All Updates Failed</h2>
+                  <p class="status-desc">The transaction aborted (dnf exited 1). Nothing was applied.</p>
+                  <div class="row-flex">
+                    <button type="button" class="btn suggested pill" data-goto-state="checking">Check Again</button>
+                    <button type="button" class="btn flat" data-goto-state="log">View Activity Log</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== VIEW: UPDATE HISTORY (TIER 2) ==================== -->
+          <section data-state-panel="history">
+            <div class="b-split-shell">
+              <aside class="b-sidebar">
+                <header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header>
+                <div class="b-sidebar-body">
+                  <div class="b-pulse-card">
+                    <div class="row-flex"><span class="pulse-dot"></span><strong style="font-size:12.5px;">Fedora Linux 44</strong></div>
+                    <span class="cap dim">History · org.rpm.dnf.v0.History</span>
+                  </div>
+                  <div class="b-nav-list">
+                    <button type="button" class="b-nav-item" data-goto-state="ready"><span>Available Updates</span><span class="b-nav-pill numeric">6</span></button>
+                    <button type="button" class="b-nav-item active" data-goto-state="history"><span>Update History</span><span class="b-nav-pill numeric">14</span></button>
+                    <button type="button" class="b-nav-item" data-goto-state="log"><span>Activity Log</span></button>
+                  </div>
+                </div>
+              </aside>
+              <div class="b-detail">
+                <header class="adw-headerbar is-raised">
+                  <div class="hb-start"><button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar>☰</button></div>
+                  <div class="hb-center"><span class="adw-win-title">Update History</span><span class="adw-win-subtitle hide-narrow">Powered by dnf5daemon History.list() &amp; fwupd GetHistory()</span></div>
+                  <div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+                </header>
+                <div class="adw-scroll">
+                  <div class="adw-clamp-680">
+                    <div class="adw-group">
+                      <div class="adw-group-header"><span class="adw-group-title">November 18, 2026</span><span class="adw-group-meta">Transaction #184 · Succeeded</span></div>
+                      <div class="adw-boxed-list">
+                        <div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">mesa-dri-drivers · mesa-vulkan-drivers (+11)</span><span class="row-sub ver-diff">25.0.5 → 25.0.7 · 3m 12s</span></div><span class="micro-tag ok">Applied</span></div>
+                        <div class="adw-row"><span class="src-badge fp">FP</span><div class="row-main"><span class="row-title">OBS Studio</span><span class="row-sub ver-diff">31.0.1 → 31.0.2 · flathub</span></div><span class="micro-tag ok">Applied</span></div>
+                      </div>
+                    </div>
+                    <div class="adw-group">
+                      <div class="adw-group-header"><span class="adw-group-title">November 11, 2026</span><span class="adw-group-meta">Transaction #181 · Rebooted</span></div>
+                      <div class="adw-boxed-list">
+                        <div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">kernel-6.14.9-300.fc44 · systemd (+24)</span><span class="row-sub">Security &amp; system core batch</span></div><span class="micro-tag ok">Applied</span></div>
+                        <div class="adw-row"><span class="src-badge fw">FW</span><div class="row-main"><span class="row-title">ThinkPad System Firmware</span><span class="row-sub ver-diff">0.1.32 → 0.1.34 · LVFS</span></div><span class="micro-tag ok">Verified</span></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== VIEW: ACTIVITY LOG ==================== -->
+          <section data-state-panel="log" data-log-scope>
+            <div class="b-split-shell">
+              <aside class="b-sidebar">
+                <header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header>
+                <div class="b-sidebar-body">
+                  <div class="b-nav-list">
+                    <button type="button" class="b-nav-item" data-goto-state="ready"><span>Available Updates</span><span class="b-nav-pill numeric">6</span></button>
+                    <button type="button" class="b-nav-item" data-goto-state="history"><span>Update History</span><span class="b-nav-pill numeric">14</span></button>
+                    <button type="button" class="b-nav-item active" data-goto-state="log"><span>Activity Log</span></button>
+                  </div>
+                </div>
+              </aside>
+              <div class="b-detail">
+                <header class="adw-headerbar is-raised">
+                  <div class="hb-start">
+                    <button type="button" class="btn icon-only flat b-back-btn" data-b-toggle-sidebar>☰</button>
+                    <div class="adw-togglegroup">
+                      <button type="button" class="adw-toggle active" data-log-filter="all">All</button>
+                      <button type="button" class="adw-toggle" data-log-filter="dnf">DNF</button>
+                      <button type="button" class="adw-toggle" data-log-filter="fp">Flatpak</button>
+                      <button type="button" class="adw-toggle" data-log-filter="fw">fwupd</button>
+                    </div>
+                  </div>
+                  <div class="hb-center"><span class="adw-win-title">Activity Log</span></div>
+                  <div class="hb-end">
+                    <button type="button" class="btn sm suggested" data-copy-log>Copy All</button>
+                    <span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span>
+                  </div>
+                </header>
+                <div class="adw-scroll" style="background:var(--console-bg); color:var(--console-fg); padding:14px;">
+                  <pre class="mono" style="margin:0; font-size:12px; line-height:1.55; white-space:pre-wrap;"><span class="log-line" data-log-src="dnf">[dnf] Session opened: /org/rpm/dnf/v0/Session_4a12
+[dnf] Advisory.list(availability="updates"): 2 security advisories
+[dnf] [1/4] Upgrading openssl-1:3.2.2-3.fc44.x86_64 100%
+[dnf] [2/4] Upgrading kernel-6.14.11-300.fc44.x86_64 100%
+</span><span class="log-line" data-log-src="fp">[flatpak-user] list_installed_refs_for_update: 1 ref (org.mozilla.Thunderbird)
+[flatpak-user] Related install: runtime/org.freedesktop.Platform.GL.nvidia-550-00-00
+</span><span class="log-line" data-log-src="fw">[fwupd] Device UEFI dbx: battery check passed (88% >= 25%)
+[fwupd] Successfully installed firmware 20241101 (reboot needed)</span></pre>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== EDGE PANELS ==================== -->
+          <section data-state-panel="ready-warn">
+            <div class="b-split-shell">
+              <aside class="b-sidebar"><header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header><div class="b-sidebar-body"><div class="b-pulse-card"><div class="row-flex"><span class="pulse-dot warn"></span><strong style="font-size:12.5px;">Partial Check</strong></div><span class="cap dim">fwupd unreachable</span></div></div></aside>
+              <div class="b-detail">
+                <header class="adw-headerbar is-raised"><div class="hb-start"></div><div class="hb-center"><span class="adw-win-title">5 Updates Available</span></div><div class="hb-end"><button type="button" class="btn suggested sm" data-goto-state="running">Update All</button></div></header>
+                <div class="adw-banner warning"><span class="banner-msg">1 source could not be checked (Firmware metadata refresh failed)</span><button type="button" class="banner-action" data-goto-state="log">View Log</button></div>
+                <div class="adw-scroll"><div class="adw-boxed-list"><div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">openssl</span><span class="row-sub">1:3.2.2-1 → 1:3.2.2-3</span></div><span class="cap dim numeric">2.1 MB</span></div><div class="adw-row"><span class="src-badge fp">FP</span><div class="row-main"><span class="row-title">Thunderbird</span><span class="row-sub">128.0.1 → 128.2.0</span></div><span class="cap dim numeric">94.0 MB</span></div></div></div>
+              </div>
+            </div>
+          </section>
+
+          <section data-state-panel="ready-stale">
+            <div class="b-split-shell">
+              <aside class="b-sidebar"><header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header></aside>
+              <div class="b-detail">
+                <header class="adw-headerbar is-raised"><div class="hb-center"><span class="adw-win-title">6 Updates</span></div></header>
+                <div class="adw-dialog-scrim open"><div class="adw-alert-dialog"><h3>Refresh Update List?</h3><p>This update list is more than 24 hours old. Refresh before applying updates.</p><div class="adw-alert-actions"><button type="button" class="btn" data-goto-state="ready">Cancel</button><button type="button" class="btn suggested" data-goto-state="checking">Refresh</button></div></div></div>
+              </div>
+            </div>
+          </section>
+
+          <section data-state-panel="running-stall">
+            <div class="b-split-shell">
+              <aside class="b-sidebar"><header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Telemetry</span></div></header><div class="b-sidebar-body"><div class="b-pulse-card"><span class="cap warn-txt">Quiet for 3m</span><span class="cap dim">dnf5daemon-server running</span></div></div></aside>
+              <div class="b-detail">
+                <header class="adw-headerbar is-raised"><div class="hb-center"><span class="adw-win-title">Downloading</span></div><div class="hb-end"><button type="button" class="btn sm" data-goto-state="ready">Stop</button></div></header>
+                <div class="adw-banner warning"><span class="banner-msg">No output for 3 minutes. Waiting on GNOME Software.</span><button type="button" class="banner-action" data-goto-state="log">Activity Log</button></div>
+                <div class="adw-scroll"><div class="adw-card"><span class="row-title">Downloading firefox — 85 MB and rising</span></div></div>
+              </div>
+            </div>
+          </section>
+
+          <section data-state-panel="done-clean">
+            <div class="b-split-shell">
+              <aside class="b-sidebar"><header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header><div class="b-sidebar-body"><div class="b-pulse-card"><div class="row-flex"><span class="pulse-dot"></span><strong style="font-size:12.5px;">Complete</strong></div><span class="cap dim">3 upgraded · 48s</span></div></div></aside>
+              <div class="b-detail">
+                <header class="adw-headerbar"><div class="hb-center"><span class="adw-win-title">All Updates Applied</span></div></header>
+                <div class="adw-status-page"><div class="status-emblem ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M20 6L9 17l-5-5"/></svg></div><h2 class="status-title">All Updates Applied</h2><p class="status-desc">3 packages upgraded in 48s. No restart needed.</p><button type="button" class="btn suggested pill" data-goto-state="idle-current">Done</button></div>
+              </div>
+            </div>
+          </section>
+
+          <section data-state-panel="done-partial">
+            <div class="b-split-shell">
+              <aside class="b-sidebar"><header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header></aside>
+              <div class="b-detail">
+                <header class="adw-headerbar is-raised"><div class="hb-center"><span class="adw-win-title">Updates Finished With Problems</span></div></header>
+                <div class="adw-banner error"><span class="banner-msg">1 update failed (UEFI dbx battery check). 5 applied.</span><button type="button" class="banner-action" data-goto-state="log">View Log</button></div>
+                <div class="adw-scroll"><div class="adw-boxed-list"><div class="adw-row"><span class="src-badge fw">FW</span><div class="row-main"><span class="row-title">UEFI dbx</span><span class="row-sub">Battery below 25% threshold</span></div><span class="cap err-txt">Failed</span></div><div class="adw-row is-done"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">kernel</span></div><span class="cap ok-txt">Done</span></div></div></div>
+              </div>
+            </div>
+          </section>
+
+          <section data-state-panel="failed-reboot">
+            <div class="b-split-shell">
+              <aside class="b-sidebar"><header class="adw-headerbar"><div class="hb-start"><span style="font-weight:800; font-size:13px;">Observatory</span></div></header></aside>
+              <div class="b-detail">
+                <header class="adw-headerbar"><div class="hb-center"><span class="adw-win-title">Fedora Updater</span></div></header>
+                <div class="adw-status-page"><div class="status-emblem warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.6L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0z"/></svg></div><h2 class="status-title">Reboot Blocked</h2><p class="status-desc">A shutdown inhibitor is still active. Retry rebooting in a few seconds.</p><button type="button" class="btn suggested pill" data-toast-msg="Retrying reboot…">Restart</button></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Shared Dialogs -->
+          <div class="adw-dialog-scrim" id="dialog-b-upgrade">
+            <div class="adw-sheet-dialog">
+              <div class="adw-sheet-head"><h3>Upgrade to Fedora Linux 45</h3><button type="button" class="btn icon-only flat" data-close-dialog>✕</button></div>
+              <div class="adw-sheet-body">
+                <p class="cap dim" style="margin:0;">Two separate commands (never chained with <code>&amp;&amp;</code>):</p>
+                <div class="cmd-copy-row"><code class="mono">sudo dnf system-upgrade download --releasever=45</code><button type="button" class="btn sm" data-copy-cmd="sudo dnf system-upgrade download --releasever=45">Copy</button></div>
+                <div class="cmd-copy-row"><code class="mono">sudo dnf system-upgrade reboot</code><button type="button" class="btn sm" data-copy-cmd="sudo dnf system-upgrade reboot">Copy</button></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="adw-dialog-scrim" id="dialog-b-stop">
+            <div class="adw-alert-dialog">
+              <h3>Stop This Update?</h3>
+              <p>Stopping during an RPM transaction can leave the package database incomplete.</p>
+              <div class="adw-alert-actions">
+                <button type="button" class="btn" data-close-dialog>Keep Waiting</button>
+                <button type="button" class="btn destructive" data-goto-state="failed">Stop Anyway</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="adw-dialog-scrim" id="dialog-b-about">
+            <div class="adw-alert-dialog">
+              <h3>Fedora Updater</h3>
+              <p>Variant B "Observatory" · NEON Redesign<br/>Adaptive Split-Pane Workbench with live D-Bus telemetry &amp; history.</p>
+              <button type="button" class="btn" data-close-dialog>Close</button>
+            </div>
+          </div>
+
+          <div class="adw-toast-wrap"><div class="adw-toast" role="status" aria-live="polite"></div></div>
+        </div>
+      </div>
+
+      <aside class="neon-spec-panel" id="neon-spec-panel" aria-live="polite"></aside>
+    </div>
+  </main>
+
+  <script>
+    document.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-b-toggle-sidebar]");
+      if (btn) {
+        btn.closest(".b-split-shell")?.classList.toggle("show-sidebar");
+      }
+    });
+
+    window.NEON_BLUEPRINTS = {
+      idle: {
+        phase: "Phase::Idle(Fresh)",
+        title: "Persistent Workbench Sidebar + Release Card",
+        summary: "Moves Fedora 45 release advice into the sidebar footer while keeping History & Activity Log immediately reachable even before checking.",
+        tier1: "pkexec helper on Check",
+        tier2: "Zero-auth Check + History.list()",
+        blueprint: `Adw.NavigationSplitView {\n  sidebar: Adw.NavigationPage { SystemPulse; ListBox; UpgradeCard }\n  content: Adw.NavigationPage { Adw.StatusPage }\n}`,
+        notes: [
+          "At <500px (Viewport: Narrow), sidebar collapses into push/pop drawer via ☰ button."
+        ]
+      },
+      "idle-current": {
+        phase: "Phase::Idle(Current)",
+        title: "Verified System Pulse + Quick History",
+        summary: "Sidebar displays current kernel and green pulse status while main view offers Check Again.",
+        tier1: "IdleScreen::Current",
+        tier2: "DNF5 + Flatpak + fwupd synced",
+        blueprint: `Adw.NavigationSplitView {\n  sidebar: SystemPulse (green)\n  content: Adw.StatusPage (System Is Up to Date)\n}`,
+        notes: ["Update History stays accessible without running a check."]
+      },
+      auth: {
+        phase: "Phase::Authenticating",
+        title: "Non-Blocking Auth in Content Pane",
+        summary: "Clean authentication prompt in content pane; cancelled cleanly via WORK_GEN.",
+        tier1: "pkexec --helper",
+        tier2: "Apply-only polkit prompt",
+        blueprint: `Adw.NavigationPage { Adw.StatusPage (Authentication Required) }`,
+        notes: ["Eliminated for Checks when dnf5daemon D-Bus is used."]
+      },
+      checking: {
+        phase: "Phase::Checking",
+        title: "Sidebar Source Checklist + Streaming Rows",
+        summary: "Sidebar tracks per-source check status live while main pane streams discovered packages.",
+        tier1: "dnf check-update + libflatpak + fwupd",
+        tier2: "dnf5daemon Rpm.list_fd",
+        blueprint: `Adw.NavigationSplitView {\n  sidebar: Source checklist (4 ✓ / … / Queued)\n  content: ProgressBar + ListView + BottomSheet\n}`,
+        notes: ["Avoids modal wait feeling; user sees each backend resolve."]
+      },
+      ready: {
+        phase: "Phase::Ready",
+        title: "Selective Queue + Adw.OverlaySplitView Inspector",
+        summary: "Combines selective package checkboxes, Adw.SplitButton (Live / Reboot / Offline / Download Only), and a slide-out CVE & changelog inspector.",
+        tier1: "All-or-nothing Update All",
+        tier2: "Selective Rpm.upgrade + Offline + Advisory.list",
+        blueprint: `Adw.NavigationSplitView {\n  sidebar: Source filters + Views + Fedora 45\n  content: Adw.OverlaySplitView {\n    Gtk.ListView (CheckButton + Diff)\n    [sidebar] PackageInspector\n  }\n}`,
+        notes: [
+          "Click any row to live-update the right OverlaySplitView inspector.",
+          "Uncheck items to watch the header count & CTA update live.",
+          "Open the Adw.SplitButton menu next to Update All to preview Offline / Download Only modes."
+        ]
+      },
+      running: {
+        phase: "Phase::Running",
+        title: "Live Throughput Sparkline + Stage Deck",
+        summary: "Sidebar converts into Pipeline Telemetry with a 60s Cairo MB/s sparkline; main pane tracks Download → Prepare → Install → Verify.",
+        tier1: "Stdout + cache poll",
+        tier2: "D-Bus download_progress bytes/s",
+        blueprint: `Adw.NavigationSplitView {\n  sidebar: Gtk.DrawingArea (Sparkline) + Source Queue\n  content: StageCrumbs + RingCard + ListView\n}`,
+        notes: ["Click 'Simulate Live Motion' to animate progress ring & console output."]
+      },
+      done: {
+        phase: "Phase::Done(Reboot)",
+        title: "Reboot Callout + Integrated Log Link",
+        summary: "Promotes Restart Now while linking cleanly into the inline Activity Log view rather than spawning a modal dialog.",
+        tier1: "Core allowlist + fwupd exit 0",
+        tier2: "login1 CanReboot + History updated",
+        blueprint: `Adw.ToolbarView {\n  warn-card (Restart Now)\n  Gtk.ListView (Installed)\n}`,
+        notes: ["History counter increments automatically after run completion."]
+      },
+      failed: {
+        phase: "Phase::Failed",
+        title: "Failure Recovery + Inline Log Switch",
+        summary: "Failure status page with direct jump into the searchable Activity Log view.",
+        tier1: "RetryAction::CheckAgain",
+        tier2: "Structured D-Bus error",
+        blueprint: `Adw.StatusPage { Check Again | View Activity Log }`,
+        notes: ["Sidebar flags Transaction Failed clearly in red."]
+      },
+      history: {
+        phase: "Tier 2 View: History",
+        title: "Persistent Transaction Timeline",
+        summary: "Powered directly by org.rpm.dnf.v0.History.list() and org.freedesktop.fwupd.GetHistory(). Shows past kernel, Mesa, Flatpak, and BIOS updates.",
+        tier1: "Not available via CLI scraper",
+        tier2: "dnf5daemon History.list() + fwupd",
+        blueprint: `Adw.PreferencesGroup (per date) {\n  Adw.ActionRow (Transaction summary)\n}`,
+        notes: ["Requires zero polkit password to read history."]
+      },
+      log: {
+        phase: "Integrated View: Activity Log",
+        title: "Searchable Multi-Source Console View",
+        summary: "Replaces the old modal log window with an embedded filterable console supporting source toggles (All / DNF / Flatpak / fwupd).",
+        tier1: "ConsoleBuffer (8,000 lines)",
+        tier2: "Structured D-Bus event stream",
+        blueprint: `Adw.ToolbarView {\n  [top] Adw.ToggleGroup (All|DNF|FP|FW) + Copy All\n  Gtk.TextView (monospace)\n}`,
+        notes: ["Click the DNF / Flatpak / fwupd pills above to filter log lines live."]
+      },
+      "ready-warn": {
+        phase: "Edge: Soft Error",
+        title: "Partial Source Warning Banner",
+        summary: "Preserves remaining packages when one source fails metadata refresh.",
+        tier1: "Phase::Ready { soft_errors }",
+        tier2: "Per-source D-Bus status",
+        blueprint: `Adw.Banner.warning -> View Log`,
+        notes: ["Links directly to Activity Log."]
+      },
+      "ready-stale": {
+        phase: "Edge: Stale >24h",
+        title: "Stale List AlertDialog",
+        summary: "Prompts before applying an update list older than 24 hours.",
+        tier1: "UPDATE_LIST_MAX_AGE",
+        tier2: "Same policy",
+        blueprint: `Adw.AlertDialog (Refresh Update List?)`,
+        notes: ["Confirming triggers StartCheck { then_apply: true }."]
+      },
+      "running-stall": {
+        phase: "Edge: Stalled >120s",
+        title: "GNOME Software Contention Banner",
+        summary: "Displays cache growth + GNOME Software waiting state.",
+        tier1: "quiet_ui() + /proc scan",
+        tier2: "Eliminated by dnf5daemon",
+        blueprint: `Adw.Banner.warning ("Waiting on GNOME Software")`,
+        notes: ["Stop during Download exits immediately without dialog."]
+      },
+      "done-clean": {
+        phase: "Edge: Done (No Reboot)",
+        title: "Clean Finish",
+        summary: "Sole suggested Done pill when no reboot-triggering package ran.",
+        tier1: "needs_reboot: false",
+        tier2: "Desktop notification if unfocused",
+        blueprint: `Adw.StatusPage (All Updates Applied)`,
+        notes: ["No unnecessary Restart banner."]
+      },
+      "done-partial": {
+        phase: "Edge: Partial Failure",
+        title: "Mixed Result Summary",
+        summary: "Highlights failed firmware battery threshold while showing succeeded RPMs.",
+        tier1: "Phase::Done { failed > 0 }",
+        tier2: "fwupd BatteryLevel guard",
+        blueprint: `Adw.Banner.error + Failed-first list`,
+        notes: ["Prevents unsafe firmware flashing below battery threshold."]
+      },
+      "failed-reboot": {
+        phase: "Edge: Reboot Inhibitor",
+        title: "Reboot Retry Recovery",
+        summary: "Handles systemd shutdown block inhibitors cleanly with Restart CTA.",
+        tier1: "RetryAction::Reboot",
+        tier2: "login1 ListInhibitors()",
+        blueprint: `Adw.StatusPage { Restart (suggested pill) }`,
+        notes: ["Specific verb 'Restart' matches action."]
+      }
+    };
+  </script>
+  <script src="neon-shared.js"></script>
+</body>
+</html>

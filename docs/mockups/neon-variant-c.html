@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NEON · Variant C "Cadence" — Fedora Updater Redesign</title>
+  <link rel="stylesheet" href="neon-shared.css" />
+  <style>
+    /* Variant C ("Cadence") — Journey Rail + Bento Cards + Smart Complexity Folding */
+    .cadence-rail {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px;
+      border-radius: 999px;
+      background: var(--adw-btn-bg);
+    }
+    .cadence-step {
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--adw-dim-fg);
+      white-space: nowrap;
+    }
+    .cadence-step.done {
+      color: var(--success-color);
+    }
+    .cadence-step.active {
+      background: var(--adw-card-bg-solid);
+      color: var(--adw-window-fg);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+    }
+
+    .bento-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .gtk-win.is-narrow .bento-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .bento-card {
+      padding: 13px 14px;
+      border-radius: 12px;
+      background: var(--adw-card-bg);
+      border: 1.5px solid var(--adw-card-border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      text-align: left;
+      cursor: pointer;
+      transition: border-color 140ms ease, background 140ms ease, transform 100ms ease;
+    }
+    .bento-card:hover {
+      background: var(--adw-card-hover);
+    }
+    .bento-card.active {
+      border-color: var(--accent-color);
+      background: var(--accent-tint);
+    }
+    .bento-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .bento-count {
+      font-size: 17px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Segmented 3-Phase Bar */
+    .seg-bar {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 5px;
+      width: 100%;
+    }
+    .seg-track {
+      height: 6px;
+      border-radius: 999px;
+      background: var(--adw-track);
+      overflow: hidden;
+    }
+    .seg-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: var(--accent-bg);
+      transition: width 320ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .seg-fill.ok {
+      background: var(--success-bg);
+    }
+
+    .milestone-hero {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .active-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--accent-tint);
+      border: 1px solid var(--accent-ring);
+      font-size: 12.5px;
+      font-weight: 700;
+      align-self: flex-start;
+    }
+
+    .offline-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--adw-card-border);
+      background: var(--adw-btn-bg);
+      font-size: 12px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    .offline-chip.active {
+      background: var(--accent-tint);
+      border-color: var(--accent-ring);
+      color: var(--accent-color);
+    }
+  </style>
+</head>
+<body>
+  <header class="neon-studio-bar">
+    <div class="neon-studio-inner">
+      <a href="neon-index.html" class="neon-brand">
+        <span class="neon-mark"><span class="neon-mark-dot"></span>NEON</span>
+        <span class="neon-brand-title">Fedora Updater</span>
+        <span class="neon-brand-sub">Variant C · Cadence</span>
+      </a>
+      <nav class="neon-nav" aria-label="NEON Mockup Navigation">
+        <a href="neon-index.html">Hub</a>
+        <a href="neon-variant-a.html">A · Lumen</a>
+        <a href="neon-variant-b.html">B · Observatory</a>
+        <a href="neon-variant-c.html" class="active">C · Cadence</a>
+        <a href="neon-assessment.md">Assessment</a>
+      </nav>
+      <div class="neon-controls">
+        <button type="button" class="studio-btn" data-theme-toggle aria-pressed="false">Theme: Dark</button>
+        <button type="button" class="studio-btn" data-narrow-toggle aria-pressed="false">Viewport: Desktop</button>
+        <button type="button" class="studio-btn" data-xray-toggle aria-pressed="false">GTK4 X-Ray</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="neon-shell">
+    <div class="neon-variant-intro">
+      <div>
+        <h1>Variant C · "Cadence" — Stage-Driven Guided Bento Flow</h1>
+        <p>
+          Frames updating as a calm 3-act journey (<code>1 Check → 2 Review → 3 Install</code>). Uses interactive Source Bento cards, human-first security &amp; reboot callouts, smart rollup folding for 75-RPM transactions, and a serene milestone track during execution.
+        </p>
+      </div>
+    </div>
+
+    <div class="neon-state-rail" role="tablist" aria-label="Application States">
+      <button type="button" class="state-pill" data-state-btn="idle">1 · Idle</button>
+      <button type="button" class="state-pill" data-state-btn="idle-current">1b · Up to Date</button>
+      <button type="button" class="state-pill" data-state-btn="auth">2 · Auth</button>
+      <button type="button" class="state-pill" data-state-btn="checking">3 · Checking</button>
+      <button type="button" class="state-pill active" data-state-btn="ready">4 · Ready Bento</button>
+      <button type="button" class="state-pill" data-state-btn="running">5 · Running Milestone</button>
+      <button type="button" class="state-pill" data-state-btn="done">6 · Done (Reboot)</button>
+      <button type="button" class="state-pill" data-state-btn="failed">7 · Failed</button>
+      <span class="rail-group-sep" aria-hidden="true"></span>
+      <button type="button" class="state-pill edge" data-state-btn="ready-warn">Edge: Soft Error</button>
+      <button type="button" class="state-pill edge" data-state-btn="ready-stale">Edge: Stale &gt;24h</button>
+      <button type="button" class="state-pill edge" data-state-btn="running-stall">Edge: Stalled</button>
+      <button type="button" class="state-pill edge" data-state-btn="done-clean">Edge: Clean Done</button>
+      <button type="button" class="state-pill edge" data-state-btn="done-partial">Edge: Partial Fail</button>
+      <button type="button" class="state-pill edge" data-state-btn="failed-reboot">Edge: Reboot Block</button>
+    </div>
+
+    <div class="neon-stage-grid">
+      <div class="neon-window-stage">
+        <div class="gtk-win" data-gtk="Adw.ApplicationWindow">
+
+          <!-- ==================== 1. IDLE ==================== -->
+          <section data-state-panel="idle">
+            <header class="adw-headerbar" data-gtk="Adw.HeaderBar">
+              <div class="hb-start"></div>
+              <div class="hb-center">
+                <div class="cadence-rail" data-gtk="Gtk.Box (JourneyRail)">
+                  <span class="cadence-step active">1 Check</span>
+                  <span class="cadence-step">2 Review</span>
+                  <span class="cadence-step">3 Install</span>
+                </div>
+              </div>
+              <div class="hb-end">
+                <button type="button" class="btn icon-only flat" data-open-dialog="dialog-c-about" title="Main Menu"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 4h12v1.5H2zm0 3.25h12v1.5H2zm0 3.25h12V12H2z"/></svg></button>
+                <span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span>
+              </div>
+            </header>
+            <div class="adw-scroll">
+              <div class="adw-clamp-680" style="min-height:100%; justify-content:space-between;">
+                <div class="release-card">
+                  <div class="release-card-text">
+                    <strong>Fedora Linux 45 is available <span class="cap dim">(12 days since release)</span></strong>
+                    <span>Upgrade guide available anytime</span>
+                  </div>
+                  <button type="button" class="btn sm" data-open-dialog="dialog-c-upgrade">Upgrade Guide</button>
+                </div>
+                <div class="adw-status-page">
+                  <div class="status-emblem">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M21 12a9 9 0 0 1-15.4 6.4M3 12A9 9 0 0 1 18.4 5.6"/><path d="M21 6v6h-6M3 18v-6h6"/></svg>
+                  </div>
+                  <h2 class="status-title">Ready to Check for Updates</h2>
+                  <p class="status-desc">We’ll scan System packages, Flatpak apps, and Firmware—then summarize what actually matters before installing.</p>
+                  <button type="button" class="btn suggested pill" data-goto-state="checking">Check for Updates</button>
+                </div>
+                <div class="bento-grid">
+                  <div class="adw-card compact"><span class="src-badge dnf">DNF</span><div style="font-weight:700; margin-top:6px;">System Packages</div><div class="cap dim">Kernel, security, core</div></div>
+                  <div class="adw-card compact"><span class="src-badge fp">FP</span><div style="font-weight:700; margin-top:6px;">Applications</div><div class="cap dim">User &amp; system Flatpaks</div></div>
+                  <div class="adw-card compact"><span class="src-badge fw">FW</span><div style="font-weight:700; margin-top:6px;">Device Firmware</div><div class="cap dim">LVFS hardware updates</div></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 1b. UP TO DATE ==================== -->
+          <section data-state-panel="idle-current">
+            <header class="adw-headerbar">
+              <div class="hb-start"></div>
+              <div class="hb-center">
+                <div class="cadence-rail">
+                  <span class="cadence-step done">1 Check ✓</span>
+                  <span class="cadence-step">2 Review</span>
+                  <span class="cadence-step">3 Install</span>
+                </div>
+              </div>
+              <div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+            </header>
+            <div class="adw-scroll">
+              <div class="adw-clamp-680" style="min-height:100%; justify-content:space-between;">
+                <div class="release-card">
+                  <div class="release-card-text">
+                    <strong>Fedora Linux 45 is available <span class="cap dim">(12 days since release)</span></strong>
+                    <span>Your Fedora 44 install is ready whenever you choose to upgrade</span>
+                  </div>
+                  <button type="button" class="btn sm" data-open-dialog="dialog-c-upgrade">How to Upgrade</button>
+                </div>
+                <div class="adw-status-page">
+                  <div class="status-emblem ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M20 6L9 17l-5-5"/></svg></div>
+                  <h2 class="status-title">Everything Is Current</h2>
+                  <p class="status-desc">Last checked just now · System, Apps, and Firmware are all up to date.</p>
+                  <button type="button" class="btn pill" data-goto-state="checking">Check Again</button>
+                </div>
+                <div></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== 2. AUTH ==================== -->
+          <section data-state-panel="auth">
+            <header class="adw-headerbar">
+              <div class="hb-start"></div>
+              <div class="hb-center"><span class="adw-win-title">Authorization</span><span class="adw-win-subtitle hide-narrow">Applying updates</span></div>
+              <div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+            </header>
+            <div class="adw-status-page">
+              <div class="status-emblem"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+              <h2 class="status-title">Administrator Permission Needed</h2>
+              <p class="status-desc">Confirm the system prompt once to proceed. Your password stays strictly inside the system dialog.</p>
+              <div class="adw-card compact row-flex"><span class="adw-spinner sm"></span><span class="cap dim">Waiting for confirmation…</span></div>
+              <button type="button" class="btn flat" data-goto-state="idle">Cancel</button>
+            </div>
+          </section>
+
+          <!-- ==================== 3. CHECKING ==================== -->
+          <section data-state-panel="checking">
+            <header class="adw-headerbar is-raised">
+              <div class="hb-start"></div>
+              <div class="hb-center">
+                <div class="cadence-rail">
+                  <span class="cadence-step active">1 Checking…</span>
+                  <span class="cadence-step">2 Review</span>
+                  <span class="cadence-step">3 Install</span>
+                </div>
+              </div>
+              <div class="hb-end"><button type="button" class="btn sm" data-goto-state="idle">Cancel</button><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+            </header>
+            <div class="adw-scroll">
+              <div class="adw-clamp-680">
+                <div class="adw-card milestone-hero">
+                  <div class="row-between">
+                    <div>
+                      <div style="font-size:16px; font-weight:800;">Checking Repositories</div>
+                      <div class="cap dim">About 20 seconds left · Apps metadata in progress</div>
+                    </div>
+                    <span class="numeric" style="font-weight:800;">50%</span>
+                  </div>
+                  <div class="seg-bar">
+                    <div class="seg-track"><div class="seg-fill ok" style="width:100%;"></div></div>
+                    <div class="seg-track"><div class="seg-fill" style="width:65%;"></div></div>
+                    <div class="seg-track"><div class="seg-fill" style="width:0%;"></div></div>
+                  </div>
+                </div>
+                <div class="bento-grid">
+                  <div class="bento-card"><div class="bento-top"><span class="src-badge dnf">DNF</span><span class="micro-tag ok">Done</span></div><div class="bento-count">4 found</div><div class="cap dim">220.8 MB</div></div>
+                  <div class="bento-card active"><div class="bento-top"><span class="src-badge fp">FP</span><span class="adw-spinner sm"></span></div><div class="bento-count">Scanning</div><div class="cap dim">Flathub metadata</div></div>
+                  <div class="bento-card"><div class="bento-top"><span class="src-badge fw">FW</span><span class="cap dim">Queued</span></div><div class="bento-count">LVFS</div><div class="cap dim">Waiting</div></div>
+                </div>
+              </div>
+            </div>
+            <div class="adw-bottom-sheet" data-log-scope>
+              <div class="sheet-drawer-body">
+                <div class="sheet-console-toolbar"><span class="cap" style="color:#fff;font-weight:700;">Check Output</span><button type="button" class="btn sm flat" style="color:#fff;" data-copy-log>Copy</button></div>
+                <pre class="sheet-console-pre mono">[dnf] Found 4 system package upgrades
+[flatpak-user] Querying libflatpak updates…</pre>
+              </div>
+              <button type="button" class="sheet-handle-btn" data-console-toggle>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 3l6 5-6 5z"/></svg>
+                <span class="sheet-handle-line mono">[flatpak-user] Querying libflatpak updates…</span>
+                <span class="cap accent-txt">Console</span>
+              </button>
+            </div>
+          </section>
+
+          <!-- ==================== 4. READY BENTO ==================== -->
+          <section data-state-panel="ready" class="active" data-filter-scope>
+            <header class="adw-headerbar is-raised" data-gtk="Adw.HeaderBar">
+              <div class="hb-start">
+                <button type="button" class="btn icon-only flat" title="Refresh" data-goto-state="checking"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 8a5.5 5.5 0 1 1-1.4-3.7L10 6h4.5V1.5l-1.3 1.4A7 7 0 1 0 15 8z"/></svg></button>
+              </div>
+              <div class="hb-center">
+                <div class="cadence-rail" data-gtk="Gtk.Box (JourneyRail)">
+                  <span class="cadence-step done">1 Check ✓</span>
+                  <span class="cadence-step active">2 Review</span>
+                  <span class="cadence-step">3 Install</span>
+                </div>
+              </div>
+              <div class="hb-end">
+                <button type="button" class="btn icon-only flat" title="Main Menu" data-open-dialog="dialog-c-about"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 4h12v1.5H2zm0 3.25h12v1.5H2zm0 3.25h12V12H2z"/></svg></button>
+                <span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span>
+              </div>
+            </header>
+
+            <div class="adw-scroll">
+              <div class="adw-clamp-680">
+                <!-- Human-First Impact Callout -->
+                <div class="adw-card compact warn-card row-between wrap-narrow" data-gtk="Gtk.Box.card (ImpactCallout)">
+                  <div class="row-flex">
+                    <span class="micro-tag sec">2 Security Fixes</span>
+                    <span class="cap" style="font-weight:650;">OpenSSL critical TLS fix · Restart needed for Kernel 6.14.11 &amp; UEFI dbx</span>
+                  </div>
+                  <button type="button" class="btn sm flat" data-filter-btn="sec">Filter Security</button>
+                </div>
+
+                <!-- 3 Interactive Source Bento Cards (Click to Filter!) -->
+                <div class="bento-grid" data-gtk="Adw.WrapBox (SourceBento)">
+                  <button type="button" class="bento-card" data-filter-btn="dnf">
+                    <div class="bento-top"><span class="src-badge dnf">DNF</span><span class="micro-tag reboot">Restart</span></div>
+                    <div class="bento-count">4 System</div>
+                    <div class="cap dim numeric">220.8 MB · Core &amp; browser</div>
+                  </button>
+                  <button type="button" class="bento-card" data-filter-btn="fp">
+                    <div class="bento-top"><span class="src-badge fp">FP</span><span class="micro-tag ext">+ NVIDIA GL</span></div>
+                    <div class="bento-count">1 App</div>
+                    <div class="cap dim numeric">94.0 MB · Thunderbird</div>
+                  </button>
+                  <button type="button" class="bento-card" data-filter-btn="fw">
+                    <div class="bento-top"><span class="src-badge fw">FW</span><span class="micro-tag reboot">Restart</span></div>
+                    <div class="bento-count">1 Firmware</div>
+                    <div class="cap dim numeric">18 KB · UEFI dbx</div>
+                  </button>
+                </div>
+
+                <!-- Filter Bar Reset + Search -->
+                <div class="row-between wrap-narrow">
+                  <div class="row-flex">
+                    <button type="button" class="adw-toggle active" data-filter-btn="all" style="background:var(--adw-card-bg); border:1px solid var(--adw-card-border);">Show All Updates (6 + 18 libs)</button>
+                  </div>
+                  <label class="adw-search-entry" data-gtk="Gtk.SearchEntry">
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="opacity:0.6"><path d="M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0zm-.8 4.8a6 6 0 1 1 1.1-1.1l3.3 3.3-1.1 1.1-3.3-3.3z"/></svg>
+                    <input type="search" placeholder="Search updates…" data-search-input />
+                  </label>
+                </div>
+
+                <!-- Primary Human-Readable Packages -->
+                <div class="adw-group" data-pkg-group data-gtk="Adw.PreferencesGroup">
+                  <div class="adw-group-header">
+                    <span class="adw-group-title">Key Updates</span>
+                    <span class="adw-group-meta">Click any item for details</span>
+                  </div>
+                  <div class="adw-boxed-list">
+                    <div class="adw-row is-clickable" data-pkg-row data-tags="dnf sec" data-pkg-id="openssl">
+                      <span class="src-badge dnf">DNF</span>
+                      <div class="row-main"><div class="row-title-line"><span class="row-title">openssl</span><span class="micro-tag sec">CVE-2026-2401</span></div><span class="row-sub ver-diff">1:3.2.2-1.fc44 → <span class="ver-new">1:3.2.2-3.fc44</span></span></div>
+                      <span class="cap dim numeric">2.1 MB</span>
+                    </div>
+                    <div class="adw-row is-clickable" data-pkg-row data-tags="dnf sec" data-pkg-id="kernel">
+                      <span class="src-badge dnf">DNF</span>
+                      <div class="row-main"><div class="row-title-line"><span class="row-title">kernel</span><span class="micro-tag sec">Security</span><span class="micro-tag reboot">Restart</span></div><span class="row-sub ver-diff">6.14.9-300.fc44 → <span class="ver-new">6.14.11-300.fc44</span></span></div>
+                      <span class="cap dim numeric">98.0 MB</span>
+                    </div>
+                    <div class="adw-row is-clickable" data-pkg-row data-tags="dnf" data-pkg-id="firefox">
+                      <span class="src-badge dnf">DNF</span>
+                      <div class="row-main"><div class="row-title-line"><span class="row-title">firefox</span></div><span class="row-sub ver-diff">139.0-1.fc44 → <span class="ver-new">140.0-1.fc44</span></span></div>
+                      <span class="cap dim numeric">112.0 MB</span>
+                    </div>
+                    <div class="adw-row is-clickable" data-pkg-row data-tags="dnf" data-pkg-id="gnome-shell">
+                      <span class="src-badge dnf">DNF</span>
+                      <div class="row-main"><div class="row-title-line"><span class="row-title">gnome-shell</span></div><span class="row-sub ver-diff">48.1-1.fc44 → <span class="ver-new">48.2-1.fc44</span></span></div>
+                      <span class="cap dim numeric">8.7 MB</span>
+                    </div>
+                    <div class="adw-row is-clickable" data-pkg-row data-tags="fp" data-pkg-id="thunderbird">
+                      <span class="src-badge fp">FP</span>
+                      <div class="row-main"><div class="row-title-line"><span class="row-title">Thunderbird</span><span class="micro-tag ext">+ NVIDIA GL</span></div><span class="row-sub ver-diff">128.0.1 → <span class="ver-new">128.2.0</span> · flathub</span></div>
+                      <span class="cap dim numeric">94.0 MB</span>
+                    </div>
+                    <div class="adw-row is-clickable" data-pkg-row data-tags="fw" data-pkg-id="uefi-dbx">
+                      <span class="src-badge fw">FW</span>
+                      <div class="row-main"><div class="row-title-line"><span class="row-title">UEFI dbx</span><span class="micro-tag reboot">Restart</span></div><span class="row-sub ver-diff">20240101 → <span class="ver-new">20241101</span> · LVFS</span></div>
+                      <span class="cap dim numeric">18 KB</span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Smart Complexity Folding for Supporting System Libraries -->
+                <div class="adw-boxed-list adw-expander" data-pkg-group data-gtk="Adw.ExpanderRow (SupportingRollup)">
+                  <button type="button" class="adw-expander-head" data-expander-btn>
+                    <svg class="exp-chev" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 3l5 5-5 5z"/></svg>
+                    <span class="row-main"><span class="row-title">+ 18 supporting system libraries</span><span class="row-sub">Automatic runtime dependencies bundled with this update</span></span>
+                    <span class="cap dim numeric">42.4 MB</span>
+                  </button>
+                  <div class="adw-expander-body">
+                    <div class="adw-row" data-pkg-row data-tags="dnf"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">glibc-common</span><span class="row-sub ver-diff">2.43-8 → 2.43-9</span></div><span class="cap dim numeric">14.2 MB</span></div>
+                    <div class="adw-row" data-pkg-row data-tags="dnf"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">mesa-filesystem</span><span class="row-sub ver-diff">25.0.5 → 25.0.7</span></div><span class="cap dim numeric">18.1 MB</span></div>
+                    <div class="adw-row" data-pkg-row data-tags="dnf"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">libxml2</span><span class="row-sub ver-diff">2.12.8 → 2.12.9</span></div><span class="cap dim numeric">10.1 MB</span></div>
+                  </div>
+                </div>
+
+                <div class="adw-card compact hidden" data-empty-filter style="text-align:center;">
+                  <span class="cap dim">No matching packages.</span>
+                </div>
+              </div>
+            </div>
+
+            <footer class="adw-bottom-bar" data-gtk="Adw.ToolbarView [bottom]">
+              <div class="adw-bottom-bar-inner wrap-narrow">
+                <div class="row-flex">
+                  <span class="cap dim numeric">314.8 MB · ~3 min</span>
+                  <button type="button" class="offline-chip hide-narrow" id="c-offline-chip" data-toast-msg="Toggled Apply on Reboot (dnf5daemon Offline mode)">
+                    <span>Apply on Reboot</span>
+                  </button>
+                </div>
+                <div class="row-flex" style="margin-left:auto;">
+                  <button type="button" class="btn suggested pill" data-goto-state="running">Update All</button>
+                </div>
+              </div>
+            </footer>
+          </section>
+
+          <!-- ==================== 5. RUNNING MILESTONE ==================== -->
+          <section data-state-panel="running">
+            <header class="adw-headerbar is-raised" data-gtk="Adw.HeaderBar">
+              <div class="hb-start">
+                <button type="button" class="btn sm" data-sim-running>Simulate Live Motion</button>
+              </div>
+              <div class="hb-center">
+                <div class="cadence-rail">
+                  <span class="cadence-step done">1 Check ✓</span>
+                  <span class="cadence-step done">2 Review ✓</span>
+                  <span class="cadence-step active">3 Installing</span>
+                </div>
+              </div>
+              <div class="hb-end">
+                <button type="button" class="btn destructive sm" data-open-dialog="dialog-c-stop">Stop…</button>
+                <span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span>
+              </div>
+            </header>
+
+            <div class="adw-scroll">
+              <div class="adw-clamp-680">
+                <!-- Serene Milestone Card -->
+                <div class="adw-card milestone-hero" data-gtk="Gtk.Box.card (MilestoneHero)">
+                  <div class="row-flex" style="gap:16px;">
+                    <div class="gsk-ring-wrap" style="width:54px; height:54px;" data-gtk="Gtk.DrawingArea (Ring)">
+                      <svg viewBox="0 0 54 54" style="width:54px; height:54px;">
+                        <circle class="gsk-ring-track" cx="27" cy="27" r="23"></circle>
+                        <circle class="gsk-ring-arc" cx="27" cy="27" r="23" stroke-dasharray="144.5" stroke-dashoffset="72.2" data-sim-ring></circle>
+                      </svg>
+                      <span class="gsk-ring-label numeric" data-sim-overall-pct>50%</span>
+                    </div>
+                    <div class="row-main">
+                      <div style="font-size:18px; font-weight:800; letter-spacing:-0.02em;" data-sim-stage>Installing System Updates</div>
+                      <div class="cap dim numeric" data-sim-eta>About 2 minutes left · <span data-sim-rem>3 done · 3 remaining</span> · <span data-sim-speed>24.8 MB/s</span></div>
+                    </div>
+                  </div>
+
+                  <div class="seg-bar" data-gtk="Gtk.Box (3-PhaseTrack)">
+                    <div class="seg-track"><div class="seg-fill ok" style="width:100%;"></div></div>
+                    <div class="seg-track"><div class="seg-fill" style="width:72%;" data-sim-overall-bar></div></div>
+                    <div class="seg-track"><div class="seg-fill" style="width:0%;"></div></div>
+                  </div>
+
+                  <div class="active-pill" data-gtk="Gtk.Stack (ActiveItem)">
+                    <span class="adw-spinner sm"></span>
+                    <span data-sim-item-name>gnome-shell</span>
+                    <span class="numeric accent-txt" data-sim-item-pct>72%</span>
+                  </div>
+                </div>
+
+                <!-- 3-Source Horizontal Track Cards -->
+                <div class="bento-grid" data-gtk="Adw.WrapBox (MacroTrack)">
+                  <div class="bento-card active">
+                    <div class="bento-top"><span class="src-badge dnf">DNF</span><span class="cap accent-txt numeric">3/4</span></div>
+                    <div style="font-weight:750;">System</div>
+                    <div class="cap dim">Installing RPMs</div>
+                  </div>
+                  <div class="bento-card">
+                    <div class="bento-top"><span class="src-badge fp">FP</span><span class="cap dim">Queued</span></div>
+                    <div style="font-weight:750;">Apps</div>
+                    <div class="cap dim">Thunderbird + GL</div>
+                  </div>
+                  <div class="bento-card">
+                    <div class="bento-top"><span class="src-badge fw">FW</span><span class="cap dim">Queued</span></div>
+                    <div style="font-weight:750;">Firmware</div>
+                    <div class="cap dim">UEFI dbx</div>
+                  </div>
+                </div>
+
+                <!-- Quiet-by-default Collapsible Queue Disclosure -->
+                <div class="adw-boxed-list adw-expander" data-gtk="Adw.ExpanderRow (QueueDisclosure)">
+                  <button type="button" class="adw-expander-head" data-expander-btn>
+                    <svg class="exp-chev" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 3l5 5-5 5z"/></svg>
+                    <span class="row-main"><span class="row-title">Show package queue</span><span class="row-sub numeric">3 remaining · 3 completed</span></span>
+                    <span class="cap dim">Inspect</span>
+                  </button>
+                  <div class="adw-expander-body">
+                    <div class="adw-row is-active"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">gnome-shell</span></div><span class="cap accent-txt numeric">Installing · 72%</span></div>
+                    <div class="adw-row is-pending"><span class="src-badge fp">FP</span><div class="row-main"><span class="row-title">Thunderbird</span></div><span class="cap dim">Queued</span></div>
+                    <div class="adw-row is-pending"><span class="src-badge fw">FW</span><div class="row-main"><span class="row-title">UEFI dbx</span></div><span class="cap dim">Queued</span></div>
+                    <div class="adw-row is-done"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">openssl · kernel · firefox</span></div><span class="cap ok-txt">Done</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="adw-bottom-sheet" data-gtk="Adw.BottomSheet" data-log-scope>
+              <div class="sheet-drawer-body">
+                <div class="sheet-console-toolbar"><span class="cap" style="color:#fff;font-weight:700;">Live Output</span><button type="button" class="btn sm flat" style="color:#fff;" data-copy-log>Copy</button></div>
+                <pre class="sheet-console-pre mono">[dnf] [4/4] Upgrading gnome-shell-48.2-1.fc44.x86_64 72%</pre>
+              </div>
+              <button type="button" class="sheet-handle-btn" data-console-toggle>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M5 3l6 5-6 5z"/></svg>
+                <span class="sheet-handle-line mono" data-sim-console>[dnf] [4/4] Upgrading gnome-shell-48.2-1.fc44.x86_64 72%</span>
+                <span class="cap accent-txt">Console</span>
+              </button>
+            </div>
+          </section>
+
+          <!-- ==================== 6. DONE (NEEDS REBOOT) ==================== -->
+          <section data-state-panel="done">
+            <header class="adw-headerbar">
+              <div class="hb-start"></div>
+              <div class="hb-center">
+                <div class="cadence-rail">
+                  <span class="cadence-step done">1 Check ✓</span>
+                  <span class="cadence-step done">2 Review ✓</span>
+                  <span class="cadence-step done">3 Installed ✓</span>
+                </div>
+              </div>
+              <div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div>
+            </header>
+            <div class="adw-scroll">
+              <div class="adw-clamp-600">
+                <div class="adw-card" style="padding:22px 20px; text-align:center; display:flex; flex-direction:column; align-items:center; gap:10px;">
+                  <div class="status-emblem warn" style="width:66px; height:66px;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></div>
+                  <h2 style="margin:0; font-size:20px; font-weight:800;">Updates Installed — Restart to Finish</h2>
+                  <p class="cap dim" style="margin:0;">6 updates succeeded cleanly in 4m 18s.</p>
+                </div>
+
+                <div class="bento-grid">
+                  <div class="adw-card compact" style="text-align:center;"><strong class="numeric" style="font-size:17px;">6</strong><div class="cap dim">Installed</div></div>
+                  <div class="adw-card compact" style="text-align:center;"><strong class="numeric" style="font-size:17px;">314.8 MB</strong><div class="cap dim">Downloaded</div></div>
+                  <div class="adw-card compact" style="text-align:center;"><strong class="numeric" style="font-size:17px;">4m 18s</strong><div class="cap dim">Duration</div></div>
+                </div>
+
+                <div class="adw-card warn-card row-between wrap-narrow">
+                  <div>
+                    <div style="font-weight:800;">Restart Required</div>
+                    <div class="cap dim">kernel 6.14.11 &amp; UEFI dbx will activate on next boot</div>
+                  </div>
+                  <button type="button" class="btn suggested" data-toast-msg="Scheduling reboot via logind…">Restart Now</button>
+                </div>
+
+                <div class="adw-boxed-list adw-expander">
+                  <button type="button" class="adw-expander-head" data-expander-btn>
+                    <svg class="exp-chev" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M6 3l5 5-5 5z"/></svg>
+                    <span class="row-main"><span class="row-title">Review 6 installed updates</span></span>
+                  </button>
+                  <div class="adw-expander-body">
+                    <div class="adw-row"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">kernel</span></div><span class="micro-tag reboot">Restart</span></div>
+                    <div class="adw-row"><span class="src-badge fw">FW</span><div class="row-main"><span class="row-title">UEFI dbx</span></div><span class="micro-tag reboot">Restart</span></div>
+                    <div class="adw-row"><span class="src-badge fp">FP</span><div class="row-main"><span class="row-title">Thunderbird</span></div><span class="cap ok-txt">Done</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <footer class="adw-bottom-bar">
+              <div class="adw-bottom-bar-inner" style="max-width:600px;">
+                <button type="button" class="btn flat" data-open-dialog="dialog-c-log">View Full Log</button>
+                <button type="button" class="btn" data-goto-state="idle-current">Done</button>
+              </div>
+            </footer>
+          </section>
+
+          <!-- ==================== 7. FAILED ==================== -->
+          <section data-state-panel="failed">
+            <header class="adw-headerbar"><div class="hb-center"><span class="adw-win-title">Fedora Updater</span></div><div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div></header>
+            <div class="adw-status-page">
+              <div class="status-emblem err"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5h.01"/></svg></div>
+              <h2 class="status-title">All Updates Failed</h2>
+              <p class="status-desc">The transaction could not finish (dnf exited 1). Your installed system was left untouched.</p>
+              <div class="row-flex">
+                <button type="button" class="btn suggested pill" data-goto-state="checking">Check Again</button>
+                <button type="button" class="btn flat" data-open-dialog="dialog-c-log">View Log</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- ==================== EDGE PANELS ==================== -->
+          <section data-state-panel="ready-warn">
+            <header class="adw-headerbar is-raised"><div class="hb-center"><span class="adw-win-title">5 Updates Available</span></div><div class="hb-end"><span class="win-ctrl" aria-hidden="true"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.6"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></div></header>
+            <div class="adw-banner warning"><span class="banner-msg">1 source could not be checked (Firmware offline)</span><button type="button" class="banner-action" data-open-dialog="dialog-c-log">View Log</button></div>
+            <div class="adw-scroll"><div class="adw-clamp-680"><div class="bento-grid"><div class="bento-card"><span class="src-badge dnf">DNF</span><div class="bento-count">4 System</div></div><div class="bento-card"><span class="src-badge fp">FP</span><div class="bento-count">1 App</div></div><div class="bento-card"><span class="src-badge fw">FW</span><div class="bento-count err-txt">Offline</div></div></div></div></div>
+            <footer class="adw-bottom-bar"><div class="adw-bottom-bar-inner"><span class="cap dim">Available sources ready</span><button type="button" class="btn suggested pill" data-goto-state="running">Update All</button></div></footer>
+          </section>
+
+          <section data-state-panel="ready-stale">
+            <header class="adw-headerbar is-raised"><div class="hb-center"><span class="adw-win-title">Review Updates</span></div></header>
+            <div class="adw-dialog-scrim open"><div class="adw-alert-dialog"><h3>Refresh Update List?</h3><p>This list is more than 24 hours old. Refresh before installing.</p><div class="adw-alert-actions"><button type="button" class="btn" data-goto-state="ready">Cancel</button><button type="button" class="btn suggested" data-goto-state="checking">Refresh</button></div></div></div>
+          </section>
+
+          <section data-state-panel="running-stall">
+            <header class="adw-headerbar is-raised"><div class="hb-center"><span class="adw-win-title">Downloading</span></div><div class="hb-end"><button type="button" class="btn sm" data-goto-state="ready">Stop</button></div></header>
+            <div class="adw-banner warning"><span class="banner-msg">No output for 3 minutes. Waiting on GNOME Software.</span><button type="button" class="banner-action" data-open-dialog="dialog-c-log">View Log</button></div>
+            <div class="adw-scroll"><div class="adw-clamp-680"><div class="adw-card milestone-hero"><div class="row-flex"><span class="adw-spinner"></span><div><div style="font-weight:800;">Downloading firefox — 85 MB and rising</div><div class="cap dim">Detected cache growth under /var/cache/libdnf5</div></div></div></div></div></div>
+          </section>
+
+          <section data-state-panel="done-clean">
+            <header class="adw-headerbar"><div class="hb-center"><span class="adw-win-title">All Updates Applied</span></div></header>
+            <div class="adw-scroll"><div class="adw-clamp-600"><div class="adw-card done-hero" style="padding:26px 20px; text-align:center; display:flex; flex-direction:column; align-items:center; gap:10px;"><div class="status-emblem ok" style="width:66px; height:66px;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M20 6L9 17l-5-5"/></svg></div><h2 style="margin:0; font-size:20px; font-weight:800;">System Updated Cleanly</h2><p class="cap dim" style="margin:0;">3 updates finished in 48s. No restart needed.</p></div></div></div>
+            <footer class="adw-bottom-bar"><div class="adw-bottom-bar-inner" style="max-width:600px;"><button type="button" class="btn flat" data-open-dialog="dialog-c-log">View Full Log</button><button type="button" class="btn suggested pill" data-goto-state="idle-current">Done</button></div></footer>
+          </section>
+
+          <section data-state-panel="done-partial">
+            <header class="adw-headerbar is-raised"><div class="hb-center"><span class="adw-win-title">Updates Finished With Problems</span></div></header>
+            <div class="adw-banner error"><span class="banner-msg">1 update failed (UEFI dbx — battery below 25%). 5 applied.</span><button type="button" class="banner-action" data-open-dialog="dialog-c-log">View Log</button></div>
+            <div class="adw-scroll"><div class="adw-clamp-680"><div class="adw-boxed-list"><div class="adw-row"><span class="src-badge fw">FW</span><div class="row-main"><span class="row-title">UEFI dbx</span><span class="row-sub">Plug in charger and retry</span></div><span class="cap err-txt">Failed</span></div><div class="adw-row is-done"><span class="src-badge dnf">DNF</span><div class="row-main"><span class="row-title">kernel</span></div><span class="cap ok-txt">Done</span></div></div></div></div>
+          </section>
+
+          <section data-state-panel="failed-reboot">
+            <header class="adw-headerbar"><div class="hb-center"><span class="adw-win-title">Fedora Updater</span></div></header>
+            <div class="adw-status-page"><div class="status-emblem warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.6L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0z"/></svg></div><h2 class="status-title">Reboot Blocked</h2><p class="status-desc">An active shutdown inhibitor blocked restart. Try restarting again in a moment.</p><button type="button" class="btn suggested pill" data-toast-msg="Retrying reboot…">Restart</button></div>
+          </section>
+
+          <!-- Modals -->
+          <div class="adw-dialog-scrim" id="pkg-inspector-dialog">
+            <div class="adw-sheet-dialog">
+              <div class="adw-sheet-head"><h3 id="pkg-inspector-title">Package Details</h3><button type="button" class="btn icon-only flat" data-close-dialog>✕</button></div>
+              <div class="adw-sheet-body" id="pkg-inspector-body"></div>
+            </div>
+          </div>
+
+          <div class="adw-dialog-scrim" id="dialog-c-upgrade">
+            <div class="adw-sheet-dialog">
+              <div class="adw-sheet-head"><h3>Upgrade to Fedora Linux 45</h3><button type="button" class="btn icon-only flat" data-close-dialog>✕</button></div>
+              <div class="adw-sheet-body">
+                <p class="cap dim" style="margin:0;">Run each step separately in Terminal:</p>
+                <div class="cmd-copy-row"><code class="mono">sudo dnf system-upgrade download --releasever=45</code><button type="button" class="btn sm" data-copy-cmd="sudo dnf system-upgrade download --releasever=45">Copy</button></div>
+                <div class="cmd-copy-row"><code class="mono">sudo dnf system-upgrade reboot</code><button type="button" class="btn sm" data-copy-cmd="sudo dnf system-upgrade reboot">Copy</button></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="adw-dialog-scrim" id="dialog-c-stop">
+            <div class="adw-alert-dialog">
+              <h3>Stop This Update?</h3>
+              <p>Stopping mid-transaction can leave the RPM database incomplete.</p>
+              <div class="adw-alert-actions"><button type="button" class="btn" data-close-dialog>Keep Waiting</button><button type="button" class="btn destructive" data-goto-state="failed">Stop Anyway</button></div>
+            </div>
+          </div>
+
+          <div class="adw-dialog-scrim" id="dialog-c-stale">
+            <div class="adw-alert-dialog">
+              <h3>Refresh Update List?</h3>
+              <p>This update list is more than 24 hours old.</p>
+              <div class="adw-alert-actions"><button type="button" class="btn" data-close-dialog>Cancel</button><button type="button" class="btn suggested" data-goto-state="checking">Refresh</button></div>
+            </div>
+          </div>
+
+          <div class="adw-dialog-scrim" id="dialog-c-log">
+            <div class="adw-sheet-dialog">
+              <div class="adw-sheet-head"><h3>Full Transaction Log</h3><button type="button" class="btn icon-only flat" data-close-dialog>✕</button></div>
+              <div class="adw-sheet-body">
+                <pre class="sheet-console-pre mono" style="height:240px; border-radius:10px; background:var(--console-bg); color:var(--console-fg);">[dnf] 4 system packages upgraded
+[flatpak-user] Thunderbird updated
+[fwupd] UEFI dbx installed (reboot required)</pre>
+                <button type="button" class="btn suggested sm" data-copy-log style="align-self:flex-end;">Copy All</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="adw-dialog-scrim" id="dialog-c-about">
+            <div class="adw-alert-dialog">
+              <h3>Fedora Updater</h3>
+              <p>Variant C "Cadence" · NEON Redesign<br/>Stage-Driven Guided Bento Flow for GNOME / Fedora.</p>
+              <button type="button" class="btn" data-close-dialog>Close</button>
+            </div>
+          </div>
+
+          <div class="adw-toast-wrap"><div class="adw-toast" role="status" aria-live="polite"></div></div>
+        </div>
+      </div>
+
+      <aside class="neon-spec-panel" id="neon-spec-panel" aria-live="polite"></aside>
+    </div>
+  </main>
+
+  <script>
+    document.getElementById("c-offline-chip")?.addEventListener("click", (e) => {
+      e.currentTarget.classList.toggle("active");
+    });
+
+    window.NEON_BLUEPRINTS = {
+      idle: {
+        phase: "Phase::Idle(Fresh)",
+        title: "Journey Rail + 3-Source Welcome Bento",
+        summary: "Frames the updater as a calm 3-act journey while introducing the 3 update domains cleanly at launch.",
+        tier1: "pkexec helper on Check",
+        tier2: "Zero-auth Check via dnf5daemon",
+        blueprint: `Adw.HeaderBar { JourneyRail (1 Check | 2 Review | 3 Install) }\nAdw.Clamp (max: 680) {\n  ReleaseOfferCard\n  Adw.StatusPage\n  Adw.WrapBox (3 source tiles)\n}`,
+        notes: ["Journey rail replaces multi-word header noise with calm orientation."]
+      },
+      "idle-current": {
+        phase: "Phase::Idle(Current)",
+        title: "Up-to-Date Calm View",
+        summary: "Clean confirmation with Fedora 45 invite when applicable.",
+        tier1: "IdleScreen::Current",
+        tier2: "Synced state",
+        blueprint: `Adw.StatusPage (Everything Is Current)`,
+        notes: ["Check Again stays flat/quiet."]
+      },
+      auth: {
+        phase: "Phase::Authenticating",
+        title: "Guided Authorization",
+        summary: "Clear single-sentence explanation + Adw.Spinner + Cancel.",
+        tier1: "pkexec --helper",
+        tier2: "Apply-only prompt",
+        blueprint: `Adw.StatusPage (Authentication)`,
+        notes: ["No in-app password input."]
+      },
+      checking: {
+        phase: "Phase::Checking",
+        title: "Segmented Stage Check + Live Bento",
+        summary: "Segmented bar paired with 3 Bento cards that light up as System, Apps, and Firmware finish scanning.",
+        tier1: "Sequential CLI + libflatpak",
+        tier2: "D-Bus metadata sync",
+        blueprint: `Gtk.Box.card { 3-segment progress }\nAdw.WrapBox { 3 Bento status cards }\n[bottom] Adw.BottomSheet`,
+        notes: ["Click the bottom console handle to inspect raw output."]
+      },
+      ready: {
+        phase: "Phase::Ready",
+        title: "Impact Callout + Interactive Bento + Dependency Rollup",
+        summary: "Distills what actually matters into 3 clickable Source Bento cards and folds noisy supporting libraries into an Adw.ExpanderRow.",
+        tier1: "All-or-nothing Update All",
+        tier2: "CVE callouts + Apply-on-Reboot Offline toggle",
+        blueprint: `Adw.Clamp (max: 680) {\n  Gtk.Box.warn-card (Security & Reboot summary)\n  Adw.WrapBox (3 clickable Bento cards)\n  Gtk.ListView (Key Updates)\n  Adw.ExpanderRow (+ 18 supporting libs)\n}\n[bottom] Apply-on-Reboot chip + Update All`,
+        notes: [
+          "Click any Source Bento card above to filter the list live!",
+          "Click '+ 18 supporting system libraries' to expand bundled dependencies."
+        ]
+      },
+      running: {
+        phase: "Phase::Running",
+        title: "Serene Milestone Track + Quiet-by-Default Queue",
+        summary: "Focuses on a 54px GSK ring, 3-phase segmented bar, and 3 macro source tiles—keeping scrolling row churn collapsed unless requested.",
+        tier1: "Stdout + cache poll",
+        tier2: "D-Bus MB/s + phase signals",
+        blueprint: `Gtk.Box.card { 54px Ring; 3-PhaseBar; ActivePill }\nAdw.WrapBox (3 Macro Source Cards)\nAdw.ExpanderRow (Collapsed queue)\n[bottom] Adw.BottomSheet`,
+        notes: ["Click 'Simulate Live Motion' in the header to preview transitions."]
+      },
+      done: {
+        phase: "Phase::Done(Reboot)",
+        title: "Balanced Closure + Explicit Reboot Card",
+        summary: "Tactile 3-metric Bento row + elevated Restart Required card + collapsed review expander.",
+        tier1: "Core allowlist + fwupd exit 0",
+        tier2: "login1 CanReboot",
+        blueprint: `Adw.Clamp (max: 600) {\n  DoneHero\n  3 Bento Metrics\n  WarnCard (Restart Now)\n  Adw.ExpanderRow (Review 6 installed)\n}`,
+        notes: ["Sole suggested-action sits on Restart Now."]
+      },
+      failed: {
+        phase: "Phase::Failed",
+        title: "Clean Recovery",
+        summary: "Explains clearly that the system was left untouched.",
+        tier1: "RetryAction::CheckAgain",
+        tier2: "Structured D-Bus error",
+        blueprint: `Adw.StatusPage { Check Again | View Log }`,
+        notes: ["Consistent across all variants."]
+      },
+      "ready-warn": {
+        phase: "Edge: Soft Error",
+        title: "Offline Source Card + Warning Banner",
+        summary: "Marks the unreachable source inside its Bento card while letting DNF & Flatpak proceed.",
+        tier1: "Phase::Ready { soft_errors }",
+        tier2: "Per-source status",
+        blueprint: `Adw.Banner.warning + BentoGrid`,
+        notes: ["Never blocks healthy sources."]
+      },
+      "ready-stale": {
+        phase: "Edge: Stale >24h",
+        title: "24-Hour Staleness Guard",
+        summary: "Adw.AlertDialog prompts refresh before apply.",
+        tier1: "UPDATE_LIST_MAX_AGE",
+        tier2: "Same policy",
+        blueprint: `Adw.AlertDialog`,
+        notes: ["Queues StartCheck { then_apply: true }."]
+      },
+      "running-stall": {
+        phase: "Edge: Stalled >120s",
+        title: "GNOME Software Contention Banner",
+        summary: "Explains quiet periods clearly with /var/cache/libdnf5 feedback.",
+        tier1: "quiet_ui()",
+        tier2: "Eliminated by dnf5daemon",
+        blueprint: `Adw.Banner.warning`,
+        notes: ["Plain Stop exits immediately during download."]
+      },
+      "done-clean": {
+        phase: "Edge: Done (No Reboot)",
+        title: "Emerald Clean Finish",
+        summary: "Zero restart required; Done promoted to suggested pill.",
+        tier1: "needs_reboot: false",
+        tier2: "Desktop notification",
+        blueprint: `Adw.Clamp (max: 600) { DoneHero }`,
+        notes: ["Clean closure."]
+      },
+      "done-partial": {
+        phase: "Edge: Partial Failure",
+        title: "Mixed Finish",
+        summary: "Surfaces failed firmware battery threshold first.",
+        tier1: "Phase::Done { failed > 0 }",
+        tier2: "fwupd BatteryLevel check",
+        blueprint: `Adw.Banner.error + Failed list`,
+        notes: ["Clear remediation hint."]
+      },
+      "failed-reboot": {
+        phase: "Edge: Reboot Inhibitor",
+        title: "Reboot Retry Recovery",
+        summary: "Offers immediate Restart pill on inhibitor failure.",
+        tier1: "RetryAction::Reboot",
+        tier2: "login1 ListInhibitors()",
+        blueprint: `Adw.StatusPage { Restart }`,
+        notes: ["Accurate verb."]
+      }
+    };
+  </script>
+  <script src="neon-shared.js"></script>
+</body>
+</html>
