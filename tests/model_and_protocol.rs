@@ -22,6 +22,9 @@ fn apply_order_is_dnf_flatpak_firmware() {
             status: PackageStatus::Pending,
             source: UpdateSource::Firmware,
             detail: String::new(),
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
         },
         Package::new_dnf("kernel", "x86_64", "1", "updates"),
         Package {
@@ -35,6 +38,9 @@ fn apply_order_is_dnf_flatpak_firmware() {
             status: PackageStatus::Pending,
             source: UpdateSource::FlatpakUser,
             detail: String::new(),
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
         },
     ];
     sort_for_apply(&mut pkgs);

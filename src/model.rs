@@ -148,6 +148,46 @@ impl PackageStatus {
     }
 }
 
+/// Sub-view displayed in Observatory's detail pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetailView {
+    #[default]
+    Updates,
+    ActivityLog,
+    /// Populated in Phase 2 (#35).
+    History,
+}
+
+/// Execution mode for Phase 2 `Adw.SplitButton` apply options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApplyMode {
+    #[default]
+    Live,
+    LiveAndReboot,
+    OfflineOnReboot,
+    DownloadOnly,
+}
+
+/// Advisory category attached in Phase 2 by DNF5/fwupd metadata engines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisoryKind {
+    Security,
+    Bugfix,
+    Enhancement,
+    NewPackage,
+}
+
+/// Structured advisory metadata (populated in Phase 2; optional in Phase 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageAdvisory {
+    pub id: String,
+    pub kind: AdvisoryKind,
+    pub severity: Option<String>,
+    pub cves: Vec<String>,
+    pub bugzillas: Vec<String>,
+    pub description: Option<String>,
+}
+
 /// One updatable unit (RPM, Flatpak ref, or firmware device).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Package {
@@ -161,6 +201,9 @@ pub struct Package {
     pub status: PackageStatus,
     pub source: UpdateSource,
     pub detail: String,
+    pub summary: Option<String>,
+    pub install_size_delta: Option<i64>,
+    pub advisories: Vec<PackageAdvisory>,
 }
 
 impl Package {
@@ -186,7 +229,76 @@ impl Package {
             status: PackageStatus::Pending,
             source: UpdateSource::Dnf,
             detail: format!("{version} · {repo}"),
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
         }
+    }
+
+    /// Related extensions extracted from Flatpak `detail` (`... · installs a, b`).
+    pub fn related_extensions(&self) -> Vec<String> {
+        let Some((_, rest)) = self.detail.split_once("installs ") else {
+            return Vec::new();
+        };
+        let list_part = rest.split(" · ").next().unwrap_or(rest);
+        list_part
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Detail text without any trailing `installs ...` extension list.
+    pub fn clean_detail_without_installs(&self) -> String {
+        let trimmed = self.detail.trim();
+        if let Some((prefix, _)) = trimmed.split_once(" · installs ") {
+            return prefix.trim().to_string();
+        }
+        if trimmed.starts_with("installs ") {
+            return String::new();
+        }
+        trimmed.to_string()
+    }
+
+    /// Primary security badge label (`CVE-...` or `"Security"`) when advisories include one.
+    pub fn primary_security_tag(&self) -> Option<String> {
+        for adv in self
+            .advisories
+            .iter()
+            .filter(|a| a.kind == AdvisoryKind::Security)
+        {
+            if let Some(cve) = adv.cves.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
+                return Some(cve.to_string());
+            }
+        }
+        for adv in &self.advisories {
+            if let Some(cve) = adv.cves.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
+                return Some(cve.to_string());
+            }
+        }
+        self.advisories
+            .iter()
+            .any(|a| a.kind == AdvisoryKind::Security)
+            .then(|| "Security".to_string())
+    }
+
+    /// Searchable summary of attached advisory IDs and CVE identifiers.
+    pub fn advisory_summary(&self) -> String {
+        let mut parts = Vec::new();
+        for adv in &self.advisories {
+            let id = adv.id.trim();
+            if !id.is_empty() {
+                parts.push(id.to_string());
+            }
+            for cve in &adv.cves {
+                let cve = cve.trim();
+                if !cve.is_empty() {
+                    parts.push(cve.to_string());
+                }
+            }
+        }
+        parts.join(" ")
     }
 
     pub fn size_label(&self) -> Option<String> {
@@ -454,6 +566,9 @@ mod tests {
             status: PackageStatus::Pending,
             source: UpdateSource::FlatpakUser,
             detail: String::new(),
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
         };
         assert!(fp.matches_progress_name("Thunderbird"));
         assert!(fp.matches_progress_name("org.mozilla.Thunderbird"));
@@ -493,6 +608,9 @@ mod tests {
             status: PackageStatus::Pending,
             source: UpdateSource::Firmware,
             detail: String::new(),
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
         }
     }
 
@@ -823,5 +941,49 @@ mod tests {
         assert_eq!(pkgs[1].status, PackageStatus::Failed);
         assert_eq!(pkgs[2].status, PackageStatus::Pending);
         assert!((overall_progress(&pkgs) - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn detail_view_apply_mode_and_optional_package_metadata_defaults() {
+        assert_eq!(DetailView::default(), DetailView::Updates);
+        assert_eq!(ApplyMode::default(), ApplyMode::Live);
+
+        let mut pkg = Package::new_dnf("openssl", "x86_64", "3.2.2-3", "updates");
+        assert!(pkg.summary.is_none());
+        assert!(pkg.install_size_delta.is_none());
+        assert!(pkg.advisories.is_empty());
+        assert!(pkg.related_extensions().is_empty());
+        assert_eq!(pkg.clean_detail_without_installs(), "3.2.2-3 · updates");
+        assert_eq!(pkg.primary_security_tag(), None);
+        assert_eq!(pkg.advisory_summary(), "");
+
+        pkg.detail =
+            "128.2.0 · flathub · user · installs org.freedesktop.Platform.GL.nvidia-550, org.freedesktop.Platform.VAAPI.Intel"
+                .into();
+        assert_eq!(
+            pkg.related_extensions(),
+            vec![
+                "org.freedesktop.Platform.GL.nvidia-550",
+                "org.freedesktop.Platform.VAAPI.Intel"
+            ]
+        );
+        assert_eq!(pkg.clean_detail_without_installs(), "128.2.0 · flathub · user");
+
+        pkg.advisories.push(PackageAdvisory {
+            id: "FEDORA-2026-84a1".into(),
+            kind: AdvisoryKind::Security,
+            severity: Some("Important".into()),
+            cves: vec!["CVE-2026-2401".into()],
+            bugzillas: vec!["RHBZ#12345".into()],
+            description: Some("Fixes TLS 1.3 read".into()),
+        });
+        assert_eq!(
+            pkg.primary_security_tag().as_deref(),
+            Some("CVE-2026-2401")
+        );
+        assert_eq!(pkg.advisory_summary(), "FEDORA-2026-84a1 CVE-2026-2401");
+
+        pkg.advisories[0].cves.clear();
+        assert_eq!(pkg.primary_security_tag().as_deref(), Some("Security"));
     }
 }

@@ -1,7 +1,10 @@
+mod activity_log;
 mod charts;
 mod dialogs;
+mod inspector;
 mod prefs;
 mod preview;
+mod queue_list;
 mod rows;
 mod sidebar;
 pub mod window;

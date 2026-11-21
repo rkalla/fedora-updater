@@ -147,6 +147,9 @@ pub fn packages_from_flatpak_updates(
             status: PackageStatus::Pending,
             source,
             detail,
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
         });
     }
     packages
@@ -700,6 +703,9 @@ mod tests {
             status: PackageStatus::Pending,
             source: UpdateSource::FlatpakSystem,
             detail: String::new(),
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
         };
         assert_eq!(
             update_ref_from_package(&p).as_deref(),

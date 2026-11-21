@@ -45,6 +45,9 @@ fn flatpak(name: &str) -> Package {
         status: PackageStatus::Pending,
         source: UpdateSource::FlatpakUser,
         detail: "flathub · user".into(),
+        summary: None,
+        install_size_delta: None,
+        advisories: Vec::new(),
     }
 }
 
@@ -60,6 +63,9 @@ fn firmware(name: &str) -> Package {
         status: PackageStatus::Pending,
         source: UpdateSource::Firmware,
         detail: "1.0 → 2.0".into(),
+        summary: None,
+        install_size_delta: None,
+        advisories: Vec::new(),
     }
 }
 

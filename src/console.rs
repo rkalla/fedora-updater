@@ -82,6 +82,10 @@ impl ConsoleBuffer {
         self.lines.back().map(String::as_str).unwrap_or("")
     }
 
+    pub fn lines(&self) -> impl ExactSizeIterator<Item = &str> + DoubleEndedIterator + '_ {
+        self.lines.iter().map(String::as_str)
+    }
+
     pub fn full_text(&self) -> String {
         if self.lines.is_empty() {
             return String::new();
@@ -135,6 +139,10 @@ mod tests {
         );
         assert_eq!(console.len(), 2);
         assert!(console.last_line().contains("Complete!"));
+        assert_eq!(
+            console.lines().collect::<Vec<_>>(),
+            vec!["[dnf] [26/26] grok-bot 100%", "[dnf] Complete!"]
+        );
     }
 
     #[test]

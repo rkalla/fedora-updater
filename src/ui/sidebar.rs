@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
-use fedora_updater::model::count_by_source;
+use fedora_updater::model::{count_by_source, DetailView};
 use fedora_updater::presenter::{check_progress, run_heading};
 use fedora_updater::release_upgrade::{
     banner_title, os_release_version, release_age_caption, upgrade_button_name,
@@ -420,6 +420,10 @@ pub struct Sidebar {
     #[allow(dead_code)] // Phase 2 (#35) drives live samples into the sparkline.
     sparkline: ThroughputSparkline,
     sources_list: gtk::ListBox,
+    row_all: gtk::ListBoxRow,
+    row_system: gtk::ListBoxRow,
+    row_apps: gtk::ListBoxRow,
+    row_firmware: gtk::ListBoxRow,
     count_all: gtk::Label,
     count_system: gtk::Label,
     count_apps: gtk::Label,
@@ -428,9 +432,11 @@ pub struct Sidebar {
     view_updates_row: gtk::ListBoxRow,
     #[allow(dead_code)] // Kept for Phase 2 (#35) Update History reveal and tests.
     view_history_row: gtk::ListBoxRow,
+    view_log_row: gtk::ListBoxRow,
     upgrade_footer: gtk::Box,
     upgrade_card: UpgradeCard,
     selected_source: Rc<Cell<SourceFilter>>,
+    ignore_nav: Rc<Cell<bool>>,
 }
 
 impl Sidebar {
@@ -624,6 +630,10 @@ impl Sidebar {
             sparkline_card,
             sparkline,
             sources_list,
+            row_all,
+            row_system,
+            row_apps,
+            row_firmware,
             count_all,
             count_system,
             count_apps,
@@ -631,9 +641,11 @@ impl Sidebar {
             views_list,
             view_updates_row,
             view_history_row,
+            view_log_row,
             upgrade_footer,
             upgrade_card,
             selected_source: Rc::new(Cell::new(SourceFilter::All)),
+            ignore_nav: Rc::new(Cell::new(false)),
         }
     }
 
@@ -652,7 +664,11 @@ impl Sidebar {
         on_activity_log: impl Fn() + 'static,
     ) {
         let selected_source = self.selected_source.clone();
+        let ignore_nav = self.ignore_nav.clone();
         self.sources_list.connect_row_activated(move |_, row| {
+            if ignore_nav.get() {
+                return;
+            }
             let filter = match row.widget_name().as_str() {
                 "source:system" => SourceFilter::System,
                 "source:apps" => SourceFilter::Apps,
@@ -663,19 +679,40 @@ impl Sidebar {
             on_source(filter);
         });
 
-        let views_list = self.views_list.clone();
-        let updates_row = self.view_updates_row.clone();
+        let ignore_nav = self.ignore_nav.clone();
         self.views_list.connect_row_activated(move |_, row| {
+            if ignore_nav.get() {
+                return;
+            }
             match row.widget_name().as_str() {
-                "view:log" => {
-                    on_activity_log();
-                    // Phase 1 still shows Activity Log via win.view-log; keep
-                    // Updates highlighted in-window until #30 embeds the page.
-                    views_list.select_row(Some(&updates_row));
-                }
+                "view:log" => on_activity_log(),
                 _ => on_updates(),
             }
         });
+    }
+
+    pub fn select_source(&self, filter: SourceFilter) {
+        self.selected_source.set(filter);
+        let row = match filter {
+            SourceFilter::All => &self.row_all,
+            SourceFilter::System => &self.row_system,
+            SourceFilter::Apps => &self.row_apps,
+            SourceFilter::Firmware => &self.row_firmware,
+        };
+        self.ignore_nav.set(true);
+        self.sources_list.select_row(Some(row));
+        self.ignore_nav.set(false);
+    }
+
+    pub fn select_view(&self, view: DetailView) {
+        let row = match view {
+            DetailView::Updates => &self.view_updates_row,
+            DetailView::ActivityLog => &self.view_log_row,
+            DetailView::History => &self.view_history_row,
+        };
+        self.ignore_nav.set(true);
+        self.views_list.select_row(Some(row));
+        self.ignore_nav.set(false);
     }
 
     pub fn paint(&self, state: &AppState) {
@@ -753,6 +790,18 @@ impl Sidebar {
     #[cfg(test)]
     pub fn selected_source(&self) -> SourceFilter {
         self.selected_source.get()
+    }
+
+    #[cfg(test)]
+    pub fn views_list(&self) -> &gtk::ListBox {
+        &self.views_list
+    }
+
+    #[cfg(test)]
+    pub fn selected_view_name(&self) -> Option<String> {
+        self.views_list
+            .selected_row()
+            .map(|r| r.widget_name().to_string())
     }
 }
 

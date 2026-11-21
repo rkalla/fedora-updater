@@ -25,6 +25,7 @@ pub(super) fn present_about(parent: &impl IsA<gtk::Widget>) {
     dialog.present(Some(parent));
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Removed with log_window.blp in #31.
 pub(super) fn build_log_window(log: &str) -> (AdwWindow, TextView, Button) {
     let builder = Builder::from_string(LOG_WINDOW_UI);
     let win: AdwWindow = obj(&builder, "log_window");
@@ -57,6 +58,7 @@ pub(super) fn build_log_window(log: &str) -> (AdwWindow, TextView, Button) {
     (win, view, copy_btn)
 }
 
+#[allow(dead_code)] // Removed with log_window.blp in #31.
 pub(super) fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
     let (win, _, _) = build_log_window(log);
     if let Some(parent_win) = parent.root().and_downcast::<gtk::Window>() {

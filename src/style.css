@@ -197,3 +197,91 @@ window.is-dark .source-dot.src-firmware {
   font-size: 11px;
   font-weight: 700;
 }
+
+/* Virtualized Gtk.ListView boxed-card presentation */
+listview.queue-list {
+  background: transparent;
+  padding: 4px 12px 12px 12px;
+}
+
+listview.queue-list > row {
+  background-color: @card_bg_color;
+  color: inherit;
+  border-left: 1px solid alpha(@window_fg_color, 0.10);
+  border-right: 1px solid alpha(@window_fg_color, 0.10);
+  border-bottom: 1px solid alpha(@window_fg_color, 0.08);
+  padding: 0;
+  transition: background-color 140ms ease;
+}
+
+listview.queue-list > row:first-child {
+  border-top: 1px solid alpha(@window_fg_color, 0.10);
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+}
+
+listview.queue-list > row:last-child {
+  border-bottom: 1px solid alpha(@window_fg_color, 0.10);
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
+}
+
+listview.queue-list > row:hover {
+  background-color: alpha(@window_fg_color, 0.04);
+}
+
+listview.queue-list > row:selected {
+  background-color: alpha(@accent_bg_color, 0.10);
+  color: inherit;
+}
+
+window.is-dark listview.queue-list > row:selected {
+  background-color: alpha(@accent_bg_color, 0.14);
+  color: inherit;
+}
+
+.pkg-title {
+  font-weight: 600;
+}
+
+.ver-diff {
+  letter-spacing: 0.01em;
+}
+
+.tag-ext {
+  color: #813d9c;
+  background-color: alpha(#813d9c, 0.11);
+}
+
+window.is-dark .tag-ext {
+  color: #dc8add;
+  background-color: alpha(#dc8add, 0.16);
+}
+
+/* Adw.OverlaySplitView Package Inspector */
+.inspector-pane {
+  background-color: @view_bg_color;
+  border-left: 1px solid alpha(@window_fg_color, 0.12);
+}
+
+.inspector-header {
+  border-bottom: 1px solid alpha(@window_fg_color, 0.10);
+}
+
+.inspector-reboot-card {
+  background-color: alpha(@warning_bg_color, 0.12);
+}
+
+window.is-dark .inspector-reboot-card {
+  background-color: alpha(@warning_bg_color, 0.16);
+}
+
+/* Embedded Activity Log */
+.activity-log-bar {
+  border-bottom: 1px solid alpha(@window_fg_color, 0.10);
+}
+
+.activity-log-view {
+  background-color: @view_bg_color;
+  color: @view_fg_color;
+}

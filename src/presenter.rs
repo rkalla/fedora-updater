@@ -299,6 +299,7 @@ pub enum HeaderView<'a> {
     Running { heading: &'a str, footnote: &'a str },
     Done { failed: bool, subtitle: &'a str },
     Failed,
+    ActivityLog { subtitle: &'a str },
 }
 
 pub fn window_header(view: HeaderView<'_>, narrow: bool) -> HeaderChrome {
@@ -328,10 +329,25 @@ pub fn window_header(view: HeaderView<'_>, narrow: bool) -> HeaderChrome {
             };
             (title.into(), subtitle.to_string())
         }
+        HeaderView::ActivityLog { subtitle } => ("Activity Log".into(), subtitle.to_string()),
     };
     HeaderChrome {
         title,
         subtitle: if narrow { String::new() } else { subtitle },
+    }
+}
+
+pub fn activity_log_subtitle(matched: usize, total: usize) -> String {
+    if total == 0 {
+        "No output yet".into()
+    } else if matched == total {
+        if total == 1 {
+            "1 line".into()
+        } else {
+            format!("{total} lines")
+        }
+    } else {
+        format!("{matched} of {total} lines")
     }
 }
 
@@ -958,7 +974,18 @@ mod tests {
                 "8 applied · 1 failed · 4 minutes",
             ),
             (HeaderView::Failed, "Fedora Updater", ""),
+            (
+                HeaderView::ActivityLog {
+                    subtitle: "4 of 12 lines",
+                },
+                "Activity Log",
+                "4 of 12 lines",
+            ),
         ];
+        assert_eq!(activity_log_subtitle(0, 0), "No output yet");
+        assert_eq!(activity_log_subtitle(1, 1), "1 line");
+        assert_eq!(activity_log_subtitle(12, 12), "12 lines");
+        assert_eq!(activity_log_subtitle(4, 12), "4 of 12 lines");
         for (view, title, subtitle) in cases {
             let wide = window_header(view, false);
             assert_eq!(wide.title, title);

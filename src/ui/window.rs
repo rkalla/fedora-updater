@@ -17,19 +17,20 @@ use libadwaita::{
 };
 
 use fedora_updater::backend::dnf;
-use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
+use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
-    count_by_source, AuthPurpose, IdleScreen, Package, RetryAction, RunPass, UpdateSource,
+    count_by_source, AuthPurpose, DetailView, IdleScreen, Package, RetryAction, RunPass,
+    UpdateSource,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
     run_systemctl_reboot, session_started_event, WorkerMsg,
 };
 use fedora_updater::presenter::{
-    about_time_left, cache_activity_note, check_progress, checking_footnote, done_header_subtitle,
-    fail_retry_label, idle_chrome, now_playing_subtitle, now_playing_title, quiet_ui,
-    ready_banner_title, run_heading, running_progress_captions, source_summary_line, window_header,
-    HeaderView, QuietInput, AUTH_DESCRIPTION,
+    about_time_left, activity_log_subtitle, cache_activity_note, check_progress, checking_footnote,
+    done_header_subtitle, fail_retry_label, idle_chrome, now_playing_subtitle, now_playing_title,
+    quiet_ui, ready_banner_title, run_heading, running_progress_captions, source_summary_line,
+    window_header, HeaderView, QuietInput, AUTH_DESCRIPTION,
 };
 use fedora_updater::privilege::{
     dnf_daemon_is_running, kill_recorded_helper, kill_recorded_local_command,
@@ -37,7 +38,7 @@ use fedora_updater::privilege::{
 use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RunningState};
 
 use super::prefs::{DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH};
-use super::{charts, dialogs, obj, prefs, preview, rows, sidebar};
+use super::{activity_log, charts, dialogs, inspector, obj, prefs, preview, queue_list, rows, sidebar};
 
 const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
 
@@ -45,6 +46,14 @@ struct Widgets {
     window: ApplicationWindow,
     split_view: NavigationSplitView,
     detail_toolbar: ToolbarView,
+    detail_view: Cell<DetailView>,
+    detail_view_stack: Stack,
+    back_to_updates_btn: Button,
+    inspector_split: libadwaita::OverlaySplitView,
+    inspector: inspector::PackageInspector,
+    inspected_id: RefCell<Option<String>>,
+    activity_log: activity_log::ActivityLogView,
+    source_filter: Cell<sidebar::SourceFilter>,
     #[cfg_attr(not(test), allow(dead_code))] // Verified by headless widget E2E tests.
     ready_toolbar: ToolbarView,
     #[cfg_attr(not(test), allow(dead_code))] // Verified by headless widget E2E tests.
@@ -85,13 +94,20 @@ struct Widgets {
     check_progress: ProgressBar,
     check_progress_meta: Label,
     check_progress_pct: Label,
-    check_group: PreferencesGroup,
+    check_list_header_clamp: libadwaita::Clamp,
     check_list_scroll: gtk::ScrolledWindow,
-    check_rows: RefCell<Vec<gtk::Widget>>,
+    check_queue: queue_list::QueueList,
     ready_banner: Banner,
-    ready_group: PreferencesGroup,
-    ready_rows: RefCell<Vec<gtk::Widget>>,
+    ready_filter_clamp: libadwaita::Clamp,
+    ready_search: gtk::SearchEntry,
+    ready_filter_status: Label,
+    ready_clear_filter: Button,
+    ready_empty_clear_btn: Button,
+    ready_list_stack: Stack,
+    ready_queue: queue_list::QueueList,
     ready_update: Button,
+    #[cfg_attr(not(test), allow(dead_code))] // Kept hidden until Phase 2 (#35) enables ApplyMode menu.
+    ready_split_update: libadwaita::SplitButton,
     run_stop: Button,
     run_stall: Banner,
     run_progress: ProgressBar,
@@ -104,9 +120,8 @@ struct Widgets {
     now_playing_size: Label,
     now_playing_pct: Label,
     now_playing_spinner: Spinner,
-    run_list_group: PreferencesGroup,
-    run_list_rows: RefCell<Vec<rows::ChecklistRow>>,
-    run_list_ids: RefCell<Vec<String>>,
+    run_list_scroll: gtk::ScrolledWindow,
+    run_queue: queue_list::QueueList,
     run_completed_group: PreferencesGroup,
     run_completed: ExpanderRow,
     run_completed_rows: RefCell<Vec<gtk::Widget>>,
@@ -123,9 +138,10 @@ struct Widgets {
     done_retry_btn: Button,
     reboot_banner: Banner,
     done_problem_banner: Banner,
+    done_installed_header_clamp: libadwaita::Clamp,
+    done_installed_heading: Label,
     done_installed_scroll: gtk::ScrolledWindow,
-    done_installed: PreferencesGroup,
-    done_installed_rows: RefCell<Vec<gtk::Widget>>,
+    done_queue: queue_list::QueueList,
     fail_page: StatusPage,
     fail_retry: Button,
     /// Last byte from the backend, including a carriage-return redraw.
@@ -142,6 +158,30 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
     let sidebar_host: gtk::Box = obj(builder, "sidebar_host");
     let sidebar = sidebar::Sidebar::new();
     sidebar_host.append(sidebar.root());
+
+    let inspector_host: gtk::Box = obj(builder, "inspector_host");
+    let inspector = inspector::PackageInspector::new();
+    inspector_host.append(inspector.root());
+
+    let activity_log_host: gtk::Box = obj(builder, "activity_log_host");
+    let activity_log = activity_log::ActivityLogView::new();
+    activity_log_host.append(activity_log.root());
+
+    let check_queue = queue_list::QueueList::new(queue_list::QueueRowMode::Review);
+    let check_list_clamp: libadwaita::ClampScrollable = obj(builder, "check_list_clamp");
+    check_list_clamp.set_child(Some(check_queue.list_view()));
+
+    let ready_queue = queue_list::QueueList::new(queue_list::QueueRowMode::Review);
+    let ready_list_clamp: libadwaita::ClampScrollable = obj(builder, "ready_list_clamp");
+    ready_list_clamp.set_child(Some(ready_queue.list_view()));
+
+    let run_queue = queue_list::QueueList::new(queue_list::QueueRowMode::Running);
+    let run_list_clamp: libadwaita::ClampScrollable = obj(builder, "run_list_clamp");
+    run_list_clamp.set_child(Some(run_queue.list_view()));
+
+    let done_queue = queue_list::QueueList::new(queue_list::QueueRowMode::Finished);
+    let done_list_clamp: libadwaita::ClampScrollable = obj(builder, "done_list_clamp");
+    done_list_clamp.set_child(Some(done_queue.list_view()));
 
     let idle_upgrade_slot: gtk::Box = obj(builder, "idle_upgrade_slot");
     let idle_upgrade = sidebar::UpgradeCard::new_inline();
@@ -161,10 +201,12 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
 
     let sidebar_toggle: ToggleButton = obj(builder, "sidebar_toggle");
     let sidebar_close_btn: Button = obj(builder, "sidebar_close_btn");
+    let back_to_updates_btn: Button = obj(builder, "back_to_updates_btn");
     let header_refresh: Button = obj(builder, "header_refresh");
     let header_menu: gtk::MenuButton = obj(builder, "header_menu");
     set_accessible_label(&sidebar_toggle, "Toggle Sidebar");
     set_accessible_label(&sidebar_close_btn, "Return to Updates");
+    set_accessible_label(&back_to_updates_btn, "Back to Updates");
     set_accessible_label(&header_refresh, "Refresh");
     set_accessible_label(&header_menu, "Main Menu");
 
@@ -174,6 +216,14 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         window,
         split_view: obj(builder, "split_view"),
         detail_toolbar: obj(builder, "detail_toolbar"),
+        detail_view: Cell::new(DetailView::Updates),
+        detail_view_stack: obj(builder, "detail_view_stack"),
+        back_to_updates_btn,
+        inspector_split: obj(builder, "inspector_split"),
+        inspector,
+        inspected_id: RefCell::new(None),
+        activity_log,
+        source_filter: Cell::new(sidebar::SourceFilter::All),
         ready_toolbar: obj(builder, "ready_toolbar"),
         done_toolbar: obj(builder, "done_toolbar"),
         window_title: obj(builder, "window_title"),
@@ -210,13 +260,19 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         check_progress: obj(builder, "check_progress"),
         check_progress_meta: obj(builder, "check_progress_meta"),
         check_progress_pct: obj(builder, "check_progress_pct"),
-        check_group: obj(builder, "check_group"),
+        check_list_header_clamp: obj(builder, "check_list_header_clamp"),
         check_list_scroll: obj(builder, "check_list_scroll"),
-        check_rows: RefCell::new(Vec::new()),
+        check_queue,
         ready_banner: obj(builder, "ready_banner"),
-        ready_group: obj(builder, "ready_group"),
-        ready_rows: RefCell::new(Vec::new()),
+        ready_filter_clamp: obj(builder, "ready_filter_clamp"),
+        ready_search: obj(builder, "ready_search"),
+        ready_filter_status: obj(builder, "ready_filter_status"),
+        ready_clear_filter: obj(builder, "ready_clear_filter"),
+        ready_empty_clear_btn: obj(builder, "ready_empty_clear_btn"),
+        ready_list_stack: obj(builder, "ready_list_stack"),
+        ready_queue,
         ready_update: obj(builder, "ready_update"),
+        ready_split_update: obj(builder, "ready_split_update"),
         run_stop: obj(builder, "run_stop"),
         run_stall: obj(builder, "run_stall"),
         run_progress: obj(builder, "run_progress"),
@@ -229,9 +285,8 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         now_playing_size: obj(builder, "now_playing_size"),
         now_playing_pct: obj(builder, "now_playing_pct"),
         now_playing_spinner: obj(builder, "now_playing_spinner"),
-        run_list_group: obj(builder, "run_list_group"),
-        run_list_rows: RefCell::new(Vec::new()),
-        run_list_ids: RefCell::new(Vec::new()),
+        run_list_scroll: obj(builder, "run_list_scroll"),
+        run_queue,
         run_completed_group: obj(builder, "run_completed_group"),
         run_completed: obj(builder, "run_completed"),
         run_completed_rows: RefCell::new(Vec::new()),
@@ -248,9 +303,10 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         done_retry_btn: obj(builder, "done_retry_btn"),
         reboot_banner: obj(builder, "reboot_banner"),
         done_problem_banner: obj(builder, "done_problem_banner"),
+        done_installed_header_clamp: obj(builder, "done_installed_header_clamp"),
+        done_installed_heading: obj(builder, "done_installed_heading"),
         done_installed_scroll: obj(builder, "done_installed_scroll"),
-        done_installed: obj(builder, "done_installed"),
-        done_installed_rows: RefCell::new(Vec::new()),
+        done_queue,
         fail_page: obj(builder, "fail_page"),
         fail_retry: obj(builder, "fail_retry"),
         last_output: Cell::new(None),
@@ -315,6 +371,7 @@ fn sync_shell_layout(w: &Widgets) {
     }));
     w.sidebar_close_btn
         .set_visible(collapsed && !w.split_view.shows_content());
+    w.inspector_split.set_collapsed(compact);
 
     sync_release_upgrade_cards(w);
 }
@@ -431,16 +488,6 @@ pub fn build(app: &Application) {
     }
     window.add_action(&about);
 
-    let view_log = gio::SimpleAction::new("view-log", None);
-    {
-        let window = window.clone();
-        let console = console.clone();
-        view_log.connect_activate(move |_, _| {
-            dialogs::show_log_window(&window, &console.borrow().full_text());
-        });
-    }
-    window.add_action(&view_log);
-
     let toggle_sidebar_action = gio::SimpleAction::new("toggle-sidebar", None);
     {
         let widgets = widgets.clone();
@@ -449,8 +496,17 @@ pub fn build(app: &Application) {
     window.add_action(&toggle_sidebar_action);
     app.set_accels_for_action("win.toggle-sidebar", &["F9", "<Primary>backslash"]);
 
+    let focus_search = gio::SimpleAction::new("focus-search", None);
+    {
+        let state = state.clone();
+        let widgets = widgets.clone();
+        focus_search.connect_activate(move |_, _| focus_active_search(&state.borrow(), &widgets));
+    }
+    window.add_action(&focus_search);
+    app.set_accels_for_action("win.focus-search", &["<Primary>f"]);
+
     wire_breakpoints(&widgets, &builder);
-    wire_shell_controls(&widgets);
+    wire_observatory_views(&widgets, &state, &console);
 
     let idle_btn = widgets.idle_btn.clone();
     let header_refresh = widgets.header_refresh.clone();
@@ -730,6 +786,144 @@ fn wire_breakpoints(widgets: &Rc<Widgets>, builder: &Builder) {
     }
 }
 
+fn focus_active_search(state: &AppState, w: &Widgets) {
+    match w.detail_view.get() {
+        DetailView::ActivityLog => {
+            w.activity_log.search_entry().grab_focus();
+        }
+        DetailView::Updates | DetailView::History => {
+            if matches!(&state.phase, Phase::Ready { packages, .. } if !packages.is_empty()) {
+                w.ready_search.grab_focus();
+            }
+        }
+    }
+}
+
+fn close_inspector(w: &Widgets) {
+    *w.inspected_id.borrow_mut() = None;
+    if w.inspector_split.shows_sidebar() {
+        w.inspector_split.set_show_sidebar(false);
+    }
+    for queue in [&w.check_queue, &w.ready_queue, &w.run_queue, &w.done_queue] {
+        queue.clear_selection();
+    }
+}
+
+fn open_or_toggle_inspector(w: &Widgets, pkg: Package) {
+    if w.inspected_id.borrow().as_deref() == Some(pkg.id.as_str())
+        && w.inspector_split.shows_sidebar()
+    {
+        close_inspector(w);
+        return;
+    }
+    *w.inspected_id.borrow_mut() = Some(pkg.id.clone());
+    w.inspector.paint(&pkg);
+    w.inspector_split.set_show_sidebar(true);
+    for queue in [&w.check_queue, &w.ready_queue, &w.run_queue, &w.done_queue] {
+        queue.select_by_id(&pkg.id);
+    }
+}
+
+fn sync_inspector_from_packages(w: &Widgets, packages: &[Package], active_queue: &queue_list::QueueList) {
+    let inspected = w.inspected_id.borrow().clone();
+    let Some(id) = inspected else {
+        return;
+    };
+    if let Some(pkg) = packages.iter().find(|p| p.id == id) {
+        w.inspector.paint(pkg);
+        active_queue.select_by_id(&id);
+    } else {
+        close_inspector(w);
+    }
+}
+
+fn apply_source_filter(w: &Widgets, filter: sidebar::SourceFilter, package_count: usize) {
+    w.source_filter.set(filter);
+    w.sidebar.select_source(filter);
+    for queue in [&w.check_queue, &w.ready_queue, &w.run_queue, &w.done_queue] {
+        queue.set_source_filter(filter);
+    }
+    update_ready_filter_chrome(w, package_count);
+}
+
+fn reset_filters(w: &Widgets, package_count: usize) {
+    if !w.ready_search.text().is_empty() {
+        w.ready_search.set_text("");
+    }
+    for queue in [&w.check_queue, &w.ready_queue, &w.run_queue, &w.done_queue] {
+        queue.set_query("");
+    }
+    apply_source_filter(w, sidebar::SourceFilter::All, package_count);
+}
+
+fn update_ready_filter_chrome(w: &Widgets, total_packages: usize) {
+    let has_packages = total_packages > 0;
+    w.ready_filter_clamp.set_visible(has_packages);
+    w.ready_list_stack.set_visible(has_packages);
+    if !has_packages {
+        w.ready_filter_status.set_visible(false);
+        w.ready_clear_filter.set_visible(false);
+        return;
+    }
+
+    let matched = w.ready_queue.filtered_count() as usize;
+    let query_active = !w.ready_search.text().trim().is_empty();
+    let source_active = w.source_filter.get() != sidebar::SourceFilter::All;
+    let filtered = query_active || source_active;
+    if filtered {
+        w.ready_filter_status
+            .set_label(&format!("{matched} of {total_packages}"));
+        w.ready_filter_status.set_visible(true);
+        w.ready_clear_filter.set_visible(true);
+    } else {
+        w.ready_filter_status.set_visible(false);
+        w.ready_clear_filter.set_visible(false);
+    }
+
+    w.ready_list_stack.set_visible_child_name(if matched > 0 {
+        "list"
+    } else {
+        "empty-filter"
+    });
+}
+
+fn paint_activity_log_chrome(w: &Widgets, matched: usize, total: usize) {
+    let sub = activity_log_subtitle(matched, total);
+    w.detail_toolbar.set_top_bar_style(ToolbarStyle::Raised);
+    w.detail_toolbar.set_bottom_bar_style(ToolbarStyle::Flat);
+    w.back_to_updates_btn.set_visible(true);
+    w.header_refresh.set_visible(false);
+    w.run_stop.set_visible(false);
+    sync_console_drawer(w, false);
+    paint_header(w, HeaderView::ActivityLog { subtitle: &sub });
+}
+
+fn switch_detail_view(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    w: &Widgets,
+    view: DetailView,
+) {
+    let target = match view {
+        DetailView::ActivityLog => DetailView::ActivityLog,
+        DetailView::Updates | DetailView::History => DetailView::Updates,
+    };
+    w.detail_view.set(target);
+    w.sidebar.select_view(target);
+    match target {
+        DetailView::ActivityLog => {
+            close_inspector(w);
+            w.detail_view_stack.set_visible_child_name("activity-log");
+            let (matched, total) = w.activity_log.sync_full(&console.borrow());
+            paint_activity_log_chrome(w, matched, total);
+        }
+        DetailView::Updates | DetailView::History => {
+            w.detail_view_stack.set_visible_child_name("updates");
+            render(&state.borrow(), &console.borrow(), w);
+        }
+    }
+}
+
 fn wire_shell_controls(widgets: &Rc<Widgets>) {
     {
         let sidebar_toggle = widgets.sidebar_toggle.clone();
@@ -768,19 +962,47 @@ fn wire_shell_controls(widgets: &Rc<Widgets>) {
         let widgets = widgets.clone();
         let key = gtk::EventControllerKey::new();
         key.connect_key_pressed(move |_, keyval, _, _| {
-            if keyval == gtk::gdk::Key::Escape
-                && widgets.split_view.is_collapsed()
-                && !widgets.split_view.shows_content()
-            {
-                widgets.split_view.set_show_content(true);
-                sync_shell_layout(&widgets);
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
+            if keyval == gtk::gdk::Key::Escape {
+                if widgets.inspector_split.shows_sidebar() {
+                    close_inspector(&widgets);
+                    return glib::Propagation::Stop;
+                }
+                if widgets.split_view.is_collapsed() && !widgets.split_view.shows_content() {
+                    widgets.split_view.set_show_content(true);
+                    sync_shell_layout(&widgets);
+                    return glib::Propagation::Stop;
+                }
             }
+            glib::Propagation::Proceed
         });
         window.add_controller(key);
     }
+}
+
+fn register_view_log_action(
+    widgets: &Rc<Widgets>,
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+) {
+    let view_log = gio::SimpleAction::new("view-log", None);
+    {
+        let state = state.clone();
+        let console = console.clone();
+        let widgets = widgets.clone();
+        view_log.connect_activate(move |_, _| {
+            switch_detail_view(&state, &console, &widgets, DetailView::ActivityLog);
+        });
+    }
+    widgets.window.add_action(&view_log);
+}
+
+fn wire_observatory_views(
+    widgets: &Rc<Widgets>,
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+) {
+    register_view_log_action(widgets, state, console);
+    wire_shell_controls(widgets);
 
     let close_compact_drawer = |w: &Rc<Widgets>| {
         if w.split_view.is_collapsed() {
@@ -789,28 +1011,119 @@ fn wire_shell_controls(widgets: &Rc<Widgets>) {
         }
     };
 
-    let on_source = {
+    {
+        let on_source = {
+            let state = state.clone();
+            let console = console.clone();
+            let widgets = widgets.clone();
+            move |filter: sidebar::SourceFilter| {
+                let count = state.borrow().packages().len();
+                apply_source_filter(&widgets, filter, count);
+                if widgets.detail_view.get() != DetailView::Updates {
+                    switch_detail_view(&state, &console, &widgets, DetailView::Updates);
+                }
+                close_compact_drawer(&widgets);
+            }
+        };
+        let on_updates = {
+            let state = state.clone();
+            let console = console.clone();
+            let widgets = widgets.clone();
+            move || {
+                close_compact_drawer(&widgets);
+                switch_detail_view(&state, &console, &widgets, DetailView::Updates);
+            }
+        };
+        let on_activity_log = {
+            let state = state.clone();
+            let console = console.clone();
+            let widgets = widgets.clone();
+            move || {
+                close_compact_drawer(&widgets);
+                switch_detail_view(&state, &console, &widgets, DetailView::ActivityLog);
+            }
+        };
+        widgets
+            .sidebar
+            .wire_navigation(on_source, on_updates, on_activity_log);
+    }
+
+    {
+        let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
-        move |_filter: sidebar::SourceFilter| {
-            close_compact_drawer(&widgets);
-        }
-    };
-    let on_updates = {
+        let back_btn = widgets.back_to_updates_btn.clone();
+        back_btn.connect_clicked(move |_| {
+            switch_detail_view(&state, &console, &widgets, DetailView::Updates);
+        });
+    }
+
+    {
+        let state = state.clone();
         let widgets = widgets.clone();
-        move || {
-            close_compact_drawer(&widgets);
-        }
-    };
-    let on_activity_log = {
+        let search = widgets.ready_search.clone();
+        search.connect_changed(move |entry| {
+            widgets.ready_queue.set_query(&entry.text());
+            let total = state.borrow().packages().len();
+            update_ready_filter_chrome(&widgets, total);
+        });
+    }
+    {
+        let search = widgets.ready_search.clone();
+        search.connect_stop_search(move |entry| {
+            if !entry.text().is_empty() {
+                entry.set_text("");
+            }
+        });
+    }
+    for btn in [
+        widgets.ready_clear_filter.clone(),
+        widgets.ready_empty_clear_btn.clone(),
+    ] {
+        let state = state.clone();
         let widgets = widgets.clone();
-        move || {
-            close_compact_drawer(&widgets);
-            let _ = WidgetExt::activate_action(&widgets.window, "win.view-log", None);
-        }
-    };
-    widgets
-        .sidebar
-        .wire_navigation(on_source, on_updates, on_activity_log);
+        btn.connect_clicked(move |_| {
+            let total = state.borrow().packages().len();
+            reset_filters(&widgets, total);
+        });
+    }
+
+    for queue in [
+        &widgets.check_queue,
+        &widgets.ready_queue,
+        &widgets.run_queue,
+        &widgets.done_queue,
+    ] {
+        let widgets = widgets.clone();
+        queue.connect_package_activated(move |pkg| {
+            open_or_toggle_inspector(&widgets, pkg);
+        });
+    }
+
+    {
+        let w_cb = widgets.clone();
+        widgets.inspector.connect_close(move || {
+            close_inspector(&w_cb);
+        });
+    }
+    {
+        let inspector_split = widgets.inspector_split.clone();
+        let w_cb = widgets.clone();
+        inspector_split.connect_show_sidebar_notify(move |split| {
+            if !split.shows_sidebar() && w_cb.inspected_id.borrow().is_some() {
+                close_inspector(&w_cb);
+            }
+        });
+    }
+
+    {
+        let w_cb = widgets.clone();
+        widgets.activity_log.wire(console.clone(), move |matched, total| {
+            if w_cb.detail_view.get() == DetailView::ActivityLog {
+                paint_activity_log_chrome(&w_cb, matched, total);
+            }
+        });
+    }
 }
 
 fn wire_upgrade_buttons(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppState>>) {
@@ -831,6 +1144,18 @@ fn wire_upgrade_buttons(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppState>>) {
     }
 }
 
+fn prepare_for_operation(
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Widgets,
+) {
+    close_inspector(widgets);
+    reset_filters(widgets, 0);
+    widgets.detail_view.set(DetailView::Updates);
+    widgets.sidebar.select_view(DetailView::Updates);
+    widgets.detail_view_stack.set_visible_child_name("updates");
+    clear_console(console, widgets);
+}
+
 fn start_check(
     state: &Rc<RefCell<AppState>>,
     console: &Rc<RefCell<ConsoleBuffer>>,
@@ -838,7 +1163,7 @@ fn start_check(
     tx: async_channel::Sender<WorkerMsg>,
     then_apply: bool,
 ) {
-    clear_console(console, widgets);
+    prepare_for_operation(console, widgets);
     dispatch(state, console, widgets, Event::StartCheck { then_apply }, true);
     if can_skip_auth_ui() {
         dispatch(
@@ -860,7 +1185,7 @@ fn begin_apply(
 ) {
     widgets.last_output.set(None);
     *widgets.cache_cursor.borrow_mut() = None;
-    clear_console(console, widgets);
+    prepare_for_operation(console, widgets);
     let packages = state.borrow().packages().to_vec();
     dispatch(state, console, widgets, Event::StartApply, true);
     if can_skip_auth_ui() {
@@ -986,6 +1311,10 @@ fn clear_console(console: &Rc<RefCell<ConsoleBuffer>>, widgets: &Widgets) {
     console.borrow_mut().clear();
     widgets.console_full.buffer().set_text("");
     widgets.console_line.set_text("Starting…");
+    widgets.activity_log.clear();
+    if widgets.detail_view.get() == DetailView::ActivityLog {
+        paint_activity_log_chrome(widgets, 0, 0);
+    }
 }
 
 fn sync_console_drawer(w: &Widgets, show: bool) {
@@ -1015,39 +1344,14 @@ fn record_console_output(
     };
     widgets.console_line.set_text(&last_line);
     if widgets.console_reveal.reveals_child() {
-        apply_console_delta(&widgets.console_full.buffer(), delta, &last_line);
+        activity_log::apply_text_buffer_delta(&widgets.console_full.buffer(), delta, &last_line);
     }
-}
-
-fn append_console_line(buffer: &gtk::TextBuffer, line: &str) {
-    let mut end = buffer.end_iter();
-    if buffer.char_count() > 0 {
-        buffer.insert(&mut end, "\n");
-    }
-    buffer.insert(&mut end, line);
-}
-
-fn apply_console_delta(buffer: &gtk::TextBuffer, delta: ConsoleDelta, line: &str) {
-    match delta {
-        ConsoleDelta::Appended => append_console_line(buffer, line),
-        ConsoleDelta::ReplacedLast => {
-            let mut end = buffer.end_iter();
-            let mut start = end;
-            start.set_line_offset(0);
-            buffer.delete(&mut start, &mut end);
-            buffer.insert(&mut start, line);
-        }
-        ConsoleDelta::TrimmedAndAppended => {
-            let mut start = buffer.start_iter();
-            let mut line1 = start;
-            if line1.forward_line() {
-                buffer.delete(&mut start, &mut line1);
-            } else {
-                let mut end = buffer.end_iter();
-                buffer.delete(&mut start, &mut end);
-            }
-            append_console_line(buffer, line);
-        }
+    if widgets.detail_view.get() == DetailView::ActivityLog {
+        let (matched, total) =
+            widgets
+                .activity_log
+                .apply_delta(&console.borrow(), delta, &last_line);
+        paint_activity_log_chrome(widgets, matched, total);
     }
 }
 
@@ -1171,15 +1475,11 @@ fn restore_default_window_size(window: &ApplicationWindow) {
 }
 
 fn clear_running_lists(w: &Widgets) {
-    if w.run_list_rows.borrow().is_empty() && w.run_completed_rows.borrow().is_empty() {
+    if w.run_queue.total_count() == 0 && w.run_completed_rows.borrow().is_empty() {
         return;
     }
-    for child in w.run_list_rows.borrow().iter() {
-        w.run_list_group.remove(&child.row);
-    }
-    w.run_list_rows.borrow_mut().clear();
-    w.run_list_ids.borrow_mut().clear();
-    w.run_list_group.set_visible(true);
+    w.run_queue.sync(&[], None, None);
+    w.run_list_scroll.set_visible(true);
     w.ignore_expand.set(true);
     rows::refill_expander(&w.run_completed, &w.run_completed_rows, std::iter::empty());
     w.run_completed_keys.borrow_mut().clear();
@@ -1259,13 +1559,15 @@ fn paint_quiet_chrome_with(
     if let Some(note) = &quiet.footnote {
         foot = note.clone();
     }
-    paint_header(
-        w,
-        HeaderView::Running {
-            heading: &w.window_title.title(),
-            footnote: &foot,
-        },
-    );
+    if w.detail_view.get() == DetailView::Updates {
+        paint_header(
+            w,
+            HeaderView::Running {
+                heading: &w.window_title.title(),
+                footnote: &foot,
+            },
+        );
+    }
 
     if quiet.show_spinner || running.work_progress.is_none() {
         w.now_playing_spinner.set_opacity(1.0);
@@ -1364,31 +1666,18 @@ fn render_running(running: &RunningState, elapsed: u64, last_console: &str, w: &
         w.now_playing_pct.set_text("");
     }
 
-    let remaining: Vec<&Package> = packages.iter().filter(|p| !p.status.is_done()).collect();
-    let rem_ids: Vec<String> = remaining.iter().map(|p| p.id.clone()).collect();
-    if *w.run_list_ids.borrow() != rem_ids {
-        for child in w.run_list_rows.borrow().iter() {
-            w.run_list_group.remove(&child.row);
-        }
-        let built: Vec<rows::ChecklistRow> =
-            remaining.iter().copied().map(rows::checklist_row).collect();
-        for row in &built {
-            w.run_list_group.add(&row.row);
-        }
-        *w.run_list_rows.borrow_mut() = built;
-        *w.run_list_ids.borrow_mut() = rem_ids;
-    }
-    {
-        let list = w.run_list_rows.borrow();
-        for (p, row) in remaining.iter().zip(list.iter()) {
-            let is_current = running
-                .active_index
-                .and_then(|i| packages.get(i))
-                .is_some_and(|cur| cur.id == p.id && !cur.status.is_done());
-            rows::sync_checklist_row(row, p, is_current);
-        }
-    }
-    w.run_list_group.set_visible(!remaining.is_empty());
+    let remaining: Vec<Package> = packages
+        .iter()
+        .filter(|p| !p.status.is_done())
+        .cloned()
+        .collect();
+    let active_id = running
+        .active_index
+        .and_then(|i| packages.get(i))
+        .filter(|cur| !cur.status.is_done())
+        .map(|cur| cur.id.as_str());
+    w.run_queue.sync(&remaining, active_id, running.work_progress);
+    w.run_list_scroll.set_visible(!remaining.is_empty());
 
     let completed: Vec<&Package> = packages.iter().filter(|p| p.status.is_done()).collect();
     let completed_keys: Vec<String> = completed.iter().map(|p| p.id.clone()).collect();
@@ -1426,6 +1715,7 @@ fn render_running(running: &RunningState, elapsed: u64, last_console: &str, w: &
     w.run_completed_group.set_visible(has_completed);
     w.ignore_expand.set(false);
 
+    sync_inspector_from_packages(w, packages, &w.run_queue);
     paint_quiet_chrome(running, &caption, elapsed, w);
 }
 
@@ -1467,11 +1757,8 @@ fn sync_release_upgrade_cards(w: &Widgets) {
 
     w.done_upgrade
         .paint(version, days, slot == sidebar::InlineUpgradeSlot::Done);
-    let done_upgrade_visible = w.done_upgrade.root().get_visible();
-    w.done_upgrade_slot.set_visible(done_upgrade_visible);
-    if done_upgrade_visible {
-        w.done_installed_scroll.set_visible(true);
-    }
+    w.done_upgrade_slot
+        .set_visible(w.done_upgrade.root().get_visible());
 }
 
 fn paint_release_upgrade(w: &Widgets, version: Option<u32>, days: Option<u32>) {
@@ -1536,7 +1823,8 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
     w.sidebar.paint(state);
     sync_console_drawer(
         w,
-        matches!(state.phase, Phase::Checking { .. } | Phase::Running(_)),
+        w.detail_view.get() == DetailView::Updates
+            && matches!(state.phase, Phase::Checking { .. } | Phase::Running(_)),
     );
     if !matches!(state.phase, Phase::Running(_)) {
         w.progress_ring.set_progress(None, false);
@@ -1555,6 +1843,7 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
     match &state.phase {
         Phase::Idle(screen) => {
             clear_running_lists(w);
+            close_inspector(w);
             restore_default_window_size(&w.window);
             w.stack
                 .set_visible_child_full("idle", gtk::StackTransitionType::None);
@@ -1580,11 +1869,12 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             w.idle_page.set_description(chrome.description.as_deref());
             w.idle_log.set_visible(chrome.show_view_log);
             paint_header(w, HeaderView::Idle);
-            if matches!(screen, IdleScreen::Fresh) {
+            if matches!(screen, IdleScreen::Fresh) && w.detail_view.get() == DetailView::Updates {
                 arm_idle_check_focus(w);
             }
         }
         Phase::Authenticating { purpose, .. } => {
+            close_inspector(w);
             w.stack.set_visible_child_name("auth");
             w.auth_page.set_title("Authentication Required");
             w.auth_page.set_description(Some(AUTH_DESCRIPTION));
@@ -1607,12 +1897,10 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             w.check_progress_pct
                 .set_text(&format!("{:.0}%", frac * 100.0));
             let found = !packages_so_far.is_empty();
+            w.check_list_header_clamp.set_visible(found);
             w.check_list_scroll.set_visible(found);
-            rows::refill_group(
-                &w.check_group,
-                &w.check_rows,
-                packages_so_far.iter().map(|p| rows::package_row(p, false)),
-            );
+            w.check_queue.sync(packages_so_far, None, None);
+            sync_inspector_from_packages(w, packages_so_far, &w.check_queue);
         }
         Phase::Ready {
             packages,
@@ -1636,13 +1924,9 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 w.ready_banner.set_revealed(false);
             }
             w.ready_update.set_sensitive(!packages.is_empty());
-            w.ready_group.set_visible(!packages.is_empty());
-
-            rows::refill_group(
-                &w.ready_group,
-                &w.ready_rows,
-                packages.iter().map(|p| rows::package_row(p, false)),
-            );
+            w.ready_queue.sync(packages, None, None);
+            update_ready_filter_chrome(w, packages.len());
+            sync_inspector_from_packages(w, packages, &w.ready_queue);
         }
         Phase::Running(running) => {
             render_running(running, elapsed, console.last_line(), w);
@@ -1697,24 +1981,19 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                     w.done_btn.add_css_class("suggested-action");
                 }
             }
-            w.done_installed
-                .set_title(if *failed > 0 { "Finished" } else { "Installed" });
-            w.done_installed.set_visible(!packages.is_empty());
-            let mut listed: Vec<&fedora_updater::Package> = packages.iter().collect();
+            w.done_installed_heading
+                .set_text(if *failed > 0 { "Finished" } else { "Installed" });
+            w.done_installed_header_clamp
+                .set_visible(!packages.is_empty());
+            let mut listed: Vec<Package> = packages.to_vec();
             listed.sort_by_key(|package| match package.status {
                 fedora_updater::PackageStatus::Failed => 0,
                 fedora_updater::PackageStatus::Completed => 1,
                 _ => 2,
             });
-            rows::refill_group(
-                &w.done_installed,
-                &w.done_installed_rows,
-                listed
-                    .into_iter()
-                    .map(|package| rows::finished_row(package, false)),
-            );
-            w.done_installed_scroll
-                .set_visible(!packages.is_empty() || w.done_upgrade_slot.get_visible());
+            w.done_queue.sync(&listed, None, None);
+            w.done_installed_scroll.set_visible(!packages.is_empty());
+            sync_inspector_from_packages(w, packages, &w.done_queue);
         }
         Phase::Failed {
             title,
@@ -1722,6 +2001,7 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             retry,
         } => {
             clear_running_lists(w);
+            close_inspector(w);
             restore_default_window_size(&w.window);
             w.stack
                 .set_visible_child_full("failed", gtk::StackTransitionType::None);
@@ -1730,6 +2010,15 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             w.fail_page.set_description(Some(detail));
             w.fail_retry.set_label(fail_retry_label(*retry));
         }
+    }
+
+    if w.detail_view.get() == DetailView::ActivityLog {
+        w.detail_view_stack.set_visible_child_name("activity-log");
+        let (matched, total) = w.activity_log.sync_full(console);
+        paint_activity_log_chrome(w, matched, total);
+    } else {
+        w.back_to_updates_btn.set_visible(false);
+        w.detail_view_stack.set_visible_child_name("updates");
     }
 }
 
@@ -1836,7 +2125,9 @@ mod tests {
             "pack_end prepends: list the menu before Stop so Stop is the start-side button"
         );
 
-        let installed_at = xml.find("id=\"done_installed\"").expect("done_installed");
+        let installed_at = xml
+            .find("id=\"done_installed_heading\"")
+            .expect("done_installed_heading");
         let done_btn_at = xml.find("id=\"done_btn\"").expect("done_btn");
         assert!(
             installed_at < done_btn_at,
@@ -1846,14 +2137,14 @@ mod tests {
         let stall_at = xml.find("id=\"run_stall\"").expect("run_stall");
         let card_at = xml.find("id=\"current_package\"").expect("current_package");
         let scroll_at = xml.find("id=\"run_list_scroll\"").expect("run_list_scroll");
-        let list_at = xml.find("id=\"run_list_group\"").expect("run_list_group");
+        let list_at = xml.find("id=\"run_list_clamp\"").expect("run_list_clamp");
         let completed_at = xml.find("id=\"run_completed\"").expect("run_completed");
         assert!(
             stall_at < card_at
                 && card_at < scroll_at
                 && scroll_at < list_at
                 && list_at < completed_at,
-            "running page layout order: run_stall < current_package < run_list_scroll < run_list_group < run_completed"
+            "running page layout order: run_stall < current_package < run_list_scroll < run_list_clamp < run_completed"
         );
 
         let scroll_block = object_block(xml, "run_list_scroll");
@@ -1861,11 +2152,27 @@ mod tests {
             scroll_block.contains("propagate-natural-height"),
             "run_list_scroll must not propagate the package list height to the window"
         );
-        assert!(scroll_block.contains("id=\"run_list_group\""));
+        assert!(scroll_block.contains("id=\"run_list_clamp\""));
         assert!(
             !scroll_block.contains("id=\"run_completed\""),
             "completed expander must not live inside the remaining-work scroll"
         );
+
+        // Observatory 1.2 additions: detail_view_stack, OverlaySplitView Inspector, ClampScrollables, filter bar.
+        assert!(object_block(xml, "detail_view_stack").contains("activity-log"));
+        let insp_block = object_block(xml, "inspector_split");
+        assert!(insp_block.contains("AdwOverlaySplitView"));
+        assert!(insp_block.contains("max-sidebar-width"));
+        for clamp_id in [
+            "check_list_clamp",
+            "ready_list_clamp",
+            "run_list_clamp",
+            "done_list_clamp",
+        ] {
+            assert!(object_block(xml, clamp_id).contains("AdwClampScrollable"));
+        }
+        assert!(object_block(xml, "ready_search").contains("GtkSearchEntry"));
+        assert!(object_block(xml, "ready_split_update").contains("AdwSplitButton"));
     }
 
     #[test]
@@ -1955,79 +2262,12 @@ mod tests {
             assert!(lbl.has_css_class(cls));
         }
 
-        // NVIDIA extension Ready row: show_status = false shows byte size and 2-line wrapping.
-        let mut steam = Package::new_dnf("Steam", "", "1.0.0.82", "flathub");
-        steam.source = UpdateSource::FlatpakSystem;
-        steam.size_bytes = Some(251 * 1024 * 1024);
-        steam.detail =
-            "1.0.0.81 → 1.0.0.82 · flathub (system) · installs org.freedesktop.Platform.GL32.nvidia-570-133-07".into();
-        let ready_row = rows::package_row(&steam, false);
-        assert_eq!(ready_row.title().as_str(), "Steam");
-        assert!(ready_row.subtitle().unwrap().contains("nvidia-570-133-07"));
-        assert_eq!(ready_row.subtitle_lines(), 2);
-        let mut labels = Vec::new();
-        collect_descendants::<gtk::Label>(&ready_row, &mut labels);
-        assert!(labels.iter().any(|l| l.label().as_str() == "251 MB"));
-
-        // Without size_bytes, show_status = false falls back to source badge suffix.
-        let firefox = Package::new_dnf("firefox", "x86_64", "140.0-1.fc44", "updates");
-        let fallback_row = rows::package_row(&firefox, false);
-        let mut fallback_labels = Vec::new();
-        collect_descendants::<gtk::Label>(&fallback_row, &mut fallback_labels);
-        assert!(fallback_labels
-            .iter()
-            .filter(|l| l.has_css_class("dimmed"))
-            .any(|l| l.label().as_str() == "DNF"));
-
-        // show_status = true shows live status caption.
-        let mut installing = firefox.clone();
-        installing.status = PackageStatus::Installing;
-        let status_row = rows::package_row(&installing, true);
-        let mut status_labels = Vec::new();
-        collect_descendants::<gtk::Label>(&status_row, &mut status_labels);
-        assert!(status_labels
-            .iter()
-            .any(|l| l.label().as_str() == "installing" && l.has_css_class("phase-tag")));
-
-        // checklist_row + sync_checklist_row CSS transitions across all 5 statuses.
-        let mut p = Package::new_dnf("kernel-core", "x86_64", "7.1.12-200.fc44", "updates");
-        let check_row = rows::checklist_row(&p);
-        assert!(check_row.row.has_css_class("pending"));
-        assert_eq!(check_row.status_label().label().as_str(), "queued");
-        assert!(check_row.status_label().has_css_class("dimmed"));
-
-        p.status = PackageStatus::Downloading;
-        rows::sync_checklist_row(&check_row, &p, true);
-        assert!(check_row.row.has_css_class("active"));
-        assert!(!check_row.row.has_css_class("pending"));
-        assert_eq!(check_row.status_label().label().as_str(), "downloading");
-        assert!(check_row.status_label().has_css_class("accent"));
-        assert!(check_row.status_label().has_css_class("phase-tag"));
-
-        p.status = PackageStatus::Installing;
-        rows::sync_checklist_row(&check_row, &p, false);
-        assert!(!check_row.row.has_css_class("active"));
-        assert_eq!(check_row.status_label().label().as_str(), "installing");
-        assert!(check_row.status_label().has_css_class("accent"));
-
-        p.status = PackageStatus::Completed;
-        rows::sync_checklist_row(&check_row, &p, false);
-        assert!(check_row.row.has_css_class("done"));
-        assert_eq!(check_row.status_label().label().as_str(), "done");
-        assert!(check_row.status_label().has_css_class("success"));
-        assert!(!check_row.status_label().has_css_class("phase-tag"));
-
-        p.status = PackageStatus::Failed;
-        rows::sync_checklist_row(&check_row, &p, false);
-        assert!(!check_row.row.has_css_class("done"));
-        assert_eq!(check_row.status_label().label().as_str(), "failed");
-        assert!(check_row.status_label().has_css_class("error"));
-
-        // finished_row: Done installed (mark_completed = false) omits "done", keeps Failed & size.
+        // finished_row: omits redundant `· System` / `· Apps`, marks completed when requested, keeps Failed & size.
         let mut done_pkg = Package::new_dnf("openssl", "x86_64", "3.2.2", "updates");
         done_pkg.size_bytes = Some(2 * 1024 * 1024);
         done_pkg.status = PackageStatus::Completed;
         let done_unmarked = rows::finished_row(&done_pkg, false);
+        assert!(!done_unmarked.subtitle().unwrap_or_default().contains("· System"));
         let mut done_labels = Vec::new();
         collect_descendants::<gtk::Label>(&done_unmarked, &mut done_labels);
         assert!(!done_labels.iter().any(|l| l.label().as_str() == "done"));
@@ -2048,14 +2288,7 @@ mod tests {
             .iter()
             .any(|l| l.label().as_str() == "failed" && l.has_css_class("error")));
 
-        // refill_group / refill_expander / append_expander store tracking.
-        let group = libadwaita::PreferencesGroup::new();
-        let store = std::cell::RefCell::new(Vec::new());
-        rows::refill_group(&group, &store, vec![rows::package_row(&firefox, false)]);
-        assert_eq!(store.borrow().len(), 1);
-        rows::refill_group(&group, &store, std::iter::empty());
-        assert_eq!(store.borrow().len(), 0);
-
+        // refill_expander / append_expander store tracking for the Running completed drawer.
         let exp = libadwaita::ExpanderRow::new();
         let exp_store = std::cell::RefCell::new(Vec::new());
         rows::refill_expander(&exp, &exp_store, vec![rows::finished_row(&done_pkg, true)]);
@@ -2326,7 +2559,7 @@ mod tests {
         assert!((widgets.check_progress.fraction() - 0.25).abs() < 1e-6);
         assert_eq!(widgets.check_progress_pct.label().as_str(), "25%");
         assert!(widgets.check_list_scroll.get_visible());
-        assert_eq!(widgets.check_rows.borrow().len(), 1);
+        assert_eq!(widgets.check_queue.total_count(), 1);
 
         // 5) Ready: clean, soft error, pre-install Stop notice, and empty-list sensitivity guard.
         let mut fp_pkg = Package::new_dnf("Steam", "", "1.0.0.82", "flathub");
@@ -2345,7 +2578,7 @@ mod tests {
         assert!(widgets.header_refresh.get_visible());
         assert!(!widgets.ready_banner.is_revealed());
         assert!(widgets.ready_update.get_sensitive());
-        assert_eq!(widgets.ready_rows.borrow().len(), 2);
+        assert_eq!(widgets.ready_queue.total_count(), 2);
         assert_eq!(widgets.window_title.title().as_str(), "2 Updates Available");
         assert!(widgets.window_title.subtitle().contains("1 system · 1 apps"));
 
@@ -2425,7 +2658,7 @@ mod tests {
         assert_eq!(widgets.now_playing_spinner.opacity(), 0.0);
         assert!(widgets.now_playing_size.get_visible());
         assert_eq!(widgets.now_playing_size.label().as_str(), "21 MB");
-        assert_eq!(widgets.run_list_rows.borrow().len(), 2);
+        assert_eq!(widgets.run_queue.total_count(), 2);
         assert!(!widgets.run_completed_group.get_visible());
 
         // Switch to Apply pass with 1 completed row, expand run_completed, then add a 2nd completed row.
@@ -2542,7 +2775,7 @@ mod tests {
         assert!(!widgets.done_problem_banner.is_revealed());
         assert!(!widgets.done_retry_btn.get_visible());
         assert!(widgets.done_btn.has_css_class("suggested-action"));
-        assert_eq!(widgets.done_installed.title().as_str(), "Installed");
+        assert_eq!(widgets.done_installed_heading.label().as_str(), "Installed");
 
         // Partial Done: Failed package listed BEFORE Completed package regardless of input order.
         let mut dnf_failed = Package::new_dnf("kernel", "x86_64", "7.1.12", "updates");
@@ -2558,7 +2791,7 @@ mod tests {
             ..Default::default()
         };
         super::render(&done_partial, &console, &widgets);
-        assert_eq!(widgets.done_installed.title().as_str(), "Finished");
+        assert_eq!(widgets.done_installed_heading.label().as_str(), "Finished");
         assert!(widgets.done_problem_banner.is_revealed());
         assert!(widgets
             .done_problem_banner
@@ -2567,19 +2800,10 @@ mod tests {
         assert!(widgets.done_retry_btn.get_visible());
         assert!(widgets.done_retry_btn.has_css_class("suggested-action"));
         assert!(!widgets.done_btn.has_css_class("suggested-action"));
-        let rows_ref = widgets.done_installed_rows.borrow();
-        assert_eq!(rows_ref.len(), 2);
-        let first_row = rows_ref[0]
-            .clone()
-            .downcast::<libadwaita::ActionRow>()
-            .expect("ActionRow");
-        let second_row = rows_ref[1]
-            .clone()
-            .downcast::<libadwaita::ActionRow>()
-            .expect("ActionRow");
-        assert_eq!(first_row.title().as_str(), "kernel");
-        assert_eq!(second_row.title().as_str(), "firefox");
-        drop(rows_ref);
+        assert_eq!(
+            widgets.done_queue.filtered_ids(),
+            vec![dnf_failed.id.clone(), p_done.id.clone()]
+        );
 
         let done_partial_reboot = AppState {
             phase: Phase::Done {
@@ -2752,7 +2976,7 @@ mod tests {
             packages: vec![dnf_pkg.clone()],
             soft_error: None,
         }));
-        assert_eq!(widgets.check_rows.borrow().len(), 1);
+        assert_eq!(widgets.check_queue.total_count(), 1);
         feed(WorkerMsg::Event(Event::BackendCheckDone {
             source: UpdateSource::FlatpakUser,
             packages: vec![fp_pkg.clone()],
@@ -2777,7 +3001,7 @@ mod tests {
         assert_eq!(release_lookup_calls.get(), 1);
         assert_eq!(auto_apply_calls.get(), 0);
         assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("ready"));
-        assert_eq!(widgets.ready_rows.borrow().len(), 2);
+        assert_eq!(widgets.ready_queue.total_count(), 2);
 
         // Apply flow via handle_worker_with.
         super::dispatch(&state, &console, &widgets, Event::StartApply, false);
@@ -2812,7 +3036,7 @@ mod tests {
         feed(WorkerMsg::Event(Event::ApplyComplete { needs_reboot: true }));
         assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("done"));
         assert!(widgets.reboot_banner.is_revealed());
-        assert_eq!(widgets.done_installed_rows.borrow().len(), 2);
+        assert_eq!(widgets.done_queue.total_count(), 2);
 
         // Stale refresh replay (then_apply: true) invokes auto-apply callback cleanly on CheckComplete.
         super::dispatch(&state, &console, &widgets, Event::ResetToIdle, false);
@@ -2853,7 +3077,9 @@ mod tests {
 
         // 2) StyleManager notify::dark toggles `.is-dark` on ApplicationWindow.
         let widgets = super::Widgets::for_test();
-        super::wire_shell_controls(&widgets);
+        let state = std::rc::Rc::new(std::cell::RefCell::new(AppState::default()));
+        let console_cell = std::rc::Rc::new(std::cell::RefCell::new(ConsoleBuffer::new(100)));
+        super::wire_observatory_views(&widgets, &state, &console_cell);
         super::sync_shell_layout(&widgets);
         let style_mgr = libadwaita::StyleManager::default();
         let initial_scheme = style_mgr.color_scheme();
@@ -3014,10 +3240,12 @@ mod tests {
         widgets.sidebar_toggle.set_active(true);
         assert!(widgets.sidebar_open.get());
         assert!(!widgets.split_view.is_collapsed());
+        assert!(!widgets.inspector_split.is_collapsed());
 
         widgets.compact.set(true);
         super::sync_shell_layout(&widgets);
         assert!(widgets.split_view.is_collapsed());
+        assert!(widgets.inspector_split.is_collapsed());
 
         // Simulates libadwaita unapplying compact_breakpoint when narrow_breakpoint activates.
         widgets.compact.set(false);
@@ -3025,11 +3253,13 @@ mod tests {
         super::sync_shell_layout(&widgets);
         assert!(super::is_compact_viewport(&widgets));
         assert!(widgets.split_view.is_collapsed());
+        assert!(widgets.inspector_split.is_collapsed());
 
         // Widening back restores Workbench mode since sidebar_open remained true.
         widgets.narrow.set(false);
         super::sync_shell_layout(&widgets);
         assert!(!widgets.split_view.is_collapsed());
+        assert!(!widgets.inspector_split.is_collapsed());
 
         // 5) Sidebar source navigation and sparkline scaffold API work cleanly.
         if let Some(apps_row) = widgets.sidebar.sources_list().row_at_index(2) {
@@ -3041,6 +3271,345 @@ mod tests {
             .sparkline()
             .push_sample(12.5 * 1024.0 * 1024.0, Some((100, 200)));
         widgets.sidebar.sparkline().clear();
+
+        gtk::prelude::GtkWindowExt::destroy(&widgets.window);
+    }
+
+    fn verify_queue_inspector_and_activity_log() {
+        use super::super::activity_log::LogSourceFilter;
+        use super::super::queue_list::{QueueList, QueueRowMode};
+        use super::super::sidebar::SourceFilter;
+        use fedora_updater::console::ConsoleBuffer;
+        use fedora_updater::model::{
+            AdvisoryKind, DetailView, Package, PackageAdvisory, PackageStatus, UpdateSource,
+        };
+        use fedora_updater::state::{AppState, Phase, RunningState};
+        use gtk::prelude::*;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let widgets = super::Widgets::for_test();
+        let state = Rc::new(RefCell::new(AppState::default()));
+        let console = Rc::new(RefCell::new(ConsoleBuffer::new(8_000)));
+        super::wire_observatory_views(&widgets, &state, &console);
+        super::sync_shell_layout(&widgets);
+
+        // Build representative Fedora packages: kernel (reboot), multi-arch mesa twins,
+        // Flatpak with NVIDIA extensions, and firmware without arch/size.
+        let mut kernel = Package::new_dnf("kernel", "x86_64", "6.14.11-300.fc44", "updates");
+        kernel.old_version = Some("6.14.9-300.fc44".into());
+        kernel.size_bytes = Some(98 * 1024 * 1024);
+
+        let mut mesa_32 = Package::new_dnf("mesa-dri-drivers", "i686", "25.0.7", "updates");
+        mesa_32.size_bytes = Some(24 * 1024 * 1024);
+        let mut mesa_64 = Package::new_dnf("mesa-dri-drivers", "x86_64", "25.0.7", "updates");
+        mesa_64.size_bytes = Some(26 * 1024 * 1024);
+
+        let mut thunderbird = Package::new_dnf("Thunderbird", "x86_64", "128.2.0", "flathub");
+        thunderbird.id = "flatpak:user:app/org.mozilla.Thunderbird/x86_64/stable".into();
+        thunderbird.source = UpdateSource::FlatpakUser;
+        thunderbird.size_bytes = Some(94 * 1024 * 1024);
+        thunderbird.detail =
+            "128.2.0 · flathub · user · installs org.freedesktop.Platform.GL.nvidia-570-133-07"
+                .into();
+
+        let mut uefi = Package::new_dnf("UEFI dbx", "", "20241101", "LVFS");
+        uefi.id = "fwupd:uefi-dbx".into();
+        uefi.source = UpdateSource::Firmware;
+
+        // 1) Row widget layout guarantees: 1 source badge, zero trailing duplicate, zero `· System`/`· Apps`, hidden Phase-2 CheckButton.
+        let fw_row = QueueList::build_row_for_test(&uefi, QueueRowMode::Review, false, None);
+        assert!(!fw_row.check_btn().get_visible());
+        assert_eq!(fw_row.source_badge().label().as_str(), "FW");
+        assert!(!fw_row.trailing_label().get_visible());
+        assert!(!fw_row.subtitle_label().label().contains("· Firmware"));
+        assert!(!fw_row.sec_tag().get_visible());
+        assert!(!fw_row.reboot_tag().get_visible());
+
+        let kernel_row = QueueList::build_row_for_test(&kernel, QueueRowMode::Review, false, None);
+        assert_eq!(kernel_row.name_label().label().as_str(), "kernel");
+        assert_eq!(kernel_row.source_badge().label().as_str(), "DNF");
+        assert!(kernel_row.reboot_tag().get_visible());
+        assert_eq!(kernel_row.reboot_tag().label().as_str(), "Restart");
+        assert!(!kernel_row.sec_tag().get_visible());
+        assert_eq!(
+            kernel_row.subtitle_label().label().as_str(),
+            "6.14.9-300.fc44 → 6.14.11-300.fc44"
+        );
+        assert_eq!(kernel_row.trailing_label().label().as_str(), "98 MB");
+
+        let fp_row = QueueList::build_row_for_test(&thunderbird, QueueRowMode::Review, false, None);
+        assert_eq!(fp_row.source_badge().label().as_str(), "FP");
+        assert!(fp_row.ext_tag().get_visible());
+        assert_eq!(
+            fp_row.ext_tag().label().as_str(),
+            "+ GL.nvidia-570-133-07"
+        );
+        assert!(!fp_row.subtitle_label().label().contains("installs"));
+        assert!(!fp_row.subtitle_label().label().contains("Apps"));
+
+        // Verify optional Phase-2 CVE micro-tag lights up only when populated.
+        let mut with_cve = kernel.clone();
+        with_cve.advisories.push(PackageAdvisory {
+            id: "FEDORA-2026-1".into(),
+            kind: AdvisoryKind::Security,
+            severity: Some("Important".into()),
+            cves: vec!["CVE-2026-9999".into()],
+            bugzillas: vec![],
+            description: None,
+        });
+        let cve_row = QueueList::build_row_for_test(&with_cve, QueueRowMode::Review, false, None);
+        assert!(cve_row.sec_tag().get_visible());
+        assert_eq!(cve_row.sec_tag().label().as_str(), "CVE-2026-9999");
+
+        // Running row highlights current active row with live progress.
+        let mut kernel_dl = kernel.clone();
+        kernel_dl.status = PackageStatus::Downloading;
+        let run_row =
+            QueueList::build_row_for_test(&kernel_dl, QueueRowMode::Running, true, Some(0.65));
+        assert!(run_row.root().has_css_class("active"));
+        assert_eq!(
+            run_row.trailing_label().label().as_str(),
+            "Downloading · 65%"
+        );
+
+        // 2) Render Ready state and verify in-place `PackageObject` reuse + multi-arch twin distinction.
+        *state.borrow_mut() = AppState {
+            phase: Phase::Ready {
+                packages: vec![
+                    kernel.clone(),
+                    mesa_32.clone(),
+                    mesa_64.clone(),
+                    thunderbird.clone(),
+                    uefi.clone(),
+                ],
+                soft_errors: vec![],
+            },
+            ..Default::default()
+        };
+        super::render(&state.borrow(), &console.borrow(), &widgets);
+        assert!(!widgets.ready_split_update.get_visible());
+        assert_eq!(widgets.ready_queue.total_count(), 5);
+        assert_eq!(
+            widgets.sidebar.count_texts(),
+            ("5".into(), "3".into(), "1".into(), "1".into())
+        );
+
+        let kernel_ptr_before = widgets
+            .ready_queue
+            .find_object(&kernel.id)
+            .expect("kernel object")
+            .as_ptr();
+        let mesa32_obj = widgets
+            .ready_queue
+            .find_object(&mesa_32.id)
+            .expect("i686 twin");
+        let mesa64_obj = widgets
+            .ready_queue
+            .find_object(&mesa_64.id)
+            .expect("x86_64 twin");
+        assert_ne!(mesa32_obj.id(), mesa64_obj.id());
+
+        // Sync again in-place with updated size -> identical PackageObject GObject pointer!
+        let mut kernel_updated = kernel.clone();
+        kernel_updated.size_bytes = Some(102 * 1024 * 1024);
+        widgets
+            .ready_queue
+            .sync(&[kernel_updated, mesa_32, mesa_64, thunderbird.clone(), uefi.clone()], None, None);
+        let kernel_ptr_after = widgets
+            .ready_queue
+            .find_object(&kernel.id)
+            .expect("kernel object after sync")
+            .as_ptr();
+        assert_eq!(kernel_ptr_before, kernel_ptr_after);
+
+        // 3) Sidebar source filter + Gtk.SearchEntry filtering + empty filter clear.
+        widgets
+            .sidebar
+            .sources_list()
+            .row_at_index(2)
+            .expect("Apps row")
+            .activate();
+        assert_eq!(widgets.sidebar.selected_source(), SourceFilter::Apps);
+        assert_eq!(
+            widgets.ready_queue.filtered_ids(),
+            vec![thunderbird.id.clone()]
+        );
+        assert_eq!(widgets.ready_filter_status.label().as_str(), "1 of 5");
+        assert!(widgets.ready_clear_filter.get_visible());
+        assert_eq!(
+            widgets.ready_list_stack.visible_child_name().as_deref(),
+            Some("list")
+        );
+
+        widgets.ready_search.set_text("no-such-package");
+        assert_eq!(
+            widgets.ready_list_stack.visible_child_name().as_deref(),
+            Some("empty-filter")
+        );
+        widgets.ready_empty_clear_btn.emit_clicked();
+        assert_eq!(widgets.sidebar.selected_source(), SourceFilter::All);
+        assert_eq!(widgets.ready_search.text().as_str(), "");
+        assert_eq!(widgets.ready_queue.filtered_count(), 5);
+        assert_eq!(
+            widgets.ready_list_stack.visible_child_name().as_deref(),
+            Some("list")
+        );
+
+        // 4) OverlaySplitView Package Inspector: open on activate, toggle off on re-click,
+        // show reboot & extension sections cleanly, sync live during Running, close on button.
+        assert!(!widgets.inspector_split.shows_sidebar());
+        widgets.ready_queue.activate_filtered(0);
+        assert!(widgets.inspector_split.shows_sidebar());
+        assert_eq!(widgets.inspector.name_text(), "kernel");
+        assert_eq!(widgets.inspector.badge_text(), "DNF");
+        assert_eq!(widgets.inspector.repo_value().as_deref(), Some("updates"));
+        assert_eq!(widgets.inspector.arch_value().as_deref(), Some("x86_64"));
+        assert_eq!(
+            widgets.inspector.old_version_value().as_deref(),
+            Some("6.14.9-300.fc44")
+        );
+        assert_eq!(widgets.inspector.version_value(), "6.14.11-300.fc44");
+        assert_eq!(widgets.inspector.size_value().as_deref(), Some("102 MB"));
+        assert!(widgets.inspector.reboot_card_visible());
+        assert!(!widgets.inspector.extensions_card_visible());
+        assert!(!widgets.inspector.summary_visible());
+        assert!(!widgets.inspector.advisories_card_visible());
+
+        // Re-activating active row closes Inspector.
+        widgets.ready_queue.activate_filtered(0);
+        assert!(!widgets.inspector_split.shows_sidebar());
+
+        // Activate Flatpak Thunderbird (index 3 in All) -> extension breakdown shown cleanly.
+        widgets.ready_queue.activate_filtered(3);
+        assert!(widgets.inspector_split.shows_sidebar());
+        assert_eq!(widgets.inspector.name_text(), "Thunderbird");
+        assert!(widgets.inspector.extensions_card_visible());
+        assert_eq!(
+            widgets.inspector.extension_items(),
+            vec!["org.freedesktop.Platform.GL.nvidia-570-133-07"]
+        );
+        assert!(!widgets.inspector.reboot_card_visible());
+
+        // Transitioning into Running keeps Inspector synced on Thunderbird if present, and
+        // close button dismisses it cleanly.
+        let mut fp_running = thunderbird.clone();
+        fp_running.status = PackageStatus::Installing;
+        *state.borrow_mut() = AppState {
+            phase: Phase::Running(RunningState {
+                packages: vec![fp_running.clone(), uefi.clone()],
+                active_index: Some(0),
+                overall_progress: 0.5,
+                phase_label: "Installing".into(),
+                current_source: Some(UpdateSource::FlatpakUser),
+                current_name: Some("Thunderbird".into()),
+                work_progress: Some(0.5),
+                pass: fedora_updater::model::RunPass::Apply,
+                stage: None,
+                needs_reboot: false,
+                failed_sources: vec![],
+                failure_reasons: vec![],
+            }),
+            ..Default::default()
+        };
+        super::render(&state.borrow(), &console.borrow(), &widgets);
+        assert!(widgets.inspector_split.shows_sidebar());
+        assert_eq!(widgets.run_queue.selected_id().as_deref(), Some(thunderbird.id.as_str()));
+        widgets.inspector.close_btn().emit_clicked();
+        assert!(!widgets.inspector_split.shows_sidebar());
+        assert!(widgets.run_queue.selected_id().is_none());
+
+        // 5) Embedded Activity Log over ConsoleBuffer with \r redraw & ToggleGroup + search filtering.
+        super::record_console_output(&console, &widgets, "dnf", "Repositories loaded.", false);
+        super::record_console_output(&console, &widgets, "dnf", "[1/2] kernel 25%", true);
+        super::record_console_output(&console, &widgets, "dnf", "[1/2] kernel 100%", false);
+        super::record_console_output(&console, &widgets, "flatpak-user", "Thunderbird GL.nvidia", false);
+        super::record_console_output(&console, &widgets, "fwupd", "UEFI dbx ok", false);
+
+        widgets
+            .sidebar
+            .views_list()
+            .row_at_index(2)
+            .expect("Activity Log row")
+            .activate();
+        assert_eq!(widgets.detail_view.get(), DetailView::ActivityLog);
+        assert_eq!(
+            widgets.detail_view_stack.visible_child_name().as_deref(),
+            Some("activity-log")
+        );
+        assert_eq!(
+            widgets.sidebar.selected_view_name().as_deref(),
+            Some("view:log")
+        );
+        assert_eq!(widgets.window_title.title().as_str(), "Activity Log");
+        assert!(widgets.back_to_updates_btn.get_visible());
+        assert!(!widgets.console_drawer.get_visible());
+        assert!(widgets.activity_log.copy_btn().get_sensitive());
+        assert_eq!(widgets.activity_log.active_filter(), LogSourceFilter::All);
+        assert!(!widgets.activity_log.current_text().contains("25%"));
+        assert!(widgets.activity_log.current_text().contains("100%"));
+
+        // Source ToggleGroup + search filtering.
+        widgets
+            .activity_log
+            .source_toggles()
+            .set_active_name(Some("flatpak"));
+        assert_eq!(widgets.activity_log.active_filter(), LogSourceFilter::Flatpak);
+        assert_eq!(
+            widgets.activity_log.current_text(),
+            "[flatpak-user] Thunderbird GL.nvidia"
+        );
+        widgets.activity_log.search_entry().set_text("no-match");
+        assert_eq!(
+            widgets.activity_log.content_stack().visible_child_name().as_deref(),
+            Some("empty")
+        );
+        assert!(!widgets.activity_log.copy_btn().get_sensitive());
+
+        // Reset Activity Log filter & append live output; background Done render must NOT clobber ActivityLog view.
+        widgets.activity_log.search_entry().set_text("");
+        widgets
+            .activity_log
+            .source_toggles()
+            .set_active_name(Some("all"));
+        super::record_console_output(&console, &widgets, "fwupd", "Done fwupd", false);
+        assert!(widgets.activity_log.current_text().contains("Done fwupd"));
+
+        *state.borrow_mut() = AppState {
+            phase: Phase::Done {
+                packages: vec![uefi],
+                duration: "12s".into(),
+                needs_reboot: false,
+                failed: 0,
+                failure_reasons: vec![],
+            },
+            ..Default::default()
+        };
+        super::render(&state.borrow(), &console.borrow(), &widgets);
+        assert_eq!(widgets.detail_view.get(), DetailView::ActivityLog);
+        assert_eq!(widgets.window_title.title().as_str(), "Activity Log");
+
+        // Returning to Updates restores active phase title & hides back button.
+        widgets.back_to_updates_btn.emit_clicked();
+        assert_eq!(widgets.detail_view.get(), DetailView::Updates);
+        assert_eq!(
+            widgets.detail_view_stack.visible_child_name().as_deref(),
+            Some("updates")
+        );
+        assert!(!widgets.back_to_updates_btn.get_visible());
+        assert_eq!(
+            widgets.sidebar.selected_view_name().as_deref(),
+            Some("view:updates")
+        );
+        assert_eq!(widgets.window_title.title().as_str(), "All Updates Applied");
+
+        // `win.view-log` action (used by banners, header menu, and Warning/Failed pages) routes cleanly to ActivityLog.
+        assert!(WidgetExt::activate_action(&widgets.window, "win.view-log", None).is_ok());
+        assert_eq!(widgets.detail_view.get(), DetailView::ActivityLog);
+        assert_eq!(
+            widgets.detail_view_stack.visible_child_name().as_deref(),
+            Some("activity-log")
+        );
 
         gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
@@ -3066,5 +3635,6 @@ mod tests {
         verify_console_drawer_and_deltas();
         verify_handle_worker_full_replay();
         verify_observatory_shell_theme_and_charts();
+        verify_queue_inspector_and_activity_log();
     }
 }

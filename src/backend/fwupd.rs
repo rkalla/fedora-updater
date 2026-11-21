@@ -101,6 +101,9 @@ fn parse_json_updates(json: &str) -> Result<Vec<Package>, serde_json::Error> {
             status: PackageStatus::Pending,
             source: UpdateSource::Firmware,
             detail,
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
         });
     }
 
@@ -140,6 +143,9 @@ fn parse_text_updates(output: &str) -> Vec<Package> {
                 } else {
                     version
                 },
+                summary: None,
+                install_size_delta: None,
+                advisories: Vec::new(),
             });
         }
     };
