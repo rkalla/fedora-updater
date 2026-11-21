@@ -1,6 +1,7 @@
 //! Sequential multi-backend check/apply using one privileged helper session.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
 
@@ -54,15 +55,128 @@ fn line(tx: &Sender<WorkerMsg>, tag: &str, text: String) {
     );
 }
 
-/// Generation-scoped sender so a cancelled worker stops emitting events as soon as `WORK_GEN` advances.
+/// Per-run cancellation handle for injected [`OrchestratorRuntime`] workers.
+#[derive(Debug, Clone, Default)]
+pub struct WorkCancel {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl WorkCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+enum CancelCheck {
+    GlobalGen(u64),
+    Token(WorkCancel),
+}
+
+impl CancelCheck {
+    fn is_current(&self) -> bool {
+        match self {
+            Self::GlobalGen(gen) => work_is_current(*gen),
+            Self::Token(token) => !token.is_cancelled(),
+        }
+    }
+}
+
+/// Host I/O abstraction used by the check, apply, and reboot pipelines.
+pub trait OrchestratorRuntime: Send + 'static {
+    fn ensure_session(&self) -> Result<(), SessionError>;
+    fn run_helper(
+        &self,
+        cmd: HelperCommand,
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, SessionError>;
+    fn run_local(
+        &self,
+        program: &str,
+        args: &[&str],
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String>;
+    fn run_cancellable_local(
+        &self,
+        program: &str,
+        args: &[&str],
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String> {
+        self.run_local(program, args, on_line)
+    }
+    fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String>;
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// Production [`OrchestratorRuntime`] backed by OS processes, polkit helper, and libflatpak.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemRuntime;
+
+impl OrchestratorRuntime for SystemRuntime {
+    fn ensure_session(&self) -> Result<(), SessionError> {
+        with_session(|_s| Ok(()))
+    }
+
+    fn run_helper(
+        &self,
+        cmd: HelperCommand,
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, SessionError> {
+        with_session(|session| {
+            session.run_command(cmd, |ev| {
+                if let SessionEvent::Line(l) = ev {
+                    on_line(l);
+                }
+            })
+        })
+    }
+
+    fn run_local(
+        &self,
+        program: &str,
+        args: &[&str],
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String> {
+        run_local_command(program, args, on_line).map_err(|e| e.to_string())
+    }
+
+    fn run_cancellable_local(
+        &self,
+        program: &str,
+        args: &[&str],
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String> {
+        run_cancellable_local_command(program, args, on_line).map_err(|e| e.to_string())
+    }
+
+    fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String> {
+        flatpak::query_updates(user)
+    }
+
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// Generation- or token-scoped sender so a cancelled worker stops emitting events.
 struct WorkChannel<'a> {
     tx: &'a Sender<WorkerMsg>,
-    gen: u64,
+    cancel: CancelCheck,
 }
 
 impl<'a> WorkChannel<'a> {
     fn is_current(&self) -> bool {
-        work_is_current(self.gen)
+        self.cancel.is_current()
     }
 
     fn send(&self, msg: WorkerMsg) {
@@ -128,141 +242,173 @@ fn map_session_start_err(ch: &WorkChannel, e: SessionError, retry: RetryAction) 
 pub fn run_check_all(tx: Sender<WorkerMsg>) {
     let gen = begin_background_work();
     thread::spawn(move || {
-        let ch = WorkChannel { tx: &tx, gen };
-        // Ensure session up front so SessionStarted fires before long work
-        let started = with_session(|_s| Ok(()));
-        if !ch.is_current() {
-            return;
-        }
-        if let Err(e) = started {
-            map_session_start_err(&ch, e, RetryAction::CheckAgain);
-            return;
-        }
-        ch.send(WorkerMsg::SessionStarted);
+        execute_check_all_inner(&tx, &SystemRuntime, CancelCheck::GlobalGen(gen));
+    });
+}
 
-        let mut all = Vec::new();
-        let mut soft_errors = Vec::new();
+/// Spawn [`execute_check_all`] on a background thread using a custom [`OrchestratorRuntime`].
+pub fn run_check_all_with<R: OrchestratorRuntime>(
+    tx: Sender<WorkerMsg>,
+    runtime: R,
+) -> WorkCancel {
+    let cancel = WorkCancel::new();
+    let worker_cancel = cancel.clone();
+    thread::spawn(move || {
+        execute_check_all_inner(&tx, &runtime, CancelCheck::Token(worker_cancel));
+    });
+    cancel
+}
 
-        if !ch.is_current() {
-            return;
-        }
+/// Synchronously run the full check pipeline against `runtime`.
+pub fn execute_check_all<R: OrchestratorRuntime>(
+    tx: &Sender<WorkerMsg>,
+    runtime: &R,
+    cancel: &WorkCancel,
+) {
+    execute_check_all_inner(tx, runtime, CancelCheck::Token(cancel.clone()));
+}
 
-        // 1) DNF (privileged)
-        let dnf_res = run_helper_check(&ch, HelperCommand::CheckDnf, "dnf", |log, code| {
-            let mut pkgs = dnf::parse_check_update(log);
-            if dnf::check_exit_is_hard_error(code, &pkgs) {
-                Err(format!("dnf check-update failed (exit {code})"))
-            } else {
-                attach_dnf_download_sizes(&ch, &mut pkgs);
-                Ok(pkgs)
-            }
-        });
-        if !ch.is_current() {
-            return;
-        }
-        emit_backend_check(&ch, UpdateSource::Dnf, dnf_res, &mut all, &mut soft_errors);
+fn execute_check_all_inner<R: OrchestratorRuntime>(
+    tx: &Sender<WorkerMsg>,
+    runtime: &R,
+    cancel: CancelCheck,
+) {
+    let ch = WorkChannel { tx, cancel };
+    // Ensure session up front so SessionStarted fires before long work
+    let started = runtime.ensure_session();
+    if !ch.is_current() {
+        return;
+    }
+    if let Err(e) = started {
+        map_session_start_err(&ch, e, RetryAction::CheckAgain);
+        return;
+    }
+    ch.send(WorkerMsg::SessionStarted);
 
-        // 2) Flatpak appstream (unprivileged). Names and versions come from this
-        // metadata; the update set itself comes from libflatpak below.
-        if !ch.is_current() {
-            return;
-        }
-        let _ = run_cancellable_local_command(
-            "flatpak",
-            &["update", "--user", "--appstream", "--noninteractive"],
-            |l| ch.line("flatpak-user", l),
-        );
-        if !ch.is_current() {
-            return;
-        }
-        let _ = run_cancellable_local_command(
-            "flatpak",
-            &["update", "--system", "--appstream", "--noninteractive"],
-            |l| ch.line("flatpak-system", l),
-        );
+    let mut all = Vec::new();
+    let mut soft_errors = Vec::new();
 
-        // 3–4) Flatpak lists. Same decision as GNOME Software: a ref is included
-        // when its commit changed or a related extension still needs installing.
-        if !ch.is_current() {
-            return;
-        }
-        let flatpak_user_res =
-            run_flatpak_check(&ch, true).map_err(|e| format!("flatpak user: {e}"));
-        if !ch.is_current() {
-            return;
-        }
-        emit_backend_check(
-            &ch,
-            UpdateSource::FlatpakUser,
-            flatpak_user_res,
-            &mut all,
-            &mut soft_errors,
-        );
-        if !ch.is_current() {
-            return;
-        }
-        let flatpak_system_res =
-            run_flatpak_check(&ch, false).map_err(|e| format!("flatpak system: {e}"));
-        if !ch.is_current() {
-            return;
-        }
-        emit_backend_check(
-            &ch,
-            UpdateSource::FlatpakSystem,
-            flatpak_system_res,
-            &mut all,
-            &mut soft_errors,
-        );
+    if !ch.is_current() {
+        return;
+    }
 
-        // 5) fwupd
-        if !ch.is_current() {
-            return;
+    // 1) DNF (privileged)
+    let dnf_res = run_helper_check(&ch, runtime, HelperCommand::CheckDnf, "dnf", |log, code| {
+        let mut pkgs = dnf::parse_check_update(log);
+        if dnf::check_exit_is_hard_error(code, &pkgs) {
+            Err(format!("dnf check-update failed (exit {code})"))
+        } else {
+            attach_dnf_download_sizes(&ch, runtime, &mut pkgs);
+            Ok(pkgs)
         }
-        let _ = run_helper_check(
-            &ch,
-            HelperCommand::CheckFwupdRefresh,
-            "fwupd",
-            |_log, _code| Ok(Vec::new()),
-        );
-        if !ch.is_current() {
-            return;
-        }
+    });
+    if !ch.is_current() {
+        return;
+    }
+    emit_backend_check(&ch, UpdateSource::Dnf, dnf_res, &mut all, &mut soft_errors);
 
-        let fwupd_res = run_helper_check(&ch, HelperCommand::CheckFwupd, "fwupd", |log, code| {
+    // 2) Flatpak appstream (unprivileged). Names and versions come from this
+    // metadata; the update set itself comes from libflatpak below.
+    if !ch.is_current() {
+        return;
+    }
+    let _ = runtime.run_cancellable_local(
+        "flatpak",
+        &["update", "--user", "--appstream", "--noninteractive"],
+        &mut |l| ch.line("flatpak-user", l),
+    );
+    if !ch.is_current() {
+        return;
+    }
+    let _ = runtime.run_cancellable_local(
+        "flatpak",
+        &["update", "--system", "--appstream", "--noninteractive"],
+        &mut |l| ch.line("flatpak-system", l),
+    );
+
+    // 3–4) Flatpak lists. Same decision as GNOME Software: a ref is included
+    // when its commit changed or a related extension still needs installing.
+    if !ch.is_current() {
+        return;
+    }
+    let flatpak_user_res =
+        run_flatpak_check(&ch, runtime, true).map_err(|e| format!("flatpak user: {e}"));
+    if !ch.is_current() {
+        return;
+    }
+    emit_backend_check(
+        &ch,
+        UpdateSource::FlatpakUser,
+        flatpak_user_res,
+        &mut all,
+        &mut soft_errors,
+    );
+    if !ch.is_current() {
+        return;
+    }
+    let flatpak_system_res =
+        run_flatpak_check(&ch, runtime, false).map_err(|e| format!("flatpak system: {e}"));
+    if !ch.is_current() {
+        return;
+    }
+    emit_backend_check(
+        &ch,
+        UpdateSource::FlatpakSystem,
+        flatpak_system_res,
+        &mut all,
+        &mut soft_errors,
+    );
+
+    // 5) fwupd
+    if !ch.is_current() {
+        return;
+    }
+    let _ = run_helper_check(
+        &ch,
+        runtime,
+        HelperCommand::CheckFwupdRefresh,
+        "fwupd",
+        |_log, _code| Ok(Vec::new()),
+    );
+    if !ch.is_current() {
+        return;
+    }
+
+    let fwupd_res =
+        run_helper_check(&ch, runtime, HelperCommand::CheckFwupd, "fwupd", |log, code| {
             let pkgs = fwupd::parse_get_updates(log);
             if code != 0 && pkgs.is_empty() {
                 let lower = log.to_ascii_lowercase();
-                if lower.contains("no updates") || lower.contains("nothing") {
-                    return Ok(vec![]);
-                }
                 if lower.contains("not found") || lower.contains("no such file") {
                     return Err("fwupd not available".into());
+                }
+                if fwupd::check_output_is_no_updates(log, code) {
+                    return Ok(vec![]);
                 }
                 return Err(format!("fwupdmgr get-updates exit {code}"));
             }
             Ok(pkgs)
         });
-        if !ch.is_current() {
-            return;
-        }
-        emit_backend_check(
-            &ch,
-            UpdateSource::Firmware,
-            fwupd_res,
-            &mut all,
-            &mut soft_errors,
-        );
+    if !ch.is_current() {
+        return;
+    }
+    emit_backend_check(
+        &ch,
+        UpdateSource::Firmware,
+        fwupd_res,
+        &mut all,
+        &mut soft_errors,
+    );
 
-        if !ch.is_current() {
-            return;
-        }
+    if !ch.is_current() {
+        return;
+    }
 
-        // Leave session open for Apply and later Checks (app-lifetime elevation).
-        ch.event(StateEvent::CheckComplete {
-            packages: all,
-            soft_errors,
-            listed_at: SystemTime::now(),
-        });
+    // Leave session open for Apply and later Checks (app-lifetime elevation).
+    ch.event(StateEvent::CheckComplete {
+        packages: all,
+        soft_errors,
+        listed_at: runtime.now(),
     });
 }
 
@@ -296,12 +442,16 @@ fn emit_backend_check(
     }
 }
 
-fn attach_dnf_download_sizes(ch: &WorkChannel, pkgs: &mut [Package]) {
+fn attach_dnf_download_sizes<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    pkgs: &mut [Package],
+) {
     if pkgs.is_empty() || !ch.is_current() {
         return;
     }
     let mut log = String::new();
-    match run_cancellable_local_command("dnf", dnf::REPOQUERY_UPGRADES_ARGS, |l| {
+    match runtime.run_cancellable_local("dnf", dnf::REPOQUERY_UPGRADES_ARGS, &mut |l| {
         log.push_str(&l);
         log.push('\n');
     }) {
@@ -318,39 +468,41 @@ fn attach_dnf_download_sizes(ch: &WorkChannel, pkgs: &mut [Package]) {
     }
 }
 
-fn run_helper_check<F>(
+fn run_helper_check<R, F>(
     ch: &WorkChannel,
+    runtime: &R,
     cmd: HelperCommand,
     tag: &str,
     parse: F,
 ) -> Result<Vec<Package>, String>
 where
+    R: OrchestratorRuntime,
     F: Fn(&str, i32) -> Result<Vec<Package>, String>,
 {
     let mut log = String::new();
-    let code = with_session(|session| {
-        session.run_command(cmd, |ev| match ev {
-            SessionEvent::Line(l) => {
-                accept_helper_line(ch, tag, &mut log, &l);
-            }
-            SessionEvent::Finished { .. } => {}
+    let code = runtime
+        .run_helper(cmd, &mut |l| {
+            accept_helper_line(ch, tag, &mut log, &l);
         })
-    })
-    .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
     if !ch.is_current() {
         return Err("cancelled".into());
     }
     parse(&log, code)
 }
 
-fn run_flatpak_check(ch: &WorkChannel, user: bool) -> Result<Vec<Package>, String> {
+fn run_flatpak_check<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    user: bool,
+) -> Result<Vec<Package>, String> {
     let tag = if user {
         "flatpak-user"
     } else {
         "flatpak-system"
     };
     let scope = if user { "user" } else { "system" };
-    let check = flatpak::query_updates(user)?;
+    let check = runtime.query_flatpak(user)?;
     if let Some(warning) = check.warning {
         ch.line(tag, warning);
     }
@@ -371,137 +523,166 @@ fn run_flatpak_check(ch: &WorkChannel, user: bool) -> Result<Vec<Package>, Strin
 pub fn run_apply_all(tx: Sender<WorkerMsg>, packages: Vec<Package>) {
     let gen = begin_background_work();
     thread::spawn(move || {
-        let ch = WorkChannel { tx: &tx, gen };
-        let sources = crate::model::sources_present(&packages);
-        if sources.is_empty() {
-            ch.event(StateEvent::Fail {
-                title: "Nothing to apply".into(),
-                detail: "Package list was empty.".into(),
-                retry: RetryAction::CheckAgain,
-            });
+        execute_apply_all_inner(&tx, packages, &SystemRuntime, CancelCheck::GlobalGen(gen));
+    });
+}
+
+/// Spawn [`execute_apply_all`] on a background thread using a custom [`OrchestratorRuntime`].
+pub fn run_apply_all_with<R: OrchestratorRuntime>(
+    tx: Sender<WorkerMsg>,
+    packages: Vec<Package>,
+    runtime: R,
+) -> WorkCancel {
+    let cancel = WorkCancel::new();
+    let worker_cancel = cancel.clone();
+    thread::spawn(move || {
+        execute_apply_all_inner(&tx, packages, &runtime, CancelCheck::Token(worker_cancel));
+    });
+    cancel
+}
+
+/// Synchronously run the full apply pipeline against `runtime`.
+pub fn execute_apply_all<R: OrchestratorRuntime>(
+    tx: &Sender<WorkerMsg>,
+    packages: Vec<Package>,
+    runtime: &R,
+    cancel: &WorkCancel,
+) {
+    execute_apply_all_inner(tx, packages, runtime, CancelCheck::Token(cancel.clone()));
+}
+
+fn execute_apply_all_inner<R: OrchestratorRuntime>(
+    tx: &Sender<WorkerMsg>,
+    packages: Vec<Package>,
+    runtime: &R,
+    cancel: CancelCheck,
+) {
+    let ch = WorkChannel { tx, cancel };
+    let sources = crate::model::sources_present(&packages);
+    if sources.is_empty() {
+        ch.event(StateEvent::Fail {
+            title: "Nothing to apply".into(),
+            detail: "Package list was empty.".into(),
+            retry: RetryAction::CheckAgain,
+        });
+        return;
+    }
+
+    // Flatpak runs as the current user (its own polkit). Only dnf/fwupd need helper.
+    let needs_session = sources
+        .iter()
+        .any(|s| matches!(s, UpdateSource::Dnf | UpdateSource::Firmware));
+
+    if needs_session {
+        if let Err(e) = runtime.ensure_session() {
+            map_session_start_err(&ch, e, RetryAction::RetryApply);
             return;
         }
+    }
+    if !ch.is_current() {
+        return;
+    }
+    ch.send(WorkerMsg::SessionStarted);
 
-        // Flatpak runs as the current user (its own polkit). Only dnf/fwupd need helper.
-        let needs_session = sources
-            .iter()
-            .any(|s| matches!(s, UpdateSource::Dnf | UpdateSource::Firmware));
+    let mut overall_reboot = false;
 
-        if needs_session {
-            if let Err(e) = with_session(|_s| Ok(())) {
-                map_session_start_err(&ch, e, RetryAction::RetryApply);
-                return;
-            }
-        }
+    for source in &sources {
         if !ch.is_current() {
             return;
         }
-        ch.send(WorkerMsg::SessionStarted);
+        let source = *source;
+        let tag = source.console_tag();
 
-        let mut overall_reboot = false;
+        ch.line(
+            "orchestrator",
+            format!("── Applying {} ──", source.label()),
+        );
 
-        for source in &sources {
-            if !ch.is_current() {
-                return;
-            }
-            let source = *source;
-            let tag = source.console_tag();
+        ch.event(StateEvent::ApplyProgress {
+            source,
+            package_hint: None,
+            status_hint: None,
+            progress: None,
+            phase_label: format!("Updating {}", source.label()),
+            stage_current: None,
+            stage_total: None,
+        });
 
-            ch.line(
-                "orchestrator",
-                format!("── Applying {} ──", source.label()),
-            );
-
-            ch.event(StateEvent::ApplyProgress {
-                source,
-                package_hint: None,
-                status_hint: None,
-                progress: None,
-                phase_label: format!("Updating {}", source.label()),
-                stage_current: None,
-                stage_total: None,
-            });
-
-            let (code, log) = match source {
-                UpdateSource::Dnf => run_helper_apply(&ch, HelperCommand::ApplyDnf, tag, source),
-                UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
-                    // Apply the exact refs we listed at Check time, as the user.
-                    // (Running system flatpak as root via helper can disagree with
-                    // the user-session view and report "Nothing to update".)
-                    let user = source == UpdateSource::FlatpakUser;
-                    let refs: Vec<String> = packages
-                        .iter()
-                        .filter(|p| p.source == source)
-                        .filter_map(flatpak::update_ref_from_package)
-                        .collect();
-                    if refs.is_empty() {
-                        ch.line(tag, "No flatpak refs to update".into());
-                        (0, String::new())
-                    } else {
-                        ch.line(
-                            tag,
-                            format!("Updating {} ref(s): {}", refs.len(), refs.join(", ")),
-                        );
-                        let args = flatpak::update_args_for_refs(user, &refs);
-                        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        run_local_apply(&ch, "flatpak", &arg_refs, tag, source)
-                    }
+        let (code, log) = match source {
+            UpdateSource::Dnf => run_helper_apply(&ch, runtime, HelperCommand::ApplyDnf, tag, source),
+            UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
+                // Apply the exact refs we listed at Check time, as the user.
+                // (Running system flatpak as root via helper can disagree with
+                // the user-session view and report "Nothing to update".)
+                let user = source == UpdateSource::FlatpakUser;
+                let refs: Vec<String> = packages
+                    .iter()
+                    .filter(|p| p.source == source)
+                    .filter_map(flatpak::update_ref_from_package)
+                    .collect();
+                if refs.is_empty() {
+                    ch.line(tag, "No flatpak refs to update".into());
+                    (0, String::new())
+                } else {
+                    ch.line(
+                        tag,
+                        format!("Updating {} ref(s): {}", refs.len(), refs.join(", ")),
+                    );
+                    let args = flatpak::update_args_for_refs(user, &refs);
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source)
                 }
-                UpdateSource::Firmware => {
-                    run_helper_apply(&ch, HelperCommand::ApplyFwupd, tag, source)
-                }
-            };
-
-            if !ch.is_current() {
-                return;
             }
+            UpdateSource::Firmware => {
+                run_helper_apply(&ch, runtime, HelperCommand::ApplyFwupd, tag, source)
+            }
+        };
 
-            let reboot = backend::detect_reboot(source, &log, &packages);
-            if reboot {
+        if !ch.is_current() {
+            return;
+        }
+
+        let reboot = code == 0 && backend::detect_reboot(source, &log, &packages);
+        if reboot {
+            overall_reboot = true;
+        }
+        let error = if code == 0 {
+            None
+        } else {
+            Some(summarize_apply_failure(source, &log, code))
+        };
+
+        ch.event(StateEvent::BackendApplyDone {
+            source,
+            success: code == 0,
+            needs_reboot: reboot,
+            error,
+        });
+    }
+
+    if !ch.is_current() {
+        return;
+    }
+
+    if sources.contains(&UpdateSource::Firmware) {
+        ch.line("fwupd", "Checking whether a reboot is needed…".into());
+        let mut log = String::new();
+        if let Ok(code) = runtime.run_helper(HelperCommand::CheckFwupdReboot, &mut |l| {
+            accept_helper_line(&ch, "fwupd", &mut log, &l);
+        }) {
+            if fwupd::parse_reboot_needed_output(&log, code) {
                 overall_reboot = true;
             }
-            let error = if code == 0 {
-                None
-            } else {
-                Some(summarize_apply_failure(source, &log, code))
-            };
-
-            ch.event(StateEvent::BackendApplyDone {
-                source,
-                success: code == 0,
-                needs_reboot: reboot,
-                error,
-            });
         }
+    }
 
-        if !ch.is_current() {
-            return;
-        }
+    if !ch.is_current() {
+        return;
+    }
 
-        if sources.contains(&UpdateSource::Firmware) {
-            ch.line("fwupd", "Checking whether a reboot is needed…".into());
-            let mut log = String::new();
-            if let Ok(code) = with_session(|session| {
-                session.run_command(HelperCommand::CheckFwupdReboot, |ev| {
-                    if let SessionEvent::Line(l) = ev {
-                        accept_helper_line(&ch, "fwupd", &mut log, &l);
-                    }
-                })
-            }) {
-                if fwupd::parse_reboot_needed_output(&log, code) {
-                    overall_reboot = true;
-                }
-            }
-        }
-
-        if !ch.is_current() {
-            return;
-        }
-
-        // Keep elevated helper for further Checks / Applies in this app session.
-        ch.event(StateEvent::ApplyComplete {
-            needs_reboot: overall_reboot,
-        });
+    // Keep elevated helper for further Checks / Applies in this app session.
+    ch.event(StateEvent::ApplyComplete {
+        needs_reboot: overall_reboot,
     });
 }
 
@@ -525,21 +706,17 @@ fn emit_progress_from_line(ch: &WorkChannel, source: UpdateSource, l: &str) {
     });
 }
 
-fn run_helper_apply(
+fn run_helper_apply<R: OrchestratorRuntime>(
     ch: &WorkChannel,
+    runtime: &R,
     cmd: HelperCommand,
     tag: &str,
     source: UpdateSource,
 ) -> (i32, String) {
     let mut log = String::new();
-    match with_session(|session| {
-        session.run_command(cmd, |ev| match ev {
-            SessionEvent::Line(l) => {
-                let text = accept_helper_line(ch, tag, &mut log, &l);
-                emit_progress_from_line(ch, source, &text);
-            }
-            SessionEvent::Finished { .. } => {}
-        })
+    match runtime.run_helper(cmd, &mut |l| {
+        let text = accept_helper_line(ch, tag, &mut log, &l);
+        emit_progress_from_line(ch, source, &text);
     }) {
         Ok(code) => (code, log),
         Err(e) => {
@@ -549,15 +726,16 @@ fn run_helper_apply(
     }
 }
 
-fn run_local_apply(
+fn run_local_apply<R: OrchestratorRuntime>(
     ch: &WorkChannel,
+    runtime: &R,
     program: &str,
     args: &[&str],
     tag: &str,
     source: UpdateSource,
 ) -> (i32, String) {
     let mut log = String::new();
-    match run_cancellable_local_command(program, args, |l| {
+    match runtime.run_cancellable_local(program, args, &mut |l| {
         log.push_str(&l);
         log.push('\n');
         ch.line(tag, l.clone());
@@ -569,7 +747,7 @@ fn run_local_apply(
         }
         Err(e) => {
             ch.line(tag, format!("error: {e}"));
-            (-1, e.to_string())
+            (-1, e)
         }
     }
 }
@@ -692,32 +870,39 @@ fn reboot_fail_event(title: &'static str, detail: String) -> StateEvent {
 }
 
 pub fn run_systemctl_reboot(tx: Sender<WorkerMsg>) {
+    run_systemctl_reboot_with(tx, SystemRuntime);
+}
+
+/// Spawn [`execute_systemctl_reboot`] on a background thread using a custom [`OrchestratorRuntime`].
+pub fn run_systemctl_reboot_with<R: OrchestratorRuntime>(tx: Sender<WorkerMsg>, runtime: R) {
     thread::spawn(move || {
-        let mut log = String::new();
-        match run_local_command("systemctl", &["reboot"], |l| {
-            if !log.is_empty() {
-                log.push('\n');
-            }
-            log.push_str(&l);
-            line(&tx, "systemctl", l);
-        }) {
-            Ok(0) => {}
-            Ok(code) => send(
-                &tx,
-                WorkerMsg::Event(reboot_fail_event(
-                    REBOOT_FAILED_TITLE,
-                    reboot_failure_detail(&log, code),
-                )),
-            ),
-            Err(e) => send(
-                &tx,
-                WorkerMsg::Event(reboot_fail_event(
-                    REBOOT_SPAWN_FAILED_TITLE,
-                    e.to_string(),
-                )),
-            ),
-        }
+        execute_systemctl_reboot(&tx, &runtime);
     });
+}
+
+/// Synchronously run `systemctl reboot` against `runtime`.
+pub fn execute_systemctl_reboot<R: OrchestratorRuntime>(tx: &Sender<WorkerMsg>, runtime: &R) {
+    let mut log = String::new();
+    match runtime.run_local("systemctl", &["reboot"], &mut |l| {
+        if !log.is_empty() {
+            log.push('\n');
+        }
+        log.push_str(&l);
+        line(tx, "systemctl", l);
+    }) {
+        Ok(0) => {}
+        Ok(code) => send(
+            tx,
+            WorkerMsg::Event(reboot_fail_event(
+                REBOOT_FAILED_TITLE,
+                reboot_failure_detail(&log, code),
+            )),
+        ),
+        Err(e) => send(
+            tx,
+            WorkerMsg::Event(reboot_fail_event(REBOOT_SPAWN_FAILED_TITLE, e)),
+        ),
+    }
 }
 
 pub fn session_started_event(purpose: AuthPurpose) -> StateEvent {
@@ -756,7 +941,10 @@ mod tests {
         let _guard = lock_work_gen();
         let (tx, rx) = async_channel::unbounded();
         let gen = begin_background_work();
-        let ch = WorkChannel { tx: &tx, gen };
+        let ch = WorkChannel {
+            tx: &tx,
+            cancel: CancelCheck::GlobalGen(gen),
+        };
         let mut log = String::new();
 
         accept_helper_line(
@@ -830,7 +1018,10 @@ mod tests {
         let _guard = lock_work_gen();
         let (tx, rx) = async_channel::unbounded();
         let gen = begin_background_work();
-        let ch = WorkChannel { tx: &tx, gen };
+        let ch = WorkChannel {
+            tx: &tx,
+            cancel: CancelCheck::GlobalGen(gen),
+        };
         map_session_start_err(&ch, SessionError::AuthDenied, RetryAction::CheckAgain);
         assert!(matches!(
             rx.try_recv(),
@@ -893,7 +1084,10 @@ mod tests {
         let _guard = lock_work_gen();
         let (tx, rx) = async_channel::unbounded();
         let gen = begin_background_work();
-        let ch = WorkChannel { tx: &tx, gen };
+        let ch = WorkChannel {
+            tx: &tx,
+            cancel: CancelCheck::GlobalGen(gen),
+        };
 
         ch.line("dnf", "line before cancel".into());
         ch.live_line("dnf", "draw before cancel".into());
@@ -933,5 +1127,91 @@ mod tests {
                 ..
             }) if name == "firefox"
         ));
+    }
+
+    struct CancellingGlobalRuntime {
+        cancel_on_ensure_session: bool,
+        cancel_on_check_dnf: bool,
+        helper_calls: Mutex<Vec<HelperCommand>>,
+    }
+
+    impl OrchestratorRuntime for CancellingGlobalRuntime {
+        fn ensure_session(&self) -> Result<(), SessionError> {
+            if self.cancel_on_ensure_session {
+                cancel_background_work();
+            }
+            Ok(())
+        }
+
+        fn run_helper(
+            &self,
+            cmd: HelperCommand,
+            on_line: &mut dyn FnMut(String),
+        ) -> Result<i32, SessionError> {
+            self.helper_calls.lock().unwrap().push(cmd);
+            if self.cancel_on_check_dnf && cmd == HelperCommand::CheckDnf {
+                on_line("firefox.x86_64 140.0-1.fc44 updates".into());
+                cancel_background_work();
+                on_line("late-line-after-cancel".into());
+            }
+            Ok(0)
+        }
+
+        fn run_local(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _on_line: &mut dyn FnMut(String),
+        ) -> Result<i32, String> {
+            panic!("local command must not be called after cancel");
+        }
+
+        fn query_flatpak(&self, _user: bool) -> Result<flatpak::FlatpakCheck, String> {
+            panic!("flatpak check must not be called after cancel");
+        }
+    }
+
+    #[test]
+    fn cancel_background_work_stops_global_gen_check_pipeline() {
+        let _guard = lock_work_gen();
+
+        // Cancel during ensure_session: emits nothing and never invokes CheckDnf.
+        let (tx, rx) = async_channel::unbounded();
+        let gen = begin_background_work();
+        let rt_auth = CancellingGlobalRuntime {
+            cancel_on_ensure_session: true,
+            cancel_on_check_dnf: false,
+            helper_calls: Mutex::new(Vec::new()),
+        };
+        execute_check_all_inner(&tx, &rt_auth, CancelCheck::GlobalGen(gen));
+        assert!(rx.try_recv().is_err());
+        assert!(rt_auth.helper_calls.lock().unwrap().is_empty());
+
+        // Cancel mid-CheckDnf: drops late lines, emits no BackendCheckDone / CheckComplete.
+        let (tx, rx) = async_channel::unbounded();
+        let gen = begin_background_work();
+        let rt_dnf = CancellingGlobalRuntime {
+            cancel_on_ensure_session: false,
+            cancel_on_check_dnf: true,
+            helper_calls: Mutex::new(Vec::new()),
+        };
+        execute_check_all_inner(&tx, &rt_dnf, CancelCheck::GlobalGen(gen));
+        let mut msgs = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            msgs.push(msg);
+        }
+        assert!(matches!(msgs.first(), Some(WorkerMsg::SessionStarted)));
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            WorkerMsg::ConsoleLine { text, .. } if text == "firefox.x86_64 140.0-1.fc44 updates"
+        )));
+        assert!(!msgs.iter().any(|m| matches!(
+            m,
+            WorkerMsg::ConsoleLine { text, .. } if text == "late-line-after-cancel"
+        )));
+        assert!(!msgs
+            .iter()
+            .any(|m| matches!(m, WorkerMsg::Event(_))));
+        assert_eq!(*rt_dnf.helper_calls.lock().unwrap(), vec![HelperCommand::CheckDnf]);
     }
 }

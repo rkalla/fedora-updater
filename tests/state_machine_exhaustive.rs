@@ -318,41 +318,247 @@ fn happy_path_multi_source() {
 
 #[test]
 fn illegal_transitions() {
-    let s = AppState::default();
-    assert!(apply(s.clone(), Event::StartApply).is_err());
-    assert!(apply(
-        s.clone(),
+    let assert_rejected = |state: &AppState, events: Vec<Event>| {
+        for ev in events {
+            let label = format!("{ev:?}");
+            let mut copy = state.clone();
+            assert!(
+                reduce(&mut copy, ev).is_err(),
+                "expected illegal transition from {} for {label}",
+                phase_name(&state.phase)
+            );
+            assert_eq!(
+                copy.phase, state.phase,
+                "rejected event mutated phase from {}",
+                phase_name(&state.phase)
+            );
+        }
+    };
+
+    // Idle
+    assert_rejected(
+        &AppState::default(),
+        vec![
+            Event::StartApply,
+            Event::SessionReady {
+                purpose: AuthPurpose::Check,
+            },
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+            Event::BackendCheckDone {
+                source: UpdateSource::Dnf,
+                packages: vec![],
+                soft_error: None,
+            },
+            Event::CheckComplete {
+                packages: vec![],
+                soft_errors: vec![],
+                listed_at: SystemTime::UNIX_EPOCH,
+            },
+            dnf_progress(None, None, None, "Installing", None, None),
+            Event::BackendApplyDone {
+                source: UpdateSource::Dnf,
+                success: true,
+                needs_reboot: false,
+                error: None,
+            },
+            Event::ApplyComplete {
+                needs_reboot: false,
+            },
+            Event::StopApply {
+                during_transaction: false,
+            },
+            Event::CancelAuth,
+        ],
+    );
+
+    // Authenticating(Check)
+    let auth_check = apply(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
+    assert_rejected(
+        &auth_check,
+        vec![
+            Event::StartApply,
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+            Event::BackendCheckDone {
+                source: UpdateSource::Dnf,
+                packages: vec![],
+                soft_error: None,
+            },
+            Event::CheckComplete {
+                packages: vec![],
+                soft_errors: vec![],
+                listed_at: SystemTime::UNIX_EPOCH,
+            },
+            dnf_progress(None, None, None, "Installing", None, None),
+            Event::BackendApplyDone {
+                source: UpdateSource::Dnf,
+                success: true,
+                needs_reboot: false,
+                error: None,
+            },
+            Event::ApplyComplete {
+                needs_reboot: false,
+            },
+            Event::StopApply {
+                during_transaction: false,
+            },
+        ],
+    );
+
+    // Checking
+    let checking = apply(
+        auth_check,
         Event::SessionReady {
-            purpose: AuthPurpose::Check
-        }
+            purpose: AuthPurpose::Check,
+        },
     )
-    .is_err());
-    assert!(apply(
-        s.clone(),
-        Event::CheckComplete {
+    .unwrap();
+    assert_rejected(
+        &checking,
+        vec![
+            Event::StartApply,
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+            dnf_progress(None, None, None, "Installing", None, None),
+            Event::BackendApplyDone {
+                source: UpdateSource::Dnf,
+                success: true,
+                needs_reboot: false,
+                error: None,
+            },
+            Event::ApplyComplete {
+                needs_reboot: false,
+            },
+            Event::StopApply {
+                during_transaction: false,
+            },
+            Event::CancelAuth,
+        ],
+    );
+
+    // Ready
+    let ready = ready_state(vec![dnf("kernel")]);
+    assert_rejected(
+        &ready,
+        vec![
+            Event::SessionReady {
+                purpose: AuthPurpose::Check,
+            },
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+            Event::BackendCheckDone {
+                source: UpdateSource::Dnf,
+                packages: vec![],
+                soft_error: None,
+            },
+            Event::CheckComplete {
+                packages: vec![],
+                soft_errors: vec![],
+                listed_at: SystemTime::UNIX_EPOCH,
+            },
+            dnf_progress(None, None, None, "Installing", None, None),
+            Event::BackendApplyDone {
+                source: UpdateSource::Dnf,
+                success: true,
+                needs_reboot: false,
+                error: None,
+            },
+            Event::ApplyComplete {
+                needs_reboot: false,
+            },
+            Event::StopApply {
+                during_transaction: false,
+            },
+            Event::CancelAuth,
+        ],
+    );
+
+    // Running
+    let running = running_dnf(vec![dnf("kernel")]);
+    assert_rejected(
+        &running,
+        vec![
+            Event::StartApply,
+            Event::SessionReady {
+                purpose: AuthPurpose::Check,
+            },
+            Event::BackendCheckDone {
+                source: UpdateSource::Dnf,
+                packages: vec![],
+                soft_error: None,
+            },
+            Event::CheckComplete {
+                packages: vec![],
+                soft_errors: vec![],
+                listed_at: SystemTime::UNIX_EPOCH,
+            },
+            Event::CancelAuth,
+        ],
+    );
+
+    // Done & Failed(CheckAgain)
+    let done = AppState {
+        phase: Phase::Done {
             packages: vec![],
-            soft_errors: vec![],
-            listed_at: SystemTime::UNIX_EPOCH,
-        }
-    )
-    .is_err());
-    assert!(apply(
-        s.clone(),
-        Event::BackendApplyDone {
-            source: UpdateSource::Dnf,
-            success: true,
+            duration: "1s".into(),
             needs_reboot: false,
-            error: None,
-        }
+            failed: 0,
+            failure_reasons: vec![],
+        },
+        ..Default::default()
+    };
+    let failed_check = apply(
+        AppState::default(),
+        Event::Fail {
+            title: "err".into(),
+            detail: "detail".into(),
+            retry: RetryAction::CheckAgain,
+        },
     )
-    .is_err());
-    assert!(apply(
-        s,
-        Event::ApplyComplete {
-            needs_reboot: false
-        }
-    )
-    .is_err());
+    .unwrap();
+    for state in [&done, &failed_check] {
+        assert_rejected(
+            state,
+            vec![
+                Event::StartApply,
+                Event::SessionReady {
+                    purpose: AuthPurpose::Check,
+                },
+                Event::SessionReady {
+                    purpose: AuthPurpose::Apply,
+                },
+                Event::BackendCheckDone {
+                    source: UpdateSource::Dnf,
+                    packages: vec![],
+                    soft_error: None,
+                },
+                Event::CheckComplete {
+                    packages: vec![],
+                    soft_errors: vec![],
+                    listed_at: SystemTime::UNIX_EPOCH,
+                },
+                dnf_progress(None, None, None, "Installing", None, None),
+                Event::BackendApplyDone {
+                    source: UpdateSource::Dnf,
+                    success: true,
+                    needs_reboot: false,
+                    error: None,
+                },
+                Event::ApplyComplete {
+                    needs_reboot: false,
+                },
+                Event::StopApply {
+                    during_transaction: false,
+                },
+                Event::CancelAuth,
+            ],
+        );
+    }
 }
 
 #[test]
@@ -612,7 +818,7 @@ fn soft_errors_on_empty_check_surface_message() {
 
 #[test]
 fn dnf_failure_does_not_block_done_if_others_ok() {
-    let s = ready_state(vec![dnf("kernel"), flatpak("app")]);
+    let s = ready_state(vec![dnf("kernel"), flatpak("app"), firmware("UEFI")]);
     let s = apply(s, Event::StartApply).unwrap();
     let s = apply(
         s,
@@ -643,6 +849,16 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
     .unwrap();
     let s = apply(
         s,
+        Event::BackendApplyDone {
+            source: UpdateSource::Firmware,
+            success: true,
+            needs_reboot: true,
+            error: None,
+        },
+    )
+    .unwrap();
+    let s = apply(
+        s,
         Event::ApplyComplete {
             needs_reboot: false,
         },
@@ -650,14 +866,26 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
     .unwrap();
     match s.phase {
         Phase::Done {
-            failed, packages, ..
+            failed,
+            needs_reboot,
+            failure_reasons,
+            packages,
+            ..
         } => {
             assert_eq!(failed, 1);
+            assert!(needs_reboot, "Firmware reboot flag must survive DNF failure");
+            assert_eq!(
+                failure_reasons,
+                vec!["System: RPM database is locked".to_string()]
+            );
             assert!(packages
                 .iter()
                 .any(|p| p.source == UpdateSource::Dnf && p.status == PackageStatus::Failed));
             assert!(packages.iter().any(|p| {
                 p.source == UpdateSource::FlatpakUser && p.status == PackageStatus::Completed
+            }));
+            assert!(packages.iter().any(|p| {
+                p.source == UpdateSource::Firmware && p.status == PackageStatus::Completed
             }));
         }
         other => panic!("expected Done, got {}", phase_name(&other)),
@@ -829,6 +1057,55 @@ fn done_resets_to_current_idle() {
         description.as_deref(),
         Some(format!("Last checked {checked_at}").as_str())
     );
+
+    // Done with failed > 0 (both without and with reasons) resets to IdleScreen::Warning.
+    let done_no_reasons = AppState {
+        phase: Phase::Done {
+            packages: vec![],
+            duration: "5s".into(),
+            needs_reboot: false,
+            failed: 2,
+            failure_reasons: vec![],
+        },
+        ..Default::default()
+    };
+    let reset_no_reasons = apply(done_no_reasons, Event::ResetToIdle).unwrap();
+    assert!(matches!(
+        &reset_no_reasons.phase,
+        Phase::Idle(IdleScreen::Warning { title, detail, .. })
+            if *title == "Some updates failed" && detail.starts_with("2 updates did not finish. Open View Log")
+    ));
+
+    // Failed(RetryApply) + ResetToIdle returns to Fresh and clears preserved packages.
+    let failed_retry = AppState {
+        retry_apply_packages: vec![dnf("firefox")],
+        phase: Phase::Failed {
+            title: "Authentication cancelled".into(),
+            detail: "polkit denied".into(),
+            retry: RetryAction::RetryApply,
+        },
+        ..Default::default()
+    };
+    let reset_failed = apply(failed_retry, Event::ResetToIdle).unwrap();
+    assert_eq!(reset_failed.phase, Phase::Idle(IdleScreen::Fresh));
+    assert!(reset_failed.retry_apply_packages.is_empty());
+
+    // Idle(Warning) + ResetToIdle retains Warning screen while clearing apply_when_ready.
+    let warn_idle = AppState {
+        apply_when_ready: true,
+        phase: Phase::Idle(IdleScreen::Warning {
+            title: "Could not check all sources",
+            detail: "dnf timed out".into(),
+            checked_at: Some("just now".into()),
+        }),
+        ..Default::default()
+    };
+    let reset_warn = apply(warn_idle, Event::ResetToIdle).unwrap();
+    assert!(!reset_warn.apply_when_ready);
+    assert!(matches!(
+        reset_warn.phase,
+        Phase::Idle(IdleScreen::Warning { .. })
+    ));
 }
 
 #[test]
@@ -2121,4 +2398,165 @@ fn cancel_auth_from_warning_idle_returns_fresh_not_up_to_date() {
     let auth = apply(s, Event::StartCheck { then_apply: false }).unwrap();
     let cancelled = apply(auth, Event::CancelAuth).unwrap();
     assert_eq!(cancelled.phase, Phase::Idle(IdleScreen::Fresh));
+}
+
+#[test]
+fn session_ready_is_idempotent_in_matching_active_phases() {
+    let checking = apply(
+        apply(AppState::default(), Event::StartCheck { then_apply: true }).unwrap(),
+        Event::SessionReady {
+            purpose: AuthPurpose::Check,
+        },
+    )
+    .unwrap();
+    let still_checking = apply(
+        checking.clone(),
+        Event::SessionReady {
+            purpose: AuthPurpose::Check,
+        },
+    )
+    .unwrap();
+    assert_eq!(still_checking.phase, checking.phase);
+    assert!(still_checking.apply_when_ready);
+
+    let running = running_dnf(vec![dnf("firefox")]);
+    let still_running = apply(
+        running.clone(),
+        Event::SessionReady {
+            purpose: AuthPurpose::Apply,
+        },
+    )
+    .unwrap();
+    assert_eq!(still_running.phase, running.phase);
+}
+
+#[test]
+fn repeated_apply_auth_denial_preserves_retry_apply_packages() {
+    let s = ready_state(vec![dnf("kernel"), flatpak("org.app.Foo")]);
+    let s = apply(s, Event::StartApply).unwrap();
+    let s = apply(
+        s,
+        Event::Fail {
+            title: "Authentication cancelled".into(),
+            detail: "polkit denied #1".into(),
+            retry: RetryAction::RetryApply,
+        },
+    )
+    .unwrap();
+    // Second consecutive RetryApply failure (if window/worker emitted another Fail)
+    // still preserves retry_apply_packages.
+    let s = apply(
+        s,
+        Event::Fail {
+            title: "Authentication cancelled".into(),
+            detail: "polkit denied #2".into(),
+            retry: RetryAction::RetryApply,
+        },
+    )
+    .unwrap();
+    assert_eq!(s.packages().len(), 2);
+    let retried = apply(s, Event::StartApply).unwrap();
+    assert_eq!(retried.packages().len(), 2);
+}
+
+#[test]
+fn completed_and_unknown_progress_hints_preserve_release_note_and_stop_resets_reboot() {
+    let mut s = apply(
+        AppState::default(),
+        Event::ReleaseNoted {
+            version: Some(45),
+            days_since_release: Some(3),
+        },
+    )
+    .unwrap();
+    s = apply(s, Event::StartCheck { then_apply: false }).unwrap();
+    s = apply(
+        s,
+        Event::SessionReady {
+            purpose: AuthPurpose::Check,
+        },
+    )
+    .unwrap();
+    s = apply(
+        s,
+        Event::CheckComplete {
+            packages: vec![dnf("firefox"), dnf("openssl")],
+            soft_errors: vec![],
+            listed_at: SystemTime::UNIX_EPOCH,
+        },
+    )
+    .unwrap();
+    assert_eq!(s.release_upgrade, Some(45));
+    assert_eq!(s.release_age_days, Some(3));
+
+    // ApplyProgress on already-Completed package does not override active unknown hint or uncheck done item.
+    let mut running = RunningState::new(vec![
+        {
+            let mut f = dnf("firefox");
+            f.status = PackageStatus::Completed;
+            f
+        },
+        dnf("openssl"),
+    ]);
+    running.current_source = Some(UpdateSource::Dnf);
+    running.pass = RunPass::Apply;
+    let r = AppState {
+        phase: Phase::Running(running),
+        ..Default::default()
+    };
+    let r = apply(
+        r,
+        dnf_progress(
+            Some("unknown-transitive-dep"),
+            Some(PackageStatus::Installing),
+            Some(0.4),
+            "Installing",
+            Some(1),
+            Some(3),
+        ),
+    )
+    .unwrap();
+    match &r.phase {
+        Phase::Running(st) => {
+            assert_eq!(st.current_name.as_deref(), Some("unknown-transitive-dep"));
+            assert_eq!(st.active_index, None);
+        }
+        other => panic!("expected Running, got {other:?}"),
+    }
+
+    let r = apply(
+        r,
+        dnf_progress(
+            Some("firefox"),
+            Some(PackageStatus::Installing),
+            Some(0.9),
+            "Verifying",
+            Some(2),
+            Some(3),
+        ),
+    )
+    .unwrap();
+    match &r.phase {
+        Phase::Running(st) => {
+            assert_eq!(st.packages[0].status, PackageStatus::Completed);
+            // Already-completed package must not replace current_name.
+            assert_eq!(st.current_name.as_deref(), Some("unknown-transitive-dep"));
+        }
+        other => panic!("expected Running, got {other:?}"),
+    }
+
+    // StopApply during_transaction drops RunningState (including needs_reboot).
+    let mut r_reb = running_dnf(vec![dnf("kernel-core")]);
+    if let Phase::Running(ref mut st) = r_reb.phase {
+        st.needs_reboot = true;
+        st.pass = RunPass::Apply;
+    }
+    let stopped = apply(
+        r_reb,
+        Event::StopApply {
+            during_transaction: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(stopped.phase, Phase::Failed { .. }));
 }

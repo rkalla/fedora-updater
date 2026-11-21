@@ -301,6 +301,36 @@ pub fn parse_reboot_needed_output(output: &str, exit_code: i32) -> bool {
     detect_reboot_needed(output)
 }
 
+/// Whether a non-zero `fwupdmgr get-updates` output that yielded zero packages
+/// actually means "up to date / no updates" rather than a check failure.
+pub fn check_output_is_no_updates(output: &str, exit_code: i32) -> bool {
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("not found") || lower.contains("no such file") {
+        return false;
+    }
+    if lower.contains("no updates")
+        || lower.contains("no available firmware updates")
+        || lower.contains("no updatable")
+        || lower.contains("nothing")
+    {
+        return true;
+    }
+    if exit_code == 2 {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        if let Some(json_start) = trimmed.find(['{', '[']) {
+            if let Ok(pkgs) = parse_json_updates(&trimmed[json_start..]) {
+                if pkgs.is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +539,40 @@ Devices with no available firmware updates:
                 "line `{line}` must not emit progress"
             );
         }
+    }
+
+    #[test]
+    fn check_output_is_no_updates_handles_exit_2_and_errors() {
+        assert!(check_output_is_no_updates(
+            "Devices with no available firmware updates:\n • System Firmware\n",
+            2
+        ));
+        assert!(check_output_is_no_updates(r#"{ "Devices": [] }"#, 2));
+        assert!(check_output_is_no_updates("", 2));
+        assert!(check_output_is_no_updates("No updates available\n", 2));
+        assert!(check_output_is_no_updates("Nothing to do\n", 2));
+        assert!(check_output_is_no_updates("No updatable devices\n", 2));
+
+        assert!(!check_output_is_no_updates("fwupdmgr: command not found", 2));
+        assert!(!check_output_is_no_updates(
+            "fwupdmgr: command not found",
+            127
+        ));
+        assert!(!check_output_is_no_updates(
+            "{\n  \"Devices\": [\n    {\n      \"Name\": \"System Firmware\"\n",
+            2
+        ));
+        assert!(!check_output_is_no_updates(
+            "{\n  \"Devices\": [\n    {\n      \"Name\": \"System Firmware\"\n",
+            1
+        ));
+        assert!(!check_output_is_no_updates(
+            "Failed to connect to daemon",
+            1
+        ));
+        assert!(!check_output_is_no_updates(
+            "Failed to connect to daemon",
+            2
+        ));
     }
 }
