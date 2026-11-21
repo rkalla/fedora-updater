@@ -10,8 +10,12 @@ use std::time::{Duration, SystemTime};
 use async_channel::Receiver;
 use common::fixtures::{read_fixture, read_fixture_value};
 use common::runtime::{
-    fixture_to_helper_lines, flatpak_check_from_fixture, FakeRuntime, FwupdDbusApplyStep,
-    HelperStep,
+    fixture_to_helper_lines, flatpak_check_from_fixture, FakeRuntime, FlatpakNativeApplyStep,
+    FwupdDbusApplyStep, HelperStep,
+};
+use fedora_updater::backend::flatpak::{
+    FlatpakCancellable, FlatpakOperationMeta, FlatpakProgressSnapshot,
+    FlatpakTransactionTracker, FLATPAK_TRANSACTION_ERROR_DETAILS_NON_FATAL,
 };
 use fedora_updater::backend::fwupd_dbus::{
     devices_need_reboot, evaluate_battery_safety, package_from_device_and_release,
@@ -1685,4 +1689,311 @@ fn native_logind_reboot_inhibitor_guard_and_cli_fallback() {
         rt.local_calls(),
         vec![("systemctl".into(), vec!["reboot".into()])]
     );
+}
+
+#[derive(serde::Deserialize)]
+struct NativeProgressSampleFixture {
+    snapshot: FlatpakProgressSnapshot,
+    now_us: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct NativeTxFixture {
+    requested_refs: Vec<String>,
+    ops: Vec<FlatpakOperationMeta>,
+    progress_samples: Vec<NativeProgressSampleFixture>,
+    non_fatal_details: u32,
+    fatal_details: u32,
+}
+
+#[test]
+fn native_flatpak_transaction_apply_telemetry_extensions_and_appstream_summary() {
+    // 1) Discovery fixtures populate AppStream summary & install size delta while
+    // preserving shared NVIDIA extension deduplication and single-counted bytes.
+    let user_pkgs = flatpak_check_from_fixture("flatpak/check_user_normal.json", None).packages;
+    let sys_pkgs =
+        flatpak_check_from_fixture("flatpak/check_system_nvidia_extension.json", None).packages;
+    assert_eq!(
+        user_pkgs[0].summary.as_deref(),
+        Some("Private messenger with end-to-end encryption")
+    );
+    assert_eq!(user_pkgs[0].install_size_delta, Some(8_925_568));
+    assert_eq!(
+        sys_pkgs[0].summary.as_deref(),
+        Some("Launcher for the Steam software distribution service")
+    );
+    assert!(sys_pkgs[0]
+        .related_extensions()
+        .contains(&"org.freedesktop.Platform.GL32.nvidia-570-133-07".to_string()));
+
+    // 2) Drive FlatpakTransactionTracker from the offline native transaction fixture.
+    let tx_fx: NativeTxFixture =
+        serde_json::from_value(read_fixture_value("flatpak/native_transaction_events.json"))
+            .expect("deserialize native flatpak transaction fixture");
+    let mut tracker = FlatpakTransactionTracker::new(tx_fx.requested_refs.clone());
+    let mut sys_lines = Vec::new();
+    let mut sys_draws = Vec::new();
+    let mut sys_hints = Vec::new();
+
+    for ev in tracker.on_ready(tx_fx.ops.clone()) {
+        if let Some(l) = ev.console_line {
+            sys_lines.push(l);
+        }
+    }
+    let op1_start = tracker.on_new_operation(tx_fx.ops[0].clone());
+    if let Some(l) = op1_start.console_line {
+        sys_lines.push(l);
+    }
+    if let Some(h) = op1_start.hint {
+        sys_hints.push(h);
+    }
+    for sample in &tx_fx.progress_samples {
+        if let Some(ev) = tracker.on_operation_progress(&sample.snapshot, sample.now_us) {
+            if let Some(l) = ev.console_line {
+                sys_lines.push(l);
+            }
+            if let Some(d) = ev.console_draw {
+                sys_draws.push(d);
+            }
+            if let Some(h) = ev.hint {
+                sys_hints.push(h);
+            }
+        }
+    }
+    let op1_done = tracker.on_operation_done(&tx_fx.ops[0], 0);
+    assert!(
+        op1_done.hint.is_none(),
+        "Steam parent completion must wait for its NVIDIA extension op"
+    );
+    for op in &tx_fx.ops[1..] {
+        let st = tracker.on_new_operation(op.clone());
+        if let Some(l) = st.console_line {
+            sys_lines.push(l);
+        }
+        if let Some(h) = st.hint {
+            sys_hints.push(h);
+        }
+        let dn = tracker.on_operation_done(op, 0);
+        if let Some(l) = dn.console_line {
+            sys_lines.push(l);
+        }
+        if let Some(h) = dn.hint {
+            sys_hints.push(h);
+        }
+    }
+    let sys_outcome = tracker
+        .finish_result(true, None, false)
+        .expect("native system outcome");
+    assert_eq!(sys_outcome.completed_ops, 3);
+    assert!(sys_outcome.any_changed);
+    assert_eq!(sys_outcome.throughput_samples.len(), 2);
+
+    // Non-fatal vs fatal error handling verified directly from fixture flags.
+    let mut err_tracker = FlatpakTransactionTracker::new(tx_fx.requested_refs);
+    err_tracker.on_ready(tx_fx.ops.clone());
+    err_tracker.on_new_operation(tx_fx.ops[0].clone());
+    let (_, cont_nonfatal) = err_tracker.on_operation_error(
+        &tx_fx.ops[0],
+        "transient CDN 503",
+        tx_fx.non_fatal_details,
+        false,
+    );
+    assert!(cont_nonfatal);
+    assert_eq!(
+        tx_fx.non_fatal_details,
+        FLATPAK_TRANSACTION_ERROR_DETAILS_NON_FATAL
+    );
+    let (_, cont_fatal) =
+        err_tracker.on_operation_error(&tx_fx.ops[0], "Socket I/O timed out", tx_fx.fatal_details, false);
+    assert!(!cont_fatal);
+
+    // 3) Full native apply pipeline for FlatpakUser + FlatpakSystem bypasses CLI and ensure_session.
+    let mut combined = user_pkgs;
+    combined.extend(sys_pkgs);
+
+    let rt = FakeRuntime::new();
+    let mut user_tracker =
+        FlatpakTransactionTracker::new(vec!["app/org.signal.Signal/x86_64/stable".into()]);
+    let user_op = FlatpakOperationMeta {
+        formatted_ref: "app/org.signal.Signal/x86_64/stable".into(),
+        kind: fedora_updater::backend::flatpak::FlatpakOpKind::Update,
+        remote: "flathub".into(),
+        download_bytes: 44_040_192,
+        installed_size_bytes: 378_925_568,
+        related_to: vec![],
+        is_skipped: false,
+    };
+    let mut user_lines = Vec::new();
+    let mut user_draws = Vec::new();
+    let mut user_hints = Vec::new();
+    for ev in user_tracker.on_ready(vec![user_op.clone()]) {
+        if let Some(l) = ev.console_line {
+            user_lines.push(l);
+        }
+    }
+    let u_start = user_tracker.on_new_operation(user_op.clone());
+    user_lines.extend(u_start.console_line);
+    user_hints.extend(u_start.hint);
+    if let Some(u_prog) = user_tracker.on_operation_progress(
+        &FlatpakProgressSnapshot {
+            status: "Downloading".into(),
+            progress_pct: 50,
+            bytes_transferred: 22_020_096,
+            is_estimating: false,
+            start_time_us: 1_000_000,
+        },
+        2_000_000,
+    ) {
+        user_draws.extend(u_prog.console_draw);
+        user_hints.extend(u_prog.hint);
+    }
+    let u_done = user_tracker.on_operation_done(&user_op, 0);
+    user_lines.extend(u_done.console_line);
+    user_hints.extend(u_done.hint);
+    let user_outcome = user_tracker.finish_result(true, None, false).unwrap();
+
+    rt.push_flatpak_native_apply(FlatpakNativeApplyStep {
+        lines: user_lines,
+        draws: user_draws,
+        hints: user_hints,
+        on_start: None,
+        outcome: NativeOutcome::Handled(Ok(user_outcome)),
+    });
+    rt.push_flatpak_native_apply(FlatpakNativeApplyStep {
+        lines: sys_lines,
+        draws: sys_draws,
+        hints: sys_hints,
+        on_start: None,
+        outcome: NativeOutcome::Handled(Ok(sys_outcome)),
+    });
+
+    let mut h = FlowHarness::ready(combined);
+    h.run_apply(&rt);
+
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+    assert!(
+        rt.local_calls().is_empty(),
+        "native FlatpakTransaction must bypass flatpak CLI: {:?}",
+        rt.local_calls()
+    );
+    let calls = rt.flatpak_native_apply_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].0, "FlatpakUser must execute before FlatpakSystem");
+    assert!(!calls[1].0, "FlatpakSystem must execute after FlatpakUser");
+    assert!(h.draw_count >= 4, "expected live ConsoleDraw telemetry");
+    assert!(h.saw_download_pass);
+    assert!(h.saw_apply_pass);
+
+    let full = h.console.full_text();
+    assert!(!full.contains("15%…"), "redraw ticks must stay out of log: {full}");
+    assert!(full.contains("Prepared 3 Flatpak operation(s)"), "{full}");
+
+    assert!(matches!(
+        &h.state.phase,
+        Phase::Done {
+            failed: 0,
+            needs_reboot: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn native_flatpak_transaction_cancel_and_cli_fallback() {
+    // 1) Cancellation via WorkCancel propagates directly to a real GLib GCancellable and exits cleanly.
+    let rt_cancel = FakeRuntime::new();
+    let pkgs = flatpak_check_from_fixture("flatpak/check_user_normal.json", None).packages;
+    let cancellable = FlatpakCancellable::new().expect("create GCancellable");
+    let cancellable_hook = cancellable.clone();
+
+    rt_cancel.push_flatpak_native_apply(FlatpakNativeApplyStep {
+        lines: vec!["[1/3] Updating org.signal.Signal".into()],
+        draws: vec![],
+        hints: vec![],
+        on_start: Some(Box::new(move |cancel| {
+            let c = cancellable_hook.clone();
+            cancel.on_cancel(move || c.cancel());
+            cancel.cancel();
+        })),
+        outcome: NativeOutcome::Handled(Err("cancelled".into())),
+    });
+
+    let mut h_cancel = FlowHarness::ready(pkgs.clone());
+    h_cancel.console.clear();
+    h_cancel.dispatch(Event::StartApply);
+    let (tx, rx) = async_channel::unbounded();
+    let cancel_token = WorkCancel::new();
+    execute_apply_all(&tx, pkgs.clone(), &rt_cancel, &cancel_token);
+    drop(tx);
+    h_cancel.drain(&rx);
+
+    assert!(
+        cancellable.is_cancelled(),
+        "Stop / WorkCancel must cancel GCancellable"
+    );
+    assert!(
+        rt_cancel.local_calls().is_empty(),
+        "cancelled native transaction must NOT fall back to CLI"
+    );
+    assert_eq!(phase_name(&h_cancel.state.phase), "Running");
+    h_cancel.dispatch(Event::StopApply {
+        during_transaction: false,
+    });
+    assert!(matches!(
+        &h_cancel.state.phase,
+        Phase::Ready { soft_errors, .. }
+            if soft_errors == &vec!["Stopped before install. Downloaded packages were not applied.".to_string()]
+    ));
+
+    // 2) Unavailable native apply falls back transparently to `flatpak update` CLI and succeeds.
+    let rt_fb = FakeRuntime::new();
+    rt_fb.push_flatpak_native_apply(FlatpakNativeApplyStep {
+        lines: vec![],
+        draws: vec![],
+        hints: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Unavailable("libflatpak missing transaction symbol".into()),
+    });
+    rt_fb.push_local_fixture(
+        "flatpak",
+        &["update", "--user", "-y", "--noninteractive"],
+        "flatpak/apply_progress_happy.txt",
+        0,
+    );
+    let mut h_fb = FlowHarness::ready(pkgs);
+    h_fb.run_apply(&rt_fb);
+
+    assert_eq!(rt_fb.flatpak_native_apply_calls().len(), 1);
+    assert_eq!(rt_fb.local_calls().len(), 1);
+    assert_eq!(rt_fb.local_calls()[0].0, "flatpak");
+    assert!(matches!(
+        &h_fb.state.phase,
+        Phase::Done {
+            failed: 0,
+            needs_reboot: false,
+            ..
+        }
+    ));
+
+    // 3) Actionable fatal native error is reported without invoking CLI fallback.
+    let rt_err = FakeRuntime::new();
+    let one_pkg = vec![flatpak_check_from_fixture("flatpak/check_user_normal.json", None)
+        .packages[0]
+        .clone()];
+    rt_err.push_flatpak_native_apply(FlatpakNativeApplyStep {
+        lines: vec!["error: Failed to update org.signal.Signal: Socket I/O timed out".into()],
+        draws: vec![],
+        hints: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Handled(Err("Failed to update org.signal.Signal: Socket I/O timed out".into())),
+    });
+    let mut h_err = FlowHarness::ready(one_pkg);
+    h_err.run_apply(&rt_err);
+    assert!(rt_err.local_calls().is_empty());
+    assert!(matches!(
+        &h_err.state.phase,
+        Phase::Failed { title, detail, retry: RetryAction::CheckAgain }
+            if title == "All updates failed" && detail.contains("Socket I/O timed out")
+    ));
 }

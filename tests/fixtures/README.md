@@ -2,7 +2,7 @@
 
 Checked-in, deterministic, offline test inputs for unit, functional, and end-to-end suites ([rkalla/fedora-updater#20](https://github.com/rkalla/fedora-updater/issues/20)).
 
-All 34 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
+All 35 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
 
 ## Usage in Tests
 
@@ -27,15 +27,16 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `dnf/apply_dep_conflict.txt` | `dnf update -y` (exit 1) | Dependency conflict (`Problem 1`, `Problem 2: nothing provides ...`, `--skip-broken` hint) |
 | `dnf/apply_rpm_lock_error.txt` | `dnf update -y` (exit 1) | Concurrent `dnf5daemon-server` lock on `/var/lib/rpm/.rpm.lock`, transaction aborted cleanly |
 
-### `flatpak/` (5 fixtures)
+### `flatpak/` (6 fixtures)
 
 | File | Simulated Command / Call | Scenario & Edge-Case Signals |
 |---|---|---|
-| `flatpak/check_user_normal.json` | `libflatpak` user check (`scope: "user"`) | Two user apps (`Signal`, `Thunderbird`) + one runtime (`org.gnome.Platform/x86_64/48` with empty `version` testing branch fallback) and matching `Update` byte sizes |
-| `flatpak/check_system_nvidia_extension.json` | `libflatpak` system check (`scope: "system"`) | `Steam` on current commit pulling NVIDIA `GL32` `Install` op (`251 MB`), two runtimes sharing `GL.nvidia-570-133-07` `Install` op (extension named on both rows, bytes counted once), and one `Uninstall` op to ignore |
+| `flatpak/check_user_normal.json` | `libflatpak` user check (`scope: "user"`) | Two user apps (`Signal`, `Thunderbird`) + one runtime (`org.gnome.Platform/x86_64/48` with empty `version` testing branch fallback), AppStream `summary` metadata, installed size delta, and matching `Update` byte sizes |
+| `flatpak/check_system_nvidia_extension.json` | `libflatpak` system check (`scope: "system"`) | `Steam` on current commit pulling NVIDIA `GL32` `Install` op (`251 MB`), AppStream summaries, two runtimes sharing `GL.nvidia-570-133-07` `Install` op (extension named on both rows, bytes counted once), and one `Uninstall` op to ignore |
 | `flatpak/apply_progress_happy.txt` | `flatpak update --noninteractive` (exit 0) | Mix of bare IDs (`org.signal.Signal/x86_64/stable`) and prefixed refs (`app/org.mozilla.Thunderbird/x86_64/stable`), `Downloading`/`Updating`/`Installing` percentages, `Updates complete.` |
 | `flatpak/apply_nothing_to_update.txt` | `flatpak update --noninteractive` (exit 0) | No-op apply output (`Nothing to update.`) |
 | `flatpak/apply_remote_error.txt` | `flatpak update --noninteractive` (exit 1) | Network remote pull failure (`Socket I/O timed out`) |
+| `flatpak/native_transaction_events.json` | Native `FlatpakTransaction` signal sequence | Planned direct + related NVIDIA extension ops, `FlatpakTransactionProgress` snapshots (`bytes_transferred`, `start_time_us`, estimating/deploying phases), and `NON_FATAL` vs fatal error flags |
 
 ### `fwupd/` (11 fixtures)
 

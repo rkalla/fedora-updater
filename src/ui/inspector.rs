@@ -622,6 +622,11 @@ impl PackageInspector {
     }
 
     #[cfg(test)]
+    pub fn summary_text(&self) -> String {
+        self.summary_label.text().to_string()
+    }
+
+    #[cfg(test)]
     pub fn advisories_card_visible(&self) -> bool {
         self.advisories_card.get_visible()
     }
@@ -707,12 +712,17 @@ mod tests {
         let mut steam = Package::new_dnf("Steam", "x86_64", "1.0.0.82", "flathub");
         steam.source = UpdateSource::FlatpakSystem;
         steam.size_bytes = Some(251 * 1024 * 1024);
+        steam.summary = Some("  Launcher for the Steam software distribution service  ".into());
         steam.detail = "1.0.0.82 · flathub · system · installs org.freedesktop.Platform.GL32.nvidia-570-133-07, org.freedesktop.Platform.GL.nvidia-570-133-07".into();
 
         let fp_vm = InspectorViewModel::from_package(&steam);
         assert_eq!(fp_vm.badge, "FP");
         assert_eq!(fp_vm.source_title, "Apps (Flatpak · System)");
         assert!(!fp_vm.needs_reboot);
+        assert_eq!(
+            fp_vm.summary.as_deref(),
+            Some("Launcher for the Steam software distribution service")
+        );
         assert_eq!(
             fp_vm.related_extensions,
             vec![

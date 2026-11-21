@@ -1,0 +1,71 @@
+{
+  "requested_refs": [
+    "app/com.valvesoftware.Steam/x86_64/stable",
+    "runtime/org.gnome.Platform/x86_64/48"
+  ],
+  "ops": [
+    {
+      "formatted_ref": "app/com.valvesoftware.Steam/x86_64/stable",
+      "kind": "Update",
+      "remote": "flathub",
+      "download_bytes": 12000000,
+      "installed_size_bytes": 55000000,
+      "related_to": [],
+      "is_skipped": false
+    },
+    {
+      "formatted_ref": "runtime/org.freedesktop.Platform.GL32.nvidia-570-133-07/x86_64/1.4",
+      "kind": "Install",
+      "remote": "flathub",
+      "download_bytes": 251000000,
+      "installed_size_bytes": 310000000,
+      "related_to": [
+        "app/com.valvesoftware.Steam/x86_64/stable"
+      ],
+      "is_skipped": false
+    },
+    {
+      "formatted_ref": "runtime/org.gnome.Platform/x86_64/48",
+      "kind": "Update",
+      "remote": "flathub",
+      "download_bytes": 12582912,
+      "installed_size_bytes": 420000000,
+      "related_to": [],
+      "is_skipped": false
+    }
+  ],
+  "progress_samples": [
+    {
+      "snapshot": {
+        "status": "Downloading metadata",
+        "progress_pct": 15,
+        "bytes_transferred": 1800000,
+        "is_estimating": true,
+        "start_time_us": 1000000
+      },
+      "now_us": 1500000
+    },
+    {
+      "snapshot": {
+        "status": "Downloading files",
+        "progress_pct": 65,
+        "bytes_transferred": 7800000,
+        "is_estimating": false,
+        "start_time_us": 1000000
+      },
+      "now_us": 3000000
+    },
+    {
+      "snapshot": {
+        "status": "Deploying update",
+        "progress_pct": 95,
+        "bytes_transferred": 12000000,
+        "is_estimating": false,
+        "start_time_us": 1000000
+      },
+      "now_us": 4000000
+    }
+  ],
+  "non_fatal_details": 1,
+  "fatal_details": 0
+}

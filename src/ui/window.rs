@@ -3783,6 +3783,7 @@ mod tests {
         thunderbird.id = "flatpak:user:app/org.mozilla.Thunderbird/x86_64/stable".into();
         thunderbird.source = UpdateSource::FlatpakUser;
         thunderbird.size_bytes = Some(94 * 1024 * 1024);
+        thunderbird.summary = Some("Manage emails, news feeds, and calendars".into());
         thunderbird.detail =
             "128.2.0 · flathub · user · installs org.freedesktop.Platform.GL.nvidia-570-133-07"
                 .into();
@@ -3965,10 +3966,15 @@ mod tests {
         widgets.ready_queue.activate_filtered(0);
         assert!(!widgets.inspector_split.shows_sidebar());
 
-        // Activate Flatpak Thunderbird (index 3 in All) -> extension breakdown shown cleanly.
+        // Activate Flatpak Thunderbird (index 3 in All) -> AppStream summary & extension breakdown shown cleanly.
         widgets.ready_queue.activate_filtered(3);
         assert!(widgets.inspector_split.shows_sidebar());
         assert_eq!(widgets.inspector.name_text(), "Thunderbird");
+        assert!(widgets.inspector.summary_visible());
+        assert_eq!(
+            widgets.inspector.summary_text(),
+            "Manage emails, news feeds, and calendars"
+        );
         assert!(widgets.inspector.extensions_card_visible());
         assert_eq!(
             widgets.inspector.extension_items(),

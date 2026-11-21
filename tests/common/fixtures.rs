@@ -24,6 +24,7 @@ pub const ALL_FIXTURES: &[&str] = &[
     "flatpak/apply_progress_happy.txt",
     "flatpak/apply_nothing_to_update.txt",
     "flatpak/apply_remote_error.txt",
+    "flatpak/native_transaction_events.json",
     // fwupd/
     "fwupd/get_updates_multi_device.json",
     "fwupd/get_updates_empty.json",
@@ -82,6 +83,10 @@ struct FlatpakListedRefDto {
     branch: String,
     version: String,
     origin: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    installed_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +101,8 @@ struct FlatpakResolvedOpDto {
     formatted_ref: String,
     kind: FlatpakOpKindDto,
     download_bytes: u64,
+    #[serde(default)]
+    installed_size_bytes: u64,
     #[serde(default)]
     related_to: Vec<String>,
 }
@@ -144,6 +151,8 @@ pub fn read_flatpak_fixture(rel: &str) -> FlatpakFixture {
             branch: r.branch,
             version: r.version,
             origin: r.origin,
+            summary: r.summary,
+            installed_size_bytes: r.installed_size_bytes,
         })
         .collect();
     let ops = doc
@@ -157,6 +166,7 @@ pub fn read_flatpak_fixture(rel: &str) -> FlatpakFixture {
                 FlatpakOpKindDto::Uninstall => FlatpakOpKind::Uninstall,
             },
             download_bytes: o.download_bytes,
+            installed_size_bytes: o.installed_size_bytes,
             related_to: o.related_to,
         })
         .collect();

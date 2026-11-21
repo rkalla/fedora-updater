@@ -7,7 +7,9 @@
       "arch": "x86_64",
       "branch": "stable",
       "version": "8.40.0",
-      "origin": "flathub"
+      "origin": "flathub",
+      "summary": "Private messenger with end-to-end encryption",
+      "installed_size_bytes": 370000000
     },
     {
       "formatted_ref": "app/org.mozilla.Thunderbird/x86_64/stable",
@@ -15,7 +17,8 @@
       "arch": "x86_64",
       "branch": "stable",
       "version": "128.5.0",
-      "origin": "flathub"
+      "origin": "flathub",
+      "summary": "Manage emails, news feeds, and calendars"
     },
     {
       "formatted_ref": "runtime/org.gnome.Platform/x86_64/48",
@@ -23,7 +26,8 @@
       "arch": "x86_64",
       "branch": "48",
       "version": "",
-      "origin": "flathub"
+      "origin": "flathub",
+      "summary": "Shared libraries used by GNOME applications"
     }
   ],
   "ops": [
@@ -31,6 +35,7 @@
       "formatted_ref": "app/org.signal.Signal/x86_64/stable",
       "kind": "Update",
       "download_bytes": 44040192,
+      "installed_size_bytes": 378925568,
       "related_to": []
     },
     {

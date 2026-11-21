@@ -1,7 +1,7 @@
 //! Sequential multi-backend check/apply using one privileged helper session.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
@@ -28,18 +28,40 @@ pub enum WorkerMsg {
 /// Incremented when a Check/Apply starts or the user cancels auth.
 /// In-flight workers compare against the generation they captured at spawn.
 static WORK_GEN: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_GLOBAL_CANCEL: Mutex<Option<WorkCancel>> = Mutex::new(None);
 
 fn begin_background_work() -> u64 {
-    WORK_GEN.fetch_add(1, Ordering::SeqCst) + 1
+    let gen = WORK_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let cancel = WorkCancel::new();
+    let prev = {
+        let mut guard = ACTIVE_GLOBAL_CANCEL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.replace(cancel)
+    };
+    if let Some(prev_cancel) = prev {
+        prev_cancel.cancel();
+    }
+    gen
 }
 
 fn work_is_current(gen: u64) -> bool {
     WORK_GEN.load(Ordering::SeqCst) == gen
 }
 
-/// Invalidate in-flight Check/Apply after the user cancels the auth wait.
+/// Invalidate in-flight Check/Apply after the user cancels the auth wait or clicks Stop.
 pub fn cancel_background_work() {
     WORK_GEN.fetch_add(1, Ordering::SeqCst);
+    let prev = {
+        let mut guard = ACTIVE_GLOBAL_CANCEL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    if let Some(prev_cancel) = prev {
+        prev_cancel.cancel();
+    }
+    flatpak::cancel_active_transaction();
 }
 
 fn send(tx: &Sender<WorkerMsg>, msg: WorkerMsg) {
@@ -56,10 +78,22 @@ fn line(tx: &Sender<WorkerMsg>, tag: &str, text: String) {
     );
 }
 
-/// Per-run cancellation handle for injected [`OrchestratorRuntime`] workers.
-#[derive(Debug, Clone, Default)]
+type CancelHooks = Vec<Box<dyn FnOnce() + Send>>;
+
+/// Per-run cancellation handle for injected [`OrchestratorRuntime`] workers
+/// and native `libflatpak` `GCancellable` transactions.
+#[derive(Clone, Default)]
 pub struct WorkCancel {
     cancelled: Arc<AtomicBool>,
+    hooks: Arc<Mutex<CancelHooks>>,
+}
+
+impl std::fmt::Debug for WorkCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkCancel")
+            .field("cancelled", &self.cancelled.load(Ordering::SeqCst))
+            .finish()
+    }
 }
 
 impl WorkCancel {
@@ -69,10 +103,32 @@ impl WorkCancel {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        let hooks = {
+            let mut guard = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for hook in hooks {
+            hook();
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Register a one-shot hook executed immediately when this token is cancelled.
+    pub fn on_cancel(&self, hook: impl FnOnce() + Send + 'static) {
+        if self.is_cancelled() {
+            hook();
+            return;
+        }
+        let mut guard = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_cancelled() {
+            drop(guard);
+            hook();
+        } else {
+            guard.push(Box::new(hook));
+        }
     }
 }
 
@@ -87,6 +143,17 @@ impl CancelCheck {
         match self {
             Self::GlobalGen(gen) => work_is_current(*gen),
             Self::Token(token) => !token.is_cancelled(),
+        }
+    }
+
+    fn work_cancel(&self) -> WorkCancel {
+        match self {
+            Self::Token(token) => token.clone(),
+            Self::GlobalGen(_) => ACTIVE_GLOBAL_CANCEL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_default(),
         }
     }
 }
@@ -114,6 +181,17 @@ pub trait OrchestratorRuntime: Send + 'static {
         self.run_local(program, args, on_line)
     }
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String>;
+    fn apply_flatpak_native(
+        &self,
+        _user: bool,
+        _refs: &[String],
+        _cancel: &WorkCancel,
+        _on_line: &mut dyn FnMut(String),
+        _on_draw: &mut dyn FnMut(String),
+        _on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<flatpak::FlatpakApplyOutcome> {
+        NativeOutcome::Unavailable("libflatpak transaction apply unavailable in test runtime".into())
+    }
     fn fwupd_dbus_available(&self) -> bool {
         false
     }
@@ -185,6 +263,18 @@ impl OrchestratorRuntime for SystemRuntime {
 
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String> {
         flatpak::query_updates(user)
+    }
+
+    fn apply_flatpak_native(
+        &self,
+        user: bool,
+        refs: &[String],
+        cancel: &WorkCancel,
+        on_line: &mut dyn FnMut(String),
+        on_draw: &mut dyn FnMut(String),
+        on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<flatpak::FlatpakApplyOutcome> {
+        flatpak::apply_updates(user, refs, cancel, on_line, on_draw, on_progress)
     }
 
     fn fwupd_dbus_available(&self) -> bool {
@@ -691,10 +781,37 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         tag,
                         format!("Updating {} ref(s): {}", refs.len(), refs.join(", ")),
                     );
-                    let args = flatpak::update_args_for_refs(user, &refs);
-                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                    let (c, l) = run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source);
-                    (c, l, false)
+                    let work_cancel = ch.cancel.work_cancel();
+                    let mut native_log = String::new();
+                    let outcome = runtime.apply_flatpak_native(
+                        user,
+                        &refs,
+                        &work_cancel,
+                        &mut |l| {
+                            native_log.push_str(&l);
+                            native_log.push('\n');
+                            ch.line(tag, l);
+                        },
+                        &mut |draw| ch.live_line(tag, draw),
+                        &mut |hint| emit_progress_hint(&ch, source, hint),
+                    );
+                    match outcome {
+                        NativeOutcome::Handled(Ok(_)) => (0, native_log, false),
+                        NativeOutcome::Handled(Err(reason)) => {
+                            if !native_log.contains(&reason) {
+                                native_log.push_str(&reason);
+                                native_log.push('\n');
+                            }
+                            (1, native_log, false)
+                        }
+                        NativeOutcome::Unavailable(_) => {
+                            let args = flatpak::update_args_for_refs(user, &refs);
+                            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                            let (c, l) =
+                                run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source);
+                            (c, l, false)
+                        }
+                    }
                 }
             }
             UpdateSource::Firmware => {
@@ -1058,10 +1175,11 @@ pub fn session_started_event(purpose: AuthPurpose) -> StateEvent {
     StateEvent::SessionReady { purpose }
 }
 
-/// Close elevated helper and terminate any active cancellable local apply command.
+/// Close elevated helper and terminate any active local or native Flatpak work.
 /// Call when the app window is closing — not after individual Check/Apply flows,
 /// so the user is not re-prompted mid-session.
 pub fn release_privileges() {
+    flatpak::cancel_active_transaction();
     kill_recorded_local_command();
     close_session();
 }

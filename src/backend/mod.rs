@@ -1,5 +1,5 @@
 //! Parsers and progress hints for each update backend.
-//! Flatpak discovery calls libflatpak. Installs still go through the flatpak CLI.
+//! Flatpak discovery and transaction apply call libflatpak natively, with flatpak CLI fallback.
 
 pub mod dnf;
 pub mod flatpak;

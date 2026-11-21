@@ -4,13 +4,15 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use fedora_updater::backend::flatpak::{packages_from_flatpak_updates, FlatpakCheck};
+use fedora_updater::backend::flatpak::{
+    packages_from_flatpak_updates, FlatpakApplyOutcome, FlatpakCheck,
+};
 use fedora_updater::backend::fwupd_dbus::FwupdApplyOutcome;
 use fedora_updater::backend::logind::RebootPreflight;
 use fedora_updater::backend::{NativeOutcome, ProgressHint};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
 use fedora_updater::model::Package;
-use fedora_updater::orchestrator::OrchestratorRuntime;
+use fedora_updater::orchestrator::{OrchestratorRuntime, WorkCancel};
 use fedora_updater::privilege::SessionError;
 
 use super::fixtures::{read_fixture, read_flatpak_fixture};
@@ -71,6 +73,16 @@ pub struct FwupdDbusApplyStep {
     pub outcome: NativeOutcome<FwupdApplyOutcome>,
 }
 
+pub type FlatpakOnStartHook = Box<dyn FnMut(&WorkCancel) + Send>;
+
+pub struct FlatpakNativeApplyStep {
+    pub lines: Vec<String>,
+    pub draws: Vec<String>,
+    pub hints: Vec<ProgressHint>,
+    pub on_start: Option<FlatpakOnStartHook>,
+    pub outcome: NativeOutcome<FlatpakApplyOutcome>,
+}
+
 struct LocalMatcher {
     program: String,
     required_args: Vec<String>,
@@ -93,6 +105,7 @@ struct FakeState {
     helper_calls: Vec<HelperCommand>,
     local_calls: Vec<(String, Vec<String>)>,
     flatpak_queries: Vec<bool>,
+    flatpak_native_apply_calls: Vec<(bool, Vec<String>)>,
     fwupd_dbus_available: bool,
     fwupd_dbus_check_calls: usize,
     fwupd_dbus_apply_calls: usize,
@@ -104,6 +117,7 @@ struct FakeState {
     local_steps: VecDeque<LocalMatcher>,
     flatpak_user_steps: VecDeque<Result<FlatpakCheck, String>>,
     flatpak_system_steps: VecDeque<Result<FlatpakCheck, String>>,
+    flatpak_native_apply_steps: VecDeque<FlatpakNativeApplyStep>,
     fwupd_dbus_check_steps: VecDeque<NativeOutcome<Vec<Package>>>,
     fwupd_dbus_apply_steps: VecDeque<FwupdDbusApplyStep>,
     fwupd_dbus_reboot_steps: VecDeque<NativeOutcome<bool>>,
@@ -132,6 +146,7 @@ impl FakeRuntime {
                 helper_calls: Vec::new(),
                 local_calls: Vec::new(),
                 flatpak_queries: Vec::new(),
+                flatpak_native_apply_calls: Vec::new(),
                 fwupd_dbus_available: false,
                 fwupd_dbus_check_calls: 0,
                 fwupd_dbus_apply_calls: 0,
@@ -143,6 +158,7 @@ impl FakeRuntime {
                 local_steps: VecDeque::new(),
                 flatpak_user_steps: VecDeque::new(),
                 flatpak_system_steps: VecDeque::new(),
+                flatpak_native_apply_steps: VecDeque::new(),
                 fwupd_dbus_check_steps: VecDeque::new(),
                 fwupd_dbus_apply_steps: VecDeque::new(),
                 fwupd_dbus_reboot_steps: VecDeque::new(),
@@ -307,6 +323,18 @@ impl FakeRuntime {
         self.inner.lock().unwrap().flatpak_queries.clone()
     }
 
+    pub fn push_flatpak_native_apply(&self, step: FlatpakNativeApplyStep) {
+        self.inner
+            .lock()
+            .unwrap()
+            .flatpak_native_apply_steps
+            .push_back(step);
+    }
+
+    pub fn flatpak_native_apply_calls(&self) -> Vec<(bool, Vec<String>)> {
+        self.inner.lock().unwrap().flatpak_native_apply_calls.clone()
+    }
+
     pub fn set_fwupd_dbus_available(&self, available: bool) {
         self.inner.lock().unwrap().fwupd_dbus_available = available;
     }
@@ -461,6 +489,38 @@ impl OrchestratorRuntime for FakeRuntime {
         res.unwrap_or_else(|| {
             panic!("FakeRuntime: unscripted flatpak query user={user}")
         })
+    }
+
+    fn apply_flatpak_native(
+        &self,
+        user: bool,
+        refs: &[String],
+        cancel: &WorkCancel,
+        on_line: &mut dyn FnMut(String),
+        on_draw: &mut dyn FnMut(String),
+        on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<FlatpakApplyOutcome> {
+        let step = {
+            let mut s = self.inner.lock().unwrap();
+            s.flatpak_native_apply_calls.push((user, refs.to_vec()));
+            s.flatpak_native_apply_steps.pop_front()
+        };
+        let Some(mut step) = step else {
+            return NativeOutcome::Unavailable("native FlatpakTransaction not scripted".into());
+        };
+        if let Some(mut on_start) = step.on_start.take() {
+            on_start(cancel);
+        }
+        for l in step.lines {
+            on_line(l);
+        }
+        for d in step.draws {
+            on_draw(d);
+        }
+        for h in step.hints {
+            on_progress(h);
+        }
+        step.outcome
     }
 
     fn fwupd_dbus_available(&self) -> bool {

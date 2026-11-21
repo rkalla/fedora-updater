@@ -7,7 +7,9 @@
       "arch": "x86_64",
       "branch": "stable",
       "version": "1.0.0.87",
-      "origin": "flathub"
+      "origin": "flathub",
+      "summary": "Launcher for the Steam software distribution service",
+      "installed_size_bytes": 53886464
     },
     {
       "formatted_ref": "runtime/org.gnome.Platform/x86_64/48",
@@ -15,7 +17,8 @@
       "arch": "x86_64",
       "branch": "48",
       "version": "",
-      "origin": "flathub"
+      "origin": "flathub",
+      "summary": "Shared libraries used by GNOME applications"
     },
     {
       "formatted_ref": "runtime/org.freedesktop.Platform/x86_64/24.08",

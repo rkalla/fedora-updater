@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 34, "expected 34 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 35, "expected 35 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(
@@ -146,9 +146,11 @@ fn flatpak_fixtures_deserialize_and_contain_expected_signals() {
     assert_eq!(user.refs.len(), 3);
     assert_eq!(user.ops.len(), 3);
     assert!(user.refs.iter().any(|r| r.version.is_empty() && !r.branch.is_empty()));
+    assert!(user.refs.iter().any(|r| r.summary.is_some()));
 
     let sys = read_flatpak_fixture("flatpak/check_system_nvidia_extension.json");
     assert_eq!(sys.update_source(), UpdateSource::FlatpakSystem);
+    assert!(sys.refs.iter().any(|r| r.summary.is_some()));
     assert!(sys
         .ops
         .iter()
@@ -171,6 +173,13 @@ fn flatpak_fixtures_deserialize_and_contain_expected_signals() {
     let remote_err = read_fixture("flatpak/apply_remote_error.txt");
     assert!(remote_err.contains("error: Failed to update"));
     assert!(remote_err.contains("Socket I/O timed out"));
+
+    let native_fx = read_fixture_value("flatpak/native_transaction_events.json");
+    assert_eq!(native_fx["ops"].as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        native_fx["progress_samples"].as_array().map(Vec::len),
+        Some(3)
+    );
 }
 
 #[test]
