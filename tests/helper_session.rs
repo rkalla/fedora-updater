@@ -2,10 +2,15 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use fedora_updater::helper_protocol::{parse_end_line, HelperCommand, BYE_LINE, HELLO_LINE};
 use fedora_updater::privilege::HELPER_FLAG;
+
+/// Prevents `Command::spawn` in sibling tests from inheriting a writable FD
+/// to the temporary `hung-helper` script while it is being written (ETXTBSY).
+static FORK_WRITE_LOCK: RwLock<()> = RwLock::new(());
 
 fn updater_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
@@ -25,6 +30,7 @@ fn updater_bin() -> std::path::PathBuf {
 }
 
 fn spawn_helper() -> std::process::Child {
+    let _guard = FORK_WRITE_LOCK.read().unwrap();
     Command::new(updater_bin())
         .arg(HELPER_FLAG)
         .stdin(Stdio::piped())
@@ -127,9 +133,11 @@ fn close_session_does_not_block_when_helper_command_hangs() {
 
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("hung-helper");
-    std::fs::write(
-        &script,
-        r#"#!/bin/sh
+    {
+        let _guard = FORK_WRITE_LOCK.write().unwrap();
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
 printf '%s\n' '__READY__ fedora-updater-helper'
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
@@ -144,26 +152,33 @@ while IFS= read -r line || [ -n "$line" ]; do
   esac
 done
 "#,
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).unwrap();
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
 
-    let (started_tx, started_rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel::<Result<(), String>>();
     let script_for_worker = script.clone();
     let worker = thread::spawn(move || {
-        let _ = with_direct_session_for_test(&script_for_worker, |session| {
+        let mut notified = false;
+        let res = with_direct_session_for_test(&script_for_worker, |session| {
             session.run_command(HelperCommand::CheckDnf, |ev| {
-                if matches!(ev, SessionEvent::Line(_)) {
-                    let _ = started_tx.send(());
+                if !notified && matches!(ev, SessionEvent::Line(_)) {
+                    notified = true;
+                    let _ = started_tx.send(Ok(()));
                 }
             })
         });
+        if !notified {
+            let _ = started_tx.send(Err(format!("{res:?}")));
+        }
     });
 
     started_rx
         .recv_timeout(Duration::from_secs(2))
+        .expect("hung-helper worker timed out or disconnected")
         .expect("hung-helper did not start running the command");
 
     let (tx, rx) = mpsc::channel();
