@@ -1,0 +1,359 @@
+//! Fixture-backed unit and parser regression tests consuming `tests/fixtures/`.
+
+mod common;
+
+use common::fixtures::{read_fixture, read_flatpak_fixture};
+use fedora_updater::backend::dnf::{
+    apply_download_sizes, check_exit_is_hard_error, check_exit_is_ok, detect_reboot_needed,
+    parse_check_update, parse_progress_line as parse_dnf_progress, parse_repoquery_sizes,
+};
+use fedora_updater::backend::flatpak::{
+    packages_from_flatpak_updates, parse_progress_line as parse_flatpak_progress,
+    update_args_for_refs, update_ref_from_package,
+};
+use fedora_updater::backend::fwupd::{
+    detect_reboot_needed as fwupd_detect_reboot, parse_get_updates,
+    parse_progress_line as parse_fwupd_progress, parse_reboot_needed_output,
+};
+use fedora_updater::backend::{detect_reboot, parse_progress, ProgressHint};
+use fedora_updater::model::{total_download_bytes, PackageStatus, UpdateSource};
+use fedora_updater::release_upgrade::{
+    days_since_active, newest_active_newer_than, offer_from_collections, os_release_version,
+    ReleaseOffer,
+};
+
+#[test]
+fn dnf_fixtures_cover_check_repoquery_apply_and_errors() {
+    // 1. Classic check-update + dedup + epochs + multi-arch + noarch
+    let classic_raw = read_fixture("dnf/check_update_classic.txt");
+    let mut classic = parse_check_update(&classic_raw);
+    assert_eq!(classic.len(), 8);
+    assert!(check_exit_is_ok(100, &classic));
+    assert!(!check_exit_is_hard_error(100, &classic));
+    assert_eq!(classic[2].name, "openssl");
+    assert_eq!(classic[2].version, "1:3.2.2-3.fc44");
+    assert_eq!(classic[3].name, "bind-libs");
+    assert_eq!(classic[3].version, "32:9.18.50-2.fc44");
+    assert_eq!(
+        classic
+            .iter()
+            .filter(|p| p.name == "firefox")
+            .count(),
+        1,
+        "duplicate firefox row in fixture must deduplicate"
+    );
+    assert_eq!(
+        classic
+            .iter()
+            .filter(|p| p.name == "mesa-dri-drivers")
+            .count(),
+        2
+    );
+
+    // 2. Repoquery sizes matching & intentional partial misses (firefox, kernel-tools)
+    let repoquery_raw = read_fixture("dnf/repoquery_sizes.txt");
+    let sizes = parse_repoquery_sizes(&repoquery_raw);
+    assert_eq!(sizes.len(), 6);
+    let matched = apply_download_sizes(&mut classic, &sizes);
+    assert_eq!(matched, 6);
+    assert!(classic
+        .iter()
+        .find(|p| p.name == "firefox")
+        .unwrap()
+        .size_bytes
+        .is_none());
+    assert!(classic
+        .iter()
+        .find(|p| p.name == "kernel-tools")
+        .unwrap()
+        .size_bytes
+        .is_none());
+
+    // 3. dnf5 table check-update with Obsoleting packages & inline MiB/KiB sizes
+    let dnf5_raw = read_fixture("dnf/check_update_dnf5_table.txt");
+    let dnf5_pkgs = parse_check_update(&dnf5_raw);
+    assert_eq!(dnf5_pkgs.len(), 6);
+    assert!(dnf5_pkgs.iter().all(|p| p.size_bytes.is_some()));
+    assert!(dnf5_pkgs.iter().any(|p| p.name == "pipewire-pulseaudio"));
+    assert!(detect_reboot(UpdateSource::Dnf, "", &dnf5_pkgs));
+
+    // 4. Empty check-update
+    let empty_raw = read_fixture("dnf/check_update_empty.txt");
+    let empty_pkgs = parse_check_update(&empty_raw);
+    assert!(empty_pkgs.is_empty());
+    assert!(check_exit_is_ok(0, &empty_pkgs));
+    assert!(!check_exit_is_hard_error(0, &empty_pkgs));
+
+    // 5. Repo/mirror error
+    let repo_err_raw = read_fixture("dnf/check_update_repo_error.txt");
+    let repo_err_pkgs = parse_check_update(&repo_err_raw);
+    assert!(repo_err_pkgs.is_empty());
+    assert!(check_exit_is_hard_error(1, &repo_err_pkgs));
+    assert!(!check_exit_is_ok(1, &repo_err_pkgs));
+
+    // 6. Happy kernel apply transcript with preview table, `\r` redraws, verify, scriptlet, Complete!
+    let happy_raw = read_fixture("dnf/apply_happy_kernel.txt");
+    assert!(happy_raw.contains('\r'));
+    let segments: Vec<&str> = happy_raw
+        .split(['\r', '\n'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let hints: Vec<ProgressHint> = segments
+        .iter()
+        .map(|seg| parse_progress(UpdateSource::Dnf, seg))
+        .collect();
+
+    // Preview table + Transaction Summary counts before `[1/4]` must emit zero status/package hints.
+    let first_download_pos = segments
+        .iter()
+        .position(|s| s.starts_with("[1/4]"))
+        .expect("[1/4] present");
+    for (idx, seg) in segments[..first_download_pos].iter().enumerate() {
+        assert_eq!(
+            hints[idx].status, None,
+            "preview line `{seg}` must not set status"
+        );
+        assert_eq!(
+            hints[idx].package_name, None,
+            "preview line `{seg}` must not set package_name"
+        );
+    }
+
+    assert!(hints
+        .iter()
+        .any(|h| h.status == Some(PackageStatus::Downloading)
+            && h.package_name.as_deref() == Some("openssl")
+            && h.stage_current == Some(1)
+            && h.stage_total == Some(4)));
+    assert!(hints
+        .iter()
+        .any(|h| h.status == Some(PackageStatus::Installing)
+            && h.package_name.as_deref() == Some("kernel-core")
+            && h.stage_current == Some(4)
+            && h.stage_total == Some(8)));
+    assert!(hints
+        .iter()
+        .any(|h| h.phase_label.as_deref() == Some("Verifying")
+            && h.stage_current == Some(8)
+            && h.package_name.is_none()));
+    assert!(hints
+        .iter()
+        .any(|h| h.phase_label.as_deref() == Some("Complete") && h.progress == Some(1.0)));
+    assert!(detect_reboot_needed(
+        &happy_raw,
+        &[classic[0].clone()], // kernel-core
+    ));
+
+    // 7 & 8. Dep conflict and RPM lock error produce no bogus install/reboot hints.
+    for path in ["dnf/apply_dep_conflict.txt", "dnf/apply_rpm_lock_error.txt"] {
+        let log = read_fixture(path);
+        for line in log.lines() {
+            let h = parse_dnf_progress(line);
+            assert!(
+                h.status.is_none() && h.package_name.is_none(),
+                "error fixture `{path}` line `{line}` produced spurious hint {h:?}"
+            );
+        }
+        assert!(!detect_reboot_needed(&log, &[]));
+    }
+}
+
+#[test]
+fn flatpak_fixtures_cover_user_nvidia_extensions_and_apply_logs() {
+    // 1. User check fixture (includes runtime branch-as-version fallback)
+    let user_fx = read_flatpak_fixture("flatpak/check_user_normal.json");
+    let user_pkgs =
+        packages_from_flatpak_updates(user_fx.update_source(), &user_fx.refs, &user_fx.ops);
+    assert_eq!(user_pkgs.len(), 3);
+    assert_eq!(
+        total_download_bytes(&user_pkgs),
+        Some(44_040_192 + 89_128_960 + 12_582_912)
+    );
+    assert_eq!(user_pkgs[2].version, "48");
+    let user_refs: Vec<String> = user_pkgs
+        .iter()
+        .filter_map(update_ref_from_package)
+        .collect();
+    assert_eq!(user_refs.len(), 3);
+    let user_args = update_args_for_refs(true, &user_refs);
+    assert_eq!(&user_args[..4], &["update", "--user", "-y", "--noninteractive"]);
+    assert_eq!(&user_args[4..], user_refs.as_slice());
+
+    // 2. System NVIDIA extension fixture (related extension, shared ext once-only bytes, uninstall ignored)
+    let sys_fx = read_flatpak_fixture("flatpak/check_system_nvidia_extension.json");
+    let sys_pkgs =
+        packages_from_flatpak_updates(sys_fx.update_source(), &sys_fx.refs, &sys_fx.ops);
+    assert_eq!(sys_pkgs.len(), 3);
+    assert_eq!(
+        sys_pkgs[0].detail,
+        "1.0.0.87 · flathub · system · installs org.freedesktop.Platform.GL32.nvidia-570-133-07"
+    );
+    assert_eq!(sys_pkgs[0].size_bytes, Some(251_000_000));
+    assert_eq!(
+        sys_pkgs[1].detail,
+        "48 · flathub · system · installs org.freedesktop.Platform.GL.nvidia-570-133-07"
+    );
+    assert_eq!(sys_pkgs[1].size_bytes, Some(391_118_848));
+    assert!(sys_pkgs[2]
+        .detail
+        .contains("installs org.freedesktop.Platform.GL.nvidia-570-133-07"));
+    assert!(!sys_pkgs[2].detail.contains("nvidia-565-77"));
+    assert_eq!(sys_pkgs[2].size_bytes, None);
+    assert_eq!(
+        total_download_bytes(&sys_pkgs),
+        Some(251_000_000 + 391_118_848)
+    );
+
+    // 3. Apply progress happy (both bare IDs and `app/` prefixed refs)
+    let happy_log = read_fixture("flatpak/apply_progress_happy.txt");
+    let hints: Vec<ProgressHint> = happy_log
+        .lines()
+        .map(|l| parse_progress(UpdateSource::FlatpakSystem, l))
+        .collect();
+    assert_eq!(
+        hints[1].package_name.as_deref(),
+        Some("org.signal.Signal")
+    );
+    assert_eq!(hints[1].status, Some(PackageStatus::Downloading));
+    assert_eq!(hints[1].progress, Some(0.45));
+    assert_eq!(
+        hints[4].package_name.as_deref(),
+        Some("org.mozilla.Thunderbird")
+    );
+    assert_eq!(hints[4].status, Some(PackageStatus::Downloading));
+    assert_eq!(hints[4].progress, Some(0.60));
+    assert_eq!(
+        hints[5].package_name.as_deref(),
+        Some("org.mozilla.Thunderbird")
+    );
+    assert_eq!(hints[5].status, Some(PackageStatus::Installing));
+    assert_eq!(hints[5].progress, Some(1.0));
+
+    // 4. Nothing to update
+    let noop_log = read_fixture("flatpak/apply_nothing_to_update.txt");
+    let noop_hints: Vec<ProgressHint> = noop_log.lines().map(parse_flatpak_progress).collect();
+    assert!(noop_hints
+        .iter()
+        .any(|h| h.phase_label.as_deref() == Some("Nothing to update")));
+    assert!(noop_hints.iter().all(|h| h.status.is_none()));
+
+    // 5. Remote error
+    let err_log = read_fixture("flatpak/apply_remote_error.txt");
+    for line in err_log.lines() {
+        assert_eq!(parse_flatpak_progress(line), ProgressHint::default());
+    }
+    assert!(!detect_reboot(UpdateSource::FlatpakSystem, &happy_log, &sys_pkgs));
+}
+
+#[test]
+fn fwupd_fixtures_cover_json_text_fallback_progress_and_reboot() {
+    // 1. Multi-device JSON
+    let multi_raw = read_fixture("fwupd/get_updates_multi_device.json");
+    let multi = parse_get_updates(&multi_raw);
+    assert_eq!(multi.len(), 3);
+    assert_eq!(multi[0].name, "UEFI System Firmware");
+    assert_eq!(multi[0].old_version.as_deref(), Some("1.18.0"));
+    assert_eq!(multi[0].version, "1.19.2");
+    assert_eq!(multi[0].detail, "1.18.0 → 1.19.2");
+    assert_eq!(multi[1].name, "UEFI dbx");
+    assert_eq!(multi[2].name, "WD_BLACK SN850X NVMe SSD");
+    assert_eq!(multi[2].version, "620461WD");
+
+    // 2. Empty JSON
+    let empty_raw = read_fixture("fwupd/get_updates_empty.json");
+    assert!(parse_get_updates(&empty_raw).is_empty());
+
+    // 3. Corrupt JSON falls back cleanly to empty
+    let corrupt_raw = read_fixture("fwupd/get_updates_corrupt.txt");
+    assert!(parse_get_updates(&corrupt_raw).is_empty());
+
+    // 4. Text updates (tree glyphs + ignores Bootloader Version)
+    let text_raw = read_fixture("fwupd/get_updates_text.txt");
+    let text_pkgs = parse_get_updates(&text_raw);
+    assert_eq!(text_pkgs.len(), 2);
+    assert_eq!(text_pkgs[0].name, "UEFI System Firmware");
+    assert_eq!(text_pkgs[0].version, "1.19.2");
+    assert_eq!(text_pkgs[1].name, "UEFI dbx");
+    assert_eq!(text_pkgs[1].version, "20250501");
+
+    // 5. No-updates bullet list returns empty (not phantom bullet packages)
+    let no_updates_raw = read_fixture("fwupd/get_updates_no_updates.txt");
+    assert!(parse_get_updates(&no_updates_raw).is_empty());
+
+    // 6. Happy apply + reboot detection
+    let happy_log = read_fixture("fwupd/apply_happy_reboot.txt");
+    let hints: Vec<ProgressHint> = happy_log
+        .lines()
+        .map(|l| parse_progress(UpdateSource::Firmware, l))
+        .collect();
+    assert_eq!(hints[0].status, Some(PackageStatus::Downloading));
+    assert_eq!(hints[1].phase_label.as_deref(), Some("Decompressing firmware"));
+    assert_eq!(hints[2].status, Some(PackageStatus::Installing));
+    assert_eq!(hints[2].progress, Some(0.60));
+    assert_eq!(hints[3].phase_label.as_deref(), Some("Verifying firmware"));
+    assert_eq!(hints[4].phase_label.as_deref(), Some("Restarting device"));
+    assert_ne!(hints[4].status, Some(PackageStatus::Completed));
+    assert_eq!(hints[5].phase_label.as_deref(), Some("Waiting"));
+    assert_ne!(hints[5].status, Some(PackageStatus::Completed));
+    assert_eq!(hints[6].status, Some(PackageStatus::Completed));
+    assert_eq!(hints[6].progress, Some(1.0));
+    assert_eq!(hints[7], ProgressHint::default());
+    assert_eq!(hints[8], ProgressHint::default());
+    assert!(fwupd_detect_reboot(&happy_log));
+    assert!(detect_reboot(UpdateSource::Firmware, &happy_log, &[]));
+
+    // 7. Battery error mid-run: error line does not emit 18% progress or reboot
+    let battery_log = read_fixture("fwupd/apply_battery_error.txt");
+    let battery_hints: Vec<ProgressHint> =
+        battery_log.lines().map(parse_fwupd_progress).collect();
+    assert_eq!(battery_hints[2], ProgressHint::default());
+    assert!(!fwupd_detect_reboot(&battery_log));
+
+    // 8 & 9. check-reboot-needed JSON fixtures
+    let reboot_true = read_fixture("fwupd/check_reboot_needed_true.json");
+    assert!(parse_reboot_needed_output(&reboot_true, 0));
+    assert!(fwupd_detect_reboot(&reboot_true));
+
+    let reboot_false = read_fixture("fwupd/check_reboot_needed_false.json");
+    assert!(!parse_reboot_needed_output(&reboot_false, 2));
+}
+
+#[test]
+fn release_upgrade_fixtures_cover_collections_and_os_release() {
+    let os_quoted = read_fixture("release_upgrade/os_release_quoted.txt");
+    let os_bare = read_fixture("release_upgrade/os_release_bare.txt");
+    let os_missing = read_fixture("release_upgrade/os_release_missing_version.txt");
+    let current = os_release_version(&os_quoted).expect("quoted VERSION_ID");
+    assert_eq!(current, 44);
+    assert_eq!(os_release_version(&os_bare), Some(44));
+    assert_eq!(os_release_version(&os_missing), None);
+
+    let f45_json = read_fixture("release_upgrade/collections_f45_active.json");
+    assert_eq!(newest_active_newer_than(&f45_json, current), Some(45));
+    assert_eq!(
+        offer_from_collections(&f45_json, current, "2026-11-15"),
+        Some(ReleaseOffer {
+            version: 45,
+            days_since_release: Some(12),
+        })
+    );
+
+    let already_json = read_fixture("release_upgrade/collections_already_current.json");
+    assert_eq!(offer_from_collections(&already_json, current, "2026-11-15"), None);
+    assert_eq!(newest_active_newer_than(&already_json, 43), Some(44));
+
+    let mixed_json = read_fixture("release_upgrade/collections_non_fedora_and_multi.json");
+    assert_eq!(newest_active_newer_than(&mixed_json, current), Some(46));
+    assert_eq!(days_since_active(&mixed_json, 45, "2026-11-20"), None);
+    assert_eq!(
+        offer_from_collections(&mixed_json, current, "2026-11-20"),
+        Some(ReleaseOffer {
+            version: 46,
+            days_since_release: Some(2),
+        })
+    );
+
+    let html_err = read_fixture("release_upgrade/collections_malformed.txt");
+    assert_eq!(newest_active_newer_than(&html_err, current), None);
+    assert_eq!(offer_from_collections(&html_err, current, "2026-11-20"), None);
+}

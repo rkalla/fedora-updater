@@ -91,6 +91,7 @@ fn is_noise_line(line: &str) -> bool {
         || lower.starts_with("upgrading:")
         || lower.starts_with("installing:")
         || lower.starts_with("removing:")
+        || lower.starts_with("obsoleting")
         || lower.starts_with("transaction summary")
         || lower.starts_with("total ")
         || lower.starts_with("skipping")
@@ -235,25 +236,44 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
     hint
 }
 
-/// `Upgrading:` / `Installing:` at the top of the transaction table.
+/// `Upgrading:` / `Installing:` at the top of the transaction table or inside
+/// `Transaction Summary:` (e.g., `Installing: 1 package`).
 fn is_section_header(line: &str) -> bool {
     if line.contains('[') {
         return false;
     }
-    matches!(
-        line.trim_end_matches(':')
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "upgrading"
-            | "installing"
-            | "removing"
-            | "erasing"
-            | "reinstalling"
-            | "downgrading"
-            | "obsoleting"
-            | "skipping"
-    )
+    let is_section_verb = |verb: &str| {
+        matches!(
+            verb.trim().to_ascii_lowercase().as_str(),
+            "upgrading"
+                | "installing"
+                | "removing"
+                | "erasing"
+                | "reinstalling"
+                | "downgrading"
+                | "replacing"
+                | "obsoleting"
+                | "skipping"
+        )
+    };
+    if let Some((left, right)) = line.split_once(':') {
+        if !is_section_verb(left) {
+            return false;
+        }
+        let rest = right.trim();
+        if rest.is_empty() {
+            return true;
+        }
+        let mut tokens = rest.split_whitespace();
+        return matches!(
+            (tokens.next(), tokens.next()),
+            (Some(count), Some(unit))
+                if !count.is_empty()
+                    && count.chars().all(|c| c.is_ascii_digit())
+                    && matches!(unit.to_ascii_lowercase().as_str(), "package" | "packages")
+        );
+    }
+    is_section_verb(line)
 }
 
 fn is_verify_step(lower: &str) -> bool {
@@ -316,7 +336,11 @@ fn extract_package_token(s: &str) -> Option<String> {
         return None;
     }
     let name = strip_to_package_name(token);
-    if name.is_empty() || is_action_verb(&name) || is_noise_name(&name) {
+    if name.is_empty()
+        || !name.chars().any(|c| c.is_ascii_alphabetic())
+        || is_action_verb(&name)
+        || is_noise_name(&name)
+    {
         None
     } else {
         Some(name)
@@ -563,32 +587,77 @@ mod tests {
     #[test]
     fn parse_classic_check_update() {
         let out = r#"
+Updating and loading repositories:
+Repositories loaded.
 Last metadata expiration check: 1:00:00 ago on Thu 01 Jan 2026.
+---
 kernel.x86_64                     6.14.11-300.fc42                updates
 firefox.x86_64                    140.0-1.fc42                    updates
+firefox.x86_64                    140.0-1.fc42                    updates
 openssl.x86_64                    1:3.2.2-3.fc42                  updates
+mesa-dri-drivers.i686             26.2.6-1.fc42                   updates
+mesa-dri-drivers.x86_64           26.2.6-1.fc42                   updates
+tzdata.noarch                     2026f-1.fc42                    updates
+notanarch.bogus                   1.0-1                           updates
+broken.x86_64                     2026/01/01                      updates
+No match for argument: foo
 "#;
         let pkgs = parse_check_update(out);
-        assert_eq!(pkgs.len(), 3);
+        assert_eq!(pkgs.len(), 6);
         assert_eq!(pkgs[0].name, "kernel");
         assert_eq!(pkgs[0].source, UpdateSource::Dnf);
+        assert_eq!(pkgs[1].name, "firefox");
         assert_eq!(pkgs[2].version, "1:3.2.2-3.fc42");
+        assert_eq!(pkgs[3].arch, "i686");
+        assert_eq!(pkgs[4].arch, "x86_64");
+        assert_ne!(pkgs[3].id, pkgs[4].id);
+        assert_eq!(pkgs[5].name, "tzdata");
+        assert_eq!(pkgs[5].arch, "noarch");
     }
 
     #[test]
     fn parse_check_update_parses_optional_size_bytes() {
         let out = r#"
-kernel.x86_64                     6.14.11-300.fc42                updates     98.2 MB
-firefox                   x86_64  140.0-1.fc42                    updates     112 MiB
-openssl.x86_64                    1:3.2.2-3.fc42                  updates
+Package                   Arch   Version                Repository       Size
+==============================================================================
+Upgrading:
+ kernel.x86_64                     6.14.11-300.fc42                updates     98.2 MB
+ firefox                   x86_64  140.0-1.fc42                    updates     112 MiB
+ openssl.x86_64                    1:3.2.2-3.fc42                  updates
+Obsoleting packages:
+ pipewire-pulseaudio       x86_64  1.4.2-1.fc44                    updates     310.0 KiB
+ pkgwithslash              x86_64  nodigits                        updates     10 KiB
+ badrow                    bogus   1.0-1.fc44                      updates     10 KiB
+Transaction Summary:
+Total size of inbound packages is 211 MiB.
 "#;
         let pkgs = parse_check_update(out);
-        assert_eq!(pkgs.len(), 3);
+        assert_eq!(pkgs.len(), 4);
         assert_eq!(pkgs[0].size_bytes, parse_size_bytes("98.2 MB"));
         assert_eq!(pkgs[0].size_label().as_deref(), Some("98 MB"));
         assert_eq!(pkgs[1].size_bytes, Some(112 * 1024 * 1024));
         assert_eq!(pkgs[1].size_label().as_deref(), Some("112 MB"));
         assert_eq!(pkgs[2].size_bytes, None);
+        assert_eq!(pkgs[3].name, "pipewire-pulseaudio");
+        assert_eq!(pkgs[3].size_bytes, parse_size_bytes("310.0 KiB"));
+    }
+
+    #[test]
+    fn parse_check_update_recognizes_all_supported_arches() {
+        for arch in [
+            "x86_64", "aarch64", "i686", "i386", "noarch", "src", "armv7hl", "ppc64le", "s390x",
+            "riscv64",
+        ] {
+            let line = format!("pkg.{arch} 1.2-3.fc44 updates");
+            let pkgs = parse_check_update(&line);
+            assert_eq!(pkgs.len(), 1, "classic arch `{arch}` should parse");
+            assert_eq!(pkgs[0].arch, arch);
+
+            let table_line = format!("pkg {arch} 1.2-3.fc44 updates 10 KiB");
+            let tpkgs = parse_check_update(&table_line);
+            assert_eq!(tpkgs.len(), 1, "table arch `{arch}` should parse");
+            assert_eq!(tpkgs[0].arch, arch);
+        }
     }
 
     #[test]
@@ -663,21 +732,98 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
             "kernel                    x86_64 6.14.11-300.fc42        updates     98.2 MB",
         );
         assert!(h.package_name.is_none());
-        let h = parse_progress_line("Upgrading:");
-        assert!(h.package_name.is_none());
-        assert!(h.phase_label.is_none());
-        assert!(h.status.is_none());
-        assert!(parse_progress_line("Installing:").status.is_none());
-        assert!(parse_progress_line("Removing:").phase_label.is_none());
+        for header in [
+            "Upgrading:",
+            "Installing:",
+            "Removing:",
+            " Installing:        1 package",
+            " Upgrading:         3 packages",
+            " Removing:          2 packages",
+            " Reinstalling:      1 package",
+            " Downgrading:       1 package",
+            " Replacing:         1 package",
+            " Obsoleting:        1 package",
+            " Skipping:          1 package",
+            "Transaction Summary:",
+        ] {
+            let hint = parse_progress_line(header);
+            assert_eq!(
+                hint,
+                ProgressHint::default(),
+                "header `{header}` should yield default hint"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_line_handles_cleanup_scriptlets_download_and_malformed_brackets() {
+        let cleanup = parse_progress_line("[8/8] Cleanup / Verifying 100%");
+        assert_eq!(cleanup.package_name, None);
+        assert_eq!(cleanup.phase_label.as_deref(), Some("Verifying"));
+        assert_eq!(cleanup.status, Some(PackageStatus::Installing));
+        assert_eq!(cleanup.stage_current, Some(8));
+        assert_eq!(cleanup.stage_total, Some(8));
+        assert_eq!(cleanup.progress, Some(1.0));
+
+        let scriptlet =
+            parse_progress_line("[7/8] Running scriptlet: kernel-core-0:7.1.12-200.fc44.x86_64 100%");
+        assert_eq!(scriptlet.package_name, None);
+        assert_eq!(scriptlet.phase_label.as_deref(), Some("Running transaction"));
+        assert_eq!(scriptlet.status, None);
+        assert_eq!(scriptlet.stage_current, Some(7));
+        assert_eq!(scriptlet.stage_total, Some(8));
+        assert_eq!(scriptlet.progress, Some(1.0));
+
+        let complete = parse_progress_line("Complete!");
+        assert_eq!(complete.package_name, None);
+        assert_eq!(complete.phase_label.as_deref(), Some("Complete"));
+        assert_eq!(complete.progress, Some(1.0));
+
+        let erase = parse_progress_line("[4/4] Erasing old-pkg-1.0-1.fc44.x86_64 50%");
+        assert_eq!(erase.package_name.as_deref(), Some("old-pkg"));
+        assert_eq!(erase.status, Some(PackageStatus::Installing));
+        assert_eq!(erase.phase_label.as_deref(), Some("Installing"));
+        assert_eq!(erase.progress, Some(0.5));
+
+        let downloading = parse_progress_line("Downloading Packages:");
+        assert_eq!(downloading.status, Some(PackageStatus::Downloading));
+        assert!(downloading.package_name.is_none());
+
+        let zero_total = parse_progress_line("[1/0] Upgrading firefox-140.0-1.fc44.x86_64");
+        assert_eq!(zero_total.stage_current, None);
+        assert_eq!(zero_total.stage_total, None);
+        assert_eq!(zero_total.package_name.as_deref(), Some("firefox"));
+
+        let reversed = parse_progress_line("]1/2[ Upgrading firefox-140.0-1.fc44.x86_64");
+        assert_eq!(reversed.stage_current, None);
+        assert_eq!(reversed.package_name.as_deref(), Some("firefox"));
+
+        for err_line in [
+            "Error: Could not acquire lock on /var/lib/rpm/.rpm.lock",
+            "Problem 1: package foo conflicts with bar",
+            "Failed to download metadata for repo 'updates'",
+        ] {
+            let h = parse_progress_line(err_line);
+            assert!(h.status.is_none(), "error `{err_line}` set status");
+            assert!(h.package_name.is_none(), "error `{err_line}` set package");
+        }
     }
 
     #[test]
     fn check_exit_codes() {
-        assert!(check_exit_is_ok(0, &[]));
-        assert!(check_exit_is_ok(100, &[]));
-        assert!(check_exit_is_hard_error(1, &[]));
+        for code in [0, 100] {
+            assert!(check_exit_is_ok(code, &[]));
+            assert!(!check_exit_is_hard_error(code, &[]));
+        }
+        for code in [1, 2, 130, -1] {
+            assert!(!check_exit_is_ok(code, &[]));
+            assert!(check_exit_is_hard_error(code, &[]));
+        }
         let pkgs = vec![Package::new_dnf("a", "x86_64", "1", "updates")];
-        assert!(!check_exit_is_hard_error(1, &pkgs));
+        for code in [0, 1, 2, 100, 130] {
+            assert!(check_exit_is_ok(code, &pkgs));
+            assert!(!check_exit_is_hard_error(code, &pkgs));
+        }
     }
 
     #[test]
@@ -705,13 +851,36 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
     fn core_system_packages_imply_reboot() {
         for name in [
             "kernel",
+            "KERNEL",
+            "kernel-rt",
+            "kernel-debug",
+            "kernel-smp",
+            "kernel-pae",
+            "kernel-core",
+            "kernel-core-extra",
             "kernel-modules",
             "kernel-modules-extra",
+            "kernel-rt-core",
+            "kernel-rt-modules-core",
+            "kernel-debug-core",
+            "kernel-debug-modules-extra",
+            "kernel-uki-virt",
             "glibc",
-            "systemd",
-            "dbus-broker",
+            "glibc-common",
             "linux-firmware",
+            "microcode_ctl",
+            "amd-ucode-firmware",
+            "intel-microcode",
+            "systemd",
+            "systemd-libs",
+            "systemd-udev",
+            "dbus",
+            "dbus-broker",
+            "dbus-daemon",
+            "dracut",
+            "grub2-common",
             "grub2-efi-x64",
+            "shim-x64",
         ] {
             let pkg = Package::new_dnf(name, "x86_64", "1", "updates");
             assert!(
@@ -723,9 +892,44 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
 
     #[test]
     fn ordinary_packages_do_not_imply_reboot() {
-        let firefox = Package::new_dnf("firefox", "x86_64", "140.0-1.fc42", "updates");
-        let openssl = Package::new_dnf("openssl", "x86_64", "1", "updates");
-        assert!(!detect_reboot_needed("", &[firefox, openssl]));
+        for name in [
+            "firefox",
+            "openssl",
+            "kernel-headers",
+            "systemd-resolved",
+            "glibc-langpack-en",
+            "dracut-config-reboot",
+            "shimmer",
+            "grubby",
+        ] {
+            let pkg = Package::new_dnf(name, "x86_64", "1", "updates");
+            assert!(
+                !detect_reboot_needed("", &[pkg]),
+                "{name} must not recommend a reboot"
+            );
+        }
+        // Non-DNF package named kernel must not trigger DNF reboot check.
+        let mut flatpak_kernel = Package::new_dnf("kernel", "", "1", "flathub");
+        flatpak_kernel.source = UpdateSource::FlatpakUser;
+        assert!(!detect_reboot_needed("", &[flatpak_kernel]));
+    }
+
+    #[test]
+    fn dnf_log_all_reboot_phrases_trigger_reboot() {
+        let firefox = Package::new_dnf("firefox", "x86_64", "1", "updates");
+        for phrase in [
+            "This update requires a reboot",
+            "Reboot to apply changes.",
+            "Reboot to complete installation.",
+            "System reboot required",
+            "Please restart your system soon",
+            "needs-restarting: core libraries updated",
+        ] {
+            assert!(
+                detect_reboot_needed(phrase, std::slice::from_ref(&firefox)),
+                "phrase `{phrase}` should imply reboot"
+            );
+        }
     }
 
     #[test]
@@ -771,11 +975,16 @@ openssl.x86_64                    1:3.2.2-3.fc42                  updates
         let out = r#"
 Updating and loading repositories:
 Repositories loaded.
+short line
+badarch	bogus	1.0-1	999
+nonnumeric	x86_64	1.0-1	NaN
 kernel-core	x86_64	7.1.12-200.fc44	21727761
 firefox	x86_64	140.0-1.fc42	117440512
 bind-libs	x86_64	32:9.18.50-2.fc44	1388459
+tzdata noarch 2026f-1.fc44 720896
 "#;
         let sizes = parse_repoquery_sizes(out);
+        assert_eq!(sizes.len(), 4);
         assert_eq!(
             sizes.get(&(
                 "kernel-core".into(),
@@ -792,34 +1001,99 @@ bind-libs	x86_64	32:9.18.50-2.fc44	1388459
             )),
             Some(&1388459)
         );
+        assert_eq!(
+            sizes.get(&("tzdata".into(), "noarch".into(), "2026f-1.fc44".into())),
+            Some(&720896)
+        );
 
+        let mut pre_sized = Package::new_dnf("firefox", "x86_64", "140.0-1.fc42", "updates");
+        pre_sized.size_bytes = Some(42);
         let mut pkgs = vec![
             Package::new_dnf("kernel-core", "x86_64", "7.1.12-200.fc44", "updates"),
+            pre_sized,
             Package::new_dnf("mystery", "x86_64", "1", "updates"),
         ];
         let n = apply_download_sizes(&mut pkgs, &sizes);
         assert_eq!(n, 1);
         assert_eq!(pkgs[0].size_bytes, Some(21_727_761));
         assert_eq!(pkgs[0].size_label().as_deref(), Some("21 MB"));
-        assert!(pkgs[1].size_bytes.is_none());
+        // Pre-populated sizes must be preserved and excluded from the returned count.
+        assert_eq!(pkgs[1].size_bytes, Some(42));
+        assert!(pkgs[2].size_bytes.is_none());
     }
 
     #[test]
     fn cache_growth_reports_the_newest_rpm_and_whether_it_grew() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+
+        // Missing root directory and empty directory both return None.
+        let mut cursor = None;
+        assert!(poll_cache_growth(&root.join("missing"), &mut cursor).is_none());
+        assert!(cursor.is_none());
+
         let packages = root.join("grok-bot-deadbeef").join("packages");
         std::fs::create_dir_all(&packages).unwrap();
+        assert!(poll_cache_growth(root, &mut cursor).is_none());
+
+        // Non-.rpm files and stale (>180s) RPMs are ignored.
+        std::fs::write(packages.join("ignore.part"), vec![0u8; 4096]).unwrap();
+        let stale = packages.join("stale-1.0-1.fc44.x86_64.rpm");
+        std::fs::write(&stale, vec![0u8; 500]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(300))
+            .unwrap();
+        assert!(poll_cache_growth(root, &mut cursor).is_none());
+
+        // First fresh RPM sampled: rising is false until size grows.
         let rpm = packages.join("grok-bot-0.79.2-1.x86_64.rpm");
         std::fs::write(&rpm, vec![0u8; 1000]).unwrap();
-        let mut cursor = None;
+        let older_mtime = SystemTime::now() - Duration::from_secs(30);
+        std::fs::File::options()
+            .write(true)
+            .open(&rpm)
+            .unwrap()
+            .set_modified(older_mtime)
+            .unwrap();
         let first = poll_cache_growth(root, &mut cursor).expect("fresh rpm");
         assert_eq!(first.package, "grok-bot");
         assert!(!first.rising);
         assert_eq!(first.bytes, 1000);
+
+        // Same size on steady poll keeps rising == false.
+        let steady = poll_cache_growth(root, &mut cursor).expect("steady rpm");
+        assert!(!steady.rising);
+        assert_eq!(steady.bytes, 1000);
+
+        // Growth on the tracked RPM flips rising == true.
         std::fs::write(&rpm, vec![0u8; 2500]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&rpm)
+            .unwrap()
+            .set_modified(older_mtime + Duration::from_secs(5))
+            .unwrap();
         let second = poll_cache_growth(root, &mut cursor).expect("grew");
         assert!(second.rising);
         assert_eq!(second.bytes, 2500);
+
+        // Rotation to a newer RPM directly inside a repo dir switches the cursor.
+        let direct_repo = root.join("updates-abc");
+        std::fs::create_dir_all(&direct_repo).unwrap();
+        let next_rpm = direct_repo.join("firefox-140.0-1.fc44.x86_64.rpm");
+        std::fs::write(&next_rpm, vec![0u8; 4000]).unwrap();
+        let rotated = poll_cache_growth(root, &mut cursor).expect("rotated rpm");
+        assert_eq!(rotated.package, "firefox");
+        assert!(!rotated.rising);
+        assert_eq!(rotated.bytes, 4000);
+
+        std::fs::write(&next_rpm, vec![0u8; 6000]).unwrap();
+        let rotated_grew = poll_cache_growth(root, &mut cursor).expect("rotated rpm grew");
+        assert_eq!(rotated_grew.package, "firefox");
+        assert!(rotated_grew.rising);
+        assert_eq!(rotated_grew.bytes, 6000);
     }
 }

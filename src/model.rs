@@ -662,9 +662,166 @@ mod tests {
 
     #[test]
     fn format_bytes_uses_compact_units() {
+        assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(900), "900 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(9 * 1024 + 900), "9.9 KB");
+        assert_eq!(format_bytes(10 * 1024), "10 KB");
         assert_eq!(format_bytes(12 * 1024), "12 KB");
-        assert_eq!(format_bytes(21727761), "21 MB");
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1024 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(10 * 1024 * 1024), "10 MB");
+        assert_eq!(format_bytes(21_727_761), "21 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
         assert_eq!(format_bytes(1_288_490_189), "1.2 GB");
+        assert_eq!(format_bytes(12 * 1024 * 1024 * 1024), "12 GB");
+    }
+
+    #[test]
+    fn parse_size_bytes_covers_units_commas_and_invalid_inputs() {
+        assert_eq!(parse_size_bytes("0"), Some(0));
+        assert_eq!(parse_size_bytes("0 B"), Some(0));
+        assert_eq!(parse_size_bytes("12345"), Some(12345));
+        assert_eq!(parse_size_bytes("1,024"), Some(1024));
+        assert_eq!(parse_size_bytes("1,024 KB"), Some(1024 * 1024));
+        assert_eq!(parse_size_bytes("512 byte"), Some(512));
+        assert_eq!(parse_size_bytes("512 bytes"), Some(512));
+        assert_eq!(parse_size_bytes("1k"), Some(1024));
+        assert_eq!(parse_size_bytes("412.0 KiB"), Some(412 * 1024));
+        assert_eq!(parse_size_bytes("2.5 mb"), Some(2_621_440));
+        assert_eq!(parse_size_bytes("112 MiB"), Some(112 * 1024 * 1024));
+        assert_eq!(
+            parse_size_bytes("1.5 GiB"),
+            Some((1.5_f64 * 1024.0 * 1024.0 * 1024.0).round() as u64)
+        );
+        assert_eq!(
+            parse_size_bytes("2 TB"),
+            Some(2 * 1024 * 1024 * 1024 * 1024)
+        );
+
+        for invalid in [
+            "",
+            "   ",
+            "-5 MB",
+            "NaN MB",
+            "inf MB",
+            "12 XB",
+            "MB",
+            "1.2.3 MB",
+            "abc",
+        ] {
+            assert_eq!(
+                parse_size_bytes(invalid),
+                None,
+                "invalid size `{invalid}` must yield None"
+            );
+        }
+    }
+
+    #[test]
+    fn total_download_bytes_and_package_version_line() {
+        assert_eq!(total_download_bytes(&[]), None);
+
+        let mut p1 = Package::new_dnf("firefox", "x86_64", "140.0", "updates");
+        let mut p2 = Package::new_dnf("kernel", "x86_64", "7.1.12", "updates");
+        assert_eq!(total_download_bytes(&[p1.clone(), p2.clone()]), None);
+
+        p1.size_bytes = Some(0);
+        assert_eq!(total_download_bytes(&[p1.clone(), p2.clone()]), Some(0));
+
+        p2.size_bytes = Some(500);
+        assert_eq!(total_download_bytes(&[p1.clone(), p2.clone()]), Some(500));
+
+        // Saturation guard at u64::MAX.
+        p1.size_bytes = Some(u64::MAX - 10);
+        p2.size_bytes = Some(100);
+        assert_eq!(total_download_bytes(&[p1.clone(), p2]), Some(u64::MAX));
+
+        // Package::version_line branches
+        assert_eq!(p1.version_line(), "140.0 · updates");
+        p1.detail.clear();
+        assert_eq!(p1.version_line(), "140.0");
+        p1.old_version = Some("139.0".into());
+        assert_eq!(p1.version_line(), "139.0 → 140.0");
+    }
+
+    #[test]
+    fn enums_stopwatch_ordering_and_finalization_across_all_sources() {
+        assert_eq!(UpdateSource::Dnf.label(), "System");
+        assert_eq!(UpdateSource::FlatpakUser.label(), "Apps");
+        assert_eq!(UpdateSource::FlatpakSystem.label(), "Apps");
+        assert_eq!(UpdateSource::Firmware.label(), "Firmware");
+
+        assert_eq!(UpdateSource::Dnf.badge(), "DNF");
+        assert_eq!(UpdateSource::FlatpakUser.badge(), "FP");
+        assert_eq!(UpdateSource::FlatpakSystem.badge(), "FP");
+        assert_eq!(UpdateSource::Firmware.badge(), "FW");
+
+        assert_eq!(UpdateSource::Dnf.css_class(), "src-dnf");
+        assert_eq!(UpdateSource::FlatpakUser.css_class(), "src-flatpak");
+        assert_eq!(UpdateSource::FlatpakSystem.css_class(), "src-flatpak");
+        assert_eq!(UpdateSource::Firmware.css_class(), "src-firmware");
+
+        assert_eq!(UpdateSource::Dnf.console_tag(), "dnf");
+        assert_eq!(UpdateSource::FlatpakUser.console_tag(), "flatpak-user");
+        assert_eq!(UpdateSource::FlatpakSystem.console_tag(), "flatpak-system");
+        assert_eq!(UpdateSource::Firmware.console_tag(), "fwupd");
+
+        assert_eq!(UpdateSource::Dnf.to_string(), "System");
+        assert_eq!(AuthPurpose::Check.to_string(), "check for updates");
+        assert_eq!(AuthPurpose::Apply.to_string(), "apply updates");
+
+        assert!(!PackageStatus::Pending.is_done());
+        assert!(!PackageStatus::Downloading.is_done());
+        assert!(!PackageStatus::Installing.is_done());
+        assert!(PackageStatus::Completed.is_done());
+        assert!(PackageStatus::Failed.is_done());
+        assert_eq!(PackageStatus::Pending.label(), "queued");
+        assert_eq!(PackageStatus::Downloading.label(), "downloading");
+        assert_eq!(PackageStatus::Installing.label(), "installing");
+        assert_eq!(PackageStatus::Completed.label(), "done");
+        assert_eq!(PackageStatus::Failed.label(), "failed");
+
+        let sw = Stopwatch::start();
+        assert!(sw.elapsed_secs() < 5);
+        assert!(sw.elapsed_label().ends_with('s'));
+
+        assert!((overall_progress(&[]) - 0.0).abs() < f64::EPSILON);
+
+        let mut fp_sys = Package::new_dnf("Steam", "", "1", "flathub");
+        fp_sys.source = UpdateSource::FlatpakSystem;
+        let mut fp_user = Package::new_dnf("Signal", "", "1", "flathub");
+        fp_user.source = UpdateSource::FlatpakUser;
+        let mut pkgs = vec![
+            firmware_pkg("UEFI"),
+            fp_sys,
+            Package::new_dnf("zlib", "x86_64", "1", "updates"),
+            Package::new_dnf("bash", "x86_64", "1", "updates"),
+            fp_user,
+        ];
+        sort_for_apply(&mut pkgs);
+        assert_eq!(
+            pkgs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["bash", "zlib", "Signal", "Steam", "UEFI"]
+        );
+        assert_eq!(
+            sources_present(&pkgs),
+            vec![
+                UpdateSource::Dnf,
+                UpdateSource::FlatpakUser,
+                UpdateSource::FlatpakSystem,
+                UpdateSource::Firmware,
+            ]
+        );
+        assert_eq!(count_by_source(&pkgs), (2, 2, 1));
+
+        // Partial fail + finalize preserves already-completed items and isolates sources.
+        pkgs[0].status = PackageStatus::Completed;
+        finalize_source(&mut pkgs, UpdateSource::Dnf, false);
+        assert_eq!(pkgs[0].status, PackageStatus::Completed);
+        assert_eq!(pkgs[1].status, PackageStatus::Failed);
+        assert_eq!(pkgs[2].status, PackageStatus::Pending);
+        assert!((overall_progress(&pkgs) - 0.4).abs() < 1e-9);
     }
 }

@@ -67,11 +67,12 @@ pub fn packages_from_flatpak_updates(
         UpdateSource::FlatpakSystem => "system",
         _ => "flatpak",
     };
-    let requested: HashMap<&str, usize> = refs
-        .iter()
-        .enumerate()
-        .map(|(i, r)| (r.formatted_ref.as_str(), i))
-        .collect();
+    let mut requested: HashMap<&str, usize> = HashMap::with_capacity(refs.len());
+    for (i, r) in refs.iter().enumerate() {
+        if !r.formatted_ref.is_empty() {
+            requested.entry(r.formatted_ref.as_str()).or_insert(i);
+        }
+    }
 
     let mut installs_for: HashMap<usize, Vec<String>> = HashMap::new();
     let mut bytes_for: HashMap<usize, u64> = HashMap::new();
@@ -634,13 +635,21 @@ fn looks_like_app_id(s: &str) -> bool {
             .map(|p| p == "app" || p == "runtime" || looks_like_app_id(p))
             .unwrap_or(false);
     }
-    s.contains('.') && !s.contains(' ') && s.len() >= 3
+    !s.ends_with('%')
+        && s.contains('.')
+        && !s.contains(' ')
+        && s.len() >= 3
+        && s.chars().any(|c| c.is_ascii_alphabetic())
+        && s.split('.').all(|seg| !seg.is_empty())
 }
 
 pub fn parse_progress_line(line: &str) -> ProgressHint {
     let lower = line.to_ascii_lowercase();
     let mut hint = ProgressHint::default();
 
+    if lower.trim_start().starts_with("error:") {
+        return hint;
+    }
     if lower.contains("nothing to update") || lower.contains("no updates") {
         hint.phase_label = Some("Nothing to update".into());
         return hint;
@@ -655,13 +664,14 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
     }
 
     for token in line.split_whitespace() {
-        let id = token.split('/').next().unwrap_or(token);
+        let trimmed = token.trim_matches(|c| matches!(c, ':' | ',' | ';' | '(' | ')' | '"'));
+        let without_prefix = trimmed
+            .strip_prefix("app/")
+            .or_else(|| trimmed.strip_prefix("runtime/"))
+            .unwrap_or(trimmed);
+        let id = without_prefix.split('/').next().unwrap_or(without_prefix);
         if looks_like_app_id(id) {
-            hint.package_name = Some(
-                id.trim_start_matches("app/")
-                    .trim_start_matches("runtime/")
-                    .to_string(),
-            );
+            hint.package_name = Some(id.to_string());
             break;
         }
     }
@@ -679,7 +689,7 @@ mod tests {
 
     #[test]
     fn update_ref_roundtrip() {
-        let p = Package {
+        let mut p = Package {
             id: "flatpak:system:app/org.videolan.vlc/x86_64/stable".into(),
             name: "VLC".into(),
             arch: "x86_64".into(),
@@ -694,6 +704,61 @@ mod tests {
         assert_eq!(
             update_ref_from_package(&p).as_deref(),
             Some("app/org.videolan.vlc/x86_64/stable")
+        );
+
+        p.id = "flatpak:user:runtime/org.gnome.Platform/x86_64/48".into();
+        p.source = UpdateSource::FlatpakUser;
+        assert_eq!(
+            update_ref_from_package(&p).as_deref(),
+            Some("runtime/org.gnome.Platform/x86_64/48")
+        );
+
+        for bad_id in [
+            "dnf:firefox.x86_64:140.0",
+            "flatpak:user",
+            "flatpak:user:",
+            "",
+        ] {
+            p.id = bad_id.into();
+            assert_eq!(
+                update_ref_from_package(&p),
+                None,
+                "id `{bad_id}` must not produce a flatpak ref"
+            );
+        }
+    }
+
+    #[test]
+    fn update_args_for_refs_sets_scope_noninteractive_and_refs() {
+        let refs = vec![
+            "app/org.signal.Signal/x86_64/stable".to_string(),
+            "runtime/org.gnome.Platform/x86_64/48".to_string(),
+        ];
+        assert_eq!(
+            update_args_for_refs(true, &refs),
+            vec![
+                "update",
+                "--user",
+                "-y",
+                "--noninteractive",
+                "app/org.signal.Signal/x86_64/stable",
+                "runtime/org.gnome.Platform/x86_64/48",
+            ]
+        );
+        assert_eq!(
+            update_args_for_refs(false, &refs),
+            vec![
+                "update",
+                "--system",
+                "-y",
+                "--noninteractive",
+                "app/org.signal.Signal/x86_64/stable",
+                "runtime/org.gnome.Platform/x86_64/48",
+            ]
+        );
+        assert_eq!(
+            update_args_for_refs(true, &[]),
+            vec!["update", "--user", "-y", "--noninteractive"]
         );
     }
 
@@ -833,7 +898,175 @@ mod tests {
         }];
         let pkgs = packages_from_flatpak_updates(UpdateSource::FlatpakSystem, &refs, &ops);
         assert_eq!(pkgs.len(), 1);
-        assert!(!pkgs[0].detail.contains("installs"), "{}", pkgs[0].detail);
+        assert!(pkgs.iter().all(|p| !p.detail.contains("installs")), "{pkgs:?}");
         assert!(pkgs[0].size_bytes.is_none());
+    }
+
+    #[test]
+    fn packages_from_flatpak_updates_handles_edge_cases_and_fallbacks() {
+        let refs = vec![
+            // Empty formatted_ref skipped
+            FlatpakListedRef {
+                formatted_ref: String::new(),
+                name: "Skip".into(),
+                arch: "x86_64".into(),
+                branch: "stable".into(),
+                version: "1.0".into(),
+                origin: "flathub".into(),
+            },
+            // Empty name, version, origin fallbacks
+            FlatpakListedRef {
+                formatted_ref: "app/org.example.Alpha/x86_64/stable".into(),
+                name: String::new(),
+                arch: "x86_64".into(),
+                branch: "stable".into(),
+                version: String::new(),
+                origin: String::new(),
+            },
+            // Duplicate formatted_ref ignored (keeps first)
+            FlatpakListedRef {
+                formatted_ref: "app/org.example.Alpha/x86_64/stable".into(),
+                name: "Duplicate".into(),
+                arch: "x86_64".into(),
+                branch: "stable".into(),
+                version: "9.9".into(),
+                origin: "flathub".into(),
+            },
+            FlatpakListedRef {
+                formatted_ref: "runtime/org.gnome.Platform/x86_64/48".into(),
+                name: "GNOME".into(),
+                arch: "x86_64".into(),
+                branch: "48".into(),
+                version: String::new(),
+                origin: "flathub".into(),
+            },
+            // Name fallback when formatted_ref lacks a slash
+            FlatpakListedRef {
+                formatted_ref: "bare.ref".into(),
+                name: String::new(),
+                arch: "x86_64".into(),
+                branch: "main".into(),
+                version: "2.0".into(),
+                origin: "fedora".into(),
+            },
+        ];
+        let ops = vec![
+            // Shared extension with related_to listed in reverse order -> size still goes to earliest index (Alpha).
+            FlatpakResolvedOp {
+                formatted_ref: "runtime/org.shared.Ext/x86_64/1".into(),
+                kind: FlatpakOpKind::Install,
+                download_bytes: 5_000_000,
+                related_to: vec![
+                    "runtime/org.gnome.Platform/x86_64/48".into(),
+                    "app/org.example.Alpha/x86_64/stable".into(),
+                ],
+            },
+            // Second extension sorted alphabetically with Ext on Alpha; duplicate ext id deduplicated.
+            FlatpakResolvedOp {
+                formatted_ref: "runtime/org.alpha.Ext/x86_64/1".into(),
+                kind: FlatpakOpKind::Install,
+                download_bytes: 1_000_000,
+                related_to: vec!["app/org.example.Alpha/x86_64/stable".into()],
+            },
+            FlatpakResolvedOp {
+                formatted_ref: "runtime/org.alpha.Ext/x86_64/1".into(),
+                kind: FlatpakOpKind::Install,
+                download_bytes: 500_000,
+                related_to: vec!["app/org.example.Alpha/x86_64/stable".into()],
+            },
+            // Malformed op ref (no slash) and unrelated parent refs are ignored.
+            FlatpakResolvedOp {
+                formatted_ref: "malformed".into(),
+                kind: FlatpakOpKind::Install,
+                download_bytes: 99_000_000,
+                related_to: vec!["app/org.example.Alpha/x86_64/stable".into()],
+            },
+            FlatpakResolvedOp {
+                formatted_ref: "runtime/org.orphan.Ext/x86_64/1".into(),
+                kind: FlatpakOpKind::Install,
+                download_bytes: 88_000_000,
+                related_to: vec!["app/org.not.Listed/x86_64/stable".into()],
+            },
+        ];
+
+        // Non-flatpak UpdateSource exercises default "flatpak" scope label.
+        let pkgs = packages_from_flatpak_updates(UpdateSource::Dnf, &refs, &ops);
+        assert_eq!(pkgs.len(), 3);
+
+        assert_eq!(pkgs[0].id, "flatpak:flatpak:app/org.example.Alpha/x86_64/stable");
+        assert_eq!(pkgs[0].name, "org.example.Alpha");
+        assert_eq!(pkgs[0].version, "stable");
+        assert_eq!(pkgs[0].repo, "flatpak");
+        assert_eq!(
+            pkgs[0].detail,
+            "stable · flatpak · installs org.alpha.Ext, org.shared.Ext"
+        );
+        assert_eq!(pkgs[0].size_bytes, Some(6_500_000));
+
+        assert_eq!(pkgs[1].name, "GNOME");
+        assert_eq!(pkgs[1].size_bytes, None);
+        assert_eq!(
+            pkgs[1].detail,
+            "48 · flathub · flatpak · installs org.shared.Ext"
+        );
+
+        assert_eq!(pkgs[2].name, "bare.ref");
+        assert_eq!(pkgs[2].detail, "2.0 · fedora · flatpak");
+        assert_eq!(pkgs[2].size_bytes, None);
+    }
+
+    #[test]
+    fn parse_progress_line_covers_prefixed_refs_phases_and_errors() {
+        let dl_bare = parse_progress_line("Downloading org.signal.Signal/x86_64/stable 45%");
+        assert_eq!(dl_bare.package_name.as_deref(), Some("org.signal.Signal"));
+        assert_eq!(dl_bare.status, Some(PackageStatus::Downloading));
+        assert_eq!(dl_bare.phase_label.as_deref(), Some("Downloading Flatpak"));
+        assert_eq!(dl_bare.progress, Some(0.45));
+
+        let dl_prefixed =
+            parse_progress_line("Downloading app/org.mozilla.Thunderbird/x86_64/stable 60%");
+        assert_eq!(
+            dl_prefixed.package_name.as_deref(),
+            Some("org.mozilla.Thunderbird")
+        );
+        assert_eq!(dl_prefixed.status, Some(PackageStatus::Downloading));
+        assert_eq!(dl_prefixed.progress, Some(0.60));
+
+        let inst_runtime =
+            parse_progress_line("Installing runtime/org.gnome.Platform/x86_64/48 100%");
+        assert_eq!(
+            inst_runtime.package_name.as_deref(),
+            Some("org.gnome.Platform")
+        );
+        assert_eq!(inst_runtime.status, Some(PackageStatus::Installing));
+        assert_eq!(inst_runtime.phase_label.as_deref(), Some("Updating Flatpak"));
+        assert_eq!(inst_runtime.progress, Some(1.0));
+
+        let updating = parse_progress_line("Updating org.signal.Signal/x86_64/stable 100%");
+        assert_eq!(updating.package_name.as_deref(), Some("org.signal.Signal"));
+        assert_eq!(updating.status, Some(PackageStatus::Installing));
+
+        let noop = parse_progress_line("Nothing to update.");
+        assert_eq!(noop.phase_label.as_deref(), Some("Nothing to update"));
+        assert_eq!(noop.status, None);
+        assert_eq!(noop.package_name, None);
+
+        let no_updates = parse_progress_line("No updates found.");
+        assert_eq!(no_updates.phase_label.as_deref(), Some("Nothing to update"));
+
+        let decimal_pct = parse_progress_line("Downloading 45.0%");
+        assert_eq!(decimal_pct.package_name, None);
+        assert_eq!(decimal_pct.status, Some(PackageStatus::Downloading));
+        assert_eq!(decimal_pct.progress, Some(0.45));
+
+        for noise in ["Looking for updates…", "Updates complete."] {
+            let hint = parse_progress_line(noise);
+            assert_eq!(hint, ProgressHint::default(), "noise `{noise}` should be ignored");
+        }
+
+        let err = parse_progress_line(
+            "error: Failed to update org.signal.Signal: While pulling app/org.signal.Signal/x86_64/stable from remote flathub: Socket I/O timed out",
+        );
+        assert_eq!(err, ProgressHint::default());
     }
 }

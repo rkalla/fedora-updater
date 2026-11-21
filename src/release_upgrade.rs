@@ -251,6 +251,12 @@ mod tests {
             Some(44)
         );
         assert_eq!(os_release_version("VERSION_ID=\"44\"\n"), Some(44));
+        assert_eq!(os_release_version("  VERSION_ID='45'  \n"), Some(45));
+        assert_eq!(
+            os_release_version("# VERSION_ID=99\nVERSION_ID=rawhide\nVERSION_ID=44\n"),
+            Some(44)
+        );
+        assert_eq!(os_release_version("VERSION_ID=rawhide\n"), None);
         assert_eq!(os_release_version("NAME=Fedora\n"), None);
     }
 
@@ -285,20 +291,58 @@ mod tests {
     fn release_age_is_calendar_days_from_the_active_row() {
         let json = r#"{
           "collections": [
+            {"status": "Under Development", "version": "46", "name": "Fedora Linux",
+             "date_updated": "2026-11-10 00:00:00"},
             {"status": "Active", "version": "45", "name": "Fedora Linux",
              "date_updated": "2026-11-03 14:30:00"},
             {"status": "Active", "version": "44", "name": "Fedora Linux",
-             "date_updated": "2026-04-28 14:30:00"}
+             "date_updated": "2026-04-28 14:30:00"},
+            {"status": "EOL", "version": "42", "name": "Fedora Linux",
+             "date_updated": "2025-11-01 00:00:00"},
+            {"status": "Active", "version": "99", "name": "Fedora EPEL",
+             "date_updated": "2026-11-01 00:00:00"}
           ]
         }"#;
         assert_eq!(days_since_active(json, 45, "2026-11-15"), Some(12));
         assert_eq!(days_since_active(json, 45, "2026-11-03"), Some(0));
         assert_eq!(days_since_active(json, 45, "2026-11-04"), Some(1));
         assert_eq!(days_since_active(json, 45, "2026-11-02"), None);
+        assert_eq!(days_since_active(json, 46, "2026-11-15"), None);
+        assert_eq!(days_since_active(json, 42, "2026-11-15"), None);
+        assert_eq!(days_since_active(json, 99, "2026-11-15"), None);
+        assert_eq!(days_since_active(json, 404, "2026-11-15"), None);
         assert_eq!(days_since_active(COLLECTIONS, 45, "2026-11-15"), None);
         assert_eq!(days_since_active(json, 45, "not-a-date"), None);
+
+        // Leap years including century rules, cross-year boundaries, timestamps & invalid dates.
         assert_eq!(days_between("2024-02-28", "2024-03-01"), Some(2));
+        assert_eq!(days_between("2000-02-28", "2000-03-01"), Some(2));
+        assert_eq!(days_between("2100-02-28", "2100-03-01"), Some(1));
+        assert_eq!(days_between("2025-12-31", "2026-01-01"), Some(1));
         assert_eq!(days_between("2026-04-28", "2026-11-03"), Some(189));
+        assert_eq!(
+            days_between("  2026-11-03 14:30:00 ", "2026-11-15T00:00:00Z"),
+            Some(12)
+        );
+        for bad in [
+            "2025-02-29",
+            "2100-02-29",
+            "2026-00-15",
+            "2026-13-01",
+            "2026-01-00",
+            "2026-04-31",
+            "1989-12-31",
+            "2101-01-01",
+            "2026-11",
+            "2026-1-01",
+            "🎉🎉🎉🎉",
+        ] {
+            assert_eq!(
+                days_between(bad, "2026-11-15"),
+                None,
+                "invalid date `{bad}` must yield None"
+            );
+        }
     }
 
     #[test]

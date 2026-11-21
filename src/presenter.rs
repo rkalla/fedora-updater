@@ -490,26 +490,21 @@ mod tests {
     }
 
     #[test]
-    fn check_progress_groups_flatpak() {
-        let (frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
-        assert!(frac > 0.0 && frac < 1.0);
-        assert_eq!(groups, 1);
-        assert!(status.contains("Apps in progress"));
-
-        let (_, groups, status) = check_progress(&[
-            UpdateSource::Dnf,
-            UpdateSource::FlatpakUser,
-            UpdateSource::FlatpakSystem,
-        ]);
-        assert_eq!(groups, 2);
-        assert!(status.contains("Firmware in progress"));
-    }
-
-    #[test]
     fn check_step_names_the_cursor() {
         let (frac, groups, status) = check_progress(&[]);
         assert!((frac - 0.05).abs() < 1e-9);
         assert_eq!(groups, 0);
+        assert_eq!(status, "System in progress · Apps queued · Firmware queued");
+
+        let (frac, groups, status) = check_progress(&[UpdateSource::FlatpakUser]);
+        assert!((frac - 0.25).abs() < 1e-9);
+        assert_eq!(groups, 0);
+        assert_eq!(status, "System in progress · Apps queued · Firmware queued");
+
+        let (frac, groups, status) =
+            check_progress(&[UpdateSource::FlatpakUser, UpdateSource::FlatpakSystem]);
+        assert!((frac - 0.5).abs() < 1e-9);
+        assert_eq!(groups, 1);
         assert_eq!(status, "System in progress · Apps queued · Firmware queued");
 
         let (frac, groups, status) = check_progress(&[UpdateSource::Dnf]);
@@ -551,10 +546,36 @@ mod tests {
 
     #[test]
     fn about_time_left_needs_enough_signal() {
-        assert!(about_time_left(2, 0.5).is_none());
-        assert!(about_time_left(30, 0.05).is_none());
-        let label = about_time_left(60, 0.25).expect("estimate");
-        assert!(label.contains("minute"));
+        assert_eq!(about_time_left(4, 0.5), None);
+        assert_eq!(about_time_left(5, 0.079), None);
+        assert_eq!(
+            about_time_left(5, 0.08).as_deref(),
+            Some("About 1 minute left")
+        );
+        assert_eq!(
+            about_time_left(44, 0.5).as_deref(),
+            Some("Less than a minute left")
+        );
+        assert_eq!(
+            about_time_left(45, 0.5).as_deref(),
+            Some("About 1 minute left")
+        );
+        assert_eq!(
+            about_time_left(89, 0.5).as_deref(),
+            Some("About 1 minute left")
+        );
+        assert_eq!(
+            about_time_left(90, 0.5).as_deref(),
+            Some("About 2 minutes left")
+        );
+        assert_eq!(
+            about_time_left(60, 0.25).as_deref(),
+            Some("About 3 minutes left")
+        );
+        assert_eq!(
+            about_time_left(30, 1.0).as_deref(),
+            Some("Less than a minute left")
+        );
     }
 
     #[test]
@@ -582,12 +603,18 @@ mod tests {
             running_progress_captions(Some(UpdateSource::Dnf), 25, 26, RunPass::Download);
         assert_eq!(foot, "System · 25 of 26 downloaded");
         assert_eq!(meta, "25 downloaded · 1 remaining");
+
+        // None source fallback and done > total saturating remaining count.
+        let (foot, meta) = running_progress_captions(None, 5, 3, RunPass::Download);
+        assert_eq!(foot, "all sources · 5 of 3 downloaded");
+        assert_eq!(meta, "5 downloaded · 0 remaining");
     }
 
     #[test]
     fn quiet_download_hides_eta_and_names_a_growing_cache_file() {
         let fresh = quiet_ui(QuietInput {
-            quiet_secs: 2,
+            quiet_secs: 4,
+            at_full_item: true,
             watching_dnf: true,
             ..Default::default()
         });
@@ -596,8 +623,9 @@ mod tests {
         assert!(!fresh.show_spinner);
         assert!(fresh.banner.is_none());
 
+        // Exact 5s boundary triggers ItemAtFull when at_full_item is true.
         let stuck_full = quiet_ui(QuietInput {
-            quiet_secs: 8,
+            quiet_secs: 5,
             at_full_item: true,
             watching_dnf: true,
             ..Default::default()
@@ -605,6 +633,15 @@ mod tests {
         assert_eq!(stuck_full.mode, QuietMode::ItemAtFull);
         assert!(stuck_full.show_spinner);
         assert!(stuck_full.show_eta);
+
+        // Exact 14s vs 15s ETA visibility cutoff.
+        let eta_visible = quiet_ui(QuietInput {
+            quiet_secs: 14,
+            cache_note: Some(""),
+            ..Default::default()
+        });
+        assert!(eta_visible.show_eta);
+        assert_eq!(eta_visible.mode, QuietMode::Flowing);
 
         let eta_hidden = quiet_ui(QuietInput {
             quiet_secs: 15,
@@ -615,6 +652,33 @@ mod tests {
         assert_eq!(eta_hidden.mode, QuietMode::Flowing);
         assert!(!eta_hidden.show_eta);
         assert!(!eta_hidden.show_spinner);
+
+        // Exact 119s vs 120s Stalled cutoff.
+        let almost_stalled = quiet_ui(QuietInput {
+            quiet_secs: 119,
+            watching_dnf: true,
+            ..Default::default()
+        });
+        assert_eq!(almost_stalled.mode, QuietMode::Flowing);
+        assert!(!almost_stalled.show_spinner);
+
+        let just_stalled = quiet_ui(QuietInput {
+            quiet_secs: 120,
+            watching_dnf: true,
+            ..Default::default()
+        });
+        assert_eq!(just_stalled.mode, QuietMode::Stalled);
+        assert_eq!(just_stalled.banner.as_deref(), Some("No output for 2 minutes."));
+
+        // CacheGrowing takes priority even at quiet_secs == 0 or >= 120.
+        let growing_immediately = quiet_ui(QuietInput {
+            quiet_secs: 0,
+            cache_note: Some("Downloading rpm — 1 MB"),
+            ..Default::default()
+        });
+        assert_eq!(growing_immediately.mode, QuietMode::CacheGrowing);
+        assert!(!growing_immediately.show_eta);
+        assert!(growing_immediately.show_spinner);
 
         let growing = quiet_ui(QuietInput {
             quiet_secs: 400,
@@ -723,13 +787,17 @@ mod tests {
         fp.size_bytes = Some(164 * 1024 * 1024);
         assert_eq!(fp.size_label().as_deref(), Some("164 MB"));
         let line = source_summary_line(&[kernel, fp]);
-        assert!(
-            line.starts_with("1 system · 1 apps · 0 firmware · "),
-            "got {line}"
-        );
-        assert!(
-            line.ends_with(" MB") || line.ends_with(" GB"),
-            "expected a size suffix, got {line}"
+        assert_eq!(line, "1 system · 1 apps · 0 firmware · 185 MB");
+
+        // Zero known bytes should omit the size suffix rather than printing "0 B".
+        let mut fp_sys = Package::new_dnf("Steam", "", "1", "flathub");
+        fp_sys.source = UpdateSource::FlatpakSystem;
+        fp_sys.size_bytes = Some(0);
+        let mut fw = Package::new_dnf("UEFI", "", "1", "LVFS");
+        fw.source = UpdateSource::Firmware;
+        assert_eq!(
+            source_summary_line(&[fp_sys, fw]),
+            "0 system · 1 apps · 1 firmware"
         );
     }
 
@@ -749,18 +817,24 @@ mod tests {
             run_heading("Downloading packages", RunPass::Download),
             "Downloading"
         );
+        assert_eq!(
+            run_heading("Downloading packages", RunPass::Apply),
+            "Applying"
+        );
+        assert_eq!(run_heading("Upgrading", RunPass::Download), "Applying");
         assert_eq!(run_heading("Installing", RunPass::Apply), "Applying");
         assert_eq!(
             run_heading("Running transaction", RunPass::Apply),
             "Applying"
         );
-        assert_eq!(run_heading("Verifying", RunPass::Apply), "Verifying");
+        assert_eq!(run_heading("Verifying", RunPass::Download), "Verifying");
+        assert_eq!(run_heading("Verifying firmware", RunPass::Apply), "Verifying");
         assert_eq!(run_heading("Starting…", RunPass::Download), "Updating");
     }
 
     #[test]
     fn now_playing_prefers_named_package() {
-        let pkgs = vec![
+        let mut pkgs = vec![
             Package::new_dnf("firefox", "x86_64", "1", "updates"),
             Package::new_dnf("kernel", "x86_64", "1", "updates"),
         ];
@@ -768,14 +842,18 @@ mod tests {
             now_playing_title(&pkgs, Some(1), Some("kernel"), "Installing"),
             "kernel"
         );
+        // Completed or out-of-bounds active_index falls back cleanly.
+        pkgs[0].status = crate::model::PackageStatus::Completed;
         assert_eq!(
-            now_playing_title(&pkgs, None, Some("libfoo"), "Installing"),
-            "libfoo"
+            now_playing_title(&pkgs, Some(0), Some("fallback"), "Installing"),
+            "fallback"
         );
         assert_eq!(
-            now_playing_title(&pkgs, None, None, "Downloading packages"),
+            now_playing_title(&pkgs, Some(99), Some("  "), "Downloading packages"),
             "Downloading packages"
         );
+        assert_eq!(now_playing_title(&pkgs, None, None, "   "), "Starting…");
+
         assert_eq!(
             now_playing_subtitle("kernel", "Installing", Some(UpdateSource::Dnf)),
             "Installing · System"
@@ -788,6 +866,8 @@ mod tests {
             ),
             "System"
         );
+        assert_eq!(now_playing_subtitle("kernel", "Installing", None), "Installing");
+        assert_eq!(now_playing_subtitle("kernel", "", None), "");
     }
 
     #[test]
@@ -817,6 +897,14 @@ mod tests {
                 },
                 "Checking for Updates",
                 "about 1 minute · 1 of 3 sources",
+            ),
+            (
+                HeaderView::Ready {
+                    count: 0,
+                    summary: "0 system · 0 apps · 0 firmware",
+                },
+                "0 Updates Available",
+                "0 system · 0 apps · 0 firmware",
             ),
             (
                 HeaderView::Ready {
@@ -900,9 +988,14 @@ mod tests {
             "8 applied · 1 failed · 4 minutes"
         );
         assert_eq!(checking_footnote(2, None), "2 of 3 sources");
+        assert_eq!(checking_footnote(2, Some("")), "2 of 3 sources");
         assert_eq!(
             checking_footnote(1, Some("about 1 minute")),
             "about 1 minute · 1 of 3 sources"
+        );
+        assert_eq!(
+            soft_error_banner_title(0),
+            "0 sources could not be checked"
         );
         assert_eq!(
             soft_error_banner_title(1),

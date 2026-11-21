@@ -144,6 +144,7 @@ fn parse_text_updates(output: &str) -> Vec<Package> {
         }
     };
 
+    let mut skip_section = false;
     for line in output.lines() {
         let t = line.trim();
         if t.is_empty() {
@@ -152,6 +153,29 @@ fn parse_text_updates(output: &str) -> Vec<Package> {
         let lower = t.to_ascii_lowercase();
         if lower.contains("no updates available") || lower.starts_with("no updatable") {
             return Vec::new();
+        }
+        if lower.starts_with("devices with no available")
+            || lower.starts_with("devices with serial")
+            || lower.starts_with("devices that have been updated")
+        {
+            flush(
+                &mut packages,
+                &mut current_name,
+                &mut current_id,
+                &mut current_version,
+            );
+            skip_section = true;
+            continue;
+        }
+        if t.starts_with(['{', '}', '[', ']', '"'])
+            || t.starts_with('•')
+            || t.starts_with('*')
+            || t.starts_with("- ")
+        {
+            continue;
+        }
+        if skip_section {
+            continue;
         }
         // Device name lines are often not indented and not key:value
         if !t.contains(':') && !t.starts_with('│') && !t.starts_with('├') && !t.starts_with('└')
@@ -190,11 +214,14 @@ pub fn parse_progress_line(line: &str) -> ProgressHint {
     let lower = line.to_ascii_lowercase();
     let trimmed = lower.trim_start();
     let mut hint = ProgressHint::default();
-    // Post-apply inventory listings are not progress and must not match "update".
+    // Post-apply inventory listings and fatal errors are not progress and must not match "update" or "%".
     if trimmed.starts_with("devices with")
         || trimmed.starts_with('•')
         || trimmed.starts_with('*')
         || trimmed.starts_with("- ")
+        || trimmed.starts_with("cannot ")
+        || trimmed.starts_with("error:")
+        || trimmed.starts_with("failed ")
     {
         return hint;
     }
@@ -287,34 +314,114 @@ mod tests {
               "DeviceId": "abc123",
               "Version": "1.0.0",
               "Releases": [ { "Version": "1.0.1" } ]
+            },
+            {
+              "Name": "SSD Drive",
+              "DeviceId": "ssd1",
+              "Version": "2.0",
+              "Releases": [ { "Version": "2.2" }, { "Version": "2.1" } ]
+            },
+            {
+              "Name": "Noop Empty Device",
+              "Releases": []
             }
           ]
         }"#;
         let pkgs = parse_get_updates(json);
-        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].id, "fwupd:abc123");
         assert_eq!(pkgs[0].name, "UEFI Device Firmware");
+        assert_eq!(pkgs[0].old_version.as_deref(), Some("1.0.0"));
+        assert_eq!(pkgs[0].version, "1.0.1");
         assert_eq!(pkgs[0].source, UpdateSource::Firmware);
-        assert!(pkgs[0].detail.contains('→'));
+        assert_eq!(pkgs[0].detail, "1.0.0 → 1.0.1");
+        // Picks first release from multi-release device.
+        assert_eq!(pkgs[1].version, "2.2");
+
+        // Top-level array + lowercase keys + missing DeviceId fallback.
+        let arr_json = r#"[{"name": "Dock", "Releases": [{"version": "3.4"}]}]"#;
+        let arr_pkgs = parse_get_updates(arr_json);
+        assert_eq!(arr_pkgs.len(), 1);
+        assert_eq!(arr_pkgs[0].id, "fwupd:Dock:3.4");
+        assert_eq!(arr_pkgs[0].detail, "3.4");
+
+        // Single-device object preceded by warning text and empty Releases with DeviceId.
+        let single_json = r#"Daemon warning before JSON
+        {"Name": "TPM", "DeviceId": "tpm0"}"#;
+        let single_pkgs = parse_get_updates(single_json);
+        assert_eq!(single_pkgs.len(), 1);
+        assert_eq!(single_pkgs[0].id, "fwupd:tpm0");
+        assert_eq!(single_pkgs[0].detail, "firmware update available");
+
+        // Empty JSON shapes and blank input.
+        assert!(parse_get_updates("").is_empty());
+        assert!(parse_get_updates("   \n  ").is_empty());
+        assert!(parse_get_updates("{}").is_empty());
+        assert!(parse_get_updates(r#"{"Devices": []}"#).is_empty());
     }
 
     #[test]
-    fn parse_no_updates_text() {
-        let pkgs = parse_get_updates("No updates available\n");
-        assert!(pkgs.is_empty());
+    fn parse_no_updates_and_text_or_corrupt_fallbacks() {
+        assert!(parse_get_updates("No updates available\n").is_empty());
+        assert!(parse_get_updates("No updatable devices\n").is_empty());
+        assert!(parse_get_updates(
+            "Devices with no available firmware updates:\n • System Firmware\n • UEFI dbx\n"
+        )
+        .is_empty());
+
+        // Truncated JSON falls back cleanly to empty rather than emitting fake "{" devices.
+        assert!(parse_get_updates(
+            "{\n  \"Devices\": [\n    {\n      \"Name\": \"System Firmware\",\n      \"DeviceId\": \"broken\"\n"
+        )
+        .is_empty());
+
+        // Plain-text output with Bootloader Version ignored + tree glyphs + missing DeviceId.
+        let text = "\
+[daemon] warning: stale metadata
+UEFI System Firmware
+  Device ID: dev-1
+  Version: 1.19.2
+  Bootloader Version: 1.0.2
+  ├─ Summary: BIOS update
+
+USB Receiver
+  New version: 02.04
+  └─ Update Protocol: org.usb.dfu
+
+Devices with no available firmware updates:
+ • TPM 2.0
+";
+        let pkgs = parse_get_updates(text);
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].id, "fwupd:dev-1");
+        assert_eq!(pkgs[0].name, "UEFI System Firmware");
+        assert_eq!(pkgs[0].version, "1.19.2");
+        assert_eq!(pkgs[1].id, "fwupd:USB Receiver");
+        assert_eq!(pkgs[1].version, "02.04");
     }
 
     #[test]
     fn reboot_detection() {
-        assert!(detect_reboot_needed(
-            "An update requires a reboot to complete"
-        ));
+        for positive in [
+            "An update requires a reboot to complete",
+            "Firmware update requires a reboot",
+            "Device flags: needs-reboot",
+            "There is a pending reboot",
+            "Please restart your system to finish",
+            "Restart now to apply",
+        ] {
+            assert!(
+                detect_reboot_needed(positive),
+                "line `{positive}` should trigger reboot"
+            );
+        }
         assert!(!detect_reboot_needed("Successfully installed firmware"));
         assert!(
             !detect_reboot_needed("Restarting device…: 99.0%"),
             "device restart is not a system reboot"
         );
         assert!(
-            !detect_reboot_needed("No reboot is necessary"),
+            !detect_reboot_needed("No reboot is necessary even with pending reboot word"),
             "negative phrasing must not count as needing a reboot"
         );
     }
@@ -324,7 +431,11 @@ mod tests {
         // fwupdmgr check-reboot-needed --json: 0 = reboot needed, NOTHING_TO_DO otherwise.
         assert!(parse_reboot_needed_output("", 0));
         assert!(parse_reboot_needed_output("{}", 0));
+        assert!(parse_reboot_needed_output("{broken json", 0));
+        assert!(!parse_reboot_needed_output("No reboot is necessary", 0));
+        assert!(!parse_reboot_needed_output("Nothing to do", 0));
         assert!(!parse_reboot_needed_output("", 2));
+        assert!(!parse_reboot_needed_output("{broken json", 2));
         assert!(!parse_reboot_needed_output("No reboot is necessary", 2));
         assert!(parse_reboot_needed_output(
             "An update requires a reboot to complete",
@@ -338,10 +449,29 @@ mod tests {
         assert_eq!(h.status, Some(PackageStatus::Completed));
         assert_eq!(h.progress, Some(1.0));
         assert_eq!(h.phase_label.as_deref(), Some("Firmware installed"));
+
+        // Preserves 1.0 even if trailing percentage appears.
+        let h2 = parse_progress_line("Successfully installed firmware 50%");
+        assert_eq!(h2.progress, Some(1.0));
     }
 
     #[test]
     fn firmware_phase_lines_keep_work_progress() {
+        let dl = parse_progress_line("Downloading…: 100.0%");
+        assert_eq!(dl.status, Some(PackageStatus::Downloading));
+        assert_eq!(dl.phase_label.as_deref(), Some("Downloading firmware"));
+        assert_eq!(dl.progress, Some(1.0));
+
+        let decomp = parse_progress_line("Decompressing…: 50.0%");
+        assert_eq!(decomp.status, None);
+        assert_eq!(decomp.phase_label.as_deref(), Some("Decompressing firmware"));
+        assert_eq!(decomp.progress, Some(0.5));
+
+        let writing = parse_progress_line("Writing… Percentage=60");
+        assert_eq!(writing.status, Some(PackageStatus::Installing));
+        assert_eq!(writing.phase_label.as_deref(), Some("Installing firmware"));
+        assert_eq!(writing.progress, Some(0.6));
+
         let verifying = parse_progress_line("Verifying…: 1.0%");
         assert_eq!(verifying.phase_label.as_deref(), Some("Verifying firmware"));
         assert_eq!(verifying.progress, Some(0.01));
@@ -357,13 +487,27 @@ mod tests {
 
         let pct_field = parse_progress_line("Downloading… Percentage=45");
         assert_eq!(pct_field.progress, Some(0.45));
+
+        let bad_pct = parse_progress_line("Downloading… Percentage=150");
+        assert_eq!(bad_pct.progress, None);
     }
 
     #[test]
-    fn inventory_listing_is_not_progress() {
-        let h = parse_progress_line("Devices with no available firmware updates:");
-        assert_eq!(h, ProgressHint::default());
-        let h = parse_progress_line(" • System Firmware");
-        assert_eq!(h, ProgressHint::default());
+    fn inventory_listing_and_errors_are_not_progress() {
+        for line in [
+            "Devices with no available firmware updates:",
+            " • System Firmware",
+            " * UEFI dbx",
+            " - TPM 2.0",
+            "Cannot update firmware while on battery power (battery level 18% < 25%)",
+            "Error: failed to contact fwupd",
+            "Failed to write firmware image 10%",
+        ] {
+            assert_eq!(
+                parse_progress_line(line),
+                ProgressHint::default(),
+                "line `{line}` must not emit progress"
+            );
+        }
     }
 }
