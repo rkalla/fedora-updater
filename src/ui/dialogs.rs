@@ -1,21 +1,16 @@
-//! Secondary windows and dialogs (About, Full Log, Release Upgrade, and alerts).
+//! Secondary dialogs (About, Release Upgrade, and alerts).
 
 use std::time::Duration;
 
 use gtk::glib;
 use gtk::glib::object::IsA;
 use gtk::prelude::*;
-use gtk::{Builder, Button, Label, TextView};
+use gtk::Label;
 use libadwaita::prelude::*;
-use libadwaita::Window as AdwWindow;
 
 use fedora_updater::presenter::{
     stale_update_dialog, stop_update_dialog, DialogCopy, ABOUT_COMMENTS, ABOUT_NAME,
 };
-
-use super::obj;
-
-const LOG_WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/log_window.ui"));
 
 pub(super) fn present_about(parent: &impl IsA<gtk::Widget>) {
     let dialog = libadwaita::AboutDialog::new();
@@ -23,48 +18,6 @@ pub(super) fn present_about(parent: &impl IsA<gtk::Widget>) {
     dialog.set_version(env!("CARGO_PKG_VERSION"));
     dialog.set_comments(ABOUT_COMMENTS);
     dialog.present(Some(parent));
-}
-
-#[cfg_attr(not(test), allow(dead_code))] // Removed with log_window.blp in #31.
-pub(super) fn build_log_window(log: &str) -> (AdwWindow, TextView, Button) {
-    let builder = Builder::from_string(LOG_WINDOW_UI);
-    let win: AdwWindow = obj(&builder, "log_window");
-    let view: TextView = obj(&builder, "log_view");
-    let copy_btn: Button = obj(&builder, "copy_btn");
-
-    view.buffer().set_text(log);
-    view.set_can_focus(true);
-
-    let log_owned = log.to_string();
-    copy_btn.connect_clicked(move |_| {
-        if let Some(display) = gtk::gdk::Display::default() {
-            display.clipboard().set_text(&log_owned);
-        }
-    });
-    {
-        let esc_win = win.clone();
-        let key = gtk::EventControllerKey::new();
-        key.connect_key_pressed(move |_, keyval, _, _| {
-            if keyval == gtk::gdk::Key::Escape {
-                esc_win.close();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        });
-        win.add_controller(key);
-    }
-
-    (win, view, copy_btn)
-}
-
-#[allow(dead_code)] // Removed with log_window.blp in #31.
-pub(super) fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
-    let (win, _, _) = build_log_window(log);
-    if let Some(parent_win) = parent.root().and_downcast::<gtk::Window>() {
-        win.set_transient_for(Some(&parent_win));
-    }
-    win.present();
 }
 
 pub(super) fn build_upgrade_dialog(version: u32) -> (libadwaita::Dialog, Vec<gtk::Box>) {
@@ -213,21 +166,4 @@ pub(super) fn prompt_stop_during_transaction(
     on_confirm: impl Fn() + 'static,
 ) {
     present_confirm(parent, stop_update_dialog(), on_confirm);
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn log_template_has_text_view() {
-        let xml = super::LOG_WINDOW_UI;
-        let ids = super::super::builder_ids_in_source(include_str!("dialogs.rs"));
-        assert!(!ids.is_empty());
-        for id in ids {
-            assert!(
-                xml.contains(&format!("id=\"{id}\"")),
-                "log_window.ui missing id={id}"
-            );
-        }
-        assert!(xml.contains("GtkTextView"));
-    }
 }

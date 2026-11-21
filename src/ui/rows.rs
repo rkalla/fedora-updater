@@ -1,4 +1,4 @@
-//! Adwaita expander row helpers (retained for the `Running` completed drawer until #31).
+//! Adwaita expander row helpers backing `run_completed` (`Adw.ExpanderRow`).
 
 use gtk::prelude::*;
 use gtk::{Align, Label};

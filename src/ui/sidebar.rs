@@ -5,12 +5,14 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
-use fedora_updater::model::{count_by_source, DetailView};
-use fedora_updater::presenter::{check_progress, run_heading};
+use fedora_updater::model::{count_by_source, DetailView, PackageStatus, UpdateSource};
+use fedora_updater::presenter::{
+    about_time_left, check_progress, format_elapsed, run_heading, QuietUi,
+};
 use fedora_updater::release_upgrade::{
     banner_title, os_release_version, release_age_caption, upgrade_button_name,
 };
-use fedora_updater::state::{AppState, Phase};
+use fedora_updater::state::{AppState, Phase, RunningState};
 use fedora_updater::IdleScreen;
 
 use super::charts::ThroughputSparkline;
@@ -46,6 +48,69 @@ pub struct SidebarPulse {
     pub detail: String,
     pub timestamp: Option<String>,
     pub spinning: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRunStatus {
+    Skipped,
+    Queued,
+    Active,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePipelineItem {
+    pub label: &'static str,
+    pub status: SourceRunStatus,
+    pub badge: String,
+}
+
+fn build_pipeline_item<F: Fn(UpdateSource) -> bool>(
+    running: &RunningState,
+    label: &'static str,
+    matches_group: F,
+) -> SourcePipelineItem {
+    let mut total = 0usize;
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    let mut has_live = false;
+    for pkg in running.packages.iter().filter(|p| matches_group(p.source)) {
+        total += 1;
+        match pkg.status {
+            PackageStatus::Completed => done += 1,
+            PackageStatus::Failed => failed += 1,
+            PackageStatus::Downloading | PackageStatus::Installing => has_live = true,
+            PackageStatus::Pending => {}
+        }
+    }
+    let is_current = running.current_source.is_some_and(matches_group);
+    let (status, badge) = if total == 0 {
+        (SourceRunStatus::Skipped, "—".to_string())
+    } else if failed > 0 && done + failed == total {
+        (SourceRunStatus::Failed, format!("{failed} failed"))
+    } else if done == total {
+        (SourceRunStatus::Done, format!("{done}/{total} ✓"))
+    } else if is_current || has_live {
+        (SourceRunStatus::Active, format!("{done}/{total}"))
+    } else {
+        (SourceRunStatus::Queued, "Queued".to_string())
+    };
+    SourcePipelineItem {
+        label,
+        status,
+        badge,
+    }
+}
+
+pub fn running_source_checklist(running: &RunningState) -> [SourcePipelineItem; 3] {
+    [
+        build_pipeline_item(running, "System · DNF", |s| s == UpdateSource::Dnf),
+        build_pipeline_item(running, "Apps · Flatpak", |s| {
+            matches!(s, UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem)
+        }),
+        build_pipeline_item(running, "Firmware · LVFS", |s| s == UpdateSource::Firmware),
+    ]
 }
 
 /// Extract a compact host label from `/etc/os-release` contents (for example
@@ -428,6 +493,10 @@ pub struct Sidebar {
     count_system: gtk::Label,
     count_apps: gtk::Label,
     count_firmware: gtk::Label,
+    nav_context_stack: gtk::Stack,
+    pipeline_rows: [(gtk::Box, gtk::Label); 3],
+    telemetry_elapsed: gtk::Label,
+    telemetry_eta: gtk::Label,
     views_list: gtk::ListBox,
     view_updates_row: gtk::ListBoxRow,
     #[allow(dead_code)] // Kept for Phase 2 (#35) Update History reveal and tests.
@@ -555,6 +624,69 @@ impl Sidebar {
         sources_section.append(&sources_label);
         sources_section.append(&sources_list);
 
+        // Running Pipeline Telemetry (Execution Queue + Elapsed/ETA card).
+        let pipeline_heading = section_heading("Execution Queue");
+        let pipeline_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let pipe_sys = pipeline_row("System · DNF", "src-dnf");
+        let pipe_apps = pipeline_row("Apps · Flatpak", "src-flatpak");
+        let pipe_fw = pipeline_row("Firmware · LVFS", "src-firmware");
+        pipeline_list.append(&pipe_sys.0);
+        pipeline_list.append(&pipe_apps.0);
+        pipeline_list.append(&pipe_fw.0);
+
+        let telemetry_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        telemetry_card.add_css_class("card");
+        let telemetry_inner = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        telemetry_inner.set_margin_top(14);
+        telemetry_inner.set_margin_bottom(14);
+        telemetry_inner.set_margin_start(16);
+        telemetry_inner.set_margin_end(16);
+
+        let elapsed_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let elapsed_title = gtk::Label::builder()
+            .label("Elapsed")
+            .xalign(0.0)
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .css_classes(["caption", "dimmed"])
+            .build();
+        let telemetry_elapsed = gtk::Label::builder()
+            .label("0s")
+            .xalign(1.0)
+            .halign(gtk::Align::End)
+            .css_classes(["caption", "numeric", "heading"])
+            .build();
+        elapsed_row.append(&elapsed_title);
+        elapsed_row.append(&telemetry_elapsed);
+
+        let telemetry_eta = gtk::Label::builder()
+            .label("")
+            .xalign(0.0)
+            .halign(gtk::Align::Start)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .visible(false)
+            .css_classes(["caption", "dimmed"])
+            .build();
+
+        telemetry_inner.append(&elapsed_row);
+        telemetry_inner.append(&telemetry_eta);
+        telemetry_card.append(&telemetry_inner);
+
+        let pipeline_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        pipeline_section.append(&pipeline_heading);
+        pipeline_section.append(&pipeline_list);
+        pipeline_section.append(&telemetry_card);
+
+        let nav_context_stack = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .transition_duration(150)
+            .vhomogeneous(false)
+            .build();
+        nav_context_stack.add_named(&sources_section, Some("sources"));
+        nav_context_stack.add_named(&pipeline_section, Some("pipeline"));
+        nav_context_stack.set_visible_child_name("sources");
+
         // Views navigation list (Updates, Activity Log; Update History hidden in Phase 1).
         let views_label = section_heading("Views");
         let views_list = gtk::ListBox::builder()
@@ -591,7 +723,7 @@ impl Sidebar {
         body.set_margin_end(10);
         body.append(&pulse_card);
         body.append(&sparkline_card);
-        body.append(&sources_section);
+        body.append(&nav_context_stack);
         body.append(&views_section);
 
         let scroll = gtk::ScrolledWindow::builder()
@@ -638,6 +770,10 @@ impl Sidebar {
             count_system,
             count_apps,
             count_firmware,
+            nav_context_stack,
+            pipeline_rows: [pipe_sys, pipe_apps, pipe_fw],
+            telemetry_elapsed,
+            telemetry_eta,
             views_list,
             view_updates_row,
             view_history_row,
@@ -744,6 +880,53 @@ impl Sidebar {
         self.count_system.set_text(&dnf.to_string());
         self.count_apps.set_text(&flatpak.to_string());
         self.count_firmware.set_text(&firmware.to_string());
+
+        if let Phase::Running(running) = &state.phase {
+            self.nav_context_stack.set_visible_child_name("pipeline");
+            let items = running_source_checklist(running);
+            for ((row_box, pill), item) in self.pipeline_rows.iter().zip(items.iter()) {
+                row_box.remove_css_class("active");
+                for cls in ["pipeline-pill-active", "pipeline-pill-done", "pipeline-pill-error"] {
+                    pill.remove_css_class(cls);
+                }
+                pill.set_text(&item.badge);
+                match item.status {
+                    SourceRunStatus::Active => {
+                        row_box.add_css_class("active");
+                        pill.add_css_class("pipeline-pill-active");
+                    }
+                    SourceRunStatus::Done => pill.add_css_class("pipeline-pill-done"),
+                    SourceRunStatus::Failed => pill.add_css_class("pipeline-pill-error"),
+                    SourceRunStatus::Skipped | SourceRunStatus::Queued => {}
+                }
+            }
+        } else {
+            self.nav_context_stack.set_visible_child_name("sources");
+        }
+    }
+
+    pub fn paint_running_telemetry(
+        &self,
+        elapsed_secs: u64,
+        quiet: &QuietUi,
+        overall_progress: f64,
+    ) {
+        self.telemetry_elapsed
+            .set_text(&format_elapsed(elapsed_secs));
+        let eta_text = if let Some(note) = quiet.footnote.as_deref() {
+            Some(note.to_string())
+        } else if quiet.show_eta {
+            about_time_left(elapsed_secs, overall_progress)
+        } else {
+            None
+        };
+        if let Some(eta) = eta_text.as_deref().filter(|s| !s.is_empty()) {
+            self.telemetry_eta.set_text(eta);
+            self.telemetry_eta.set_visible(true);
+        } else {
+            self.telemetry_eta.set_text("");
+            self.telemetry_eta.set_visible(false);
+        }
     }
 
     pub fn paint_upgrade(&self, version: Option<u32>, days: Option<u32>, visible: bool) {
@@ -778,6 +961,34 @@ impl Sidebar {
     }
 
     #[cfg(test)]
+    pub fn nav_context_name(&self) -> Option<String> {
+        self.nav_context_stack
+            .visible_child_name()
+            .map(|s| s.to_string())
+    }
+
+    #[cfg(test)]
+    pub fn pipeline_status_texts(&self) -> [String; 3] {
+        [
+            self.pipeline_rows[0].1.text().to_string(),
+            self.pipeline_rows[1].1.text().to_string(),
+            self.pipeline_rows[2].1.text().to_string(),
+        ]
+    }
+
+    #[cfg(test)]
+    pub fn telemetry_elapsed_text(&self) -> String {
+        self.telemetry_elapsed.text().to_string()
+    }
+
+    #[cfg(test)]
+    pub fn telemetry_eta_text(&self) -> Option<String> {
+        self.telemetry_eta
+            .get_visible()
+            .then(|| self.telemetry_eta.text().to_string())
+    }
+
+    #[cfg(test)]
     pub fn pulse_headline_text(&self) -> String {
         self.pulse_headline.text().to_string()
     }
@@ -803,6 +1014,43 @@ impl Sidebar {
             .selected_row()
             .map(|r| r.widget_name().to_string())
     }
+}
+
+fn pipeline_row(label: &str, dot_class: &str) -> (gtk::Box, gtk::Label) {
+    let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row_box.set_margin_top(5);
+    row_box.set_margin_bottom(5);
+    row_box.set_margin_start(8);
+    row_box.set_margin_end(8);
+    row_box.add_css_class("pipeline-row");
+
+    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    dot.set_size_request(8, 8);
+    dot.set_valign(gtk::Align::Center);
+    dot.set_halign(gtk::Align::Center);
+    dot.set_margin_start(4);
+    dot.set_margin_end(4);
+    dot.add_css_class("source-dot");
+    dot.add_css_class(dot_class);
+
+    let title = gtk::Label::builder()
+        .label(label)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+
+    let pill = gtk::Label::builder()
+        .label("Queued")
+        .valign(gtk::Align::Center)
+        .css_classes(["sidebar-count-pill", "caption", "numeric"])
+        .build();
+
+    row_box.append(&dot);
+    row_box.append(&title);
+    row_box.append(&pill);
+    (row_box, pill)
 }
 
 fn section_heading(title: &str) -> gtk::Label {
@@ -1058,5 +1306,43 @@ mod tests {
         let p = pulse_summary(&checking, "Fedora Linux 44");
         assert!(p.spinning);
         assert_eq!(p.detail, "1 of 3 sources · 1 found");
+    }
+
+    #[test]
+    fn running_source_checklist_reports_active_done_queued_failed_and_skipped() {
+        let mut d1 = Package::new_dnf("openssl", "x86_64", "1", "updates");
+        d1.status = PackageStatus::Completed;
+        let mut d2 = Package::new_dnf("kernel", "x86_64", "2", "updates");
+        d2.status = PackageStatus::Installing;
+
+        let mut fp = Package::new_dnf("Thunderbird", "", "128", "flathub");
+        fp.source = UpdateSource::FlatpakUser;
+        fp.status = PackageStatus::Pending;
+
+        let mut running = RunningState::new(vec![d1.clone(), d2, fp.clone()]);
+        running.current_source = Some(UpdateSource::Dnf);
+        let items = running_source_checklist(&running);
+        assert_eq!(items[0].status, SourceRunStatus::Active);
+        assert_eq!(items[0].badge, "1/2");
+        assert_eq!(items[1].status, SourceRunStatus::Queued);
+        assert_eq!(items[1].badge, "Queued");
+        assert_eq!(items[2].status, SourceRunStatus::Skipped);
+        assert_eq!(items[2].badge, "—");
+
+        let mut fw_fail = Package::new_dnf("UEFI dbx", "", "2", "LVFS");
+        fw_fail.source = UpdateSource::Firmware;
+        fw_fail.status = PackageStatus::Failed;
+
+        let mut fp_active = fp;
+        fp_active.status = PackageStatus::Installing;
+        let mut running2 = RunningState::new(vec![d1, fp_active, fw_fail]);
+        running2.current_source = Some(UpdateSource::FlatpakUser);
+        let items2 = running_source_checklist(&running2);
+        assert_eq!(items2[0].status, SourceRunStatus::Done);
+        assert_eq!(items2[0].badge, "1/1 ✓");
+        assert_eq!(items2[1].status, SourceRunStatus::Active);
+        assert_eq!(items2[1].badge, "0/1");
+        assert_eq!(items2[2].status, SourceRunStatus::Failed);
+        assert_eq!(items2[2].badge, "1 failed");
     }
 }

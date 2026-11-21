@@ -1,8 +1,9 @@
 //! Pure UI presentation helpers and view-model copy (no GTK).
 
+use crate::backend::dnf::package_implies_reboot;
 use crate::model::{
     count_by_source, format_bytes, total_download_bytes, AuthPurpose, IdleScreen, Package,
-    RetryAction, RunPass, UpdateSource,
+    PackageStatus, RetryAction, RunPass, UpdateSource,
 };
 
 pub const ABOUT_NAME: &str = "Fedora Updater";
@@ -440,6 +441,123 @@ pub fn stop_update_dialog() -> DialogCopy {
         confirm_suggested: false,
         default_id: "wait",
     }
+}
+
+/// Four-stage pipeline breadcrumb rendered on Observatory's `Running` telemetry deck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PipelineStage {
+    Download = 0,
+    Prepare = 1,
+    Install = 2,
+    Verify = 3,
+}
+
+impl PipelineStage {
+    pub const ALL: [Self; 4] = [Self::Download, Self::Prepare, Self::Install, Self::Verify];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Download => "Download",
+            Self::Prepare => "Prepare",
+            Self::Install => "Install",
+            Self::Verify => "Verify",
+        }
+    }
+
+    pub fn done_label(self) -> &'static str {
+        match self {
+            Self::Download => "Download ✓",
+            Self::Prepare => "Prepare ✓",
+            Self::Install => "Install ✓",
+            Self::Verify => "Verify ✓",
+        }
+    }
+}
+
+/// Maps backend `phase_label` + [`RunPass`] onto the 4-stage pipeline breadcrumb.
+pub fn pipeline_stage(phase_label: &str, pass: RunPass) -> PipelineStage {
+    let label = phase_label.to_ascii_lowercase();
+    if label.contains("verif")
+        || label.contains("cleanup")
+        || label.contains("complete")
+        || label.contains("installed")
+        || label.contains("restarting")
+    {
+        PipelineStage::Verify
+    } else if label.contains("prepar")
+        || label.contains("decompress")
+        || label.contains("running transaction")
+        || label.contains("waiting")
+    {
+        PipelineStage::Prepare
+    } else if pass == RunPass::Apply
+        || label.contains("install")
+        || label.contains("upgrad")
+        || label.contains("eras")
+        || label.contains("remov")
+        || label.contains("updating flatpak")
+    {
+        PipelineStage::Install
+    } else {
+        PipelineStage::Download
+    }
+}
+
+/// Formats an elapsed duration in seconds cleanly (`42s`, `3m 05s`).
+pub fn format_elapsed(secs: u64) -> String {
+    let mins = secs / 60;
+    let rem = secs % 60;
+    if mins == 0 {
+        format!("{rem}s")
+    } else {
+        format!("{mins}m {rem:02}s")
+    }
+}
+
+/// Returns deduplicated non-failed package names responsible for a reboot recommendation.
+pub fn reboot_trigger_names(packages: &[Package]) -> Vec<String> {
+    let mut names = Vec::new();
+    for pkg in packages {
+        if pkg.status != PackageStatus::Failed
+            && pkg.source == UpdateSource::Dnf
+            && package_implies_reboot(&pkg.name)
+            && !names.contains(&pkg.name)
+        {
+            names.push(pkg.name.clone());
+        }
+    }
+    if names.is_empty() {
+        for pkg in packages {
+            if pkg.status != PackageStatus::Failed
+                && pkg.source == UpdateSource::Firmware
+                && !names.contains(&pkg.name)
+            {
+                names.push(pkg.name.clone());
+            }
+        }
+    }
+    names
+}
+
+/// Human-readable description for the `Done` Restart Recommended card.
+pub fn reboot_trigger_summary(packages: &[Package]) -> String {
+    let names = reboot_trigger_names(packages);
+    match names.as_slice() {
+        [] => "Restart to finish applying system updates.".to_string(),
+        [a] => format!("{a} requires a restart to take effect."),
+        [a, b] => format!("{a} and {b} require a restart to take effect."),
+        [a, b, c] => format!("{a}, {b}, and {c} require a restart to take effect."),
+        [a, b, c, rest @ ..] => format!(
+            "{a}, {b}, {c}, and {} more require a restart to take effect.",
+            rest.len()
+        ),
+    }
+}
+
+/// Concise summary body for the clean `Done` closure card.
+pub fn done_clean_summary(upgraded: usize, duration: &str) -> String {
+    let noun = if upgraded == 1 { "update" } else { "updates" };
+    format!("{upgraded} {noun} installed in {duration}. No restart needed.")
 }
 
 #[cfg(test)]
@@ -1114,5 +1232,175 @@ mod tests {
         assert_eq!(fail_retry_label(RetryAction::CheckAgain), "Check Again");
         assert_eq!(fail_retry_label(RetryAction::RetryApply), "Retry Update");
         assert_eq!(fail_retry_label(RetryAction::Reboot), "Restart");
+    }
+
+    #[test]
+    fn pipeline_stage_maps_download_prepare_install_verify() {
+        assert_eq!(
+            PipelineStage::ALL.map(|s| s.label()),
+            ["Download", "Prepare", "Install", "Verify"]
+        );
+        assert_eq!(
+            PipelineStage::ALL.map(|s| s.done_label()),
+            ["Download ✓", "Prepare ✓", "Install ✓", "Verify ✓"]
+        );
+
+        assert_eq!(
+            pipeline_stage("Downloading packages", RunPass::Download),
+            PipelineStage::Download
+        );
+        assert_eq!(
+            pipeline_stage("Downloading Flatpak", RunPass::Download),
+            PipelineStage::Download
+        );
+        assert_eq!(
+            pipeline_stage("Downloading firmware", RunPass::Download),
+            PipelineStage::Download
+        );
+        assert_eq!(
+            pipeline_stage("Starting…", RunPass::Download),
+            PipelineStage::Download
+        );
+
+        assert_eq!(
+            pipeline_stage("Running transaction", RunPass::Download),
+            PipelineStage::Prepare
+        );
+        assert_eq!(
+            pipeline_stage("Prepare transaction", RunPass::Apply),
+            PipelineStage::Prepare
+        );
+        assert_eq!(
+            pipeline_stage("Decompressing firmware", RunPass::Download),
+            PipelineStage::Prepare
+        );
+        assert_eq!(
+            pipeline_stage("Waiting", RunPass::Apply),
+            PipelineStage::Prepare
+        );
+
+        assert_eq!(
+            pipeline_stage("Installing", RunPass::Apply),
+            PipelineStage::Install
+        );
+        assert_eq!(
+            pipeline_stage("Installing firmware", RunPass::Download),
+            PipelineStage::Install
+        );
+        assert_eq!(
+            pipeline_stage("Updating Flatpak", RunPass::Download),
+            PipelineStage::Install
+        );
+        assert_eq!(
+            pipeline_stage("", RunPass::Apply),
+            PipelineStage::Install
+        );
+
+        assert_eq!(
+            pipeline_stage("Verifying", RunPass::Apply),
+            PipelineStage::Verify
+        );
+        assert_eq!(
+            pipeline_stage("Verifying firmware", RunPass::Apply),
+            PipelineStage::Verify
+        );
+        assert_eq!(
+            pipeline_stage("Cleanup", RunPass::Apply),
+            PipelineStage::Verify
+        );
+        assert_eq!(
+            pipeline_stage("Complete", RunPass::Apply),
+            PipelineStage::Verify
+        );
+        assert_eq!(
+            pipeline_stage("Firmware installed", RunPass::Apply),
+            PipelineStage::Verify
+        );
+        assert_eq!(
+            pipeline_stage("Restarting device", RunPass::Apply),
+            PipelineStage::Verify
+        );
+    }
+
+    #[test]
+    fn format_elapsed_and_done_clean_summary_format_cleanly() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(42), "42s");
+        assert_eq!(format_elapsed(60), "1m 00s");
+        assert_eq!(format_elapsed(185), "3m 05s");
+
+        assert_eq!(
+            done_clean_summary(1, "12s"),
+            "1 update installed in 12s. No restart needed."
+        );
+        assert_eq!(
+            done_clean_summary(6, "4m 18s"),
+            "6 updates installed in 4m 18s. No restart needed."
+        );
+    }
+
+    #[test]
+    fn reboot_trigger_names_and_summary_handle_kernel_dedup_failures_and_firmware() {
+        let mut openssl = Package::new_dnf("openssl", "x86_64", "3.2.2", "updates");
+        openssl.status = PackageStatus::Completed;
+        assert_eq!(
+            reboot_trigger_summary(&[openssl.clone()]),
+            "Restart to finish applying system updates."
+        );
+
+        let mut kernel = Package::new_dnf("kernel", "x86_64", "6.14.11", "updates");
+        kernel.status = PackageStatus::Completed;
+        let mut kernel_dup = kernel.clone();
+        kernel_dup.arch = "noarch".into();
+        kernel_dup.id = "dnf:kernel.noarch:6.14.11".into();
+        let mut kernel_core = Package::new_dnf("kernel-core", "x86_64", "6.14.11", "updates");
+        kernel_core.status = PackageStatus::Completed;
+        let mut systemd = Package::new_dnf("systemd", "x86_64", "257", "updates");
+        systemd.status = PackageStatus::Completed;
+        let mut glibc = Package::new_dnf("glibc", "i686", "2.41", "updates");
+        glibc.status = PackageStatus::Completed;
+        let mut mesa = Package::new_dnf("mesa-dri-drivers", "x86_64", "25.0", "updates");
+        mesa.status = PackageStatus::Completed;
+        let mut fw = Package::new_dnf("UEFI dbx", "", "20241101", "fwupd");
+        fw.source = UpdateSource::Firmware;
+        fw.status = PackageStatus::Completed;
+
+        // 1 trigger (with duplicate arch filtered).
+        assert_eq!(
+            reboot_trigger_summary(&[kernel.clone(), kernel_dup, openssl.clone()]),
+            "kernel requires a restart to take effect."
+        );
+        // 2 triggers.
+        assert_eq!(
+            reboot_trigger_summary(&[kernel.clone(), systemd.clone()]),
+            "kernel and systemd require a restart to take effect."
+        );
+        // 3 triggers.
+        assert_eq!(
+            reboot_trigger_summary(&[kernel.clone(), kernel_core.clone(), systemd.clone()]),
+            "kernel, kernel-core, and systemd require a restart to take effect."
+        );
+        // 5 triggers -> capped at 3 + "and 2 more".
+        let mut dbus = Package::new_dnf("dbus", "x86_64", "1.16", "updates");
+        dbus.status = PackageStatus::Completed;
+        assert_eq!(
+            reboot_trigger_summary(&[kernel.clone(), kernel_core, systemd, glibc, dbus]),
+            "kernel, kernel-core, systemd, and 2 more require a restart to take effect."
+        );
+
+        // Failed DNF trigger is ignored, falling back cleanly to completed Firmware trigger.
+        let mut failed_kernel = kernel;
+        failed_kernel.status = PackageStatus::Failed;
+        assert_eq!(
+            reboot_trigger_summary(&[failed_kernel.clone(), fw]),
+            "UEFI dbx requires a restart to take effect."
+        );
+        let mut failed_fw = Package::new_dnf("UEFI dbx", "", "20241101", "fwupd");
+        failed_fw.source = UpdateSource::Firmware;
+        failed_fw.status = PackageStatus::Failed;
+        assert_eq!(
+            reboot_trigger_summary(&[failed_kernel, failed_fw, mesa]),
+            "Restart to finish applying system updates."
+        );
     }
 }

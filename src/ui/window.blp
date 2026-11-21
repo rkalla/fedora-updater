@@ -112,12 +112,21 @@ Adw.ApplicationWindow window {
             }
           }
 
-          content: Gtk.Stack detail_view_stack {
-            transition-type: crossfade;
-            hexpand: true;
-            vexpand: true;
-            hhomogeneous: true;
-            vhomogeneous: true;
+          content: Adw.BottomSheet console_sheet {
+            open: false;
+            can-open: false;
+            can-close: true;
+            reveal-bottom-bar: false;
+            show-drag-handle: true;
+            full-width: true;
+            modal: false;
+
+            content: Gtk.Stack detail_view_stack {
+              transition-type: crossfade;
+              hexpand: true;
+              vexpand: true;
+              hhomogeneous: true;
+              vhomogeneous: true;
 
             Gtk.StackPage {
               name: "updates";
@@ -518,28 +527,63 @@ Adw.ApplicationWindow window {
 
                           child: Gtk.Box {
                             orientation: vertical;
-                            spacing: 6;
-                            styles ["progress-block"]
-
-                            Gtk.ProgressBar run_progress {
-                              fraction: 0.0;
-                              hexpand: true;
-                            }
+                            styles ["card"]
 
                             Gtk.Box {
-                              orientation: horizontal;
+                              orientation: vertical;
                               spacing: 8;
+                              margin-top: 14;
+                              margin-bottom: 14;
+                              margin-start: 16;
+                              margin-end: 16;
+
+                              Gtk.Box {
+                                orientation: horizontal;
+                                spacing: 8;
+
+                                Adw.WrapBox {
+                                  hexpand: true;
+                                  child-spacing: 6;
+                                  line-spacing: 6;
+
+                                  Gtk.Label stage_download {
+                                    label: "Download";
+                                    styles ["stage-crumb"]
+                                  }
+
+                                  Gtk.Label stage_prepare {
+                                    label: "Prepare";
+                                    styles ["stage-crumb"]
+                                  }
+
+                                  Gtk.Label stage_install {
+                                    label: "Install";
+                                    styles ["stage-crumb"]
+                                  }
+
+                                  Gtk.Label stage_verify {
+                                    label: "Verify";
+                                    styles ["stage-crumb"]
+                                  }
+                                }
+
+                                Gtk.Label run_progress_pct {
+                                  label: "0%";
+                                  valign: center;
+                                  styles ["heading", "numeric"]
+                                }
+                              }
+
+                              Gtk.ProgressBar run_progress {
+                                fraction: 0.0;
+                                hexpand: true;
+                              }
 
                               Gtk.Label run_progress_meta {
                                 label: "Starting…";
                                 halign: start;
-                                hexpand: true;
+                                xalign: 0;
                                 ellipsize: end;
-                                styles ["dimmed", "caption"]
-                              }
-
-                              Gtk.Label run_progress_pct {
-                                label: "0%";
                                 styles ["dimmed", "caption", "numeric"]
                               }
                             }
@@ -548,6 +592,7 @@ Adw.ApplicationWindow window {
 
                         Adw.Banner run_stall {
                           revealed: false;
+                          button-label: "View Log";
                         }
 
                         Adw.Clamp {
@@ -565,7 +610,7 @@ Adw.ApplicationWindow window {
 
                             Gtk.Box {
                               orientation: horizontal;
-                              spacing: 12;
+                              spacing: 14;
                               margin-top: 16;
                               margin-bottom: 16;
                               margin-start: 18;
@@ -575,31 +620,31 @@ Adw.ApplicationWindow window {
                                 valign: center;
                               }
 
-                              Gtk.Label now_playing_badge {
-                                visible: false;
-                                valign: center;
-                                halign: center;
-                              }
-
-                              Adw.Spinner now_playing_spinner {
-                                width-request: 18;
-                                height-request: 18;
-                                valign: center;
-                                halign: center;
-                              }
-
                               Gtk.Box {
                                 orientation: vertical;
-                                spacing: 2;
+                                spacing: 3;
                                 hexpand: true;
                                 valign: center;
 
-                                Gtk.Label now_playing_title {
-                                  label: "Starting…";
-                                  halign: start;
-                                  ellipsize: end;
-                                  xalign: 0;
-                                  styles ["heading"]
+                                Gtk.Box {
+                                  orientation: horizontal;
+                                  spacing: 8;
+                                  valign: center;
+
+                                  Gtk.Label now_playing_badge {
+                                    visible: false;
+                                    valign: center;
+                                    halign: center;
+                                  }
+
+                                  Gtk.Label now_playing_title {
+                                    label: "Starting…";
+                                    halign: start;
+                                    hexpand: true;
+                                    ellipsize: end;
+                                    xalign: 0;
+                                    styles ["heading"]
+                                  }
                                 }
 
                                 Gtk.Label now_playing_subtitle {
@@ -615,14 +660,38 @@ Adw.ApplicationWindow window {
                                 label: "";
                                 valign: center;
                                 visible: false;
-                                styles ["dimmed", "caption"]
+                                styles ["dimmed", "caption", "numeric"]
                               }
 
-                              Gtk.Label now_playing_pct {
-                                label: "";
+                              Gtk.Stack now_playing_status_stack {
+                                width-request: 22;
+                                height-request: 22;
                                 valign: center;
-                                width-chars: 4;
-                                styles ["numeric", "caption", "dimmed"]
+                                halign: center;
+                                transition-type: crossfade;
+                                transition-duration: 150;
+                                hhomogeneous: true;
+                                vhomogeneous: true;
+
+                                Gtk.StackPage {
+                                  name: "spinner";
+                                  child: Adw.Spinner now_playing_spinner {
+                                    width-request: 18;
+                                    height-request: 18;
+                                    valign: center;
+                                    halign: center;
+                                  };
+                                }
+
+                                Gtk.StackPage {
+                                  name: "status";
+                                  child: Gtk.Image now_playing_status_icon {
+                                    icon-name: "software-update-available-symbolic";
+                                    pixel-size: 16;
+                                    valign: center;
+                                    halign: center;
+                                  };
+                                }
                               }
                             }
                           };
@@ -636,26 +705,31 @@ Adw.ApplicationWindow window {
                           propagate-natural-height: false;
                           styles ["list-scroll"]
 
-                          child: Adw.ClampScrollable run_list_clamp {
-                            maximum-size: 704;
+                          child: Adw.Clamp {
+                            maximum-size: 680;
                             tightening-threshold: 500;
-                          };
-                        }
+                            hexpand: true;
+                            margin-start: 12;
+                            margin-end: 12;
 
-                        Adw.Clamp {
-                          maximum-size: 680;
-                          tightening-threshold: 500;
-                          hexpand: true;
-                          margin-start: 12;
-                          margin-end: 12;
-                          margin-bottom: 8;
+                            child: Gtk.Box {
+                              orientation: vertical;
+                              spacing: 12;
+                              margin-top: 2;
+                              margin-bottom: 14;
 
-                          child: Adw.PreferencesGroup run_completed_group {
-                            Adw.ExpanderRow run_completed {
-                              title: "0 completed";
-                              expanded: false;
-                              enable-expansion: true;
-                            }
+                              Gtk.Box run_list_slot {
+                                orientation: vertical;
+                              }
+
+                              Adw.PreferencesGroup run_completed_group {
+                                Adw.ExpanderRow run_completed {
+                                  title: "0 completed";
+                                  expanded: false;
+                                  enable-expansion: true;
+                                }
+                              }
+                            };
                           };
                         }
                       };
@@ -676,15 +750,121 @@ Adw.ApplicationWindow window {
                         hexpand: true;
                         styles ["page-fill"]
 
-                        Adw.Banner reboot_banner {
-                          title: "Restart recommended to finish installing";
-                          button-label: "Restart Now";
-                          revealed: false;
-                        }
-
                         Adw.Banner done_problem_banner {
                           revealed: false;
                           button-label: "View Log";
+                        }
+
+                        Adw.Clamp done_summary_clamp {
+                          maximum-size: 680;
+                          tightening-threshold: 500;
+                          hexpand: true;
+                          margin-start: 12;
+                          margin-end: 12;
+                          margin-top: 12;
+                          visible: false;
+
+                          child: Gtk.Box {
+                            orientation: vertical;
+                            styles ["card", "done-summary-card"]
+
+                            Gtk.Box {
+                              orientation: horizontal;
+                              spacing: 12;
+                              margin-top: 14;
+                              margin-bottom: 14;
+                              margin-start: 18;
+                              margin-end: 18;
+
+                              Gtk.Image {
+                                icon-name: "object-select-symbolic";
+                                pixel-size: 20;
+                                valign: center;
+                                styles ["success"]
+                              }
+
+                              Gtk.Box {
+                                orientation: vertical;
+                                spacing: 2;
+                                hexpand: true;
+                                valign: center;
+
+                                Gtk.Label {
+                                  label: "All updates applied";
+                                  halign: start;
+                                  xalign: 0;
+                                  styles ["heading"]
+                                }
+
+                                Gtk.Label done_summary_detail {
+                                  label: "";
+                                  halign: start;
+                                  xalign: 0;
+                                  wrap: true;
+                                  styles ["dimmed", "caption", "numeric"]
+                                }
+                              }
+                            }
+                          };
+                        }
+
+                        Adw.Clamp done_reboot_clamp {
+                          maximum-size: 680;
+                          tightening-threshold: 500;
+                          hexpand: true;
+                          margin-start: 12;
+                          margin-end: 12;
+                          margin-top: 12;
+                          visible: false;
+
+                          child: Gtk.Box {
+                            orientation: vertical;
+                            styles ["card", "reboot-card"]
+
+                            Gtk.Box {
+                              orientation: horizontal;
+                              spacing: 12;
+                              margin-top: 14;
+                              margin-bottom: 14;
+                              margin-start: 18;
+                              margin-end: 18;
+
+                              Gtk.Image {
+                                icon-name: "system-reboot-symbolic";
+                                pixel-size: 20;
+                                valign: center;
+                                styles ["warning"]
+                              }
+
+                              Gtk.Box {
+                                orientation: vertical;
+                                spacing: 2;
+                                hexpand: true;
+                                valign: center;
+
+                                Gtk.Label done_reboot_title {
+                                  label: "Restart Recommended";
+                                  halign: start;
+                                  xalign: 0;
+                                  styles ["heading"]
+                                }
+
+                                Gtk.Label done_reboot_detail {
+                                  label: "";
+                                  halign: start;
+                                  xalign: 0;
+                                  wrap: true;
+                                  styles ["dimmed", "caption"]
+                                }
+                              }
+
+                              Gtk.Button done_reboot_btn {
+                                label: "Restart Now";
+                                valign: center;
+                                styles ["suggested-action"]
+                              }
+                            }
+                          };
                         }
 
                         Adw.Clamp done_installed_header_clamp {
@@ -806,42 +986,16 @@ Adw.ApplicationWindow window {
                 vexpand: true;
               };
             }
-          };
+            };
 
-          [bottom]
-          Gtk.Box console_drawer {
-            orientation: vertical;
-            visible: false;
-
-            Gtk.Revealer console_reveal {
-              transition-type: slide_up;
-              reveal-child: false;
-
-              child: Gtk.ScrolledWindow {
-                max-content-height: 160;
-                propagate-natural-height: true;
-
-                child: Gtk.TextView console_full {
-                  editable: false;
-                  cursor-visible: false;
-                  monospace: true;
-                  wrap-mode: word_char;
-                  left-margin: 12;
-                  right-margin: 12;
-                  top-margin: 8;
-                  bottom-margin: 8;
-                  styles ["caption"]
-                };
-              };
-            }
-
-            Gtk.Box {
+            bottom-bar: Gtk.Box {
               orientation: vertical;
               styles ["console-bar"]
 
               Gtk.Button console_toggle {
                 styles ["flat"]
                 hexpand: true;
+                tooltip-text: "Toggle live output console";
 
                 child: Gtk.Box {
                   orientation: horizontal;
@@ -858,10 +1012,75 @@ Adw.ApplicationWindow window {
                     ellipsize: end;
                     styles ["monospace", "caption", "dimmed"]
                   }
+
+                  Gtk.Label {
+                    label: "Console";
+                    valign: center;
+                    styles ["caption", "accent"]
+                  }
                 };
               }
-            }
-          }
+            };
+
+            sheet: Gtk.Box {
+              orientation: vertical;
+              height-request: 220;
+              styles ["console-sheet"]
+
+              Gtk.Box {
+                orientation: horizontal;
+                spacing: 8;
+                margin-top: 8;
+                margin-bottom: 8;
+                margin-start: 14;
+                margin-end: 10;
+                styles ["inspector-header"]
+
+                Gtk.Label {
+                  label: "Live Output";
+                  hexpand: true;
+                  halign: start;
+                  xalign: 0;
+                  styles ["heading"]
+                }
+
+                Gtk.Button console_copy_btn {
+                  label: "Copy";
+                  styles ["flat"]
+                  valign: center;
+                }
+
+                Gtk.Button console_close_btn {
+                  icon-name: "window-close-symbolic";
+                  styles ["flat"]
+                  valign: center;
+                  tooltip-text: "Close console (Esc)";
+                }
+              }
+
+              Gtk.ScrolledWindow {
+                vexpand: true;
+                hexpand: true;
+                min-content-height: 160;
+                max-content-height: 280;
+                propagate-natural-height: false;
+                hscrollbar-policy: never;
+                vscrollbar-policy: automatic;
+
+                child: Gtk.TextView console_full {
+                  editable: false;
+                  cursor-visible: false;
+                  monospace: true;
+                  wrap-mode: word_char;
+                  left-margin: 14;
+                  right-margin: 14;
+                  top-margin: 10;
+                  bottom-margin: 12;
+                  styles ["activity-log-view", "caption"]
+                };
+              }
+            };
+          };
         };
       };
     };

@@ -8,19 +8,19 @@ use std::time::{Duration, Instant, SystemTime};
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
-use gtk::{Builder, Button, Label, ProgressBar, Revealer, Stack, TextView, ToggleButton};
+use gtk::{Builder, Button, Label, ProgressBar, Stack, TextView, ToggleButton};
 use libadwaita::prelude::*;
 use libadwaita::{
-    Application, ApplicationWindow, Banner, Breakpoint, ExpanderRow, NavigationSplitView,
-    PreferencesGroup, Spinner, StatusPage, StyleManager, Toast, ToastOverlay, ToolbarStyle,
-    ToolbarView, WindowTitle,
+    Application, ApplicationWindow, Banner, BottomSheet, Breakpoint, ExpanderRow,
+    NavigationSplitView, PreferencesGroup, StatusPage, StyleManager, Toast, ToastOverlay,
+    ToolbarStyle, ToolbarView, WindowTitle,
 };
 
 use fedora_updater::backend::dnf;
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
-    count_by_source, AuthPurpose, DetailView, IdleScreen, Package, RetryAction, RunPass,
-    UpdateSource,
+    count_by_source, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus, RetryAction,
+    RunPass, UpdateSource,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
@@ -28,16 +28,16 @@ use fedora_updater::orchestrator::{
 };
 use fedora_updater::presenter::{
     about_time_left, activity_log_subtitle, cache_activity_note, check_progress, checking_footnote,
-    done_header_subtitle, fail_retry_label, idle_chrome, now_playing_subtitle, now_playing_title,
-    quiet_ui, ready_banner_title, run_heading, running_progress_captions, source_summary_line,
-    window_header, HeaderView, QuietInput, AUTH_DESCRIPTION,
+    done_clean_summary, done_header_subtitle, fail_retry_label, idle_chrome,
+    now_playing_subtitle, now_playing_title, pipeline_stage, quiet_ui, ready_banner_title,
+    reboot_trigger_summary, run_heading, running_progress_captions, source_summary_line,
+    window_header, HeaderView, PipelineStage, QuietInput, AUTH_DESCRIPTION,
 };
 use fedora_updater::privilege::{
     dnf_daemon_is_running, kill_recorded_helper, kill_recorded_local_command,
 };
 use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RunningState};
 
-use super::prefs::{DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH};
 use super::{activity_log, charts, dialogs, inspector, obj, prefs, preview, queue_list, rows, sidebar};
 
 const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
@@ -109,6 +109,10 @@ struct Widgets {
     #[cfg_attr(not(test), allow(dead_code))] // Kept hidden until Phase 2 (#35) enables ApplyMode menu.
     ready_split_update: libadwaita::SplitButton,
     run_stop: Button,
+    stage_download: Label,
+    stage_prepare: Label,
+    stage_install: Label,
+    stage_verify: Label,
     run_stall: Banner,
     run_progress: ProgressBar,
     run_progress_meta: Label,
@@ -118,9 +122,10 @@ struct Widgets {
     now_playing_title: Label,
     now_playing_subtitle: Label,
     now_playing_size: Label,
-    now_playing_pct: Label,
-    now_playing_spinner: Spinner,
+    now_playing_status_stack: Stack,
+    now_playing_status_icon: gtk::Image,
     run_list_scroll: gtk::ScrolledWindow,
+    run_list_slot: gtk::Box,
     run_queue: queue_list::QueueList,
     run_completed_group: PreferencesGroup,
     run_completed: ExpanderRow,
@@ -128,15 +133,20 @@ struct Widgets {
     run_completed_keys: RefCell<Vec<String>>,
     run_completed_user_open: Cell<bool>,
     ignore_expand: Cell<bool>,
-    console_drawer: gtk::Box,
+    console_sheet: BottomSheet,
     console_toggle: Button,
-    console_reveal: Revealer,
     console_chevron: gtk::Image,
     console_line: Label,
     console_full: TextView,
+    console_copy_btn: Button,
+    console_close_btn: Button,
     done_btn: Button,
     done_retry_btn: Button,
-    reboot_banner: Banner,
+    done_summary_clamp: libadwaita::Clamp,
+    done_summary_detail: Label,
+    done_reboot_clamp: libadwaita::Clamp,
+    done_reboot_detail: Label,
+    done_reboot_btn: Button,
     done_problem_banner: Banner,
     done_installed_header_clamp: libadwaita::Clamp,
     done_installed_heading: Label,
@@ -176,8 +186,9 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
     ready_list_clamp.set_child(Some(ready_queue.list_view()));
 
     let run_queue = queue_list::QueueList::new(queue_list::QueueRowMode::Running);
-    let run_list_clamp: libadwaita::ClampScrollable = obj(builder, "run_list_clamp");
-    run_list_clamp.set_child(Some(run_queue.list_view()));
+    run_queue.list_view().add_css_class("inline");
+    let run_list_slot: gtk::Box = obj(builder, "run_list_slot");
+    run_list_slot.append(run_queue.list_view());
 
     let done_queue = queue_list::QueueList::new(queue_list::QueueRowMode::Finished);
     let done_list_clamp: libadwaita::ClampScrollable = obj(builder, "done_list_clamp");
@@ -204,11 +215,15 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
     let back_to_updates_btn: Button = obj(builder, "back_to_updates_btn");
     let header_refresh: Button = obj(builder, "header_refresh");
     let header_menu: gtk::MenuButton = obj(builder, "header_menu");
+    let console_toggle: Button = obj(builder, "console_toggle");
+    let console_close_btn: Button = obj(builder, "console_close_btn");
     set_accessible_label(&sidebar_toggle, "Toggle Sidebar");
     set_accessible_label(&sidebar_close_btn, "Return to Updates");
     set_accessible_label(&back_to_updates_btn, "Back to Updates");
     set_accessible_label(&header_refresh, "Refresh");
     set_accessible_label(&header_menu, "Main Menu");
+    set_accessible_label(&console_toggle, "Toggle Live Console");
+    set_accessible_label(&console_close_btn, "Close Live Console");
 
     bind_style_manager(&window);
 
@@ -274,6 +289,10 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         ready_update: obj(builder, "ready_update"),
         ready_split_update: obj(builder, "ready_split_update"),
         run_stop: obj(builder, "run_stop"),
+        stage_download: obj(builder, "stage_download"),
+        stage_prepare: obj(builder, "stage_prepare"),
+        stage_install: obj(builder, "stage_install"),
+        stage_verify: obj(builder, "stage_verify"),
         run_stall: obj(builder, "run_stall"),
         run_progress: obj(builder, "run_progress"),
         run_progress_meta: obj(builder, "run_progress_meta"),
@@ -283,9 +302,10 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         now_playing_title: obj(builder, "now_playing_title"),
         now_playing_subtitle: obj(builder, "now_playing_subtitle"),
         now_playing_size: obj(builder, "now_playing_size"),
-        now_playing_pct: obj(builder, "now_playing_pct"),
-        now_playing_spinner: obj(builder, "now_playing_spinner"),
+        now_playing_status_stack: obj(builder, "now_playing_status_stack"),
+        now_playing_status_icon: obj(builder, "now_playing_status_icon"),
         run_list_scroll: obj(builder, "run_list_scroll"),
+        run_list_slot,
         run_queue,
         run_completed_group: obj(builder, "run_completed_group"),
         run_completed: obj(builder, "run_completed"),
@@ -293,15 +313,20 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         run_completed_keys: RefCell::new(Vec::new()),
         run_completed_user_open: Cell::new(false),
         ignore_expand: Cell::new(false),
-        console_drawer: obj(builder, "console_drawer"),
-        console_toggle: obj(builder, "console_toggle"),
-        console_reveal: obj(builder, "console_reveal"),
+        console_sheet: obj(builder, "console_sheet"),
+        console_toggle,
         console_chevron: obj(builder, "console_chevron"),
         console_line: obj(builder, "console_line"),
         console_full: obj(builder, "console_full"),
+        console_copy_btn: obj(builder, "console_copy_btn"),
+        console_close_btn,
         done_btn: obj(builder, "done_btn"),
         done_retry_btn: obj(builder, "done_retry_btn"),
-        reboot_banner: obj(builder, "reboot_banner"),
+        done_summary_clamp: obj(builder, "done_summary_clamp"),
+        done_summary_detail: obj(builder, "done_summary_detail"),
+        done_reboot_clamp: obj(builder, "done_reboot_clamp"),
+        done_reboot_detail: obj(builder, "done_reboot_detail"),
+        done_reboot_btn: obj(builder, "done_reboot_btn"),
         done_problem_banner: obj(builder, "done_problem_banner"),
         done_installed_header_clamp: obj(builder, "done_installed_header_clamp"),
         done_installed_heading: obj(builder, "done_installed_heading"),
@@ -457,8 +482,27 @@ impl Widgets {
     }
 }
 
+fn apply_preview_config(cfg: &preview::PreviewConfig, w: &Widgets) {
+    w.sidebar_open.set(cfg.sidebar_open);
+    w.detail_view.set(cfg.detail_view);
+    w.sidebar.select_view(cfg.detail_view);
+    if cfg.expand_completed {
+        w.ignore_expand.set(true);
+        w.run_completed_user_open.set(true);
+        w.run_completed.set_enable_expansion(true);
+        w.run_completed.set_expanded(true);
+        w.ignore_expand.set(false);
+    }
+}
+
 pub fn build(app: &Application) {
-    let state = Rc::new(RefCell::new(preview::initial_state().unwrap_or_default()));
+    let preview_cfg = preview::initial_config();
+    let is_preview = preview_cfg.is_some();
+    let initial_state = preview_cfg
+        .as_ref()
+        .map(|cfg| cfg.state.clone())
+        .unwrap_or_default();
+    let state = Rc::new(RefCell::new(initial_state));
     let console = Rc::new(RefCell::new(preview::initial_console()));
 
     let provider = gtk::CssProvider::new();
@@ -480,6 +524,9 @@ pub fn build(app: &Application) {
     widgets.sidebar_open.set(loaded_prefs.sidebar_open);
     *widgets.prefs.borrow_mut() = loaded_prefs;
     widgets.persist_prefs.set(!prefs::is_persistence_disabled());
+    if let Some(cfg) = preview_cfg.as_ref() {
+        apply_preview_config(cfg, &widgets);
+    }
 
     let about = gio::SimpleAction::new("about", None);
     {
@@ -676,10 +723,16 @@ pub fn build(app: &Application) {
         });
     }
     {
+        let window = widgets.window.clone();
+        widgets.run_stall.connect_button_clicked(move |_| {
+            let _ = WidgetExt::activate_action(&window, "win.view-log", None);
+        });
+    }
+    {
         let tx = tx.clone();
         let widgets = widgets.clone();
-        let banner = widgets.reboot_banner.clone();
-        banner.connect_button_clicked(move |_| {
+        let reboot_btn = widgets.done_reboot_btn.clone();
+        reboot_btn.connect_clicked(move |_| {
             widgets.toast.add_toast(Toast::new("Rebooting…"));
             run_systemctl_reboot(tx.clone());
         });
@@ -736,7 +789,9 @@ pub fn build(app: &Application) {
 
     sync_shell_layout(&widgets);
     render(&state.borrow(), &console.borrow(), &widgets);
-    spawn_release_lookup(&state, &console, &widgets);
+    if !is_preview {
+        spawn_release_lookup(&state, &console, &widgets);
+    }
     {
         let hooked = widgets.clone();
         glib::idle_add_local_once(move || {
@@ -745,7 +800,6 @@ pub fn build(app: &Application) {
             }
         });
     }
-    maybe_open_preview_completed(&widgets);
     window.present();
     preview::maybe_schedule_screenshot(&window);
 }
@@ -963,6 +1017,10 @@ fn wire_shell_controls(widgets: &Rc<Widgets>) {
         let key = gtk::EventControllerKey::new();
         key.connect_key_pressed(move |_, keyval, _, _| {
             if keyval == gtk::gdk::Key::Escape {
+                if widgets.console_sheet.is_open() {
+                    widgets.console_sheet.set_open(false);
+                    return glib::Propagation::Stop;
+                }
                 if widgets.inspector_split.shows_sidebar() {
                     close_inspector(&widgets);
                     return glib::Propagation::Stop;
@@ -1318,9 +1376,13 @@ fn clear_console(console: &Rc<RefCell<ConsoleBuffer>>, widgets: &Widgets) {
 }
 
 fn sync_console_drawer(w: &Widgets, show: bool) {
-    w.console_drawer.set_visible(show);
-    if !show {
-        w.console_reveal.set_reveal_child(false);
+    if show {
+        w.console_sheet.set_can_open(true);
+        w.console_sheet.set_reveal_bottom_bar(true);
+    } else {
+        w.console_sheet.set_open(false);
+        w.console_sheet.set_can_open(false);
+        w.console_sheet.set_reveal_bottom_bar(false);
         w.console_chevron.set_icon_name(Some("pan-end-symbolic"));
     }
 }
@@ -1343,7 +1405,7 @@ fn record_console_output(
         (delta, buf.last_line().to_string())
     };
     widgets.console_line.set_text(&last_line);
-    if widgets.console_reveal.reveals_child() {
+    if widgets.console_sheet.is_open() {
         activity_log::apply_text_buffer_delta(&widgets.console_full.buffer(), delta, &last_line);
     }
     if widgets.detail_view.get() == DetailView::ActivityLog {
@@ -1367,23 +1429,50 @@ fn wire_expander(widgets: &Rc<Widgets>) {
 }
 
 fn wire_console(widgets: &Rc<Widgets>, console: &Rc<RefCell<ConsoleBuffer>>) {
-    let reveal = widgets.console_reveal.clone();
-    let chevron = widgets.console_chevron.clone();
-    let full = widgets.console_full.clone();
-    let console = console.clone();
-    widgets.console_toggle.connect_clicked(move |_| {
-        let open = !reveal.reveals_child();
-        if open {
-            let text = console.borrow().full_text();
-            full.buffer().set_text(&text);
-        }
-        reveal.set_reveal_child(open);
-        chevron.set_icon_name(Some(if open {
-            "pan-down-symbolic"
-        } else {
-            "pan-end-symbolic"
-        }));
-    });
+    {
+        let sheet = widgets.console_sheet.clone();
+        widgets.console_toggle.connect_clicked(move |_| {
+            sheet.set_open(!sheet.is_open());
+        });
+    }
+    {
+        let sheet = widgets.console_sheet.clone();
+        widgets.console_close_btn.connect_clicked(move |_| {
+            sheet.set_open(false);
+        });
+    }
+    {
+        let full = widgets.console_full.clone();
+        widgets.console_copy_btn.connect_clicked(move |btn| {
+            let buf = full.buffer();
+            let text = buf.text(&buf.start_iter(), &buf.end_iter(), false);
+            if let Some(display) = gtk::gdk::Display::default() {
+                display.clipboard().set_text(&text);
+            }
+            btn.set_label("Copied");
+            let btn = btn.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1600), move || {
+                btn.set_label("Copy");
+            });
+        });
+    }
+    {
+        let chevron = widgets.console_chevron.clone();
+        let full = widgets.console_full.clone();
+        let console = console.clone();
+        widgets.console_sheet.connect_open_notify(move |sheet| {
+            let open = sheet.is_open();
+            if open {
+                let text = console.borrow().full_text();
+                full.buffer().set_text(&text);
+            }
+            chevron.set_icon_name(Some(if open {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }));
+        });
+    }
 }
 
 fn paint_header(w: &Widgets, view: HeaderView<'_>) {
@@ -1445,33 +1534,8 @@ fn current_package<'a>(
         .find(|package| package.name == name && !package.status.is_done())
 }
 
-fn maybe_open_preview_completed(w: &Widgets) {
-    if std::env::var("FEDORA_UPDATER_PREVIEW").as_deref() != Ok("running-expanded") {
-        return;
-    }
-    w.ignore_expand.set(true);
-    w.run_completed_user_open.set(true);
-    w.run_completed.set_enable_expansion(true);
-    w.run_completed.set_expanded(true);
-    w.ignore_expand.set(false);
-}
-
 fn finished_row(package: &Package) -> libadwaita::ActionRow {
     rows::finished_row(package, true)
-}
-
-fn restore_default_window_size(window: &ApplicationWindow) {
-    if window.is_maximized() || window.is_fullscreen() {
-        return;
-    }
-    let width = window.width();
-    let height = window.height();
-    if height > DEFAULT_WINDOW_HEIGHT + 24 {
-        window.set_default_size(
-            if width > 0 { width } else { DEFAULT_WINDOW_WIDTH },
-            DEFAULT_WINDOW_HEIGHT,
-        );
-    }
 }
 
 fn clear_running_lists(w: &Widgets) {
@@ -1479,6 +1543,7 @@ fn clear_running_lists(w: &Widgets) {
         return;
     }
     w.run_queue.sync(&[], None, None);
+    w.run_list_slot.set_visible(true);
     w.run_list_scroll.set_visible(true);
     w.ignore_expand.set(true);
     rows::refill_expander(&w.run_completed, &w.run_completed_rows, std::iter::empty());
@@ -1507,7 +1572,67 @@ fn console_preview_line(last_line: &str) -> &str {
     }
 }
 
-/// Footnote, spinner, and stall banner for a quiet run. Does not rebuild the list.
+fn paint_stage_breadcrumbs(w: &Widgets, active: PipelineStage) {
+    let crumbs = [
+        (&w.stage_download, PipelineStage::Download),
+        (&w.stage_prepare, PipelineStage::Prepare),
+        (&w.stage_install, PipelineStage::Install),
+        (&w.stage_verify, PipelineStage::Verify),
+    ];
+    for (label, stage) in crumbs {
+        label.remove_css_class("done");
+        label.remove_css_class("active");
+        if stage < active {
+            label.add_css_class("done");
+            label.set_text(stage.done_label());
+        } else if stage == active {
+            label.add_css_class("active");
+            label.set_text(stage.label());
+        } else {
+            label.set_text(stage.label());
+        }
+    }
+}
+
+fn paint_now_playing_status(
+    w: &Widgets,
+    show_spinner: bool,
+    running: &RunningState,
+    playing: Option<&Package>,
+) {
+    for cls in ["accent", "success", "error"] {
+        w.now_playing_status_icon.remove_css_class(cls);
+    }
+    let active_failed = running
+        .active_index
+        .and_then(|i| running.packages.get(i))
+        .is_some_and(|p| p.status == PackageStatus::Failed);
+    if active_failed || playing.is_some_and(|p| p.status == PackageStatus::Failed) {
+        w.now_playing_status_icon
+            .set_icon_name(Some("dialog-error-symbolic"));
+        w.now_playing_status_icon.add_css_class("error");
+        w.now_playing_status_stack.set_visible_child_name("status");
+    } else if show_spinner || running.work_progress.is_none() {
+        w.now_playing_status_stack.set_visible_child_name("spinner");
+    } else if running.work_progress.is_some_and(|frac| frac >= 0.999) {
+        w.now_playing_status_icon
+            .set_icon_name(Some("emblem-ok-symbolic"));
+        w.now_playing_status_icon.add_css_class("success");
+        w.now_playing_status_stack.set_visible_child_name("status");
+    } else if running.pass == RunPass::Download {
+        w.now_playing_status_icon
+            .set_icon_name(Some("folder-download-symbolic"));
+        w.now_playing_status_icon.add_css_class("accent");
+        w.now_playing_status_stack.set_visible_child_name("status");
+    } else {
+        w.now_playing_status_icon
+            .set_icon_name(Some("software-update-available-symbolic"));
+        w.now_playing_status_icon.add_css_class("accent");
+        w.now_playing_status_stack.set_visible_child_name("status");
+    }
+}
+
+/// Footnote, spinner, sidebar telemetry, and stall banner for a quiet run.
 fn paint_quiet_chrome(running: &RunningState, caption: &str, elapsed: u64, w: &Widgets) {
     let secs = quiet_secs(w);
     let watching_dnf = running.current_source == Some(UpdateSource::Dnf);
@@ -1569,11 +1694,14 @@ fn paint_quiet_chrome_with(
         );
     }
 
-    if quiet.show_spinner || running.work_progress.is_none() {
-        w.now_playing_spinner.set_opacity(1.0);
-    } else {
-        w.now_playing_spinner.set_opacity(0.0);
-    }
+    let playing = current_package(
+        &running.packages,
+        running.active_index,
+        running.current_name.as_deref(),
+    );
+    paint_now_playing_status(w, quiet.show_spinner, running, playing);
+    w.sidebar
+        .paint_running_telemetry(elapsed, &quiet, running.overall_progress);
 
     if let Some(text) = quiet.banner.as_deref() {
         w.run_stall.set_title(text);
@@ -1624,6 +1752,7 @@ fn render_running(running: &RunningState, elapsed: u64, last_console: &str, w: &
     w.window_title
         .set_title(run_heading(&running.phase_label, running.pass));
     w.console_line.set_text(console_preview_line(last_console));
+    paint_stage_breadcrumbs(w, pipeline_stage(&running.phase_label, running.pass));
     let (done, total) = running.done_and_total();
     let (caption, meta) =
         running_progress_captions(running.current_source, done, total, running.pass);
@@ -1657,14 +1786,6 @@ fn render_running(running: &RunningState, elapsed: u64, last_console: &str, w: &
         w.now_playing_size.set_visible(false);
     }
     w.progress_ring.set_progress(running.work_progress, false);
-    if let Some(frac) = running.work_progress {
-        let frac = frac.clamp(0.0, 1.0);
-        w.now_playing_spinner.set_opacity(0.0);
-        w.now_playing_pct.set_text(&format!("{:.0}%", frac * 100.0));
-    } else {
-        w.now_playing_spinner.set_opacity(1.0);
-        w.now_playing_pct.set_text("");
-    }
 
     let remaining: Vec<Package> = packages
         .iter()
@@ -1677,14 +1798,14 @@ fn render_running(running: &RunningState, elapsed: u64, last_console: &str, w: &
         .filter(|cur| !cur.status.is_done())
         .map(|cur| cur.id.as_str());
     w.run_queue.sync(&remaining, active_id, running.work_progress);
-    w.run_list_scroll.set_visible(!remaining.is_empty());
+    w.run_list_slot.set_visible(!remaining.is_empty());
 
     let completed: Vec<&Package> = packages.iter().filter(|p| p.status.is_done()).collect();
     let completed_keys: Vec<String> = completed.iter().map(|p| p.id.clone()).collect();
     w.ignore_expand.set(true);
     let failed = completed
         .iter()
-        .filter(|p| p.status == fedora_updater::PackageStatus::Failed)
+        .filter(|p| p.status == PackageStatus::Failed)
         .count();
     w.run_completed.set_title(&if failed > 0 {
         format!("{} finished · {failed} failed", completed.len())
@@ -1713,6 +1834,8 @@ fn render_running(running: &RunningState, elapsed: u64, last_console: &str, w: &
     w.run_completed
         .set_expanded(w.run_completed_user_open.get() && has_completed);
     w.run_completed_group.set_visible(has_completed);
+    w.run_list_scroll
+        .set_visible(!remaining.is_empty() || has_completed);
     w.ignore_expand.set(false);
 
     sync_inspector_from_packages(w, packages, &w.run_queue);
@@ -1844,7 +1967,6 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
         Phase::Idle(screen) => {
             clear_running_lists(w);
             close_inspector(w);
-            restore_default_window_size(&w.window);
             w.stack
                 .set_visible_child_full("idle", gtk::StackTransitionType::None);
             let chrome = idle_chrome(screen);
@@ -1939,13 +2061,12 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             failure_reasons,
         } => {
             clear_running_lists(w);
-            restore_default_window_size(&w.window);
             w.stack
                 .set_visible_child_full("done", gtk::StackTransitionType::None);
             w.stack.queue_allocate();
             let upgraded = packages
                 .iter()
-                .filter(|p| p.status == fedora_updater::PackageStatus::Completed)
+                .filter(|p| p.status == PackageStatus::Completed)
                 .count();
             let (dnf, fp, fw) = count_by_source(packages);
             let subtitle = done_header_subtitle(*failed, upgraded, dnf, fp, fw, duration);
@@ -1956,30 +2077,39 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                     subtitle: &subtitle,
                 },
             );
-            if *failed > 0 && !failure_reasons.is_empty() {
-                w.done_problem_banner
-                    .set_title(&failure_reasons.join(" · "));
+            if *failed > 0 {
+                let msg = if failure_reasons.is_empty() {
+                    if *failed == 1 {
+                        "1 update failed".to_string()
+                    } else {
+                        format!("{failed} updates failed")
+                    }
+                } else {
+                    failure_reasons.join(" · ")
+                };
+                w.done_problem_banner.set_title(&msg);
                 w.done_problem_banner.set_revealed(true);
             } else {
                 w.done_problem_banner.set_revealed(false);
             }
+            w.done_summary_detail
+                .set_text(&done_clean_summary(upgraded, duration));
+            w.done_summary_clamp.set_visible(!*needs_reboot && *failed == 0);
+            w.done_reboot_detail
+                .set_text(&reboot_trigger_summary(packages));
+            w.done_reboot_clamp.set_visible(*needs_reboot);
+
             w.done_retry_btn.set_visible(*failed > 0);
+            w.done_reboot_btn.remove_css_class("suggested-action");
             w.done_retry_btn.remove_css_class("suggested-action");
             w.done_btn.remove_css_class("suggested-action");
             w.done_btn.remove_css_class("pill");
             if *needs_reboot {
-                w.reboot_banner
-                    .set_button_style(libadwaita::BannerButtonStyle::Suggested);
-                w.reboot_banner.set_revealed(true);
+                w.done_reboot_btn.add_css_class("suggested-action");
+            } else if *failed > 0 {
+                w.done_retry_btn.add_css_class("suggested-action");
             } else {
-                w.reboot_banner
-                    .set_button_style(libadwaita::BannerButtonStyle::Default);
-                w.reboot_banner.set_revealed(false);
-                if *failed > 0 {
-                    w.done_retry_btn.add_css_class("suggested-action");
-                } else {
-                    w.done_btn.add_css_class("suggested-action");
-                }
+                w.done_btn.add_css_class("suggested-action");
             }
             w.done_installed_heading
                 .set_text(if *failed > 0 { "Finished" } else { "Installed" });
@@ -1987,8 +2117,8 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 .set_visible(!packages.is_empty());
             let mut listed: Vec<Package> = packages.to_vec();
             listed.sort_by_key(|package| match package.status {
-                fedora_updater::PackageStatus::Failed => 0,
-                fedora_updater::PackageStatus::Completed => 1,
+                PackageStatus::Failed => 0,
+                PackageStatus::Completed => 1,
                 _ => 2,
             });
             w.done_queue.sync(&listed, None, None);
@@ -2002,7 +2132,6 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
         } => {
             clear_running_lists(w);
             close_inspector(w);
-            restore_default_window_size(&w.window);
             w.stack
                 .set_visible_child_full("failed", gtk::StackTransitionType::None);
             paint_header(w, HeaderView::Failed);
@@ -2137,14 +2266,14 @@ mod tests {
         let stall_at = xml.find("id=\"run_stall\"").expect("run_stall");
         let card_at = xml.find("id=\"current_package\"").expect("current_package");
         let scroll_at = xml.find("id=\"run_list_scroll\"").expect("run_list_scroll");
-        let list_at = xml.find("id=\"run_list_clamp\"").expect("run_list_clamp");
+        let list_at = xml.find("id=\"run_list_slot\"").expect("run_list_slot");
         let completed_at = xml.find("id=\"run_completed\"").expect("run_completed");
         assert!(
             stall_at < card_at
                 && card_at < scroll_at
                 && scroll_at < list_at
                 && list_at < completed_at,
-            "running page layout order: run_stall < current_package < run_list_scroll < run_list_clamp < run_completed"
+            "running page layout order: run_stall < current_package < run_list_scroll < run_list_slot < run_completed"
         );
 
         let scroll_block = object_block(xml, "run_list_scroll");
@@ -2152,21 +2281,45 @@ mod tests {
             scroll_block.contains("propagate-natural-height"),
             "run_list_scroll must not propagate the package list height to the window"
         );
-        assert!(scroll_block.contains("id=\"run_list_clamp\""));
+        assert!(scroll_block.contains("id=\"run_list_slot\""));
         assert!(
-            !scroll_block.contains("id=\"run_completed\""),
-            "completed expander must not live inside the remaining-work scroll"
+            scroll_block.contains("id=\"run_completed\""),
+            "completed expander must live inside run_list_scroll alongside remaining work"
         );
 
-        // Observatory 1.2 additions: detail_view_stack, OverlaySplitView Inspector, ClampScrollables, filter bar.
+        // Observatory 1.2 & 1.3 additions: BottomSheet console, status stack, stage breadcrumbs, Done closure cards.
         assert!(object_block(xml, "detail_view_stack").contains("activity-log"));
+        let sheet_block = object_block(xml, "console_sheet");
+        assert!(sheet_block.contains("AdwBottomSheet"));
+        assert!(sheet_block.contains("id=\"console_toggle\""));
+        assert!(sheet_block.contains("id=\"console_full\""));
+        assert!(!xml.contains("id=\"console_drawer\""));
+        assert!(!xml.contains("id=\"reboot_banner\""));
+
+        let status_stack = object_block(xml, "now_playing_status_stack");
+        assert!(status_stack.contains("AdwSpinner"));
+        assert!(status_stack.contains("id=\"now_playing_status_icon\""));
+        assert!(status_stack.contains("<property name=\"transition-type\">1</property>"));
+        assert!(status_stack.contains("<property name=\"transition-duration\">150</property>"));
+        assert!(status_stack.contains("<property name=\"width-request\">22</property>"));
+        assert!(status_stack.contains("<property name=\"height-request\">22</property>"));
+        for stage_id in [
+            "stage_download",
+            "stage_prepare",
+            "stage_install",
+            "stage_verify",
+        ] {
+            assert!(xml.contains(&format!("id=\"{stage_id}\"")));
+        }
+        assert!(xml.contains("id=\"done_summary_clamp\""));
+        assert!(xml.contains("id=\"done_reboot_clamp\""));
+
         let insp_block = object_block(xml, "inspector_split");
         assert!(insp_block.contains("AdwOverlaySplitView"));
         assert!(insp_block.contains("max-sidebar-width"));
         for clamp_id in [
             "check_list_clamp",
             "ready_list_clamp",
-            "run_list_clamp",
             "done_list_clamp",
         ] {
             assert!(object_block(xml, clamp_id).contains("AdwClampScrollable"));
@@ -2395,27 +2548,15 @@ mod tests {
         let mut single_labels = Vec::new();
         collect_descendants::<gtk::Label>(&single_row, &mut single_labels);
         assert_eq!(single_labels[0].label().as_str(), "sudo dnf --help");
-
-        // 4) Full Log window builder populates TextView without presenting.
-        let sample_log = "[dnf] Repositories loaded.\n[dnf] Complete!";
-        let (log_win, log_view, copy_btn) = dialogs::build_log_window(sample_log);
-        assert_eq!(log_win.title().as_deref(), Some("Full Log"));
-        let buf = log_view.buffer();
-        let actual_text = buf.text(&buf.start_iter(), &buf.end_iter(), true);
-        assert_eq!(actual_text.as_str(), sample_log);
-        assert!(!log_view.is_editable());
-        assert!(log_view.is_monospace());
-        assert_eq!(copy_btn.label().as_deref(), Some("Copy All"));
-        GtkWindowExt::destroy(&log_win);
     }
 
     fn verify_all_phases_narrow_and_recovery() {
         use fedora_updater::console::ConsoleBuffer;
         use fedora_updater::model::{
-            IdleScreen, Package, PackageStatus, RetryAction, RunPass, StageCount, Stopwatch,
-            UpdateSource,
+            AuthPurpose, IdleScreen, Package, PackageStatus, RetryAction, RunPass, StageCount,
+            Stopwatch, UpdateSource,
         };
-        use fedora_updater::state::{AppState, Phase, RunningState};
+        use fedora_updater::state::{reduce, AppState, Event, Phase, RunningState};
         use gtk::prelude::*;
         use libadwaita::prelude::*;
 
@@ -2423,7 +2564,7 @@ mod tests {
         super::wire_expander(&widgets);
         let console = ConsoleBuffer::new(100);
 
-        // 1) Idle::Fresh + Release Upgrade banner (with age, without age, cleared).
+        // 1) Idle::Fresh + default_widget + Release Upgrade banner (with age, without age, cleared).
         let fresh_with_upgrade = AppState {
             phase: Phase::Idle(IdleScreen::Fresh),
             release_upgrade: Some(45),
@@ -2438,9 +2579,18 @@ mod tests {
         assert!(widgets.idle_btn.has_css_class("pill"));
         assert!(!widgets.idle_log.get_visible());
         assert!(widgets.focus_idle_check.get());
+        assert_eq!(
+            widgets.window.default_widget().as_ref(),
+            Some(widgets.idle_btn.upcast_ref()),
+            "Fresh idle must arm default_widget on Check CTA"
+        );
         assert!(!widgets.header_refresh.get_visible());
         assert!(!widgets.run_stop.get_visible());
-        assert!(!widgets.console_drawer.get_visible());
+        assert!(!widgets.console_sheet.reveals_bottom_bar());
+        assert_eq!(
+            widgets.sidebar.nav_context_name().as_deref(),
+            Some("sources")
+        );
         assert!(widgets.sidebar.upgrade_card().root().get_visible());
         assert!(widgets
             .sidebar
@@ -2464,7 +2614,7 @@ mod tests {
         super::paint_release_upgrade(&widgets, None, None);
         assert!(!widgets.sidebar.upgrade_card().root().get_visible());
 
-        // 2) Idle::Warning vs Idle::Current + Failed(RetryApply) & Done partial recovery.
+        // 2) Idle::Warning vs Idle::Current (neither arms default_widget nor hides problems).
         let warning_state = AppState {
             phase: Phase::Idle(IdleScreen::Warning {
                 title: "Could not check all sources",
@@ -2483,8 +2633,10 @@ mod tests {
             Some("dialog-warning-symbolic")
         );
         assert_eq!(widgets.idle_btn.label().as_deref(), Some("Check Again"));
+        assert!(widgets.idle_btn.has_css_class("suggested-action"));
         assert!(widgets.idle_log.get_visible());
         assert!(!widgets.focus_idle_check.get());
+        assert!(widgets.window.default_widget().is_none());
 
         let current_state = AppState {
             phase: Phase::Idle(IdleScreen::Current {
@@ -2498,12 +2650,15 @@ mod tests {
         assert!(widgets.idle_btn.has_css_class("flat"));
         assert!(!widgets.idle_btn.has_css_class("suggested-action"));
         assert!(!widgets.idle_log.get_visible());
+        assert!(widgets.window.default_widget().is_none());
 
-        // 3) Authenticating (Check vs Apply) + Cancel affordance + Narrow breakpoint.
-        let auth_apply = AppState {
+        // 3) Authenticating (Apply with packages) -> CancelAuth returns cleanly to Ready.
+        let mut dnf_pkg = Package::new_dnf("firefox", "x86_64", "140.0-1.fc44", "updates");
+        dnf_pkg.size_bytes = Some(112_000_000);
+        let mut auth_apply = AppState {
             phase: Phase::Authenticating {
-                purpose: fedora_updater::model::AuthPurpose::Apply,
-                packages: vec![],
+                purpose: AuthPurpose::Apply,
+                packages: vec![dnf_pkg.clone()],
                 last_checked: None,
             },
             ..Default::default()
@@ -2519,17 +2674,19 @@ mod tests {
         assert!(widgets.auth_cancel.get_visible());
         assert_eq!(widgets.auth_cancel.label().as_deref(), Some("Cancel"));
 
+        reduce(&mut auth_apply, Event::CancelAuth).expect("CancelAuth returns to Ready");
+        assert!(matches!(auth_apply.phase, Phase::Ready { ref packages, .. } if packages.len() == 1));
+        super::render(&auth_apply, &console, &widgets);
+        assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("ready"));
+        assert_eq!(widgets.ready_queue.total_count(), 1);
+
         widgets.narrow.set(true);
         super::apply_header_subtitle(&widgets);
         assert_eq!(widgets.window_title.subtitle().as_str(), "");
         widgets.narrow.set(false);
         super::apply_header_subtitle(&widgets);
-        assert_eq!(
-            widgets.window_title.subtitle().as_str(),
-            "Applying updates"
-        );
 
-        // 4) Checking: progress bar, footnote, incoming package list visibility, console drawer.
+        // 4) Checking: progress bar, footnote, incoming package list visibility, BottomSheet bottom bar.
         let checking_empty = AppState {
             phase: Phase::Checking {
                 packages_so_far: vec![],
@@ -2543,10 +2700,9 @@ mod tests {
         assert!((widgets.check_progress.fraction() - 0.05).abs() < 1e-6);
         assert_eq!(widgets.check_progress_pct.label().as_str(), "5%");
         assert!(!widgets.check_list_scroll.get_visible());
-        assert!(widgets.console_drawer.get_visible());
+        assert!(widgets.console_sheet.reveals_bottom_bar());
+        assert!(widgets.console_sheet.can_open());
 
-        let mut dnf_pkg = Package::new_dnf("firefox", "x86_64", "140.0-1.fc44", "updates");
-        dnf_pkg.size_bytes = Some(112_000_000);
         let checking_populated = AppState {
             phase: Phase::Checking {
                 packages_so_far: vec![dnf_pkg.clone()],
@@ -2561,7 +2717,7 @@ mod tests {
         assert!(widgets.check_list_scroll.get_visible());
         assert_eq!(widgets.check_queue.total_count(), 1);
 
-        // 5) Ready: clean, soft error, pre-install Stop notice, and empty-list sensitivity guard.
+        // 5) Ready: clean, pre-install Stop via reducer, soft error, and empty-list sensitivity guard.
         let mut fp_pkg = Package::new_dnf("Steam", "", "1.0.0.82", "flathub");
         fp_pkg.source = UpdateSource::FlatpakSystem;
         fp_pkg.size_bytes = Some(251_000_000);
@@ -2576,23 +2732,26 @@ mod tests {
         super::render(&ready_clean, &console, &widgets);
         assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("ready"));
         assert!(widgets.header_refresh.get_visible());
+        assert!(!widgets.console_sheet.reveals_bottom_bar());
         assert!(!widgets.ready_banner.is_revealed());
         assert!(widgets.ready_update.get_sensitive());
         assert_eq!(widgets.ready_queue.total_count(), 2);
         assert_eq!(widgets.window_title.title().as_str(), "2 Updates Available");
         assert!(widgets.window_title.subtitle().contains("1 system · 1 apps"));
 
-        // Ready after pre-install Stop must surface explicit Stop banner (NOT "1 source could not be checked").
-        let ready_stopped = AppState {
-            phase: Phase::Ready {
-                packages: vec![dnf_pkg.clone()],
-                soft_errors: vec![
-                    "Stopped before install. Downloaded packages were not applied.".into(),
-                ],
-            },
+        // Pre-install Stop returns via reducer to Ready with exact Stop banner (NOT "1 source could not be checked").
+        let mut stop_download_state = AppState {
+            phase: Phase::Running(RunningState::new(vec![dnf_pkg.clone()])),
             ..Default::default()
         };
-        super::render(&ready_stopped, &console, &widgets);
+        reduce(
+            &mut stop_download_state,
+            Event::StopApply {
+                during_transaction: false,
+            },
+        )
+        .expect("pre-install Stop transitions to Ready");
+        super::render(&stop_download_state, &console, &widgets);
         assert!(widgets.ready_banner.is_revealed());
         assert_eq!(
             widgets.ready_banner.title().as_str(),
@@ -2619,7 +2778,7 @@ mod tests {
         );
         assert!(!widgets.ready_update.get_sensitive());
 
-        // 6) Running: Download pass -> Apply pass -> Expander user-open preservation -> Quiet & Stall modes.
+        // 6) Running: 4-stage breadcrumbs, ProgressRing, 22x22 Gtk.Stack, sidebar pipeline + telemetry, expander user-open, quiet & stall modes.
         let mut p_done = dnf_pkg.clone();
         p_done.status = PackageStatus::Completed;
         let mut p_dl = Package::new_dnf("kernel-core", "x86_64", "7.1.12", "updates");
@@ -2653,15 +2812,60 @@ mod tests {
         assert_eq!(widgets.run_stop.label().as_deref(), Some("Stop"));
         assert!(!widgets.run_stop.has_css_class("destructive-action"));
         assert_eq!(widgets.window_title.title().as_str(), "Downloading");
+        assert!(widgets.stage_download.has_css_class("active"));
+        assert!(!widgets.stage_prepare.has_css_class("active"));
         assert_eq!(widgets.now_playing_title.label().as_str(), "kernel-core");
-        assert_eq!(widgets.now_playing_pct.label().as_str(), "65%");
-        assert_eq!(widgets.now_playing_spinner.opacity(), 0.0);
+        assert_eq!(widgets.progress_ring.label_text(), "65%");
+        assert_eq!(
+            widgets.now_playing_status_stack.transition_type(),
+            gtk::StackTransitionType::Crossfade
+        );
+        assert_eq!(
+            widgets.now_playing_status_stack.transition_duration(),
+            150
+        );
+        assert_eq!(
+            widgets.now_playing_status_stack.visible_child_name().as_deref(),
+            Some("status")
+        );
         assert!(widgets.now_playing_size.get_visible());
         assert_eq!(widgets.now_playing_size.label().as_str(), "21 MB");
         assert_eq!(widgets.run_queue.total_count(), 2);
         assert!(!widgets.run_completed_group.get_visible());
+        assert_eq!(
+            widgets.sidebar.nav_context_name().as_deref(),
+            Some("pipeline")
+        );
+        assert_eq!(
+            widgets.sidebar.pipeline_status_texts(),
+            ["0/1".to_string(), "Queued".to_string(), "—".to_string()]
+        );
+        assert!(!widgets.sidebar.sparkline_card().get_visible());
 
-        // Switch to Apply pass with 1 completed row, expand run_completed, then add a 2nd completed row.
+        // Prepare stage breadcrumb transition.
+        let running_prepare = AppState {
+            phase: Phase::Running(RunningState {
+                packages: vec![p_dl.clone(), fp_pkg.clone()],
+                active_index: Some(0),
+                overall_progress: 0.5,
+                phase_label: "Running transaction".into(),
+                current_source: Some(UpdateSource::Dnf),
+                current_name: Some("kernel-core".into()),
+                work_progress: Some(0.9),
+                pass: RunPass::Download,
+                stage: None,
+                needs_reboot: false,
+                failed_sources: vec![],
+                failure_reasons: vec![],
+            }),
+            ..Default::default()
+        };
+        super::render(&running_prepare, &console, &widgets);
+        assert!(widgets.stage_download.has_css_class("done"));
+        assert_eq!(widgets.stage_download.label().as_str(), "Download ✓");
+        assert!(widgets.stage_prepare.has_css_class("active"));
+
+        // Switch to Apply pass with 1 completed row, expand run_completed, then advance to Verifying + add a 2nd completed row.
         let mut p_inst = p_dl.clone();
         p_inst.status = PackageStatus::Installing;
         let running_apply_1 = RunningState {
@@ -2686,6 +2890,10 @@ mod tests {
         assert_eq!(widgets.run_stop.label().as_deref(), Some("Stop…"));
         assert!(widgets.run_stop.has_css_class("destructive-action"));
         assert_eq!(widgets.window_title.title().as_str(), "Applying");
+        assert!(widgets.stage_download.has_css_class("done"));
+        assert!(widgets.stage_prepare.has_css_class("done"));
+        assert!(widgets.stage_install.has_css_class("active"));
+        assert!(!widgets.stage_verify.has_css_class("active"));
         assert!(widgets.run_completed_group.get_visible());
         assert_eq!(widgets.run_completed.title().as_str(), "1 completed");
         assert!(!widgets.run_completed.is_expanded());
@@ -2717,7 +2925,16 @@ mod tests {
         };
         super::render(&state_apply_2, &console, &widgets);
         assert_eq!(widgets.window_title.title().as_str(), "Verifying");
-        assert_eq!(widgets.now_playing_spinner.opacity(), 1.0);
+        assert!(widgets.stage_install.has_css_class("done"));
+        assert!(widgets.stage_verify.has_css_class("active"));
+        assert_eq!(
+            widgets.now_playing_status_stack.visible_child_name().as_deref(),
+            Some("spinner")
+        );
+        assert_eq!(
+            widgets.sidebar.pipeline_status_texts(),
+            ["2/2 ✓".to_string(), "0/1".to_string(), "—".to_string()]
+        );
         assert_eq!(widgets.run_completed.title().as_str(), "2 completed");
         assert!(
             widgets.run_completed.is_expanded(),
@@ -2725,7 +2942,7 @@ mod tests {
         );
         assert_eq!(widgets.run_completed_rows.borrow().len(), 2);
 
-        // Deterministic quiet & stall chrome checks without host DNF cache/proc coupling.
+        // Deterministic quiet telemetry: <15s ETA -> >=15s ETA suppressed -> 5s at_full_item -> 120s GNOME Software stall banner.
         super::paint_quiet_chrome_with(
             &running_apply_1,
             "System · 1 of 3 done",
@@ -2735,13 +2952,56 @@ mod tests {
             Some("Downloading kernel-core — 21 MB and rising"),
             false,
         );
-        assert_eq!(widgets.now_playing_spinner.opacity(), 1.0);
+        assert_eq!(
+            widgets.now_playing_status_stack.visible_child_name().as_deref(),
+            Some("spinner")
+        );
         assert!(!widgets.run_stall.is_revealed());
+        assert_eq!(widgets.sidebar.telemetry_elapsed_text(), "20s");
+        assert_eq!(
+            widgets.sidebar.telemetry_eta_text().as_deref(),
+            Some("Downloading kernel-core — 21 MB and rising")
+        );
         assert!(widgets
             .window_title
             .subtitle()
             .contains("Downloading kernel-core — 21 MB and rising"));
 
+        // 15s quiet hides unreliable ETA in both header and sidebar.
+        super::paint_quiet_chrome_with(
+            &running_apply_1,
+            "System · 1 of 3 done",
+            70,
+            15,
+            &widgets,
+            None,
+            false,
+        );
+        assert!(widgets.sidebar.telemetry_eta_text().is_none());
+        assert_eq!(widgets.sidebar.telemetry_elapsed_text(), "1m 10s");
+        assert_eq!(
+            widgets.now_playing_status_stack.visible_child_name().as_deref(),
+            Some("status")
+        );
+
+        // 5s with at_full_item switches fixed 22x22 stack to spinner without layout shift.
+        let mut full_running = running_apply_1.clone();
+        full_running.work_progress = Some(1.0);
+        super::paint_quiet_chrome_with(
+            &full_running,
+            "System · 1 of 3 done",
+            25,
+            5,
+            &widgets,
+            None,
+            false,
+        );
+        assert_eq!(
+            widgets.now_playing_status_stack.visible_child_name().as_deref(),
+            Some("spinner")
+        );
+
+        // 120s quiet + dnf5daemon-server running surfaces exact GNOME Software stall banner.
         super::paint_quiet_chrome_with(
             &running_apply_1,
             "System · 1 of 3 done",
@@ -2756,8 +3016,12 @@ mod tests {
             widgets.run_stall.title().as_str(),
             "No output for 3 minutes. Waiting on GNOME Software."
         );
+        assert_eq!(
+            widgets.sidebar.telemetry_eta_text().as_deref(),
+            Some("Waiting on dnf")
+        );
 
-        // 7) Done: clean (no reboot), clean (reboot), partial (Failed sorted before Completed).
+        // 7) Done: all 4 sub-cases + sole suggested-action invariant + Failed-first sort.
         let done_clean = AppState {
             phase: Phase::Done {
                 packages: vec![p_done.clone()],
@@ -2771,13 +3035,48 @@ mod tests {
         super::render(&done_clean, &console, &widgets);
         assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("done"));
         assert!(!widgets.run_stall.is_revealed());
-        assert!(!widgets.reboot_banner.is_revealed());
+        assert!(!widgets.console_sheet.reveals_bottom_bar());
+        assert_eq!(
+            widgets.sidebar.nav_context_name().as_deref(),
+            Some("sources")
+        );
+        assert!(widgets.done_summary_clamp.get_visible());
+        assert_eq!(
+            widgets.done_summary_detail.label().as_str(),
+            "1 update installed in 45s. No restart needed."
+        );
+        assert!(!widgets.done_reboot_clamp.get_visible());
         assert!(!widgets.done_problem_banner.is_revealed());
         assert!(!widgets.done_retry_btn.get_visible());
         assert!(widgets.done_btn.has_css_class("suggested-action"));
+        assert!(!widgets.done_reboot_btn.has_css_class("suggested-action"));
+        assert!(!widgets.done_retry_btn.has_css_class("suggested-action"));
         assert_eq!(widgets.done_installed_heading.label().as_str(), "Installed");
 
-        // Partial Done: Failed package listed BEFORE Completed package regardless of input order.
+        let mut kernel_done = Package::new_dnf("kernel", "x86_64", "7.1.12", "updates");
+        kernel_done.status = PackageStatus::Completed;
+        let done_reboot = AppState {
+            phase: Phase::Done {
+                packages: vec![kernel_done.clone(), p_done.clone()],
+                duration: "2m 10s".into(),
+                needs_reboot: true,
+                failed: 0,
+                failure_reasons: vec![],
+            },
+            ..Default::default()
+        };
+        super::render(&done_reboot, &console, &widgets);
+        assert!(!widgets.done_summary_clamp.get_visible());
+        assert!(widgets.done_reboot_clamp.get_visible());
+        assert_eq!(
+            widgets.done_reboot_detail.label().as_str(),
+            "kernel requires a restart to take effect."
+        );
+        assert!(widgets.done_reboot_btn.has_css_class("suggested-action"));
+        assert!(!widgets.done_btn.has_css_class("suggested-action"));
+        assert!(!widgets.done_retry_btn.has_css_class("suggested-action"));
+
+        // Partial Done (no reboot): Failed package listed BEFORE Completed package + sole suggested Check Again.
         let mut dnf_failed = Package::new_dnf("kernel", "x86_64", "7.1.12", "updates");
         dnf_failed.status = PackageStatus::Failed;
         let done_partial = AppState {
@@ -2792,6 +3091,8 @@ mod tests {
         };
         super::render(&done_partial, &console, &widgets);
         assert_eq!(widgets.done_installed_heading.label().as_str(), "Finished");
+        assert!(!widgets.done_summary_clamp.get_visible());
+        assert!(!widgets.done_reboot_clamp.get_visible());
         assert!(widgets.done_problem_banner.is_revealed());
         assert!(widgets
             .done_problem_banner
@@ -2800,6 +3101,7 @@ mod tests {
         assert!(widgets.done_retry_btn.get_visible());
         assert!(widgets.done_retry_btn.has_css_class("suggested-action"));
         assert!(!widgets.done_btn.has_css_class("suggested-action"));
+        assert!(!widgets.done_reboot_btn.has_css_class("suggested-action"));
         assert_eq!(
             widgets.done_queue.filtered_ids(),
             vec![dnf_failed.id.clone(), p_done.id.clone()]
@@ -2816,16 +3118,15 @@ mod tests {
             ..Default::default()
         };
         super::render(&done_partial_reboot, &console, &widgets);
-        assert!(widgets.reboot_banner.is_revealed());
-        assert_eq!(
-            widgets.reboot_banner.button_style(),
-            libadwaita::BannerButtonStyle::Suggested
-        );
+        assert!(!widgets.done_summary_clamp.get_visible());
+        assert!(widgets.done_reboot_clamp.get_visible());
+        assert!(widgets.done_problem_banner.is_revealed());
+        assert!(widgets.done_reboot_btn.has_css_class("suggested-action"));
         assert!(widgets.done_retry_btn.get_visible());
         assert!(!widgets.done_retry_btn.has_css_class("suggested-action"));
         assert!(!widgets.done_btn.has_css_class("suggested-action"));
 
-        // 8) Failed: RetryAction labels (CheckAgain / RetryApply / Reboot).
+        // 8) Failed: RetryAction labels (CheckAgain / RetryApply / Reboot) + retry_apply_packages resume.
         for (retry, expected_btn) in [
             (RetryAction::CheckAgain, "Check Again"),
             (RetryAction::RetryApply, "Retry Update"),
@@ -2836,6 +3137,11 @@ mod tests {
                     title: "Failure title".into(),
                     detail: "Failure detail".into(),
                     retry,
+                },
+                retry_apply_packages: if retry == RetryAction::RetryApply {
+                    vec![dnf_pkg.clone()]
+                } else {
+                    vec![]
                 },
                 ..Default::default()
             };
@@ -2849,6 +3155,34 @@ mod tests {
             assert_eq!(widgets.fail_retry.label().as_deref(), Some(expected_btn));
         }
 
+        let mut retry_flow = AppState {
+            phase: Phase::Authenticating {
+                purpose: AuthPurpose::Apply,
+                packages: vec![dnf_pkg.clone()],
+                last_checked: None,
+            },
+            ..Default::default()
+        };
+        reduce(
+            &mut retry_flow,
+            Event::Fail {
+                title: "Authorization Failed".into(),
+                detail: "Dismissed".into(),
+                retry: RetryAction::RetryApply,
+            },
+        )
+        .expect("Fail(RetryApply)");
+        assert_eq!(retry_flow.retry_apply_packages.len(), 1);
+        reduce(&mut retry_flow, Event::StartApply).expect("StartApply resumes retry_apply_packages");
+        assert!(matches!(
+            retry_flow.phase,
+            Phase::Authenticating {
+                purpose: AuthPurpose::Apply,
+                ref packages,
+                ..
+            } if packages.len() == 1
+        ));
+
         gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
 
@@ -2861,11 +3195,14 @@ mod tests {
         let widgets = super::Widgets::for_test();
         let console = Rc::new(RefCell::new(ConsoleBuffer::new(3)));
         super::wire_console(&widgets, &console);
+        super::sync_console_drawer(&widgets, true);
+        assert!(widgets.console_sheet.reveals_bottom_bar());
+        assert!(widgets.console_sheet.can_open());
 
-        // Log lines while collapsed update console_line preview; opening drawer populates console_full.
+        // Log lines while collapsed update console_line preview; opening BottomSheet populates console_full.
         super::record_console_output(&console, &widgets, "dnf", "Loading metadata", false);
         super::record_console_output(&console, &widgets, "dnf", "[1/2] pkg 10%", true);
-        assert!(!widgets.console_reveal.reveals_child());
+        assert!(!widgets.console_sheet.is_open());
         assert_eq!(widgets.console_line.label().as_str(), "[dnf] [1/2] pkg 10%");
         assert_eq!(
             widgets.console_chevron.icon_name().as_deref(),
@@ -2873,7 +3210,7 @@ mod tests {
         );
 
         widgets.console_toggle.emit_clicked();
-        assert!(widgets.console_reveal.reveals_child());
+        assert!(widgets.console_sheet.is_open());
         assert_eq!(
             widgets.console_chevron.icon_name().as_deref(),
             Some("pan-down-symbolic")
@@ -2900,8 +3237,8 @@ mod tests {
         assert!(!text().contains("Loading metadata"));
         assert_eq!(buf.line_count(), 3);
 
-        widgets.console_toggle.emit_clicked();
-        assert!(!widgets.console_reveal.reveals_child());
+        widgets.console_close_btn.emit_clicked();
+        assert!(!widgets.console_sheet.is_open());
         assert_eq!(
             widgets.console_chevron.icon_name().as_deref(),
             Some("pan-end-symbolic")
@@ -3035,7 +3372,9 @@ mod tests {
         }));
         feed(WorkerMsg::Event(Event::ApplyComplete { needs_reboot: true }));
         assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("done"));
-        assert!(widgets.reboot_banner.is_revealed());
+        assert!(widgets.done_reboot_clamp.get_visible());
+        assert!(widgets.done_reboot_detail.label().contains("kernel-core"));
+        assert!(widgets.done_reboot_btn.has_css_class("suggested-action"));
         assert_eq!(widgets.done_queue.total_count(), 2);
 
         // Stale refresh replay (then_apply: true) invokes auto-apply callback cleanly on CheckComplete.
@@ -3543,7 +3882,7 @@ mod tests {
         );
         assert_eq!(widgets.window_title.title().as_str(), "Activity Log");
         assert!(widgets.back_to_updates_btn.get_visible());
-        assert!(!widgets.console_drawer.get_visible());
+        assert!(!widgets.console_sheet.reveals_bottom_bar());
         assert!(widgets.activity_log.copy_btn().get_sensitive());
         assert_eq!(widgets.activity_log.active_filter(), LogSourceFilter::All);
         assert!(!widgets.activity_log.current_text().contains("25%"));
@@ -3614,6 +3953,82 @@ mod tests {
         gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
 
+    fn verify_preview_presets_render_cleanly() {
+        use fedora_updater::console::ConsoleBuffer;
+        use fedora_updater::model::DetailView;
+        use gtk::prelude::*;
+        use libadwaita::prelude::*;
+
+        let presets = [
+            "idle",
+            "idle-current",
+            "idle-warning",
+            "auth",
+            "checking",
+            "ready",
+            "ready-lumen",
+            "ready-warn",
+            "running",
+            "running-expanded",
+            "done",
+            "done-reboot",
+            "done-partial",
+            "failed",
+            "log",
+        ];
+
+        for preset in presets {
+            let widgets = super::Widgets::for_test();
+            super::wire_expander(&widgets);
+            let mut console = ConsoleBuffer::new(100);
+            console.push_committed_tagged("dnf", "Repositories loaded.");
+            console.push_committed_tagged("flatpak-user", "Syncing flathub");
+            console.push_committed_tagged("fwupd", "UEFI dbx");
+
+            let cfg = super::super::preview::config_for(preset);
+            super::apply_preview_config(&cfg, &widgets);
+            super::sync_shell_layout(&widgets);
+            super::render(&cfg.state, &console, &widgets);
+
+            match preset {
+                "ready-lumen" => {
+                    assert!(!widgets.sidebar_open.get());
+                    assert!(widgets.split_view.is_collapsed());
+                    assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("ready"));
+                }
+                "running-expanded" => {
+                    assert!(widgets.run_completed.is_expanded());
+                    assert!(widgets.run_list_scroll.get_visible());
+                }
+                "done" => {
+                    assert!(widgets.done_summary_clamp.get_visible());
+                    assert!(!widgets.done_reboot_clamp.get_visible());
+                    assert!(widgets.done_btn.has_css_class("suggested-action"));
+                }
+                "done-reboot" => {
+                    assert!(!widgets.done_summary_clamp.get_visible());
+                    assert!(widgets.done_reboot_clamp.get_visible());
+                    assert!(widgets.done_reboot_btn.has_css_class("suggested-action"));
+                }
+                "done-partial" => {
+                    assert!(widgets.done_problem_banner.is_revealed());
+                    assert!(widgets.done_reboot_clamp.get_visible());
+                    assert!(widgets.done_retry_btn.get_visible());
+                }
+                "log" => {
+                    assert_eq!(widgets.detail_view.get(), DetailView::ActivityLog);
+                    assert_eq!(
+                        widgets.detail_view_stack.visible_child_name().as_deref(),
+                        Some("activity-log")
+                    );
+                }
+                _ => {}
+            }
+
+            gtk::prelude::GtkWindowExt::destroy(&widgets.window);
+        }
+    }
+
     /// Serialized on a single thread because GTK4/Libadwaita asserts main-thread ownership.
     #[test]
     fn gtk_widget_window_rows_and_dialogs_e2e() {
@@ -3636,5 +4051,6 @@ mod tests {
         verify_handle_worker_full_replay();
         verify_observatory_shell_theme_and_charts();
         verify_queue_inspector_and_activity_log();
+        verify_preview_presets_render_cleanly();
     }
 }

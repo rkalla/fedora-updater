@@ -9,7 +9,7 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ui_dir = manifest.join("src/ui");
 
-    let templates = ["window", "log_window"];
+    let templates = ["window"];
     for name in templates {
         println!("cargo:rerun-if-changed=src/ui/{name}.blp");
     }

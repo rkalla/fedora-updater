@@ -7,22 +7,32 @@ use gtk::prelude::*;
 
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
-    parse_size_bytes, AuthPurpose, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
-    Stopwatch, UpdateSource,
+    parse_size_bytes, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus, RetryAction,
+    RunPass, Stopwatch, UpdateSource,
 };
 use fedora_updater::state::{AppState, Phase, RunningState};
 
-pub fn initial_state() -> Option<AppState> {
+#[derive(Debug, Clone)]
+pub struct PreviewConfig {
+    pub state: AppState,
+    pub sidebar_open: bool,
+    pub detail_view: DetailView,
+    pub expand_completed: bool,
+}
+
+pub fn initial_config() -> Option<PreviewConfig> {
     let phase = std::env::var("FEDORA_UPDATER_PREVIEW").ok()?;
-    Some(state_for(&phase))
+    Some(config_for(&phase))
 }
 
 pub fn initial_console() -> ConsoleBuffer {
     let mut console = ConsoleBuffer::new(8_000);
     if std::env::var("FEDORA_UPDATER_PREVIEW").is_ok() {
-        console.push("[dnf] Updating and loading repositories:");
-        console.push("[dnf] Repositories loaded.");
-        console.push("[3/5] Installing gnome-shell-48.2-1.fc42.x86_64");
+        console.push_committed_tagged("dnf", "Updating and loading repositories:");
+        console.push_committed_tagged("dnf", "Repositories loaded.");
+        console.push_committed_tagged("dnf", "[3/5] Installing gnome-shell-48.2-1.fc44.x86_64");
+        console.push_committed_tagged("flatpak-user", "Syncing flathub metadata");
+        console.push_committed_tagged("fwupd", "Loaded LVFS metadata for UEFI dbx");
     }
     console
 }
@@ -56,7 +66,7 @@ fn save_png(widget: &gtk::Widget, path: &str) -> Result<(), String> {
         .map_err(|e| format!("save {path}: {e}"))
 }
 
-pub fn state_for(phase: &str) -> AppState {
+pub fn config_for(phase: &str) -> PreviewConfig {
     let mut state = AppState {
         phase: Phase::Idle(IdleScreen::Fresh),
         stopwatch: Some(Stopwatch::start()),
@@ -66,6 +76,9 @@ pub fn state_for(phase: &str) -> AppState {
         release_age_days: None,
         retry_apply_packages: Vec::new(),
     };
+    let mut sidebar_open = true;
+    let mut detail_view = DetailView::Updates;
+    let mut expand_completed = false;
 
     state.phase = match phase {
         "idle" => Phase::Idle(IdleScreen::Fresh),
@@ -92,6 +105,13 @@ pub fn state_for(phase: &str) -> AppState {
             packages: sample_packages(false),
             soft_errors: vec![],
         },
+        "ready-lumen" => {
+            sidebar_open = false;
+            Phase::Ready {
+                packages: sample_packages(false),
+                soft_errors: vec![],
+            }
+        }
         "ready-many" => Phase::Ready {
             packages: many_running_packages()
                 .into_iter()
@@ -121,6 +141,7 @@ pub fn state_for(phase: &str) -> AppState {
             failure_reasons: vec![],
         }),
         "running-many" | "running-expanded" => {
+            expand_completed = phase == "running-expanded";
             let packages = many_running_packages();
             let active_index = packages
                 .iter()
@@ -148,6 +169,20 @@ pub fn state_for(phase: &str) -> AppState {
         "done" => Phase::Done {
             packages: sample_packages(false)
                 .into_iter()
+                .filter(|p| p.name != "kernel" && p.source != UpdateSource::Firmware)
+                .map(|mut p| {
+                    p.status = PackageStatus::Completed;
+                    p
+                })
+                .collect(),
+            duration: "2m 14s".into(),
+            needs_reboot: false,
+            failed: 0,
+            failure_reasons: vec![],
+        },
+        "done-reboot" => Phase::Done {
+            packages: sample_packages(false)
+                .into_iter()
                 .map(|mut p| {
                     p.status = PackageStatus::Completed;
                     p
@@ -158,7 +193,7 @@ pub fn state_for(phase: &str) -> AppState {
             failed: 0,
             failure_reasons: vec![],
         },
-        "done-mixed" => Phase::Done {
+        "done-partial" | "done-mixed" => Phase::Done {
             packages: {
                 let mut pkgs = sample_packages(false);
                 for p in &mut pkgs {
@@ -179,12 +214,30 @@ pub fn state_for(phase: &str) -> AppState {
             detail: "dnf update -y exited 1 · nothing was applied".into(),
             retry: RetryAction::CheckAgain,
         },
+        "log" => {
+            detail_view = DetailView::ActivityLog;
+            Phase::Ready {
+                packages: sample_packages(false),
+                soft_errors: vec![],
+            }
+        }
         other => {
             eprintln!("unknown FEDORA_UPDATER_PREVIEW={other}, using idle");
             Phase::Idle(IdleScreen::Fresh)
         }
     };
-    state
+
+    PreviewConfig {
+        state,
+        sidebar_open,
+        detail_view,
+        expand_completed,
+    }
+}
+
+#[cfg(test)]
+pub fn state_for(phase: &str) -> AppState {
+    config_for(phase).state
 }
 
 fn pkg(
@@ -205,6 +258,8 @@ fn pkg(
         UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
             let mut p = Package::new_dnf(name, "", version, "flathub");
             p.source = UpdateSource::FlatpakUser;
+            p.detail =
+                format!("{version} · flathub · installs org.freedesktop.Platform.GL.nvidia-570-133-07");
             p
         }
     };
@@ -219,8 +274,8 @@ fn sample_packages(running: bool) -> Vec<Package> {
         pkg(
             "openssl",
             UpdateSource::Dnf,
-            "1:3.2.2-3.fc42",
-            "1:3.2.2-1.fc42",
+            "1:3.2.2-3.fc44",
+            "1:3.2.2-1.fc44",
             "2.1 MB",
             if running {
                 PackageStatus::Completed
@@ -231,8 +286,8 @@ fn sample_packages(running: bool) -> Vec<Package> {
         pkg(
             "kernel",
             UpdateSource::Dnf,
-            "6.14.11-300.fc42",
-            "6.14.9-300.fc42",
+            "6.14.11-300.fc44",
+            "6.14.9-300.fc44",
             "98 MB",
             if running {
                 PackageStatus::Completed
@@ -243,8 +298,8 @@ fn sample_packages(running: bool) -> Vec<Package> {
         pkg(
             "firefox",
             UpdateSource::Dnf,
-            "140.0-1.fc42",
-            "139.0-1.fc42",
+            "140.0-1.fc44",
+            "139.0-1.fc44",
             "112 MB",
             if running {
                 PackageStatus::Completed
@@ -255,8 +310,8 @@ fn sample_packages(running: bool) -> Vec<Package> {
         pkg(
             "gnome-shell",
             UpdateSource::Dnf,
-            "48.2-1.fc42",
-            "48.1-1.fc42",
+            "48.2-1.fc44",
+            "48.1-1.fc44",
             "8.7 MB",
             if running {
                 PackageStatus::Installing
@@ -337,7 +392,9 @@ fn many_running_packages() -> Vec<Package> {
 
 #[cfg(test)]
 mod tests {
-    use fedora_updater::model::{AuthPurpose, IdleScreen, PackageStatus, RetryAction, RunPass, UpdateSource};
+    use fedora_updater::model::{
+        AuthPurpose, DetailView, IdleScreen, PackageStatus, RetryAction, RunPass, UpdateSource,
+    };
     use fedora_updater::state::Phase;
 
     #[test]
@@ -394,10 +451,22 @@ mod tests {
             other => panic!("expected Checking, got {other:?}"),
         }
 
+        let ready_cfg = super::config_for("ready");
+        assert!(ready_cfg.sidebar_open);
+        assert_eq!(ready_cfg.detail_view, DetailView::Updates);
         assert!(matches!(
-            &super::state_for("ready").phase,
+            &ready_cfg.state.phase,
             Phase::Ready { packages, soft_errors } if packages.len() == 6 && soft_errors.is_empty()
         ));
+
+        let lumen_cfg = super::config_for("ready-lumen");
+        assert!(!lumen_cfg.sidebar_open);
+        assert_eq!(lumen_cfg.detail_view, DetailView::Updates);
+        assert!(matches!(
+            &lumen_cfg.state.phase,
+            Phase::Ready { packages, soft_errors } if packages.len() == 6 && soft_errors.is_empty()
+        ));
+
         assert!(matches!(
             &super::state_for("ready-many").phase,
             Phase::Ready { packages, .. }
@@ -419,7 +488,9 @@ mod tests {
         }
 
         for name in ["running-many", "running-expanded"] {
-            match super::state_for(name).phase {
+            let cfg = super::config_for(name);
+            assert_eq!(cfg.expand_completed, name == "running-expanded");
+            match cfg.state.phase {
                 Phase::Running(r) => {
                     assert!(r.packages.len() >= 70, "{name}");
                     assert!(r.active_index.is_some(), "{name}");
@@ -438,14 +509,15 @@ mod tests {
                 ..
             } => {
                 assert_eq!(failed, 0);
-                assert!(needs_reboot);
+                assert!(!needs_reboot);
                 assert!(failure_reasons.is_empty());
+                assert!(!packages.is_empty());
                 assert!(packages.iter().all(|p| p.status == PackageStatus::Completed));
             }
-            other => panic!("expected Done, got {other:?}"),
+            other => panic!("expected clean Done, got {other:?}"),
         }
 
-        match super::state_for("done-mixed").phase {
+        match super::state_for("done-reboot").phase {
             Phase::Done {
                 packages,
                 needs_reboot,
@@ -453,12 +525,31 @@ mod tests {
                 failure_reasons,
                 ..
             } => {
-                assert_eq!(failed, 1);
+                assert_eq!(failed, 0);
                 assert!(needs_reboot);
-                assert_eq!(failure_reasons.len(), 1);
-                assert_eq!(packages.last().unwrap().status, PackageStatus::Failed);
+                assert!(failure_reasons.is_empty());
+                assert_eq!(packages.len(), 6);
+                assert!(packages.iter().all(|p| p.status == PackageStatus::Completed));
             }
-            other => panic!("expected done-mixed, got {other:?}"),
+            other => panic!("expected Done (reboot), got {other:?}"),
+        }
+
+        for name in ["done-partial", "done-mixed"] {
+            match super::state_for(name).phase {
+                Phase::Done {
+                    packages,
+                    needs_reboot,
+                    failed,
+                    failure_reasons,
+                    ..
+                } => {
+                    assert_eq!(failed, 1);
+                    assert!(needs_reboot);
+                    assert_eq!(failure_reasons.len(), 1);
+                    assert_eq!(packages.last().unwrap().status, PackageStatus::Failed);
+                }
+                other => panic!("expected {name}, got {other:?}"),
+            }
         }
 
         match super::state_for("failed").phase {
@@ -474,8 +565,13 @@ mod tests {
             other => panic!("expected Failed, got {other:?}"),
         }
 
+        let log_cfg = super::config_for("log");
+        assert!(log_cfg.sidebar_open);
+        assert_eq!(log_cfg.detail_view, DetailView::ActivityLog);
+        assert!(matches!(log_cfg.state.phase, Phase::Ready { .. }));
+
         if std::env::var_os("FEDORA_UPDATER_PREVIEW").is_none() {
-            assert!(super::initial_state().is_none());
+            assert!(super::initial_config().is_none());
             assert!(super::initial_console().is_empty());
         }
     }

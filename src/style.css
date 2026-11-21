@@ -285,3 +285,91 @@ window.is-dark .inspector-reboot-card {
   background-color: @view_bg_color;
   color: @view_fg_color;
 }
+
+/* Observatory 1.3 Running telemetry deck & Done closure */
+.stage-crumb {
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 0.78em;
+  font-weight: 700;
+  background-color: alpha(@window_fg_color, 0.08);
+  color: alpha(@window_fg_color, 0.65);
+}
+
+.stage-crumb.done {
+  color: #1a8345;
+  background-color: alpha(@success_bg_color, 0.14);
+}
+
+window.is-dark .stage-crumb.done {
+  color: #57e389;
+  background-color: alpha(@success_bg_color, 0.18);
+}
+
+.stage-crumb.active {
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+}
+
+listview.queue-list.inline {
+  padding: 0;
+}
+
+.console-sheet {
+  background-color: @view_bg_color;
+  color: @view_fg_color;
+  border-top: 1px solid alpha(@window_fg_color, 0.14);
+}
+
+.done-summary-card {
+  background-color: alpha(@success_bg_color, 0.08);
+}
+
+window.is-dark .done-summary-card {
+  background-color: alpha(@success_bg_color, 0.13);
+}
+
+.reboot-card {
+  background-color: alpha(@warning_bg_color, 0.12);
+}
+
+window.is-dark .reboot-card {
+  background-color: alpha(@warning_bg_color, 0.16);
+}
+
+.pipeline-row {
+  border-radius: 8px;
+}
+
+.pipeline-row.active {
+  background-color: alpha(@accent_bg_color, 0.10);
+}
+
+window.is-dark .pipeline-row.active {
+  background-color: alpha(@accent_bg_color, 0.14);
+}
+
+.pipeline-pill-active {
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+}
+
+.pipeline-pill-done {
+  color: #1a8345;
+  background-color: alpha(@success_bg_color, 0.14);
+}
+
+window.is-dark .pipeline-pill-done {
+  color: #57e389;
+  background-color: alpha(@success_bg_color, 0.18);
+}
+
+.pipeline-pill-error {
+  color: #c01c28;
+  background-color: alpha(@error_bg_color, 0.12);
+}
+
+window.is-dark .pipeline-pill-error {
+  color: #ff7b72;
+  background-color: alpha(@error_bg_color, 0.16);
+}
