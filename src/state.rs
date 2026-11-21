@@ -3,20 +3,82 @@
 //! All transitions are pure functions of `(&mut AppState, Event) → Result<(), TransitionError>`.
 //! Side effects (spawning processes) live outside this module.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use crate::model::{
     apply_progress_hint, finalize_source, overall_progress, sort_for_apply, AuthPurpose,
     IdleScreen, Package, PackageStatus, RetryAction, RunPass, StageCount, Stopwatch, UpdateSource,
 };
 
-/// dnf rpm-reconcile latch. The view owns the clock and the probe thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryLatch {
-    Idle,
-    InFlight,
-    Backoff { not_before: Instant },
-    Settled,
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningState {
+    pub packages: Vec<Package>,
+    pub active_index: Option<usize>,
+    pub overall_progress: f64,
+    pub phase_label: String,
+    pub current_source: Option<UpdateSource>,
+    /// Last package name parsed from a backend line (may not be in `packages`).
+    pub current_name: Option<String>,
+    /// Last per-item fraction for the now-playing card. Not the top-bar count.
+    pub work_progress: Option<f64>,
+    /// Download or apply pass for the current source.
+    pub pass: RunPass,
+    /// `[current/total]` when both numbers arrived and `total > 0`.
+    pub stage: Option<StageCount>,
+    pub needs_reboot: bool,
+    pub failed_sources: Vec<UpdateSource>,
+}
+
+impl RunningState {
+    pub fn new(packages: Vec<Package>) -> Self {
+        Self {
+            packages,
+            active_index: None,
+            overall_progress: 0.0,
+            phase_label: "Starting…".into(),
+            current_source: None,
+            current_name: None,
+            work_progress: None,
+            pass: RunPass::Download,
+            stage: None,
+            needs_reboot: false,
+            failed_sources: Vec::new(),
+        }
+    }
+
+    pub fn reset_for_source(&mut self, source: UpdateSource) {
+        self.current_source = Some(source);
+        self.current_name = None;
+        self.work_progress = None;
+        self.active_index = None;
+        self.pass = RunPass::Download;
+        self.stage = None;
+        self.overall_progress = 0.0;
+    }
+
+    pub fn enter_apply_pass(&mut self) {
+        reset_live_packages(&mut self.packages);
+        self.work_progress = None;
+        self.active_index = None;
+        self.current_name = None;
+        self.stage = None;
+        self.overall_progress = 0.0;
+        self.pass = RunPass::Apply;
+    }
+
+    pub fn done_and_total(&self) -> (usize, usize) {
+        match self.stage {
+            Some(StageCount { current, total }) if total > 0 => (current as usize, total as usize),
+            _ => {
+                let done = self.packages.iter().filter(|p| p.status.is_done()).count();
+                (done, self.packages.len())
+            }
+        }
+    }
+
+    pub fn is_applying(&self) -> bool {
+        self.pass == RunPass::Apply
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,25 +100,7 @@ pub enum Phase {
         packages: Vec<Package>,
         soft_errors: Vec<String>,
     },
-    Running {
-        packages: Vec<Package>,
-        active_index: Option<usize>,
-        overall_progress: f64,
-        phase_label: String,
-        current_source: Option<UpdateSource>,
-        /// Last package name parsed from a backend line (may not be in `packages`).
-        current_name: Option<String>,
-        /// Last per-item fraction for the now-playing card. Not the top-bar count.
-        work_progress: Option<f64>,
-        /// Download or apply pass for the current source.
-        pass: RunPass,
-        /// `[current/total]` when both numbers arrived and `total > 0`.
-        stage: Option<StageCount>,
-        /// rpm -q recovery for a quiet dnf apply. Not reset when the next source starts.
-        recovery: RecoveryLatch,
-        needs_reboot: bool,
-        failed_sources: Vec<UpdateSource>,
-    },
+    Running(RunningState),
     Done {
         packages: Vec<Package>,
         duration: String,
@@ -133,7 +177,7 @@ impl AppState {
                 packages_so_far, ..
             } => packages_so_far,
             Phase::Ready { packages, .. } => packages,
-            Phase::Running { packages, .. } => packages,
+            Phase::Running(running) => &running.packages,
             Phase::Done { packages, .. } => packages,
             _ => &[],
         }
@@ -214,12 +258,6 @@ pub enum Event {
     StopApply {
         during_transaction: bool,
     },
-    /// The view is about to spawn `rpm -q`. Idle or a past backoff becomes in flight.
-    RecoveryProbeStarted,
-    /// `rpm -q` could not decide. Back off; do not fail the update.
-    RecoveryProbeUnknown,
-    /// The planned dnf versions are installed and a later source still has work.
-    RecoveryProbeSettled,
     /// A newer Fedora release was looked up. `None` hides the reminder.
     /// Valid in every phase. Does not start a check or an apply.
     /// A missing age hides only the "(N days since release)" line.
@@ -288,27 +326,14 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
                     }
                     AuthPurpose::Apply => {
                         sort_for_apply(&mut packages);
-                        state.phase = Phase::Running {
-                            packages,
-                            active_index: None,
-                            overall_progress: 0.0,
-                            phase_label: "Starting…".into(),
-                            current_source: None,
-                            current_name: None,
-                            work_progress: None,
-                            pass: RunPass::Download,
-                            stage: None,
-                            recovery: RecoveryLatch::Idle,
-                            needs_reboot: false,
-                            failed_sources: Vec::new(),
-                        };
+                        state.phase = Phase::Running(RunningState::new(packages));
                     }
                 }
                 Ok(())
             }
             // Idempotent if already advanced past auth
             Phase::Checking { .. } if purpose == AuthPurpose::Check => Ok(()),
-            Phase::Running { .. } if purpose == AuthPurpose::Apply => Ok(()),
+            Phase::Running(_) if purpose == AuthPurpose::Apply => Ok(()),
             _ => Err(invalid(state, "SessionReady")),
         },
         Event::BackendCheckDone {
@@ -372,69 +397,48 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             stage_current,
             stage_total,
         } => match &mut state.phase {
-            Phase::Running {
-                packages,
-                active_index,
-                overall_progress: op,
-                phase_label: pl,
-                current_source,
-                current_name,
-                work_progress,
-                pass,
-                stage,
-                ..
-            } => {
-                if *current_source != Some(source) {
-                    *current_name = None;
-                    *work_progress = None;
-                    *active_index = None;
-                    *pass = RunPass::Download;
-                    *stage = None;
-                    *op = 0.0;
+            Phase::Running(running) => {
+                if running.current_source != Some(source) {
+                    running.reset_for_source(source);
                 }
-                if *pass != RunPass::Apply
+                if !running.is_applying()
                     && should_enter_apply(&phase_label, status_hint, package_hint.as_deref())
                 {
-                    reset_live_packages(packages);
-                    *work_progress = None;
-                    *active_index = None;
-                    *current_name = None;
-                    *stage = None;
-                    *op = 0.0;
-                    *pass = RunPass::Apply;
+                    running.enter_apply_pass();
                 }
                 let mut status_hint = status_hint;
-                if *pass == RunPass::Apply && status_hint == Some(PackageStatus::Downloading) {
+                if running.is_applying() && status_hint == Some(PackageStatus::Downloading) {
                     status_hint = Some(PackageStatus::Installing);
                 }
                 if !phase_label.trim().is_empty()
-                    && !(*pass == RunPass::Apply && phase_is_download(&phase_label))
+                    && (!running.is_applying() || !phase_is_download(&phase_label))
                 {
-                    *pl = phase_label;
+                    running.phase_label = phase_label;
                 }
-                *current_source = Some(source);
+                running.current_source = Some(source);
                 match (stage_current, stage_total) {
                     (Some(current), Some(total)) if total > 0 => {
-                        *stage = Some(StageCount { current, total });
-                        *op = (f64::from(current) / f64::from(total)).clamp(0.0, 1.0);
+                        running.stage = Some(StageCount { current, total });
+                        running.overall_progress =
+                            (f64::from(current) / f64::from(total)).clamp(0.0, 1.0);
                     }
                     (None, None) => {}
                     _ => {
-                        *stage = None;
+                        running.stage = None;
                     }
                 }
                 if progress.is_some() {
-                    *work_progress = progress;
+                    running.work_progress = progress;
                 }
                 match apply_progress_hint(
-                    packages,
+                    &mut running.packages,
                     source,
                     package_hint.as_deref(),
                     status_hint,
                 ) {
                     Some(idx) => {
-                        *current_name = Some(packages[idx].name.clone());
-                        *active_index = if packages[idx].status.is_done() {
+                        running.current_name = Some(running.packages[idx].name.clone());
+                        running.active_index = if running.packages[idx].status.is_done() {
                             None
                         } else {
                             Some(idx)
@@ -446,25 +450,26 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
                             .map(str::trim)
                             .filter(|s| !s.is_empty())
                         {
-                            let named_done = packages.iter().any(|p| {
+                            let named_done = running.packages.iter().any(|p| {
                                 p.source == source
                                     && p.matches_progress_name(name)
                                     && p.status.is_done()
                             });
                             if !named_done {
-                                *current_name = Some(name.to_string());
-                                let still_current = active_index
-                                    .and_then(|i| packages.get(i))
+                                running.current_name = Some(name.to_string());
+                                let still_current = running
+                                    .active_index
+                                    .and_then(|i| running.packages.get(i))
                                     .is_some_and(|p| p.matches_progress_name(name));
                                 if !still_current {
-                                    *active_index = None;
+                                    running.active_index = None;
                                 }
                             }
                         }
                     }
                 }
-                if stage.is_none() && *pass == RunPass::Apply {
-                    *op = overall_progress(packages);
+                if running.stage.is_none() && running.is_applying() {
+                    running.overall_progress = overall_progress(&running.packages);
                 }
                 Ok(())
             }
@@ -475,40 +480,27 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             success,
             needs_reboot,
         } => match &mut state.phase {
-            Phase::Running {
-                packages,
-                needs_reboot: nr,
-                failed_sources,
-                overall_progress: op,
-                stage,
-                ..
-            } => {
-                finalize_source(packages, source, success);
+            Phase::Running(running) => {
+                finalize_source(&mut running.packages, source, success);
                 if needs_reboot {
-                    *nr = true;
+                    running.needs_reboot = true;
                 }
-                if !success && !failed_sources.contains(&source) {
-                    failed_sources.push(source);
+                if !success && !running.failed_sources.contains(&source) {
+                    running.failed_sources.push(source);
                 }
-                *stage = None;
-                *op = overall_progress(packages);
+                running.stage = None;
+                running.overall_progress = overall_progress(&running.packages);
                 Ok(())
             }
             _ => Err(invalid(state, "BackendApplyDone")),
         },
         Event::ApplyComplete { needs_reboot } => {
-            let Phase::Running {
-                packages,
-                needs_reboot: nr,
-                failed_sources,
-                ..
-            } = &mut state.phase
-            else {
+            let Phase::Running(running) = &mut state.phase else {
                 return Err(invalid(state, "ApplyComplete"));
             };
-            let mut packages = std::mem::take(packages);
-            let nr = *nr;
-            let failed_sources = std::mem::take(failed_sources);
+            let mut packages = std::mem::take(&mut running.packages);
+            let nr = running.needs_reboot;
+            let failed_sources = std::mem::take(&mut running.failed_sources);
             let duration = state
                 .stopwatch
                 .as_ref()
@@ -573,10 +565,10 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             Ok(())
         }
         Event::StopApply { during_transaction } => {
-            let Phase::Running { packages, .. } = &mut state.phase else {
+            let Phase::Running(running) = &mut state.phase else {
                 return Err(invalid(state, "StopApply"));
             };
-            let mut packages = std::mem::take(packages);
+            let mut packages = std::mem::take(&mut running.packages);
             state.apply_when_ready = false;
             if during_transaction {
                 state.phase = Phase::Failed {
@@ -613,41 +605,6 @@ pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError>
             });
             Ok(())
         }
-        Event::RecoveryProbeStarted => match &mut state.phase {
-            Phase::Running { recovery, .. } => {
-                let start = match *recovery {
-                    RecoveryLatch::Idle => true,
-                    RecoveryLatch::Backoff { not_before } => Instant::now() >= not_before,
-                    RecoveryLatch::InFlight | RecoveryLatch::Settled => false,
-                };
-                if start {
-                    *recovery = RecoveryLatch::InFlight;
-                }
-                Ok(())
-            }
-            _ => Err(invalid(state, "RecoveryProbeStarted")),
-        },
-        Event::RecoveryProbeUnknown => match &mut state.phase {
-            Phase::Running { recovery, .. } => {
-                // The issue table stores the backoff clock on this transition.
-                if matches!(*recovery, RecoveryLatch::InFlight) {
-                    *recovery = RecoveryLatch::Backoff {
-                        not_before: Instant::now() + Duration::from_secs(30),
-                    };
-                }
-                Ok(())
-            }
-            _ => Err(invalid(state, "RecoveryProbeUnknown")),
-        },
-        Event::RecoveryProbeSettled => match &mut state.phase {
-            Phase::Running { recovery, .. } => {
-                if !matches!(*recovery, RecoveryLatch::Settled) {
-                    *recovery = RecoveryLatch::Settled;
-                }
-                Ok(())
-            }
-            _ => Err(invalid(state, "RecoveryProbeSettled")),
-        },
     }
 }
 
@@ -666,7 +623,7 @@ pub fn session_started_purpose(phase: &Phase) -> Option<AuthPurpose> {
     match phase {
         Phase::Authenticating { purpose, .. } => Some(*purpose),
         Phase::Checking { .. } => Some(AuthPurpose::Check),
-        Phase::Running { .. } => Some(AuthPurpose::Apply),
+        Phase::Running(_) => Some(AuthPurpose::Apply),
         Phase::Idle(_) | Phase::Ready { .. } | Phase::Done { .. } | Phase::Failed { .. } => None,
     }
 }
@@ -730,7 +687,7 @@ pub fn phase_name(phase: &Phase) -> &'static str {
         Phase::Authenticating { .. } => "Authenticating",
         Phase::Checking { .. } => "Checking",
         Phase::Ready { .. } => "Ready",
-        Phase::Running { .. } => "Running",
+        Phase::Running(_) => "Running",
         Phase::Done { .. } => "Done",
         Phase::Failed { .. } => "Failed",
     }
@@ -899,7 +856,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(s.phase, Phase::Running { .. }));
+        assert!(matches!(s.phase, Phase::Running(_)));
 
         let s = apply(
             s,
@@ -1164,12 +1121,10 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running {
-                phase_label, pass, ..
-            } => {
-                assert_eq!(phase_label, "Installing firmware");
+            Phase::Running(running) => {
+                assert_eq!(running.phase_label, "Installing firmware");
                 assert_eq!(
-                    *pass,
+                    running.pass,
                     RunPass::Apply,
                     "Installing firmware is a real apply step and must leave the download pass"
                 );
@@ -1199,21 +1154,7 @@ mod tests {
 
     #[test]
     fn download_pass_does_not_finish_packages_and_apply_restarts_the_bar() {
-        let mut s = AppState::default();
-        s.phase = Phase::Running {
-            packages: vec![dnf_pkg("wireplumber"), dnf_pkg("glibc"), dnf_pkg("kernel")],
-            active_index: None,
-            overall_progress: 0.0,
-            phase_label: "Starting…".into(),
-            current_source: Some(UpdateSource::Dnf),
-            current_name: None,
-            work_progress: None,
-            pass: RunPass::Download,
-            stage: None,
-            recovery: RecoveryLatch::Idle,
-            needs_reboot: false,
-            failed_sources: Vec::new(),
-        };
+        let mut s = running_dnf(vec![dnf_pkg("wireplumber"), dnf_pkg("glibc"), dnf_pkg("kernel")]);
 
         for (name, cur) in [("wireplumber", 1), ("glibc", 2), ("kernel", 3)] {
             s = apply(
@@ -1231,33 +1172,30 @@ mod tests {
         }
 
         match &s.phase {
-            Phase::Running {
-                packages,
-                overall_progress,
-                pass,
-                stage,
-                ..
-            } => {
+            Phase::Running(running) => {
                 assert!(
-                    packages
+                    running
+                        .packages
                         .iter()
                         .all(|p| p.status != PackageStatus::Completed),
-                    "downloads must not check packages off, got {packages:?}"
+                    "downloads must not check packages off, got {:?}",
+                    running.packages
                 );
-                assert_eq!(packages[0].status, PackageStatus::Pending);
-                assert_eq!(packages[1].status, PackageStatus::Pending);
-                assert_eq!(packages[2].status, PackageStatus::Downloading);
-                assert_eq!(*pass, RunPass::Download);
+                assert_eq!(running.packages[0].status, PackageStatus::Pending);
+                assert_eq!(running.packages[1].status, PackageStatus::Pending);
+                assert_eq!(running.packages[2].status, PackageStatus::Downloading);
+                assert_eq!(running.pass, RunPass::Download);
                 assert_eq!(
-                    *stage,
+                    running.stage,
                     Some(StageCount {
                         current: 3,
                         total: 3
                     })
                 );
                 assert!(
-                    (*overall_progress - 1.0).abs() < f64::EPSILON,
-                    "top bar follows the download count, got {overall_progress}"
+                    (running.overall_progress - 1.0).abs() < f64::EPSILON,
+                    "top bar follows the download count, got {}",
+                    running.overall_progress
                 );
             }
             other => panic!("expected Running, got {other:?}"),
@@ -1269,19 +1207,17 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running {
-                packages,
-                overall_progress,
-                pass,
-                work_progress,
-                ..
-            } => {
-                assert_eq!(*pass, RunPass::Apply);
-                assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
-                assert!(work_progress.is_none());
+            Phase::Running(running) => {
+                assert_eq!(running.pass, RunPass::Apply);
+                assert!(running
+                    .packages
+                    .iter()
+                    .all(|p| p.status == PackageStatus::Pending));
+                assert!(running.work_progress.is_none());
                 assert!(
-                    (*overall_progress - 0.0).abs() < f64::EPSILON,
-                    "apply pass restarts the top bar, got {overall_progress}"
+                    (running.overall_progress - 0.0).abs() < f64::EPSILON,
+                    "apply pass restarts the top bar, got {}",
+                    running.overall_progress
                 );
             }
             other => panic!("expected Running, got {other:?}"),
@@ -1300,29 +1236,29 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running {
-                packages,
-                overall_progress,
-                work_progress,
-                pass,
-                stage,
-                ..
-            } => {
-                assert_eq!(*pass, RunPass::Apply);
-                assert_eq!(status_of(packages, "glibc"), PackageStatus::Installing);
-                assert_eq!(status_of(packages, "wireplumber"), PackageStatus::Pending);
-                assert_eq!(status_of(packages, "kernel"), PackageStatus::Pending);
-                assert_eq!(*work_progress, Some(1.0));
+            Phase::Running(running) => {
+                assert_eq!(running.pass, RunPass::Apply);
                 assert_eq!(
-                    *stage,
+                    status_of(&running.packages, "glibc"),
+                    PackageStatus::Installing
+                );
+                assert_eq!(
+                    status_of(&running.packages, "wireplumber"),
+                    PackageStatus::Pending
+                );
+                assert_eq!(status_of(&running.packages, "kernel"), PackageStatus::Pending);
+                assert_eq!(running.work_progress, Some(1.0));
+                assert_eq!(
+                    running.stage,
                     Some(StageCount {
                         current: 16,
                         total: 137
                     })
                 );
                 assert!(
-                    (*overall_progress - 16.0 / 137.0).abs() < 1e-9,
-                    "item 100% must not replace the transaction count, got {overall_progress}"
+                    (running.overall_progress - 16.0 / 137.0).abs() < 1e-9,
+                    "item 100% must not replace the transaction count, got {}",
+                    running.overall_progress
                 );
             }
             other => panic!("expected Running, got {other:?}"),
@@ -1341,16 +1277,17 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running {
-                packages,
-                overall_progress,
-                work_progress,
-                ..
-            } => {
-                assert_eq!(status_of(packages, "glibc"), PackageStatus::Completed);
-                assert_eq!(status_of(packages, "kernel"), PackageStatus::Installing);
-                assert_eq!(*work_progress, Some(0.4));
-                assert!((*overall_progress - 17.0 / 137.0).abs() < 1e-9);
+            Phase::Running(running) => {
+                assert_eq!(
+                    status_of(&running.packages, "glibc"),
+                    PackageStatus::Completed
+                );
+                assert_eq!(
+                    status_of(&running.packages, "kernel"),
+                    PackageStatus::Installing
+                );
+                assert_eq!(running.work_progress, Some(0.4));
+                assert!((running.overall_progress - 17.0 / 137.0).abs() < 1e-9);
             }
             other => panic!("expected Running, got {other:?}"),
         }
@@ -1368,17 +1305,14 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running {
-                packages,
-                active_index,
-                current_name,
-                overall_progress,
-                ..
-            } => {
-                assert_eq!(status_of(packages, "kernel"), PackageStatus::Installing);
-                assert_eq!(*active_index, None);
-                assert_eq!(current_name.as_deref(), Some("libswscale-free"));
-                assert!((*overall_progress - 18.0 / 137.0).abs() < 1e-9);
+            Phase::Running(running) => {
+                assert_eq!(
+                    status_of(&running.packages, "kernel"),
+                    PackageStatus::Installing
+                );
+                assert_eq!(running.active_index, None);
+                assert_eq!(running.current_name.as_deref(), Some("libswscale-free"));
+                assert!((running.overall_progress - 18.0 / 137.0).abs() < 1e-9);
             }
             other => panic!("expected Running, got {other:?}"),
         }
@@ -1425,13 +1359,9 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running {
-                packages,
-                overall_progress,
-                ..
-            } => {
-                assert_eq!(packages[0].status, PackageStatus::Completed);
-                assert!((*overall_progress - 1.0).abs() < f64::EPSILON);
+            Phase::Running(running) => {
+                assert_eq!(running.packages[0].status, PackageStatus::Completed);
+                assert!((running.overall_progress - 1.0).abs() < f64::EPSILON);
             }
             other => panic!("expected Running, got {other:?}"),
         }
@@ -1549,22 +1479,12 @@ mod tests {
     }
 
     fn running_dnf(packages: Vec<Package>) -> AppState {
-        let mut s = AppState::default();
-        s.phase = Phase::Running {
-            packages,
-            active_index: None,
-            overall_progress: 0.0,
-            phase_label: "Starting…".into(),
-            current_source: Some(UpdateSource::Dnf),
-            current_name: None,
-            work_progress: None,
-            pass: RunPass::Download,
-            stage: None,
-            recovery: RecoveryLatch::Idle,
-            needs_reboot: false,
-            failed_sources: Vec::new(),
-        };
-        s
+        let mut running = RunningState::new(packages);
+        running.current_source = Some(UpdateSource::Dnf);
+        AppState {
+            phase: Phase::Running(running),
+            ..Default::default()
+        }
     }
 
     /// Same skip the orchestrator uses: a section header carries no progress.
@@ -1616,28 +1536,21 @@ mod tests {
             s = apply_dnf_output(s, line);
         }
         match &s.phase {
-            Phase::Running {
-                packages,
-                pass,
-                phase_label,
-                stage,
-                current_name,
-                work_progress,
-                ..
-            } => {
+            Phase::Running(running) => {
+                let packages = &running.packages;
                 let completed = packages.iter().filter(|p| p.status.is_done()).count();
                 assert_eq!(completed, 0, "downloads must stay unchecked: {packages:?}");
-                assert_eq!(*pass, RunPass::Download);
-                assert_eq!(phase_label, "Downloading packages");
+                assert_eq!(running.pass, RunPass::Download);
+                assert_eq!(running.phase_label, "Downloading packages");
                 assert_eq!(
-                    *stage,
+                    running.stage,
                     Some(StageCount {
                         current: 5,
                         total: 5
                     })
                 );
-                assert_eq!(current_name.as_deref(), Some("tzdata-java"));
-                assert_eq!(*work_progress, Some(1.0));
+                assert_eq!(running.current_name.as_deref(), Some("tzdata-java"));
+                assert_eq!(running.work_progress, Some(1.0));
                 assert_eq!(
                     status_of(packages, "tzdata-java"),
                     PackageStatus::Downloading
@@ -1684,10 +1597,7 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running {
-                pass: RunPass::Download,
-                ..
-            } => {}
+            Phase::Running(running) if running.pass == RunPass::Download => {}
             other => panic!("expected Running, got {other:?}"),
         }
     }
@@ -1712,11 +1622,8 @@ mod tests {
 
     fn assert_download_without_stage(s: &AppState) {
         match &s.phase {
-            Phase::Running {
-                pass: RunPass::Download,
-                stage: None,
-                ..
-            } => {}
+            Phase::Running(running)
+                if running.pass == RunPass::Download && running.stage.is_none() => {}
             other => panic!("expected Download with no stage, got {other:?}"),
         }
     }
@@ -1779,9 +1686,9 @@ mod tests {
         )
         .unwrap();
         match &s.phase {
-            Phase::Running { stage, .. } => {
+            Phase::Running(running) => {
                 assert_eq!(
-                    *stage,
+                    running.stage,
                     Some(StageCount {
                         current: 2,
                         total: 4
@@ -1850,21 +1757,16 @@ mod tests {
         .unwrap();
         assert!(s.apply_when_ready);
         match &s.phase {
-            Phase::Running {
-                pass,
-                stage,
-                overall_progress,
-                ..
-            } => {
-                assert_eq!(*pass, RunPass::Download);
+            Phase::Running(running) => {
+                assert_eq!(running.pass, RunPass::Download);
                 assert_eq!(
-                    *stage,
+                    running.stage,
                     Some(StageCount {
                         current: 2,
                         total: 4
                     })
                 );
-                assert!((*overall_progress - 0.5).abs() < 1e-9);
+                assert!((running.overall_progress - 0.5).abs() < 1e-9);
             }
             other => panic!("expected Running, got {other:?}"),
         }
@@ -1882,21 +1784,16 @@ mod tests {
         )
         .unwrap();
         match &kept.phase {
-            Phase::Running {
-                pass,
-                stage,
-                overall_progress,
-                ..
-            } => {
-                assert_eq!(*pass, RunPass::Download);
+            Phase::Running(running) => {
+                assert_eq!(running.pass, RunPass::Download);
                 assert_eq!(
-                    *stage,
+                    running.stage,
                     Some(StageCount {
                         current: 2,
                         total: 4
                     })
                 );
-                assert!((*overall_progress - 0.5).abs() < 1e-9);
+                assert!((running.overall_progress - 0.5).abs() < 1e-9);
             }
             other => panic!("expected Running, got {other:?}"),
         }
@@ -1920,10 +1817,10 @@ mod tests {
         .unwrap();
         assert!(s.apply_when_ready);
         match &s.phase {
-            Phase::Running { pass, stage, .. } => {
-                assert_eq!(*pass, RunPass::Apply);
+            Phase::Running(running) => {
+                assert_eq!(running.pass, RunPass::Apply);
                 assert_eq!(
-                    *stage,
+                    running.stage,
                     Some(StageCount {
                         current: 2,
                         total: 4
@@ -1947,21 +1844,13 @@ mod tests {
         .unwrap();
         assert!(s.apply_when_ready);
         match &s.phase {
-            Phase::Running {
-                pass,
-                stage,
-                current_name,
-                work_progress,
-                active_index,
-                overall_progress,
-                ..
-            } => {
-                assert_eq!(*pass, RunPass::Download);
-                assert!(stage.is_none());
-                assert!(current_name.is_none());
-                assert!(work_progress.is_none());
-                assert!(active_index.is_none());
-                assert!((*overall_progress - 0.0).abs() < f64::EPSILON);
+            Phase::Running(running) => {
+                assert_eq!(running.pass, RunPass::Download);
+                assert!(running.stage.is_none());
+                assert!(running.current_name.is_none());
+                assert!(running.work_progress.is_none());
+                assert!(running.active_index.is_none());
+                assert!((running.overall_progress - 0.0).abs() < f64::EPSILON);
             }
             other => panic!("expected Running, got {other:?}"),
         }
@@ -2356,88 +2245,59 @@ mod tests {
     }
 
     #[test]
-    fn recovery_starts_once() {
-        let s = started_apply(vec![dnf_pkg("glibc")]);
-        let s = apply(s, Event::RecoveryProbeStarted).unwrap();
-        match &s.phase {
-            Phase::Running {
-                recovery: RecoveryLatch::InFlight,
-                ..
-            } => {}
-            other => panic!("expected in flight, got {other:?}"),
-        }
-        let s = apply(s, Event::RecoveryProbeStarted).unwrap();
-        match &s.phase {
-            Phase::Running {
-                recovery: RecoveryLatch::InFlight,
-                ..
-            } => {}
-            other => panic!("second start must stay in flight, got {other:?}"),
-        }
-    }
+    fn running_state_helpers() {
+        let mut p1 = dnf_pkg("glibc");
+        p1.status = PackageStatus::Completed;
+        let mut p2 = dnf_pkg("kernel");
+        p2.status = PackageStatus::Downloading;
 
-    #[test]
-    fn recovery_unknown_waits_thirty_seconds() {
-        let s = started_apply(vec![dnf_pkg("glibc")]);
-        let s = apply(s, Event::RecoveryProbeStarted).unwrap();
-        let started = std::time::Instant::now();
-        let s = apply(s, Event::RecoveryProbeUnknown).unwrap();
-        match &s.phase {
-            Phase::Running {
-                recovery: RecoveryLatch::Backoff { not_before },
-                ..
-            } => {
-                assert!(
-                    *not_before >= started + std::time::Duration::from_secs(30),
-                    "backoff {not_before:?} is not 30s ahead of {started:?}"
-                );
-            }
-            other => panic!("expected backoff, got {other:?}"),
-        }
-        let s = apply(s, Event::RecoveryProbeStarted).unwrap();
-        match &s.phase {
-            Phase::Running {
-                recovery: RecoveryLatch::Backoff { .. },
-                ..
-            } => {}
-            other => panic!("early probe must stay in backoff, got {other:?}"),
-        }
-        assert!(!matches!(s.phase, Phase::Failed { .. }));
-    }
+        let mut running = RunningState::new(vec![p1, p2]);
+        assert!(!running.is_applying());
+        assert_eq!(running.phase_label, "Starting…");
+        assert_eq!(running.done_and_total(), (1, 2));
 
-    #[test]
-    fn recovery_settled_sticks_across_the_next_source() {
-        let s = started_apply(vec![dnf_pkg("glibc")]);
-        match &s.phase {
-            Phase::Running {
-                recovery: RecoveryLatch::Idle,
-                pass: RunPass::Download,
-                ..
-            } => {}
-            other => panic!("apply session starts idle on download, got {other:?}"),
-        }
-        let s = apply(s, Event::RecoveryProbeSettled).unwrap();
-        let s = apply(
-            s,
-            Event::ApplyProgress {
-                source: UpdateSource::FlatpakUser,
-                package_hint: None,
-                status_hint: None,
-                progress: None,
-                phase_label: "Updating Apps".into(),
-                stage_current: None,
-                stage_total: None,
-            },
-        )
-        .unwrap();
-        match &s.phase {
-            Phase::Running {
-                recovery: RecoveryLatch::Settled,
-                pass: RunPass::Download,
-                ..
-            } => {}
-            other => panic!("expected settled download, got {other:?}"),
-        }
+        running.stage = Some(StageCount {
+            current: 3,
+            total: 10,
+        });
+        assert_eq!(running.done_and_total(), (3, 10));
+
+        running.stage = Some(StageCount {
+            current: 3,
+            total: 0,
+        });
+        assert_eq!(running.done_and_total(), (1, 2));
+
+        running.work_progress = Some(0.8);
+        running.active_index = Some(1);
+        running.current_name = Some("kernel".into());
+        running.overall_progress = 0.75;
+        running.enter_apply_pass();
+        assert!(running.is_applying());
+        assert_eq!(running.packages[0].status, PackageStatus::Completed);
+        assert_eq!(running.packages[1].status, PackageStatus::Pending);
+        assert!(running.work_progress.is_none());
+        assert!(running.active_index.is_none());
+        assert!(running.current_name.is_none());
+        assert!(running.stage.is_none());
+        assert!((running.overall_progress - 0.0).abs() < f64::EPSILON);
+
+        running.work_progress = Some(0.5);
+        running.active_index = Some(0);
+        running.current_name = Some("glibc".into());
+        running.overall_progress = 0.5;
+        running.stage = Some(StageCount {
+            current: 1,
+            total: 2,
+        });
+        running.reset_for_source(UpdateSource::Firmware);
+        assert_eq!(running.current_source, Some(UpdateSource::Firmware));
+        assert!(!running.is_applying());
+        assert!(running.work_progress.is_none());
+        assert!(running.active_index.is_none());
+        assert!(running.current_name.is_none());
+        assert!(running.stage.is_none());
+        assert!((running.overall_progress - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]

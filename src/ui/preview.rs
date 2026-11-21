@@ -10,7 +10,7 @@ use fedora_updater::model::{
     parse_size_bytes, AuthPurpose, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
     Stopwatch, UpdateSource,
 };
-use fedora_updater::state::{AppState, Phase};
+use fedora_updater::state::{AppState, Phase, RunningState};
 
 pub fn initial_state() -> Option<AppState> {
     let phase = std::env::var("FEDORA_UPDATER_PREVIEW").ok()?;
@@ -100,7 +100,7 @@ pub fn state_for(phase: &str) -> AppState {
             packages: sample_packages(false),
             soft_errors: vec!["Firmware metadata refresh failed".into()],
         },
-        "running" => Phase::Running {
+        "running" => Phase::Running(RunningState {
             packages: sample_packages(true),
             active_index: Some(3),
             overall_progress: 0.5,
@@ -110,10 +110,9 @@ pub fn state_for(phase: &str) -> AppState {
             work_progress: Some(0.72),
             pass: RunPass::Apply,
             stage: None,
-            recovery: fedora_updater::state::RecoveryLatch::Idle,
             needs_reboot: false,
             failed_sources: vec![],
-        },
+        }),
         "running-many" | "running-expanded" => {
             let packages = many_running_packages();
             let active_index = packages
@@ -124,7 +123,7 @@ pub fn state_for(phase: &str) -> AppState {
                 .filter(|p| p.status == PackageStatus::Completed)
                 .count();
             let overall = done as f64 / packages.len() as f64;
-            Phase::Running {
+            Phase::Running(RunningState {
                 packages,
                 active_index,
                 overall_progress: overall,
@@ -134,10 +133,9 @@ pub fn state_for(phase: &str) -> AppState {
                 work_progress: Some(0.42),
                 pass: RunPass::Apply,
                 stage: None,
-                recovery: fedora_updater::state::RecoveryLatch::Idle,
                 needs_reboot: false,
                 failed_sources: vec![],
-            }
+            })
         }
         "done" => Phase::Done {
             packages: sample_packages(false)

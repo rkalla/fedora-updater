@@ -16,4 +16,4 @@ pub mod state;
 
 pub use console::{ConsoleBuffer, ConsoleDelta};
 pub use model::*;
-pub use state::{phase_name, reduce, AppState, Event, Phase, TransitionError};
+pub use state::{phase_name, reduce, AppState, Event, Phase, RunningState, TransitionError};

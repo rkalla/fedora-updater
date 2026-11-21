@@ -12,6 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::helper_protocol::{
     format_end_line, ClientRequest, HelperCommand, BYE_LINE, DRAW_PREFIX, HELLO_LINE,
@@ -20,6 +21,14 @@ use crate::helper_protocol::{
 const STDBUF_PATH: &str = "/usr/bin/stdbuf";
 /// Fully unbuffered stdio. `-oL` flushes on `\n` only, which hides `\r` updates.
 const STDBUF_ARGS: &[&str] = &["-o0", "-e0"];
+const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(300);
+const POST_EXIT_DRAIN_MAX: Duration = Duration::from_secs(1);
+
+enum HelperPump {
+    Piece(StreamPiece),
+    StreamDone,
+    ChildExited(i32),
+}
 
 /// One piece of a child stream. `\r` is live; `\n` and `\r\n` are committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,10 +53,7 @@ impl StreamSplitter {
     fn push(&mut self, bytes: &[u8]) -> Vec<StreamPiece> {
         self.pending.extend_from_slice(bytes);
         let mut out = Vec::new();
-        loop {
-            let Some(idx) = self.pending.iter().position(|b| *b == b'\n' || *b == b'\r') else {
-                break;
-            };
+        while let Some(idx) = self.pending.iter().position(|b| *b == b'\n' || *b == b'\r') {
             let sep = self.pending[idx];
             if sep == b'\r' && idx + 1 == self.pending.len() {
                 break;
@@ -146,7 +152,7 @@ fn run_allowlisted(cmd: HelperCommand, stdout: &mut impl Write, stderr: &mut imp
 
     let _ = writeln!(stderr, "helper: running {} {:?}", program, args);
 
-    let mut child = match spawn_unbuffered(program, args) {
+    let child = match spawn_unbuffered(program, args) {
         Ok(c) => c,
         Err(e) => {
             let _ = writeln!(stdout, "failed to spawn {program}: {e}");
@@ -154,45 +160,116 @@ fn run_allowlisted(cmd: HelperCommand, stdout: &mut impl Write, stderr: &mut imp
         }
     };
 
+    drain_child(child, stdout)
+}
+
+fn emit_piece(stdout: &mut impl Write, piece: StreamPiece) {
+    match piece {
+        StreamPiece::Live(text) => {
+            let _ = writeln!(stdout, "{DRAW_PREFIX}{text}");
+        }
+        StreamPiece::Line(text) => {
+            let _ = writeln!(stdout, "{text}");
+        }
+    }
+    let _ = stdout.flush();
+}
+
+fn drain_child(mut child: std::process::Child, stdout: &mut impl Write) -> i32 {
     let child_out = child.stdout.take();
     let child_err = child.stderr.take();
 
-    let (tx, rx) = mpsc::channel::<StreamPiece>();
-    let tx_err = tx.clone();
+    let (tx, rx) = mpsc::channel::<HelperPump>();
+    let mut open_streams = 0usize;
 
-    let t_out = thread::spawn(move || {
-        if let Some(out) = child_out {
-            drain_stream(out, tx);
-        }
+    let t_out = child_out.map(|out| {
+        open_streams += 1;
+        let tx_out = tx.clone();
+        thread::spawn(move || {
+            drain_stream(out, &tx_out);
+            let _ = tx_out.send(HelperPump::StreamDone);
+        })
     });
-    let t_err = thread::spawn(move || {
-        if let Some(err) = child_err {
-            drain_stream(err, tx_err);
-        }
+    let t_err = child_err.map(|err| {
+        open_streams += 1;
+        let tx_err = tx.clone();
+        thread::spawn(move || {
+            drain_stream(err, &tx_err);
+            let _ = tx_err.send(HelperPump::StreamDone);
+        })
     });
+    let tx_wait = tx.clone();
+    let t_wait = thread::spawn(move || {
+        let code = match child.wait() {
+            Ok(status) => status.code().unwrap_or(-1),
+            Err(_) => -1,
+        };
+        let _ = tx_wait.send(HelperPump::ChildExited(code));
+    });
+    drop(tx);
 
-    while let Ok(piece) = rx.recv() {
-        match piece {
-            StreamPiece::Live(text) => {
-                let _ = writeln!(stdout, "{DRAW_PREFIX}{text}");
+    let mut exit_code: Option<i32> = None;
+    let mut max_deadline: Option<Instant> = None;
+
+    while exit_code.is_none() {
+        match rx.recv() {
+            Ok(HelperPump::Piece(piece)) => emit_piece(stdout, piece),
+            Ok(HelperPump::StreamDone) => {
+                open_streams = open_streams.saturating_sub(1);
             }
-            StreamPiece::Line(text) => {
-                let _ = writeln!(stdout, "{text}");
+            Ok(HelperPump::ChildExited(code)) => {
+                exit_code = Some(code);
+                max_deadline = Some(Instant::now() + POST_EXIT_DRAIN_MAX);
+                if open_streams == 0 {
+                    break;
+                }
+            }
+            Err(_) => {
+                open_streams = 0;
+                break;
             }
         }
-        let _ = stdout.flush();
     }
 
-    let _ = t_out.join();
-    let _ = t_err.join();
-
-    match child.wait() {
-        Ok(status) => status.code().unwrap_or(-1),
-        Err(_) => -1,
+    if exit_code.is_some() {
+        while open_streams > 0 {
+            let remaining_max = max_deadline
+                .expect("max_deadline set when exit_code is Some")
+                .saturating_duration_since(Instant::now());
+            if remaining_max.is_zero() {
+                break;
+            }
+            let wait = POST_EXIT_DRAIN_GRACE.min(remaining_max);
+            match rx.recv_timeout(wait) {
+                Ok(HelperPump::Piece(piece)) => emit_piece(stdout, piece),
+                Ok(HelperPump::StreamDone) => {
+                    open_streams = open_streams.saturating_sub(1);
+                }
+                Ok(HelperPump::ChildExited(_)) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    open_streams = 0;
+                    break;
+                }
+            }
+        }
     }
+
+    let _ = stdout.flush();
+    let _ = t_wait.join();
+    if open_streams == 0 {
+        if let Some(h) = t_out {
+            let _ = h.join();
+        }
+        if let Some(h) = t_err {
+            let _ = h.join();
+        }
+    }
+
+    exit_code.unwrap_or(-1)
 }
 
-fn drain_stream(mut reader: impl Read, tx: mpsc::Sender<StreamPiece>) {
+fn drain_stream(mut reader: impl Read, tx: &mpsc::Sender<HelperPump>) {
     let mut splitter = StreamSplitter::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -200,7 +277,7 @@ fn drain_stream(mut reader: impl Read, tx: mpsc::Sender<StreamPiece>) {
             Ok(0) => break,
             Ok(n) => {
                 for piece in splitter.push(&buf[..n]) {
-                    if tx.send(piece).is_err() {
+                    if tx.send(HelperPump::Piece(piece)).is_err() {
                         return;
                     }
                 }
@@ -210,7 +287,7 @@ fn drain_stream(mut reader: impl Read, tx: mpsc::Sender<StreamPiece>) {
         }
     }
     if let Some(piece) = splitter.finish() {
-        let _ = tx.send(piece);
+        let _ = tx.send(HelperPump::Piece(piece));
     }
 }
 
@@ -260,8 +337,21 @@ fn stdbuf_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamPiece, StreamSplitter, STDBUF_ARGS};
+    use super::{drain_child, StreamPiece, StreamSplitter, STDBUF_ARGS};
     use crate::helper_protocol::HelperCommand;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct ProcessGroupGuard(i32);
+
+    impl Drop for ProcessGroupGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
 
     #[test]
     fn carriage_return_is_live_and_crlf_is_one_line() {
@@ -318,5 +408,56 @@ mod tests {
         let argv = HelperCommand::ApplyFwupd.argv();
         assert!(argv.contains(&"--no-reboot-check"));
         assert!(argv.contains(&"-y"));
+    }
+
+    #[test]
+    fn leaked_grandchild_fd_does_not_hang_drain_child() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "echo hi; sleep 60 &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn /bin/sh");
+        let _guard = ProcessGroupGuard(child.id() as i32);
+
+        let started = Instant::now();
+        let mut out = Vec::new();
+        let code = drain_child(child, &mut out);
+        let elapsed = started.elapsed();
+
+        assert_eq!(code, 0);
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.lines().any(|l| l == "hi"),
+            "expected 'hi' in output, got {text:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "drain_child took too long ({elapsed:?}) with leaked grandchild FD"
+        );
+    }
+
+    #[test]
+    fn drain_child_returns_exit_code_and_both_streams_normally() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "echo out_line; echo err_line >&2; exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn /bin/sh");
+        let _guard = ProcessGroupGuard(child.id() as i32);
+
+        let mut out = Vec::new();
+        let code = drain_child(child, &mut out);
+
+        assert_eq!(code, 7);
+        let text = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.contains(&"out_line"), "missing out_line in {lines:?}");
+        assert!(lines.contains(&"err_line"), "missing err_line in {lines:?}");
     }
 }

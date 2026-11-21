@@ -16,22 +16,20 @@ use libadwaita::{
     StatusPage, StyleManager, Toast, ToastOverlay, Window as AdwWindow, WindowTitle,
 };
 
-use fedora_updater::backend::dnf::{self, InstallCheck};
+use fedora_updater::backend::dnf;
 use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
 use fedora_updater::model::{
     about_time_left, cache_activity_note, check_progress, count_by_source, idle_chrome,
     now_playing_subtitle, now_playing_title, quiet_ui, run_heading, running_progress_captions,
-    source_summary_line, AuthPurpose, IdleScreen, Package, RetryAction, RunPass, StageCount,
+    source_summary_line, AuthPurpose, IdleScreen, Package, QuietInput, RetryAction, RunPass,
     UpdateSource,
 };
 use fedora_updater::orchestrator::{
     can_skip_auth_ui, cancel_background_work, release_privileges, run_apply_all, run_check_all,
     run_systemctl_reboot, session_started_event, WorkerMsg,
 };
-use fedora_updater::privilege::{
-    dnf_daemon_is_running, helper_activity, kill_recorded_helper, run_local_command, HelperActivity,
-};
-use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RecoveryLatch};
+use fedora_updater::privilege::{dnf_daemon_is_running, kill_recorded_helper};
+use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RunningState};
 
 use super::{preview, rows};
 
@@ -239,7 +237,6 @@ struct Widgets {
     /// `None` until this run paints the Running page, so auth time is not quiet time.
     last_output: Cell<Option<Instant>>,
     cache_cursor: RefCell<Option<(PathBuf, u64)>>,
-    reconcile_tx: async_channel::Sender<InstallCheck>,
 }
 
 pub fn build(app: &Application) {
@@ -261,8 +258,6 @@ pub fn build(app: &Application) {
     window.set_application(Some(app));
 
     window.set_default_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-
-    let (reconcile_tx, reconcile_rx) = async_channel::unbounded::<InstallCheck>();
 
     let widgets = Rc::new(Widgets {
         window: window.clone(),
@@ -324,7 +319,6 @@ pub fn build(app: &Application) {
         fail_retry: obj(&builder, "fail_retry"),
         last_output: Cell::new(None),
         cache_cursor: RefCell::new(None),
-        reconcile_tx,
     });
 
     let about = gio::SimpleAction::new("about", None);
@@ -360,9 +354,6 @@ pub fn build(app: &Application) {
     let fail_retry = widgets.fail_retry.clone();
     let fail_log: Button = obj(&builder, "fail_log");
 
-    if !console.borrow().is_empty() {
-        widgets.console_line.set_text(console.borrow().last_line());
-    }
     wire_console(&widgets, &console);
     {
         let widgets = widgets.clone();
@@ -438,21 +429,19 @@ pub fn build(app: &Application) {
     }
     {
         let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         let run_stop = widgets.run_stop.clone();
         run_stop.connect_clicked(move |_| {
-            let pass_is_apply = matches!(
-                state.borrow().phase,
-                Phase::Running {
-                    pass: RunPass::Apply,
-                    ..
-                }
+            let applying = matches!(
+                &state.borrow().phase,
+                Phase::Running(running) if running.is_applying()
             );
-            let running = matches!(state.borrow().phase, Phase::Running { .. });
-            if pass_is_apply {
-                prompt_stop_during_transaction(&widgets, &state);
+            let running = matches!(state.borrow().phase, Phase::Running(_));
+            if applying {
+                prompt_stop_during_transaction(&widgets, &state, &console);
             } else if running {
-                stop_apply(&state, &widgets, false);
+                stop_apply(&state, &console, &widgets, false);
             }
         });
     }
@@ -463,7 +452,7 @@ pub fn build(app: &Application) {
         auth_cancel.connect_clicked(move |_| {
             cancel_background_work();
             clear_console(&console, &widgets);
-            dispatch(&state, &widgets, Event::CancelAuth);
+            dispatch(&state, &console, &widgets, Event::CancelAuth);
         });
     }
     {
@@ -472,7 +461,7 @@ pub fn build(app: &Application) {
         let widgets = widgets.clone();
         done_btn.connect_clicked(move |_| {
             clear_console(&console, &widgets);
-            dispatch(&state, &widgets, Event::ResetToIdle);
+            dispatch(&state, &console, &widgets, Event::ResetToIdle);
         });
     }
     {
@@ -523,15 +512,6 @@ pub fn build(app: &Application) {
     {
         let state = state.clone();
         let widgets = widgets.clone();
-        glib::spawn_future_local(async move {
-            while let Ok(check) = reconcile_rx.recv().await {
-                handle_install_check(&state, &widgets, check);
-            }
-        });
-    }
-    {
-        let state = state.clone();
-        let widgets = widgets.clone();
         glib::timeout_add_local(Duration::from_secs(1), move || {
             refresh_quiet_chrome(&state, &widgets);
             glib::ControlFlow::Continue
@@ -554,8 +534,8 @@ pub fn build(app: &Application) {
         });
     }
 
-    render(&state, &widgets);
-    spawn_release_lookup(&state, &widgets);
+    render(&state.borrow(), &console.borrow(), &widgets);
+    spawn_release_lookup(&state, &console, &widgets);
     {
         let hooked = widgets.clone();
         glib::idle_add_local_once(move || {
@@ -577,9 +557,14 @@ fn start_check(
     then_apply: bool,
 ) {
     clear_console(console, widgets);
-    dispatch(state, widgets, Event::StartCheck { then_apply });
+    dispatch(state, console, widgets, Event::StartCheck { then_apply });
     if can_skip_auth_ui() {
-        dispatch(state, widgets, session_started_event(AuthPurpose::Check));
+        dispatch(
+            state,
+            console,
+            widgets,
+            session_started_event(AuthPurpose::Check),
+        );
     }
     run_check_all(tx);
 }
@@ -594,9 +579,14 @@ fn begin_apply(
     *widgets.cache_cursor.borrow_mut() = None;
     clear_console(console, widgets);
     let packages = state.borrow().packages().to_vec();
-    dispatch(state, widgets, Event::StartApply);
+    dispatch(state, console, widgets, Event::StartApply);
     if can_skip_auth_ui() {
-        dispatch(state, widgets, session_started_event(AuthPurpose::Apply));
+        dispatch(
+            state,
+            console,
+            widgets,
+            session_started_event(AuthPurpose::Apply),
+        );
     }
     run_apply_all(tx, packages);
 }
@@ -672,10 +662,15 @@ fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
     win.present();
 }
 
-fn dispatch(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, event: Event) {
+fn dispatch(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+    event: Event,
+) {
     let result = state::reduce(&mut state.borrow_mut(), event);
     match result {
-        Ok(()) => render(state, widgets),
+        Ok(()) => render(&state.borrow(), &console.borrow(), widgets),
         Err(e) => {
             eprintln!("state error: {e}");
             widgets
@@ -685,10 +680,15 @@ fn dispatch(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, event: Event) 
     }
 }
 
-fn dispatch_worker(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, event: Event) {
+fn dispatch_worker(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+    event: Event,
+) {
     let result = state::reduce(&mut state.borrow_mut(), event);
     match result {
-        Ok(()) => render(state, widgets),
+        Ok(()) => render(&state.borrow(), &console.borrow(), widgets),
         Err(e) => {
             eprintln!("ignored worker event: {e}");
         }
@@ -720,7 +720,7 @@ fn handle_worker(
     let ev = match msg {
         WorkerMsg::SessionStarted => {
             match commit_session_started(state) {
-                Ok(true) => render(state, widgets),
+                Ok(true) => render(&state.borrow(), &console.borrow(), widgets),
                 Ok(false) => {}
                 Err(e) => eprintln!("ignored worker event: {e}"),
             }
@@ -742,7 +742,7 @@ fn handle_worker(
         widgets.last_output.set(Some(Instant::now()));
     }
 
-    dispatch_worker(state, widgets, ev);
+    dispatch_worker(state, console, widgets, ev);
 
     let apply_now = if check_finished {
         let borrowed = state.borrow();
@@ -754,7 +754,7 @@ fn handle_worker(
         begin_apply(state, console, widgets, tx.clone());
     }
     if check_finished {
-        spawn_release_lookup(state, widgets);
+        spawn_release_lookup(state, console, widgets);
     }
 }
 
@@ -986,28 +986,20 @@ fn quiet_secs(w: &Widgets) -> u64 {
     }
 }
 
-fn has_sources_after_dnf(packages: &[Package]) -> bool {
-    packages
-        .iter()
-        .any(|p| p.source.apply_order() > UpdateSource::Dnf.apply_order())
+fn console_preview_line(last_line: &str) -> &str {
+    if last_line.is_empty() {
+        "Starting…"
+    } else {
+        last_line
+    }
 }
 
 /// Footnote, spinner, and stall banner for a quiet run. Does not rebuild the list.
-fn paint_quiet_chrome(
-    state: &Rc<RefCell<AppState>>,
-    w: &Widgets,
-    caption: &str,
-    applying: bool,
-    work_progress: Option<f64>,
-    current_source: Option<UpdateSource>,
-    elapsed: u64,
-    overall_progress: f64,
-    packages: &[Package],
-) {
+fn paint_quiet_chrome(running: &RunningState, caption: &str, elapsed: u64, w: &Widgets) {
     let secs = quiet_secs(w);
-    let at_full = work_progress.is_some_and(|frac| frac >= 0.999);
-    let watching_dnf = current_source == Some(UpdateSource::Dnf);
-    let cache_note = if secs >= 5 && watching_dnf && !applying {
+    let at_full = running.work_progress.is_some_and(|frac| frac >= 0.999);
+    let watching_dnf = running.current_source == Some(UpdateSource::Dnf);
+    let cache_note = if secs >= 5 && watching_dnf && !running.is_applying() {
         dnf::poll_cache_growth(
             std::path::Path::new(dnf::DNF_CACHE_ROOT),
             &mut w.cache_cursor.borrow_mut(),
@@ -1016,21 +1008,17 @@ fn paint_quiet_chrome(
     } else {
         None
     };
-    // Absent covers preview and the moment before polkit returns. That is not
-    // "dnf exited", so the page must not rpm-reconcile the real system.
-    let tool_alive = !watching_dnf || helper_activity() != HelperActivity::Exited;
-    let quiet = quiet_ui(
-        secs,
-        at_full,
-        cache_note.as_deref(),
-        tool_alive,
+    let quiet = quiet_ui(QuietInput {
+        quiet_secs: secs,
+        at_full_item: at_full,
+        cache_note: cache_note.as_deref(),
         watching_dnf,
-        dnf_daemon_is_running(),
-    );
+        daemon_running: dnf_daemon_is_running(),
+    });
 
     let mut foot = caption.to_string();
     if quiet.show_eta {
-        if let Some(eta) = about_time_left(elapsed, overall_progress) {
+        if let Some(eta) = about_time_left(elapsed, running.overall_progress) {
             foot = format!("{eta} · {foot}");
         }
     }
@@ -1045,7 +1033,7 @@ fn paint_quiet_chrome(
         },
     );
 
-    if quiet.show_spinner || work_progress.is_none() {
+    if quiet.show_spinner || running.work_progress.is_none() {
         w.now_playing_spinner.set_opacity(1.0);
     } else {
         w.now_playing_spinner.set_opacity(0.0);
@@ -1057,25 +1045,11 @@ fn paint_quiet_chrome(
     } else {
         w.run_stall.set_revealed(false);
     }
-
-    if quiet.reconcile && watching_dnf {
-        maybe_reconcile_dnf(state, w, packages);
-    }
 }
 
 fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     let s = state.borrow();
-    let Phase::Running {
-        packages,
-        overall_progress,
-        pass,
-        current_source,
-        work_progress,
-        stage,
-        ..
-    } = &s.phase
-    else {
-        drop(s);
+    let Phase::Running(running) = &s.phase else {
         w.run_stall.set_revealed(false);
         return;
     };
@@ -1084,241 +1058,77 @@ fn refresh_quiet_chrome(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
         .as_ref()
         .map(|sw| sw.elapsed_secs())
         .unwrap_or(0);
-    let package_done = packages.iter().filter(|p| p.status.is_done()).count();
-    let (done, total) = match *stage {
-        Some(StageCount { current, total }) if total > 0 => (current as usize, total as usize),
-        _ => (package_done, packages.len()),
-    };
-    let (caption, _) = running_progress_captions(*current_source, done, total, *pass);
-    let packages = packages.clone();
-    let applying = *pass == RunPass::Apply;
-    let work_progress = *work_progress;
-    let current_source = *current_source;
-    let overall_progress = *overall_progress;
-    drop(s);
-    paint_quiet_chrome(
-        state,
-        w,
-        &caption,
-        applying,
-        work_progress,
-        current_source,
-        elapsed,
-        overall_progress,
-        &packages,
-    );
+    let (done, total) = running.done_and_total();
+    let (caption, _) = running_progress_captions(running.current_source, done, total, running.pass);
+    paint_quiet_chrome(running, &caption, elapsed, w);
 }
 
-/// Writes `RecoveryProbeStarted` onto the latch. Returns whether that moved it
-/// to `InFlight`. The caller must not hold a `Ref` on `state`: a shared borrow
-/// still outstanding panics on `borrow_mut` instead of skipping the probe.
-fn commit_recovery_probe_started(state: &Rc<RefCell<AppState>>) -> bool {
-    let can_start = {
-        let borrowed = state.borrow();
-        let recovery = match &borrowed.phase {
-            Phase::Running { recovery, .. } => *recovery,
-            _ => return false,
-        };
-        match recovery {
-            RecoveryLatch::Idle => true,
-            RecoveryLatch::Backoff { not_before } => Instant::now() >= not_before,
-            RecoveryLatch::InFlight | RecoveryLatch::Settled => false,
-        }
-    };
-    if !can_start {
-        return false;
-    }
-    let mut borrowed = state.borrow_mut();
-    if state::reduce(&mut borrowed, Event::RecoveryProbeStarted).is_err() {
-        return false;
-    }
-    matches!(
-        &borrowed.phase,
-        Phase::Running {
-            recovery: RecoveryLatch::InFlight,
-            ..
-        }
-    )
-}
-
-fn maybe_reconcile_dnf(state: &Rc<RefCell<AppState>>, w: &Widgets, packages: &[Package]) {
-    let dnf_pkgs: Vec<Package> = packages
-        .iter()
-        .filter(|p| p.source == UpdateSource::Dnf)
-        .cloned()
-        .collect();
-    if dnf_pkgs.is_empty() {
-        return;
-    }
-    if !commit_recovery_probe_started(state) {
-        return;
-    }
-    let tx = w.reconcile_tx.clone();
-    std::thread::spawn(move || {
-        let check = query_dnf_install_state(&dnf_pkgs);
-        let _ = tx.send_blocking(check);
-    });
-}
-
-fn query_dnf_install_state(packages: &[Package]) -> InstallCheck {
-    let args = dnf::rpm_query_args(packages);
-    // `-q`, `--qf`, and the format are not package specs.
-    if args.len() <= 3 {
-        return InstallCheck::Unknown;
-    }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut output = String::new();
-    match run_local_command("rpm", &arg_refs, |line| {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str(&line);
-    }) {
-        Ok(_) => {
-            let installed = dnf::parse_rpm_query(&output);
-            dnf::check_packages_installed(packages, &installed)
-        }
-        Err(_) => InstallCheck::Unknown,
-    }
-}
-
-fn handle_install_check(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, check: InstallCheck) {
-    let (packages, current_source, needs_reboot, recovery) = {
-        let borrowed = state.borrow();
-        let Phase::Running {
-            packages,
-            current_source,
-            needs_reboot,
-            recovery,
-            ..
-        } = &borrowed.phase
-        else {
-            return;
-        };
-        (packages.clone(), *current_source, *needs_reboot, *recovery)
-    };
-    if current_source != Some(UpdateSource::Dnf) {
-        return;
-    }
-    match check {
-        InstallCheck::Unknown => {
-            dispatch_worker(state, widgets, Event::RecoveryProbeUnknown);
-        }
-        InstallCheck::AllInstalled => {
-            if has_sources_after_dnf(&packages) {
-                if matches!(recovery, RecoveryLatch::Settled) {
-                    return;
-                }
-                dispatch_worker(state, widgets, Event::RecoveryProbeSettled);
-                dispatch_worker(
-                    state,
-                    widgets,
-                    Event::BackendApplyDone {
-                        source: UpdateSource::Dnf,
-                        success: true,
-                        needs_reboot,
-                    },
-                );
-            } else {
-                cancel_background_work();
-                kill_recorded_helper();
-                dispatch_worker(state, widgets, Event::ApplyComplete { needs_reboot });
-            }
-        }
-        InstallCheck::NotInstalled => {
-            cancel_background_work();
-            kill_recorded_helper();
-            dispatch_worker(
-                state,
-                widgets,
-                Event::Fail {
-                    title: "Update did not finish".into(),
-                    detail: "dnf exited and the new package versions are not installed. Nothing from this run was committed. You can run Update All again.".into(),
-                    retry: RetryAction::CheckAgain,
-                },
-            );
-        }
-        InstallCheck::Partial { installed, total } => {
-            cancel_background_work();
-            kill_recorded_helper();
-            dispatch_worker(
-                state,
-                widgets,
-                Event::Fail {
-                    title: "Update stopped partway through".into(),
-                    detail: format!(
-                        "{installed} of {total} packages were installed before dnf exited. Check `dnf history` before running Update All again."
-                    ),
-                    retry: RetryAction::CheckAgain,
-                },
-            );
-        }
-    }
-}
-
-fn prompt_stop_during_transaction(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppState>>) {
+fn prompt_stop_during_transaction(
+    widgets: &Rc<Widgets>,
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+) {
     let copy = stop_update_dialog();
     let dialog = build_dialog(&copy);
 
     let state = state.clone();
+    let console = console.clone();
     let widgets_for_cb = widgets.clone();
     dialog.connect_response(None, move |_dialog, response| {
         if response != copy.confirm_id {
             return;
         }
-        let during = matches!(
-            state.borrow().phase,
-            Phase::Running {
-                pass: RunPass::Apply,
-                ..
-            }
-        );
-        let running = matches!(state.borrow().phase, Phase::Running { .. });
-        if running {
-            stop_apply(&state, &widgets_for_cb, during);
-        }
+        let borrowed = state.borrow();
+        let Phase::Running(running) = &borrowed.phase else {
+            return;
+        };
+        let during = running.is_applying();
+        drop(borrowed);
+        stop_apply(&state, &console, &widgets_for_cb, during);
     });
     dialog.present(Some(&widgets.window));
 }
 
-fn stop_apply(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, during_transaction: bool) {
+fn stop_apply(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+    during_transaction: bool,
+) {
     cancel_background_work();
     kill_recorded_helper();
-    dispatch_worker(state, widgets, Event::StopApply { during_transaction });
+    dispatch_worker(
+        state,
+        console,
+        widgets,
+        Event::StopApply { during_transaction },
+    );
 }
 
-fn render_running(
-    state: &Rc<RefCell<AppState>>,
-    w: &Widgets,
-    packages: &[Package],
-    overall_progress: f64,
-    phase_label: &str,
-    pass: RunPass,
-    stage: Option<StageCount>,
-    current_source: Option<UpdateSource>,
-    active_index: Option<usize>,
-    current_name: Option<&str>,
-    work_progress: Option<f64>,
-    elapsed: u64,
-) {
+fn render_running(running: &RunningState, elapsed: u64, last_console: &str, w: &Widgets) {
     w.stack.set_visible_child_name("running");
-    w.header_refresh.set_visible(false);
     w.run_stop.set_visible(true);
-    paint_stop_button(&w.run_stop, pass);
-    w.window_title.set_title(run_heading(phase_label, pass));
-    let package_done = packages.iter().filter(|p| p.status.is_done()).count();
-    let (done, total) = match stage {
-        Some(StageCount { current, total }) if total > 0 => (current as usize, total as usize),
-        _ => (package_done, packages.len()),
-    };
-    let (caption, meta) = running_progress_captions(current_source, done, total, pass);
-    w.run_progress.set_fraction(overall_progress);
+    paint_stop_button(&w.run_stop, running.pass);
+    w.window_title
+        .set_title(run_heading(&running.phase_label, running.pass));
+    w.console_line.set_text(console_preview_line(last_console));
+    let (done, total) = running.done_and_total();
+    let (caption, meta) =
+        running_progress_captions(running.current_source, done, total, running.pass);
+    w.run_progress.set_fraction(running.overall_progress);
     w.run_progress_meta.set_text(&meta);
     w.run_progress_pct
-        .set_text(&format!("{:.0}%", overall_progress * 100.0));
+        .set_text(&format!("{:.0}%", running.overall_progress * 100.0));
 
-    let title = now_playing_title(packages, active_index, current_name, phase_label);
-    let subtitle = now_playing_subtitle(&title, phase_label, current_source);
+    let packages = &running.packages;
+    let current_name = running.current_name.as_deref();
+    let title = now_playing_title(
+        packages,
+        running.active_index,
+        current_name,
+        &running.phase_label,
+    );
+    let subtitle = now_playing_subtitle(&title, &running.phase_label, running.current_source);
     w.now_playing_title.set_text(&title);
     w.now_playing_subtitle.set_text(if subtitle.is_empty() {
         "Working"
@@ -1326,7 +1136,7 @@ fn render_running(
         &subtitle
     });
     w.now_playing_subtitle.set_visible(true);
-    let playing = current_package(packages, active_index, current_name);
+    let playing = current_package(packages, running.active_index, current_name);
     paint_source_badge(&w.now_playing_badge, playing);
     if let Some(size) = playing.and_then(Package::size_label) {
         w.now_playing_size.set_text(&size);
@@ -1334,7 +1144,7 @@ fn render_running(
     } else {
         w.now_playing_size.set_visible(false);
     }
-    if let Some(frac) = work_progress {
+    if let Some(frac) = running.work_progress {
         let frac = frac.clamp(0.0, 1.0);
         w.now_playing_spinner.set_opacity(0.0);
         w.now_playing_pct.set_text(&format!("{:.0}%", frac * 100.0));
@@ -1360,7 +1170,8 @@ fn render_running(
     {
         let list = w.run_list_rows.borrow();
         for (p, row) in remaining.iter().zip(list.iter()) {
-            let is_current = active_index
+            let is_current = running
+                .active_index
                 .and_then(|i| packages.get(i))
                 .is_some_and(|cur| cur.id == p.id && !cur.status.is_done());
             rows::sync_checklist_row(row, p, is_current);
@@ -1404,17 +1215,7 @@ fn render_running(
     w.run_completed_group.set_visible(has_completed);
     w.ignore_expand.set(false);
 
-    paint_quiet_chrome(
-        state,
-        w,
-        &caption,
-        pass == RunPass::Apply,
-        work_progress,
-        current_source,
-        elapsed,
-        overall_progress,
-        packages,
-    );
+    paint_quiet_chrome(running, &caption, elapsed, w);
 }
 
 fn arm_idle_check_focus(w: &Widgets) {
@@ -1535,7 +1336,11 @@ fn command_row(command: &str, copy_name: &str) -> gtk::Box {
     row
 }
 
-fn spawn_release_lookup(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>) {
+fn spawn_release_lookup(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+) {
     let (tx, rx) =
         async_channel::bounded::<Option<fedora_updater::release_upgrade::ReleaseOffer>>(1);
     std::thread::spawn(move || {
@@ -1543,11 +1348,13 @@ fn spawn_release_lookup(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>) {
         let _ = tx.send_blocking(offer);
     });
     let state = state.clone();
+    let console = console.clone();
     let widgets = widgets.clone();
     glib::spawn_future_local(async move {
         if let Ok(offer) = rx.recv().await {
             dispatch(
                 &state,
+                &console,
                 &widgets,
                 Event::ReleaseNoted {
                     version: offer.as_ref().map(|offer| offer.version),
@@ -1558,81 +1365,26 @@ fn spawn_release_lookup(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>) {
     });
 }
 
-fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
+fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
     w.run_stall.set_revealed(false);
     clear_idle_check_focus(w);
-    let s = state.borrow();
-    paint_release_upgrade(w, s.release_upgrade, s.release_age_days);
-    sync_console_drawer(w, matches!(s.phase, Phase::Checking { .. } | Phase::Running { .. }));
-    let elapsed = s
+    paint_release_upgrade(w, state.release_upgrade, state.release_age_days);
+    sync_console_drawer(
+        w,
+        matches!(state.phase, Phase::Checking { .. } | Phase::Running(_)),
+    );
+    let elapsed = state
         .stopwatch
         .as_ref()
         .map(|sw| sw.elapsed_secs())
         .unwrap_or(0);
 
-    // Quiet reconcile writes the recovery latch. Clone the Running page and
-    // drop this Ref before that paint; a shared borrow still held here panics
-    // on the write and the rpm probe never starts.
-    let running = match &s.phase {
-        Phase::Running {
-            packages,
-            overall_progress,
-            phase_label,
-            current_source,
-            active_index,
-            current_name,
-            work_progress,
-            pass,
-            stage,
-            ..
-        } => Some((
-            packages.clone(),
-            *overall_progress,
-            phase_label.clone(),
-            *current_source,
-            *active_index,
-            current_name.clone(),
-            *work_progress,
-            *pass,
-            *stage,
-        )),
-        _ => None,
-    };
-    if let Some((
-        packages,
-        overall_progress,
-        phase_label,
-        current_source,
-        active_index,
-        current_name,
-        work_progress,
-        pass,
-        stage,
-    )) = running
-    {
-        drop(s);
-        render_running(
-            state,
-            w,
-            &packages,
-            overall_progress,
-            &phase_label,
-            pass,
-            stage,
-            current_source,
-            active_index,
-            current_name.as_deref(),
-            work_progress,
-            elapsed,
-        );
-        return;
-    }
-
     w.header_refresh
-        .set_visible(matches!(s.phase, Phase::Ready { .. }));
-    w.run_stop.set_visible(false);
+        .set_visible(matches!(state.phase, Phase::Ready { .. }));
+    w.run_stop
+        .set_visible(matches!(state.phase, Phase::Running(_)));
 
-    match &s.phase {
+    match &state.phase {
         Phase::Idle(screen) => {
             clear_running_lists(w);
             restore_default_window_size(&w.window);
@@ -1675,6 +1427,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             ..
         } => {
             w.stack.set_visible_child_name("checking");
+            w.console_line
+                .set_text(console_preview_line(console.last_line()));
             let (frac, groups_done, status) = check_progress(checked_sources);
             let eta = about_time_left(elapsed, frac);
             let foot = checking_footnote(groups_done, eta.as_deref());
@@ -1720,8 +1474,8 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 packages.iter().map(|p| rows::package_row(p, false)),
             );
         }
-        Phase::Running { .. } => {
-            unreachable!("Running is painted after the state borrow is dropped");
+        Phase::Running(running) => {
+            render_running(running, elapsed, console.last_line(), w);
         }
         Phase::Done {
             packages,
@@ -2171,81 +1925,6 @@ mod tests {
             "Check Again"
         );
         assert_eq!(super::fail_retry_label(RetryAction::Reboot), "Restart");
-    }
-
-    fn running_after_session_ready() -> fedora_updater::state::AppState {
-        use fedora_updater::model::{AuthPurpose, Package};
-        use fedora_updater::state::{AppState, Event, Phase};
-        let mut s = AppState::default();
-        s.phase = Phase::Ready {
-            packages: vec![Package::new_dnf("glibc", "x86_64", "1", "updates")],
-            soft_errors: vec![],
-        };
-        fedora_updater::state::reduce(&mut s, Event::StartApply).unwrap();
-        fedora_updater::state::reduce(
-            &mut s,
-            Event::SessionReady {
-                purpose: AuthPurpose::Apply,
-            },
-        )
-        .unwrap();
-        s
-    }
-
-    #[test]
-    fn recovery_probe_commit_writes_inflight_and_panics_if_a_borrow_is_held() {
-        use fedora_updater::state::{Phase, RecoveryLatch};
-        use std::cell::RefCell;
-        use std::panic::{catch_unwind, AssertUnwindSafe};
-        use std::rc::Rc;
-
-        let state = Rc::new(RefCell::new(running_after_session_ready()));
-        assert!(
-            matches!(
-                state.borrow().phase,
-                Phase::Running {
-                    recovery: RecoveryLatch::Idle,
-                    ..
-                }
-            ),
-            "SessionReady for Apply starts the latch Idle"
-        );
-        assert!(super::commit_recovery_probe_started(&state));
-        assert!(matches!(
-            state.borrow().phase,
-            Phase::Running {
-                recovery: RecoveryLatch::InFlight,
-                ..
-            }
-        ));
-        assert!(
-            !super::commit_recovery_probe_started(&state),
-            "a second start leaves InFlight and does not spawn another probe"
-        );
-
-        let state = Rc::new(RefCell::new(running_after_session_ready()));
-        let held = state.borrow();
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let panicked = catch_unwind(AssertUnwindSafe(|| {
-            super::commit_recovery_probe_started(&state);
-        }));
-        std::panic::set_hook(prev_hook);
-        assert!(
-            panicked.is_err(),
-            "a held Ref must panic on the latch write, not skip the probe"
-        );
-        drop(held);
-        assert!(
-            matches!(
-                state.borrow().phase,
-                Phase::Running {
-                    recovery: RecoveryLatch::Idle,
-                    ..
-                }
-            ),
-            "the panicked write must leave the latch Idle"
-        );
     }
 
     #[test]

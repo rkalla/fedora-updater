@@ -600,11 +600,19 @@ pub fn running_progress_captions(
 /// Why the running page looks quiet. First match wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuietMode {
-    Exited,
     CacheGrowing,
     Stalled,
     ItemAtFull,
     Flowing,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QuietInput<'a> {
+    pub quiet_secs: u64,
+    pub at_full_item: bool,
+    pub cache_note: Option<&'a str>,
+    pub watching_dnf: bool,
+    pub daemon_running: bool,
 }
 
 /// How the running page should look when backend output has gone quiet.
@@ -617,27 +625,15 @@ pub struct QuietUi {
     /// Replaces the ETA prefix on the footnote. `None` keeps the normal caption.
     pub footnote: Option<String>,
     pub banner: Option<String>,
-    /// Ask rpm whether the planned DNF versions are already installed.
-    pub reconcile: bool,
 }
 
-pub fn quiet_ui(
-    quiet_secs: u64,
-    at_full_item: bool,
-    cache_note: Option<&str>,
-    tool_alive: bool,
-    watching_dnf: bool,
-    daemon_running: bool,
-) -> QuietUi {
-    let cache = cache_note.filter(|s| !s.is_empty());
-    let show_eta = quiet_secs < 15 && cache.is_none();
-    let exited = watching_dnf && !tool_alive && quiet_secs >= 20;
-    let stalled = quiet_secs >= 120 && cache.is_none() && !exited;
-    let at_full_spinner = quiet_secs >= 5 && at_full_item && cache.is_none();
-    let show_spinner = cache.is_some() || exited || stalled || at_full_spinner;
-    let mode = if exited {
-        QuietMode::Exited
-    } else if cache.is_some() {
+pub fn quiet_ui(input: QuietInput<'_>) -> QuietUi {
+    let cache = input.cache_note.filter(|s| !s.is_empty());
+    let show_eta = input.quiet_secs < 15 && cache.is_none();
+    let stalled = input.quiet_secs >= 120 && cache.is_none();
+    let at_full_spinner = input.quiet_secs >= 5 && input.at_full_item && cache.is_none();
+    let show_spinner = cache.is_some() || stalled || at_full_spinner;
+    let mode = if cache.is_some() {
         QuietMode::CacheGrowing
     } else if stalled {
         QuietMode::Stalled
@@ -648,10 +644,8 @@ pub fn quiet_ui(
     };
     let footnote = if let Some(note) = cache {
         Some(note.to_string())
-    } else if exited {
-        Some("dnf has exited".into())
     } else if stalled {
-        Some(if watching_dnf {
+        Some(if input.watching_dnf {
             "Waiting on dnf".into()
         } else {
             "Waiting for output".into()
@@ -659,11 +653,9 @@ pub fn quiet_ui(
     } else {
         None
     };
-    let banner = if exited {
-        Some("dnf has exited. Checking whether the packages were installed.".into())
-    } else if stalled {
-        let mins = (quiet_secs / 60).max(2);
-        Some(if daemon_running {
+    let banner = if stalled {
+        let mins = (input.quiet_secs / 60).max(2);
+        Some(if input.daemon_running {
             format!("No output for {mins} minutes. Waiting on GNOME Software.")
         } else {
             format!("No output for {mins} minutes.")
@@ -677,7 +669,6 @@ pub fn quiet_ui(
         show_spinner,
         footnote,
         banner,
-        reconcile: exited,
     }
 }
 
@@ -945,26 +936,43 @@ mod tests {
 
     #[test]
     fn quiet_download_hides_eta_and_names_a_growing_cache_file() {
-        let fresh = quiet_ui(2, false, None, true, true, false);
+        let fresh = quiet_ui(QuietInput {
+            quiet_secs: 2,
+            watching_dnf: true,
+            ..Default::default()
+        });
         assert_eq!(fresh.mode, QuietMode::Flowing);
         assert!(fresh.show_eta);
         assert!(!fresh.show_spinner);
         assert!(fresh.banner.is_none());
-        assert!(!fresh.reconcile);
 
-        let stuck_full = quiet_ui(8, true, None, true, true, false);
+        let stuck_full = quiet_ui(QuietInput {
+            quiet_secs: 8,
+            at_full_item: true,
+            watching_dnf: true,
+            ..Default::default()
+        });
         assert_eq!(stuck_full.mode, QuietMode::ItemAtFull);
         assert!(stuck_full.show_spinner);
         assert!(stuck_full.show_eta);
 
-        let growing = quiet_ui(
-            400,
-            true,
-            Some("Downloading grok-bot — 85 MB and rising"),
-            true,
-            true,
-            false,
-        );
+        let eta_hidden = quiet_ui(QuietInput {
+            quiet_secs: 15,
+            at_full_item: false,
+            watching_dnf: true,
+            ..Default::default()
+        });
+        assert_eq!(eta_hidden.mode, QuietMode::Flowing);
+        assert!(!eta_hidden.show_eta);
+        assert!(!eta_hidden.show_spinner);
+
+        let growing = quiet_ui(QuietInput {
+            quiet_secs: 400,
+            at_full_item: true,
+            cache_note: Some("Downloading grok-bot — 85 MB and rising"),
+            watching_dnf: true,
+            daemon_running: false,
+        });
         assert_eq!(growing.mode, QuietMode::CacheGrowing);
         assert!(!growing.show_eta);
         assert!(growing.show_spinner);
@@ -973,48 +981,47 @@ mod tests {
             Some("Downloading grok-bot — 85 MB and rising")
         );
         assert!(growing.banner.is_none());
-        assert!(!growing.reconcile);
 
-        let stalled = quiet_ui(180, true, None, true, true, false);
+        let stalled = quiet_ui(QuietInput {
+            quiet_secs: 180,
+            at_full_item: true,
+            watching_dnf: true,
+            ..Default::default()
+        });
         assert_eq!(stalled.mode, QuietMode::Stalled);
         assert!(!stalled.show_eta);
+        assert!(stalled.show_spinner);
+        assert_eq!(stalled.footnote.as_deref(), Some("Waiting on dnf"));
         let stalled_banner = stalled.banner.expect("stalled banner");
         assert_eq!(stalled_banner, "No output for 3 minutes.");
         assert!(!stalled_banner.contains("Last line:"));
-        assert!(!stalled.reconcile);
 
-        let exited = quiet_ui(25, true, None, false, true, false);
-        assert_eq!(exited.mode, QuietMode::Exited);
-        assert!(exited.reconcile);
-        assert!(exited.banner.unwrap().contains("Checking whether"));
-
-        let overlap = quiet_ui(
-            25,
-            true,
-            Some("Downloading grok-bot — 85 MB and rising"),
-            false,
-            true,
-            false,
-        );
-        assert_eq!(overlap.mode, QuietMode::Exited);
+        let flatpak_stalled = quiet_ui(QuietInput {
+            quiet_secs: 180,
+            at_full_item: false,
+            watching_dnf: false,
+            ..Default::default()
+        });
+        assert_eq!(flatpak_stalled.mode, QuietMode::Stalled);
         assert_eq!(
-            overlap.footnote.as_deref(),
-            Some("Downloading grok-bot — 85 MB and rising")
+            flatpak_stalled.footnote.as_deref(),
+            Some("Waiting for output")
         );
-        assert!(overlap.reconcile);
         assert_eq!(
-            overlap.banner.as_deref(),
-            Some("dnf has exited. Checking whether the packages were installed.")
+            flatpak_stalled.banner.as_deref(),
+            Some("No output for 3 minutes.")
         );
-
-        let flatpak = quiet_ui(30, false, None, false, false, false);
-        assert_eq!(flatpak.mode, QuietMode::Flowing);
-        assert!(!flatpak.reconcile);
     }
 
     #[test]
     fn stalled_banner_names_the_daemon_only_when_asked() {
-        let on = quiet_ui(180, true, None, true, true, true);
+        let on = quiet_ui(QuietInput {
+            quiet_secs: 180,
+            at_full_item: true,
+            watching_dnf: true,
+            daemon_running: true,
+            ..Default::default()
+        });
         let on_banner = on.banner.expect("stalled banner");
         assert_eq!(
             on_banner,
@@ -1027,7 +1034,13 @@ mod tests {
         assert!(!on_banner.contains("dnf daemon"), "{on_banner}");
         assert!(!on_banner.contains("Last line:"), "{on_banner}");
 
-        let off = quiet_ui(180, true, None, true, true, false);
+        let off = quiet_ui(QuietInput {
+            quiet_secs: 180,
+            at_full_item: true,
+            watching_dnf: true,
+            daemon_running: false,
+            ..Default::default()
+        });
         let off_banner = off.banner.expect("stalled banner");
         assert_eq!(off_banner, "No output for 3 minutes.");
         assert!(
@@ -1036,12 +1049,6 @@ mod tests {
         );
         assert!(!off_banner.contains("dnf daemon"), "{off_banner}");
         assert!(!off_banner.contains("Last line:"), "{off_banner}");
-    }
-
-    #[test]
-    fn absent_helper_does_not_look_like_exited() {
-        let quiet = quiet_ui(25, true, None, true, true, false);
-        assert!(!quiet.reconcile);
     }
 
     #[test]

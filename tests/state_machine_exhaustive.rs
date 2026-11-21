@@ -3,8 +3,8 @@
 
 use std::time::SystemTime;
 
-use fedora_updater::model::{Package, PackageStatus, RunPass, UpdateSource};
-use fedora_updater::state::{phase_name, reduce, AppState, Event, Phase};
+use fedora_updater::model::{Package, PackageStatus, UpdateSource};
+use fedora_updater::state::{phase_name, reduce, AppState, Event, Phase, RunningState};
 use fedora_updater::{AuthPurpose, TransitionError};
 
 fn apply(mut state: AppState, event: Event) -> Result<AppState, TransitionError> {
@@ -264,20 +264,12 @@ fn auth_cancel_style_fail() {
 
 #[test]
 fn progress_marks_package_and_completes_previous() {
-    let mut s = AppState::default();
-    s.phase = Phase::Running {
-        packages: vec![dnf("openssl"), dnf("kernel")],
-        active_index: None,
-        overall_progress: 0.0,
-        phase_label: "x".into(),
-        current_source: None,
-        current_name: None,
-        work_progress: None,
-        pass: RunPass::Download,
-        stage: None,
-        recovery: fedora_updater::state::RecoveryLatch::Idle,
-        needs_reboot: false,
-        failed_sources: Vec::new(),
+    let s = AppState {
+        phase: Phase::Running(RunningState {
+            phase_label: "x".into(),
+            ..RunningState::new(vec![dnf("openssl"), dnf("kernel")])
+        }),
+        ..Default::default()
     };
     let s = apply(
         s,
@@ -312,20 +304,13 @@ fn progress_marks_package_and_completes_previous() {
 
 #[test]
 fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
-    let mut s = AppState::default();
-    s.phase = Phase::Running {
-        packages: vec![dnf("abrt"), dnf("kernel")],
-        active_index: None,
-        overall_progress: 0.0,
-        phase_label: "x".into(),
-        current_source: Some(UpdateSource::Dnf),
-        current_name: None,
-        work_progress: None,
-        pass: RunPass::Download,
-        stage: None,
-        recovery: fedora_updater::state::RecoveryLatch::Idle,
-        needs_reboot: false,
-        failed_sources: Vec::new(),
+    let s = AppState {
+        phase: Phase::Running(RunningState {
+            phase_label: "x".into(),
+            current_source: Some(UpdateSource::Dnf),
+            ..RunningState::new(vec![dnf("abrt"), dnf("kernel")])
+        }),
+        ..Default::default()
     };
     let s = apply(
         s,
@@ -341,19 +326,15 @@ fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
     )
     .unwrap();
     match &s.phase {
-        Phase::Running {
-            packages,
-            active_index,
-            current_name,
-            work_progress,
-            overall_progress,
-            ..
-        } => {
-            assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
-            assert_eq!(*active_index, None);
-            assert_eq!(current_name.as_deref(), None);
-            assert_eq!(*work_progress, Some(0.5));
-            assert!((*overall_progress - 0.0).abs() < f64::EPSILON);
+        Phase::Running(running) => {
+            assert!(running
+                .packages
+                .iter()
+                .all(|p| p.status == PackageStatus::Pending));
+            assert_eq!(running.active_index, None);
+            assert_eq!(running.current_name.as_deref(), None);
+            assert_eq!(running.work_progress, Some(0.5));
+            assert!((running.overall_progress - 0.0).abs() < f64::EPSILON);
         }
         other => panic!("expected Running, got {other:?}"),
     }
@@ -361,20 +342,12 @@ fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
 
 #[test]
 fn kernel_hint_does_not_complete_kernel_core() {
-    let mut s = AppState::default();
-    s.phase = Phase::Running {
-        packages: vec![dnf("kernel"), dnf("kernel-core")],
-        active_index: None,
-        overall_progress: 0.0,
-        phase_label: "x".into(),
-        current_source: None,
-        current_name: None,
-        work_progress: None,
-        pass: RunPass::Download,
-        stage: None,
-        recovery: fedora_updater::state::RecoveryLatch::Idle,
-        needs_reboot: false,
-        failed_sources: Vec::new(),
+    let s = AppState {
+        phase: Phase::Running(RunningState {
+            phase_label: "x".into(),
+            ..RunningState::new(vec![dnf("kernel"), dnf("kernel-core")])
+        }),
+        ..Default::default()
     };
     let s = apply(
         s,
@@ -396,28 +369,26 @@ fn kernel_hint_does_not_complete_kernel_core() {
 
 #[test]
 fn verify_pass_does_not_move_current_back_to_completed() {
-    let mut s = AppState::default();
-    s.phase = Phase::Running {
-        packages: vec![dnf("firefox"), dnf("kernel")],
-        active_index: Some(1),
-        overall_progress: 0.5,
-        phase_label: "Installing".into(),
-        current_source: Some(UpdateSource::Dnf),
-        current_name: Some("kernel".into()),
-        work_progress: Some(0.5),
-        pass: RunPass::Apply,
-        stage: None,
-        recovery: fedora_updater::state::RecoveryLatch::Idle,
-        needs_reboot: false,
-        failed_sources: Vec::new(),
+    let mut firefox = dnf("firefox");
+    firefox.status = PackageStatus::Completed;
+    let mut kernel = dnf("kernel");
+    kernel.status = PackageStatus::Installing;
+    let s = AppState {
+        phase: Phase::Running(RunningState {
+            packages: vec![firefox, kernel],
+            active_index: Some(1),
+            overall_progress: 0.5,
+            phase_label: "Installing".into(),
+            current_source: Some(UpdateSource::Dnf),
+            current_name: Some("kernel".into()),
+            work_progress: Some(0.5),
+            pass: fedora_updater::model::RunPass::Apply,
+            stage: None,
+            needs_reboot: false,
+            failed_sources: Vec::new(),
+        }),
+        ..Default::default()
     };
-    match &mut s.phase {
-        Phase::Running { packages, .. } => {
-            packages[0].status = PackageStatus::Completed;
-            packages[1].status = PackageStatus::Installing;
-        }
-        _ => unreachable!(),
-    }
     let s = apply(
         s,
         Event::ApplyProgress {
@@ -432,16 +403,11 @@ fn verify_pass_does_not_move_current_back_to_completed() {
     )
     .unwrap();
     match &s.phase {
-        Phase::Running {
-            packages,
-            active_index,
-            current_name,
-            ..
-        } => {
-            assert_eq!(packages[0].status, PackageStatus::Completed);
-            assert_eq!(packages[1].status, PackageStatus::Installing);
-            assert_eq!(*active_index, Some(1));
-            assert_eq!(current_name.as_deref(), Some("kernel"));
+        Phase::Running(running) => {
+            assert_eq!(running.packages[0].status, PackageStatus::Completed);
+            assert_eq!(running.packages[1].status, PackageStatus::Installing);
+            assert_eq!(running.active_index, Some(1));
+            assert_eq!(running.current_name.as_deref(), Some("kernel"));
         }
         other => panic!("expected Running, got {other:?}"),
     }
@@ -449,20 +415,14 @@ fn verify_pass_does_not_move_current_back_to_completed() {
 
 #[test]
 fn source_switch_progress_does_not_mark_first_package() {
-    let mut s = AppState::default();
-    s.phase = Phase::Running {
-        packages: vec![dnf("abrt"), dnf("kernel")],
-        active_index: None,
-        overall_progress: 0.0,
-        phase_label: "x".into(),
-        current_source: None,
-        current_name: Some("stale".into()),
-        work_progress: Some(0.3),
-        pass: RunPass::Download,
-        stage: None,
-        recovery: fedora_updater::state::RecoveryLatch::Idle,
-        needs_reboot: false,
-        failed_sources: Vec::new(),
+    let s = AppState {
+        phase: Phase::Running(RunningState {
+            phase_label: "x".into(),
+            current_name: Some("stale".into()),
+            work_progress: Some(0.3),
+            ..RunningState::new(vec![dnf("abrt"), dnf("kernel")])
+        }),
+        ..Default::default()
     };
     let s = apply(
         s,
@@ -478,19 +438,15 @@ fn source_switch_progress_does_not_mark_first_package() {
     )
     .unwrap();
     match &s.phase {
-        Phase::Running {
-            packages,
-            active_index,
-            current_name,
-            work_progress,
-            phase_label,
-            ..
-        } => {
-            assert!(packages.iter().all(|p| p.status == PackageStatus::Pending));
-            assert_eq!(*active_index, None);
-            assert_eq!(*current_name, None);
-            assert_eq!(*work_progress, None);
-            assert_eq!(phase_label, "Updating System");
+        Phase::Running(running) => {
+            assert!(running
+                .packages
+                .iter()
+                .all(|p| p.status == PackageStatus::Pending));
+            assert_eq!(running.active_index, None);
+            assert_eq!(running.current_name, None);
+            assert_eq!(running.work_progress, None);
+            assert_eq!(running.phase_label, "Updating System");
         }
         other => panic!("expected Running, got {other:?}"),
     }
