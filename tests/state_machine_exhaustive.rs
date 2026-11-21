@@ -5,7 +5,12 @@ use std::time::SystemTime;
 
 use fedora_updater::model::{Package, PackageStatus, RunPass, UpdateSource};
 use fedora_updater::state::{phase_name, reduce, AppState, Event, Phase};
-use fedora_updater::AuthPurpose;
+use fedora_updater::{AuthPurpose, TransitionError};
+
+fn apply(mut state: AppState, event: Event) -> Result<AppState, TransitionError> {
+    reduce(&mut state, event)?;
+    Ok(state)
+}
 
 fn dnf(name: &str) -> Package {
     Package::new_dnf(name, "x86_64", "1.0-1.fc42", "updates")
@@ -50,10 +55,10 @@ fn happy_path_multi_source() {
     let s = AppState::default();
     assert_phase(&s, "Idle");
 
-    let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
+    let s = apply(s, Event::StartCheck { then_apply: false }).unwrap();
     assert_phase(&s, "Authenticating");
 
-    let s = reduce(
+    let s = apply(
         s,
         Event::SessionReady {
             purpose: AuthPurpose::Check,
@@ -62,18 +67,8 @@ fn happy_path_multi_source() {
     .unwrap();
     assert_phase(&s, "Checking");
 
-    let s = reduce(
-        s,
-        Event::ConsoleLine {
-            tag: "dnf".into(),
-            text: "loading".into(),
-        },
-    )
-    .unwrap();
-    assert!(s.console.last_line().contains("[dnf]"));
-
     let pkgs = vec![dnf("kernel"), flatpak("org.app.Foo"), firmware("UEFI")];
-    let s = reduce(
+    let s = apply(
         s,
         Event::BackendCheckDone {
             source: UpdateSource::Dnf,
@@ -82,7 +77,7 @@ fn happy_path_multi_source() {
         },
     )
     .unwrap();
-    let s = reduce(
+    let s = apply(
         s,
         Event::BackendCheckDone {
             source: UpdateSource::FlatpakUser,
@@ -91,7 +86,7 @@ fn happy_path_multi_source() {
         },
     )
     .unwrap();
-    let s = reduce(
+    let s = apply(
         s,
         Event::BackendCheckDone {
             source: UpdateSource::Firmware,
@@ -102,7 +97,7 @@ fn happy_path_multi_source() {
     .unwrap();
     assert_eq!(s.packages().len(), 3);
 
-    let s = reduce(
+    let s = apply(
         s,
         Event::CheckComplete {
             packages: pkgs.clone(),
@@ -125,10 +120,10 @@ fn happy_path_multi_source() {
         .collect();
     assert!(names.windows(2).all(|w| w[0] <= w[1]));
 
-    let s = reduce(s, Event::StartApply).unwrap();
+    let s = apply(s, Event::StartApply).unwrap();
     assert_phase(&s, "Authenticating");
 
-    let s = reduce(
+    let s = apply(
         s,
         Event::SessionReady {
             purpose: AuthPurpose::Apply,
@@ -143,7 +138,7 @@ fn happy_path_multi_source() {
         (UpdateSource::FlatpakUser, "Apps"),
         (UpdateSource::Firmware, "Firmware"),
     ] {
-        s = reduce(
+        s = apply(
             s,
             Event::ApplyProgress {
                 source,
@@ -156,7 +151,7 @@ fn happy_path_multi_source() {
             },
         )
         .unwrap();
-        s = reduce(
+        s = apply(
             s,
             Event::BackendApplyDone {
                 source,
@@ -167,7 +162,7 @@ fn happy_path_multi_source() {
         .unwrap();
     }
 
-    let s = reduce(
+    let s = apply(
         s,
         Event::ApplyComplete {
             needs_reboot: false,
@@ -196,15 +191,15 @@ fn happy_path_multi_source() {
 #[test]
 fn illegal_transitions() {
     let s = AppState::default();
-    assert!(reduce(s.clone(), Event::StartApply).is_err());
-    assert!(reduce(
+    assert!(apply(s.clone(), Event::StartApply).is_err());
+    assert!(apply(
         s.clone(),
         Event::SessionReady {
             purpose: AuthPurpose::Check
         }
     )
     .is_err());
-    assert!(reduce(
+    assert!(apply(
         s.clone(),
         Event::CheckComplete {
             packages: vec![],
@@ -213,7 +208,7 @@ fn illegal_transitions() {
         }
     )
     .is_err());
-    assert!(reduce(
+    assert!(apply(
         s.clone(),
         Event::BackendApplyDone {
             source: UpdateSource::Dnf,
@@ -222,7 +217,7 @@ fn illegal_transitions() {
         }
     )
     .is_err());
-    assert!(reduce(
+    assert!(apply(
         s,
         Event::ApplyComplete {
             needs_reboot: false
@@ -238,22 +233,22 @@ fn cannot_apply_empty_ready() {
         packages: vec![],
         soft_errors: vec![],
     };
-    assert!(reduce(s, Event::StartApply).is_err());
+    assert!(apply(s, Event::StartApply).is_err());
 }
 
 #[test]
 fn in_app_cancel_auth_returns_idle() {
-    let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
+    let s = apply(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
     assert_phase(&s, "Authenticating");
-    let s = reduce(s, Event::CancelAuth).unwrap();
+    let s = apply(s, Event::CancelAuth).unwrap();
     assert_phase(&s, "Idle");
-    assert!(reduce(AppState::default(), Event::CancelAuth).is_err());
+    assert!(apply(AppState::default(), Event::CancelAuth).is_err());
 }
 
 #[test]
 fn auth_cancel_style_fail() {
-    let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
-    let s = reduce(
+    let s = apply(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
+    let s = apply(
         s,
         Event::Fail {
             title: "Authentication cancelled".into(),
@@ -263,7 +258,7 @@ fn auth_cancel_style_fail() {
     )
     .unwrap();
     assert_phase(&s, "Failed");
-    let s = reduce(s, Event::ResetToIdle).unwrap();
+    let s = apply(s, Event::ResetToIdle).unwrap();
     assert_phase(&s, "Idle");
 }
 
@@ -284,7 +279,7 @@ fn progress_marks_package_and_completes_previous() {
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
-    let s = reduce(
+    let s = apply(
         s,
         Event::ApplyProgress {
             source: UpdateSource::Dnf,
@@ -297,7 +292,7 @@ fn progress_marks_package_and_completes_previous() {
         },
     )
     .unwrap();
-    let s = reduce(
+    let s = apply(
         s,
         Event::ApplyProgress {
             source: UpdateSource::Dnf,
@@ -332,7 +327,7 @@ fn unnamed_progress_does_not_burn_down_or_poke_first_package() {
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
-    let s = reduce(
+    let s = apply(
         s,
         Event::ApplyProgress {
             source: UpdateSource::Dnf,
@@ -381,7 +376,7 @@ fn kernel_hint_does_not_complete_kernel_core() {
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
-    let s = reduce(
+    let s = apply(
         s,
         Event::ApplyProgress {
             source: UpdateSource::Dnf,
@@ -423,7 +418,7 @@ fn verify_pass_does_not_move_current_back_to_completed() {
         }
         _ => unreachable!(),
     }
-    let s = reduce(
+    let s = apply(
         s,
         Event::ApplyProgress {
             source: UpdateSource::Dnf,
@@ -469,7 +464,7 @@ fn source_switch_progress_does_not_mark_first_package() {
         needs_reboot: false,
         failed_sources: Vec::new(),
     };
-    let s = reduce(
+    let s = apply(
         s,
         Event::ApplyProgress {
             source: UpdateSource::Dnf,
@@ -503,15 +498,15 @@ fn source_switch_progress_does_not_mark_first_package() {
 
 #[test]
 fn soft_errors_on_empty_check_surface_message() {
-    let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
-    let s = reduce(
+    let s = apply(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
+    let s = apply(
         s,
         Event::SessionReady {
             purpose: AuthPurpose::Check,
         },
     )
     .unwrap();
-    let s = reduce(
+    let s = apply(
         s,
         Event::CheckComplete {
             packages: vec![],
@@ -538,15 +533,15 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
         packages: vec![dnf("kernel"), flatpak("app")],
         soft_errors: vec![],
     };
-    let s = reduce(s, Event::StartApply).unwrap();
-    let s = reduce(
+    let s = apply(s, Event::StartApply).unwrap();
+    let s = apply(
         s,
         Event::SessionReady {
             purpose: AuthPurpose::Apply,
         },
     )
     .unwrap();
-    let s = reduce(
+    let s = apply(
         s,
         Event::BackendApplyDone {
             source: UpdateSource::Dnf,
@@ -555,7 +550,7 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
         },
     )
     .unwrap();
-    let s = reduce(
+    let s = apply(
         s,
         Event::BackendApplyDone {
             source: UpdateSource::FlatpakUser,
@@ -564,7 +559,7 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
         },
     )
     .unwrap();
-    let s = reduce(
+    let s = apply(
         s,
         Event::ApplyComplete {
             needs_reboot: false,
@@ -589,29 +584,12 @@ fn dnf_failure_does_not_block_done_if_others_ok() {
 
 #[test]
 fn session_ready_wrong_purpose_rejected() {
-    let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
-    assert!(reduce(
+    let s = apply(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
+    assert!(apply(
         s,
         Event::SessionReady {
             purpose: AuthPurpose::Apply
         }
     )
     .is_err());
-}
-
-#[test]
-fn console_buffer_caps() {
-    let mut s = AppState::default();
-    s.console = fedora_updater::ConsoleBuffer::new(10);
-    for i in 0..50 {
-        s = reduce(
-            s,
-            Event::ConsoleLine {
-                tag: "t".into(),
-                text: format!("{i}"),
-            },
-        )
-        .unwrap();
-    }
-    assert!(s.console.len() <= 10);
 }

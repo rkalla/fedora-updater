@@ -5,6 +5,7 @@
 //! commands are allowlisted and executed only by the helper.
 
 pub mod backend;
+pub mod console;
 pub mod helper_mode;
 pub mod helper_protocol;
 pub mod model;
@@ -13,5 +14,6 @@ pub mod privilege;
 pub mod release_upgrade;
 pub mod state;
 
+pub use console::{ConsoleBuffer, ConsoleDelta};
 pub use model::*;
 pub use state::{phase_name, reduce, AppState, Event, Phase, TransitionError};

@@ -17,6 +17,8 @@ use crate::state::Event as StateEvent;
 #[derive(Debug, Clone)]
 pub enum WorkerMsg {
     SessionStarted,
+    ConsoleLine { tag: String, text: String },
+    ConsoleDraw { tag: String, text: String },
     Event(StateEvent),
 }
 
@@ -44,10 +46,10 @@ fn send(tx: &Sender<WorkerMsg>, msg: WorkerMsg) {
 fn line(tx: &Sender<WorkerMsg>, tag: &str, text: String) {
     send(
         tx,
-        WorkerMsg::Event(StateEvent::ConsoleLine {
+        WorkerMsg::ConsoleLine {
             tag: tag.into(),
             text,
-        }),
+        },
     );
 }
 
@@ -73,14 +75,14 @@ impl<'a> WorkChannel<'a> {
     }
 
     fn line(&self, tag: &str, text: String) {
-        self.event(StateEvent::ConsoleLine {
+        self.send(WorkerMsg::ConsoleLine {
             tag: tag.into(),
             text,
         });
     }
 
     fn live_line(&self, tag: &str, text: String) {
-        self.event(StateEvent::ConsoleDraw {
+        self.send(WorkerMsg::ConsoleDraw {
             tag: tag.into(),
             text,
         });
@@ -664,7 +666,7 @@ mod tests {
         assert!(
             matches!(
                 &draw,
-                WorkerMsg::Event(StateEvent::ConsoleDraw { tag, text })
+                WorkerMsg::ConsoleDraw { tag, text }
                     if tag == "dnf" && text == "[26/26] grok-bot 40%"
             ),
             "live draw must stay a console replacement, got {draw:?}"
@@ -673,10 +675,7 @@ mod tests {
 
         accept_helper_line(&ch, "dnf", &mut log, "[26/26] grok-bot 100%");
         let committed = rx.try_recv().expect("line event");
-        assert!(matches!(
-            committed,
-            WorkerMsg::Event(StateEvent::ConsoleLine { .. })
-        ));
+        assert!(matches!(committed, WorkerMsg::ConsoleLine { .. }));
         assert!(log.contains("[26/26] grok-bot 100%"));
     }
 
@@ -771,11 +770,11 @@ mod tests {
         assert_eq!(drained.len(), 3);
         assert!(matches!(
             &drained[0],
-            WorkerMsg::Event(StateEvent::ConsoleLine { text, .. }) if text == "line before cancel"
+            WorkerMsg::ConsoleLine { text, .. } if text == "line before cancel"
         ));
         assert!(matches!(
             &drained[1],
-            WorkerMsg::Event(StateEvent::ConsoleDraw { text, .. }) if text == "draw before cancel"
+            WorkerMsg::ConsoleDraw { text, .. } if text == "draw before cancel"
         ));
         assert!(matches!(
             &drained[2],

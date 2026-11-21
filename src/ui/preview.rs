@@ -5,15 +5,26 @@ use gtk::gdk::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
 
+use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
-    parse_size_bytes, AuthPurpose, ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction,
-    RunPass, Stopwatch, UpdateSource,
+    parse_size_bytes, AuthPurpose, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
+    Stopwatch, UpdateSource,
 };
 use fedora_updater::state::{AppState, Phase};
 
 pub fn initial_state() -> Option<AppState> {
     let phase = std::env::var("FEDORA_UPDATER_PREVIEW").ok()?;
     Some(state_for(&phase))
+}
+
+pub fn initial_console() -> ConsoleBuffer {
+    let mut console = ConsoleBuffer::new(8_000);
+    if std::env::var("FEDORA_UPDATER_PREVIEW").is_ok() {
+        console.push("[dnf] Updating and loading repositories:");
+        console.push("[dnf] Repositories loaded.");
+        console.push("[3/5] Installing gnome-shell-48.2-1.fc42.x86_64");
+    }
+    console
 }
 
 pub fn maybe_schedule_screenshot(window: &impl IsA<gtk::Widget>) {
@@ -46,14 +57,8 @@ fn save_png(widget: &gtk::Widget, path: &str) -> Result<(), String> {
 }
 
 pub fn state_for(phase: &str) -> AppState {
-    let mut console = ConsoleBuffer::new(200);
-    console.push("[dnf] Updating and loading repositories:");
-    console.push("[dnf] Repositories loaded.");
-    console.push("[3/5] Installing gnome-shell-48.2-1.fc42.x86_64");
-
     let mut state = AppState {
         phase: Phase::Idle(IdleScreen::Fresh),
-        console,
         stopwatch: Some(Stopwatch::start()),
         updates_listed_at: None,
         apply_when_ready: false,

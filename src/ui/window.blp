@@ -233,54 +233,7 @@ Adw.ApplicationWindow window {
                   };
                 };
               }
-
-              Gtk.Revealer check_console_reveal {
-                transition-type: slide_up;
-                reveal-child: false;
-
-                child: Gtk.ScrolledWindow {
-                  max-content-height: 160;
-                  propagate-natural-height: true;
-
-                  child: Gtk.Label check_console_full {
-                    label: "";
-                    wrap: true;
-                    selectable: true;
-                    halign: start;
-                    xalign: 0;
-                    styles ["monospace", "caption"]
-                  };
-                };
-              }
             };
-
-            [bottom]
-            Gtk.Box {
-              orientation: vertical;
-              styles ["console-bar"]
-
-              Gtk.Button check_console_toggle {
-                styles ["flat"]
-                hexpand: true;
-
-                child: Gtk.Box {
-                  orientation: horizontal;
-                  spacing: 8;
-
-                  Gtk.Image check_console_chevron {
-                    icon-name: "pan-end-symbolic";
-                  }
-
-                  Gtk.Label check_console_line {
-                    label: "Starting…";
-                    hexpand: true;
-                    halign: start;
-                    ellipsize: end;
-                    styles ["monospace", "caption", "dimmed"]
-                  }
-                };
-              }
-            }
           };
         }
 
@@ -499,54 +452,7 @@ Adw.ApplicationWindow window {
                   }
                 };
               }
-
-              Gtk.Revealer run_console_reveal {
-                transition-type: slide_up;
-                reveal-child: false;
-
-                child: Gtk.ScrolledWindow {
-                  max-content-height: 160;
-                  propagate-natural-height: true;
-
-                  child: Gtk.Label run_console_full {
-                    label: "";
-                    wrap: true;
-                    selectable: true;
-                    halign: start;
-                    xalign: 0;
-                    styles ["monospace", "caption"]
-                  };
-                };
-              }
             };
-
-            [bottom]
-            Gtk.Box {
-              orientation: vertical;
-              styles ["console-bar"]
-
-              Gtk.Button run_console_toggle {
-                styles ["flat"]
-                hexpand: true;
-
-                child: Gtk.Box {
-                  orientation: horizontal;
-                  spacing: 8;
-
-                  Gtk.Image run_console_chevron {
-                    icon-name: "pan-end-symbolic";
-                  }
-
-                  Gtk.Label run_console_line {
-                    label: "";
-                    hexpand: true;
-                    halign: start;
-                    ellipsize: end;
-                    styles ["monospace", "caption", "dimmed"]
-                  }
-                };
-              }
-            }
           };
         }
 
@@ -639,6 +545,61 @@ Adw.ApplicationWindow window {
           };
         }
       };
+
+      [bottom]
+      Gtk.Box console_drawer {
+        orientation: vertical;
+        visible: false;
+
+        Gtk.Revealer console_reveal {
+          transition-type: slide_up;
+          reveal-child: false;
+
+          child: Gtk.ScrolledWindow {
+            max-content-height: 160;
+            propagate-natural-height: true;
+
+            child: Gtk.TextView console_full {
+              editable: false;
+              cursor-visible: false;
+              monospace: true;
+              wrap-mode: word_char;
+              left-margin: 12;
+              right-margin: 12;
+              top-margin: 8;
+              bottom-margin: 8;
+              styles ["caption"]
+            };
+          };
+        }
+
+        Gtk.Box {
+          orientation: vertical;
+          styles ["console-bar"]
+
+          Gtk.Button console_toggle {
+            styles ["flat"]
+            hexpand: true;
+
+            child: Gtk.Box {
+              orientation: horizontal;
+              spacing: 8;
+
+              Gtk.Image console_chevron {
+                icon-name: "pan-end-symbolic";
+              }
+
+              Gtk.Label console_line {
+                label: "Starting…";
+                hexpand: true;
+                halign: start;
+                ellipsize: end;
+                styles ["monospace", "caption", "dimmed"]
+              }
+            };
+          }
+        }
+      }
     };
   };
 }

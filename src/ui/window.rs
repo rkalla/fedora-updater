@@ -17,6 +17,7 @@ use libadwaita::{
 };
 
 use fedora_updater::backend::dnf::{self, InstallCheck};
+use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
 use fedora_updater::model::{
     about_time_left, cache_activity_note, check_progress, count_by_source, idle_chrome,
     now_playing_subtitle, now_playing_title, quiet_ui, run_heading, running_progress_captions,
@@ -198,8 +199,6 @@ struct Widgets {
     check_group: PreferencesGroup,
     check_list_scroll: gtk::ScrolledWindow,
     check_rows: RefCell<Vec<gtk::Widget>>,
-    check_console_line: Label,
-    check_console_full: Label,
     ready_banner: Banner,
     ready_group: PreferencesGroup,
     ready_rows: RefCell<Vec<gtk::Widget>>,
@@ -223,8 +222,12 @@ struct Widgets {
     run_completed_keys: RefCell<Vec<String>>,
     run_completed_user_open: Cell<bool>,
     ignore_expand: Cell<bool>,
-    run_console_line: Label,
-    run_console_full: Label,
+    console_drawer: gtk::Box,
+    console_toggle: Button,
+    console_reveal: Revealer,
+    console_chevron: gtk::Image,
+    console_line: Label,
+    console_full: TextView,
     done_btn: Button,
     reboot_banner: Banner,
     done_installed_scroll: gtk::ScrolledWindow,
@@ -241,6 +244,7 @@ struct Widgets {
 
 pub fn build(app: &Application) {
     let state = Rc::new(RefCell::new(preview::initial_state().unwrap_or_default()));
+    let console = Rc::new(RefCell::new(preview::initial_console()));
 
     let provider = gtk::CssProvider::new();
     provider.load_from_string(include_str!("../style.css"));
@@ -282,8 +286,6 @@ pub fn build(app: &Application) {
         check_group: obj(&builder, "check_group"),
         check_list_scroll: obj(&builder, "check_list_scroll"),
         check_rows: RefCell::new(Vec::new()),
-        check_console_line: obj(&builder, "check_console_line"),
-        check_console_full: obj(&builder, "check_console_full"),
         ready_banner: obj(&builder, "ready_banner"),
         ready_group: obj(&builder, "ready_group"),
         ready_rows: RefCell::new(Vec::new()),
@@ -307,8 +309,12 @@ pub fn build(app: &Application) {
         run_completed_keys: RefCell::new(Vec::new()),
         run_completed_user_open: Cell::new(false),
         ignore_expand: Cell::new(false),
-        run_console_line: obj(&builder, "run_console_line"),
-        run_console_full: obj(&builder, "run_console_full"),
+        console_drawer: obj(&builder, "console_drawer"),
+        console_toggle: obj(&builder, "console_toggle"),
+        console_reveal: obj(&builder, "console_reveal"),
+        console_chevron: obj(&builder, "console_chevron"),
+        console_line: obj(&builder, "console_line"),
+        console_full: obj(&builder, "console_full"),
         done_btn: obj(&builder, "done_btn"),
         reboot_banner: obj(&builder, "reboot_banner"),
         done_installed_scroll: obj(&builder, "done_installed_scroll"),
@@ -353,23 +359,11 @@ pub fn build(app: &Application) {
     let done_log_btn: Button = obj(&builder, "done_log_btn");
     let fail_retry = widgets.fail_retry.clone();
     let fail_log: Button = obj(&builder, "fail_log");
-    let check_console_toggle: Button = obj(&builder, "check_console_toggle");
-    let check_console_reveal: Revealer = obj(&builder, "check_console_reveal");
-    let check_console_chevron: gtk::Image = obj(&builder, "check_console_chevron");
-    let run_console_toggle: Button = obj(&builder, "run_console_toggle");
-    let run_console_reveal: Revealer = obj(&builder, "run_console_reveal");
-    let run_console_chevron: gtk::Image = obj(&builder, "run_console_chevron");
 
-    wire_console(
-        &check_console_toggle,
-        &check_console_reveal,
-        &check_console_chevron,
-    );
-    wire_console(
-        &run_console_toggle,
-        &run_console_reveal,
-        &run_console_chevron,
-    );
+    if !console.borrow().is_empty() {
+        widgets.console_line.set_text(console.borrow().last_line());
+    }
+    wire_console(&widgets, &console);
     {
         let widgets = widgets.clone();
         let expander = widgets.run_completed.clone();
@@ -385,18 +379,20 @@ pub fn build(app: &Application) {
 
     {
         let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
         idle_btn.connect_clicked(move |_| {
-            start_check(&state, &widgets, tx.clone(), false);
+            start_check(&state, &console, &widgets, tx.clone(), false);
         });
     }
     {
         let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
         header_refresh.connect_clicked(move |_| {
-            start_check(&state, &widgets, tx.clone(), false);
+            start_check(&state, &console, &widgets, tx.clone(), false);
         });
     }
     {
@@ -411,6 +407,7 @@ pub fn build(app: &Application) {
     }
     {
         let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
         fail_retry.connect_clicked(move |_| {
@@ -423,19 +420,20 @@ pub fn build(app: &Application) {
                 run_systemctl_reboot(tx.clone());
                 return;
             }
-            start_check(&state, &widgets, tx.clone(), false);
+            start_check(&state, &console, &widgets, tx.clone(), false);
         });
     }
     {
         let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
         ready_update.connect_clicked(move |_| {
             if state.borrow().update_list_needs_refresh(SystemTime::now()) {
-                prompt_stale_update_list(&widgets, &state, tx.clone());
+                prompt_stale_update_list(&widgets, &state, &console, tx.clone());
                 return;
             }
-            begin_apply(&state, &widgets, tx.clone());
+            begin_apply(&state, &console, &widgets, tx.clone());
         });
     }
     {
@@ -460,40 +458,44 @@ pub fn build(app: &Application) {
     }
     {
         let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         auth_cancel.connect_clicked(move |_| {
             cancel_background_work();
+            clear_console(&console, &widgets);
             dispatch(&state, &widgets, Event::CancelAuth);
         });
     }
     {
         let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         done_btn.connect_clicked(move |_| {
+            clear_console(&console, &widgets);
             dispatch(&state, &widgets, Event::ResetToIdle);
         });
     }
     {
-        let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         done_log_btn.connect_clicked(move |_| {
-            let log = state.borrow().console.full_text();
+            let log = console.borrow().full_text();
             show_log_window(&widgets.stack, &log);
         });
     }
     {
-        let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         fail_log.connect_clicked(move |_| {
-            let log = state.borrow().console.full_text();
+            let log = console.borrow().full_text();
             show_log_window(&widgets.stack, &log);
         });
     }
     {
-        let state = state.clone();
+        let console = console.clone();
         let stack = widgets.stack.clone();
         widgets.ready_banner.connect_button_clicked(move |_| {
-            let log = state.borrow().console.full_text();
+            let log = console.borrow().full_text();
             show_log_window(&stack, &log);
         });
     }
@@ -509,11 +511,12 @@ pub fn build(app: &Application) {
 
     {
         let state = state.clone();
+        let console = console.clone();
         let widgets = widgets.clone();
         let tx = tx.clone();
         glib::spawn_future_local(async move {
             while let Ok(ev) = rx.recv().await {
-                handle_worker(&state, &widgets, &tx, ev);
+                handle_worker(&state, &console, &widgets, &tx, ev);
             }
         });
     }
@@ -568,10 +571,12 @@ pub fn build(app: &Application) {
 
 fn start_check(
     state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
     widgets: &Rc<Widgets>,
     tx: async_channel::Sender<WorkerMsg>,
     then_apply: bool,
 ) {
+    clear_console(console, widgets);
     dispatch(state, widgets, Event::StartCheck { then_apply });
     if can_skip_auth_ui() {
         dispatch(state, widgets, session_started_event(AuthPurpose::Check));
@@ -581,11 +586,13 @@ fn start_check(
 
 fn begin_apply(
     state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
     widgets: &Rc<Widgets>,
     tx: async_channel::Sender<WorkerMsg>,
 ) {
     widgets.last_output.set(None);
     *widgets.cache_cursor.borrow_mut() = None;
+    clear_console(console, widgets);
     let packages = state.borrow().packages().to_vec();
     dispatch(state, widgets, Event::StartApply);
     if can_skip_auth_ui() {
@@ -604,16 +611,18 @@ fn can_start_apply(state: &AppState) -> bool {
 fn prompt_stale_update_list(
     widgets: &Rc<Widgets>,
     state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
     tx: async_channel::Sender<WorkerMsg>,
 ) {
     let copy = stale_update_dialog();
     let dialog = build_dialog(&copy);
 
     let state = state.clone();
+    let console = console.clone();
     let widgets_for_cb = widgets.clone();
     dialog.connect_response(None, move |_dialog, response| {
         if response == copy.confirm_id {
-            start_check(&state, &widgets_for_cb, tx.clone(), true);
+            start_check(&state, &console, &widgets_for_cb, tx.clone(), true);
         }
     });
     dialog.present(Some(&widgets.window));
@@ -664,12 +673,9 @@ fn show_log_window(parent: &impl IsA<gtk::Widget>, log: &str) {
 }
 
 fn dispatch(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, event: Event) {
-    let current = state.borrow().clone();
-    match state::reduce(current, event) {
-        Ok(next) => {
-            *state.borrow_mut() = next;
-            render(state, widgets);
-        }
+    let result = state::reduce(&mut state.borrow_mut(), event);
+    match result {
+        Ok(()) => render(state, widgets),
         Err(e) => {
             eprintln!("state error: {e}");
             widgets
@@ -680,12 +686,9 @@ fn dispatch(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, event: Event) 
 }
 
 fn dispatch_worker(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>, event: Event) {
-    let current = state.borrow().clone();
-    match state::reduce(current, event) {
-        Ok(next) => {
-            *state.borrow_mut() = next;
-            render(state, widgets);
-        }
+    let result = state::reduce(&mut state.borrow_mut(), event);
+    match result {
+        Ok(()) => render(state, widgets),
         Err(e) => {
             eprintln!("ignored worker event: {e}");
         }
@@ -703,18 +706,13 @@ fn commit_session_started(state: &Rc<RefCell<AppState>>) -> Result<bool, state::
     let Some(purpose) = purpose else {
         return Ok(false);
     };
-    let current = state.borrow().clone();
-    match state::reduce(current, session_started_event(purpose)) {
-        Ok(next) => {
-            *state.borrow_mut() = next;
-            Ok(true)
-        }
-        Err(e) => Err(e),
-    }
+    state::reduce(&mut state.borrow_mut(), session_started_event(purpose))?;
+    Ok(true)
 }
 
 fn handle_worker(
     state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
     widgets: &Rc<Widgets>,
     tx: &async_channel::Sender<WorkerMsg>,
     msg: WorkerMsg,
@@ -728,31 +726,20 @@ fn handle_worker(
             }
             return;
         }
+        WorkerMsg::ConsoleLine { tag, text } => {
+            record_console_output(console, widgets, &tag, &text, false);
+            return;
+        }
+        WorkerMsg::ConsoleDraw { tag, text } => {
+            record_console_output(console, widgets, &tag, &text, true);
+            return;
+        }
         WorkerMsg::Event(ev) => ev,
     };
 
     let check_finished = matches!(ev, Event::CheckComplete { .. });
-    if matches!(
-        ev,
-        Event::ConsoleLine { .. } | Event::ConsoleDraw { .. } | Event::ApplyProgress { .. }
-    ) {
+    if matches!(ev, Event::ApplyProgress { .. }) {
         widgets.last_output.set(Some(Instant::now()));
-    }
-
-    if matches!(ev, Event::ConsoleLine { .. } | Event::ConsoleDraw { .. }) {
-        let current = state.borrow().clone();
-        if let Ok(next) = state::reduce(current, ev) {
-            *state.borrow_mut() = next;
-        }
-        let s = state.borrow();
-        let last = s.console.last_line().to_string();
-        let full = s.console.full_text();
-        drop(s);
-        widgets.check_console_line.set_text(&last);
-        widgets.check_console_full.set_text(&full);
-        widgets.run_console_line.set_text(&last);
-        widgets.run_console_full.set_text(&full);
-        return;
     }
 
     dispatch_worker(state, widgets, ev);
@@ -764,18 +751,93 @@ fn handle_worker(
         false
     };
     if apply_now {
-        begin_apply(state, widgets, tx.clone());
+        begin_apply(state, console, widgets, tx.clone());
     }
     if check_finished {
         spawn_release_lookup(state, widgets);
     }
 }
 
-fn wire_console(toggle: &Button, reveal: &Revealer, chevron: &gtk::Image) {
-    let reveal = reveal.clone();
-    let chevron = chevron.clone();
-    toggle.connect_clicked(move |_| {
+fn clear_console(console: &Rc<RefCell<ConsoleBuffer>>, widgets: &Widgets) {
+    console.borrow_mut().clear();
+    widgets.console_full.buffer().set_text("");
+    widgets.console_line.set_text("Starting…");
+}
+
+fn sync_console_drawer(w: &Widgets, show: bool) {
+    w.console_drawer.set_visible(show);
+    if !show {
+        w.console_reveal.set_reveal_child(false);
+        w.console_chevron.set_icon_name(Some("pan-end-symbolic"));
+    }
+}
+
+fn record_console_output(
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Widgets,
+    tag: &str,
+    text: &str,
+    live: bool,
+) {
+    widgets.last_output.set(Some(Instant::now()));
+    let (delta, last_line) = {
+        let mut buf = console.borrow_mut();
+        let delta = if live {
+            buf.push_live_tagged(tag, text)
+        } else {
+            buf.push_committed_tagged(tag, text)
+        };
+        (delta, buf.last_line().to_string())
+    };
+    widgets.console_line.set_text(&last_line);
+    if widgets.console_reveal.reveals_child() {
+        apply_console_delta(&widgets.console_full.buffer(), delta, &last_line);
+    }
+}
+
+fn append_console_line(buffer: &gtk::TextBuffer, line: &str) {
+    let mut end = buffer.end_iter();
+    if buffer.char_count() > 0 {
+        buffer.insert(&mut end, "\n");
+    }
+    buffer.insert(&mut end, line);
+}
+
+fn apply_console_delta(buffer: &gtk::TextBuffer, delta: ConsoleDelta, line: &str) {
+    match delta {
+        ConsoleDelta::Appended => append_console_line(buffer, line),
+        ConsoleDelta::ReplacedLast => {
+            let mut end = buffer.end_iter();
+            let mut start = end;
+            start.set_line_offset(0);
+            buffer.delete(&mut start, &mut end);
+            buffer.insert(&mut start, line);
+        }
+        ConsoleDelta::TrimmedAndAppended => {
+            let mut start = buffer.start_iter();
+            let mut line1 = start;
+            if line1.forward_line() {
+                buffer.delete(&mut start, &mut line1);
+            } else {
+                let mut end = buffer.end_iter();
+                buffer.delete(&mut start, &mut end);
+            }
+            append_console_line(buffer, line);
+        }
+    }
+}
+
+fn wire_console(widgets: &Rc<Widgets>, console: &Rc<RefCell<ConsoleBuffer>>) {
+    let reveal = widgets.console_reveal.clone();
+    let chevron = widgets.console_chevron.clone();
+    let full = widgets.console_full.clone();
+    let console = console.clone();
+    widgets.console_toggle.connect_clicked(move |_| {
         let open = !reveal.reveals_child();
+        if open {
+            let text = console.borrow().full_text();
+            full.buffer().set_text(&text);
+        }
         reveal.set_reveal_child(open);
         chevron.set_icon_name(Some(if open {
             "pan-down-symbolic"
@@ -1066,19 +1128,17 @@ fn commit_recovery_probe_started(state: &Rc<RefCell<AppState>>) -> bool {
     if !can_start {
         return false;
     }
-    let current = state.borrow().clone();
-    let Ok(next) = state::reduce(current, Event::RecoveryProbeStarted) else {
+    let mut borrowed = state.borrow_mut();
+    if state::reduce(&mut borrowed, Event::RecoveryProbeStarted).is_err() {
         return false;
-    };
-    let moved = matches!(
-        &next.phase,
+    }
+    matches!(
+        &borrowed.phase,
         Phase::Running {
             recovery: RecoveryLatch::InFlight,
             ..
         }
-    );
-    *state.borrow_mut() = next;
-    moved
+    )
 }
 
 fn maybe_reconcile_dnf(state: &Rc<RefCell<AppState>>, w: &Widgets, packages: &[Package]) {
@@ -1240,8 +1300,6 @@ fn render_running(
     current_name: Option<&str>,
     work_progress: Option<f64>,
     elapsed: u64,
-    last_console: &str,
-    full_console: &str,
 ) {
     w.stack.set_visible_child_name("running");
     w.header_refresh.set_visible(false);
@@ -1346,10 +1404,6 @@ fn render_running(
     w.run_completed_group.set_visible(has_completed);
     w.ignore_expand.set(false);
 
-    if !last_console.is_empty() {
-        w.run_console_line.set_text(last_console);
-    }
-    w.run_console_full.set_text(full_console);
     paint_quiet_chrome(
         state,
         w,
@@ -1509,8 +1563,7 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
     clear_idle_check_focus(w);
     let s = state.borrow();
     paint_release_upgrade(w, s.release_upgrade, s.release_age_days);
-    let last_console = s.console.last_line().to_string();
-    let full_console = s.console.full_text();
+    sync_console_drawer(w, matches!(s.phase, Phase::Checking { .. } | Phase::Running { .. }));
     let elapsed = s
         .stopwatch
         .as_ref()
@@ -1571,8 +1624,6 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
             current_name.as_deref(),
             work_progress,
             elapsed,
-            &last_console,
-            &full_console,
         );
         return;
     }
@@ -1639,10 +1690,6 @@ fn render(state: &Rc<RefCell<AppState>>, w: &Rc<Widgets>) {
                 &w.check_rows,
                 packages_so_far.iter().map(|p| rows::package_row(p, false)),
             );
-            if !last_console.is_empty() {
-                w.check_console_line.set_text(&last_console);
-            }
-            w.check_console_full.set_text(&full_console);
         }
         Phase::Ready {
             packages,
@@ -1763,7 +1810,9 @@ mod tests {
             "idle_page",
             "auth_page",
             "check_group",
-            "check_console_toggle",
+            "console_drawer",
+            "console_toggle",
+            "console_full",
             "ready_banner",
             "ready_group",
             "ready_update",
@@ -1774,7 +1823,6 @@ mod tests {
             "run_list_scroll",
             "run_list_group",
             "run_completed",
-            "run_console_toggle",
             "done_installed",
             "done_installed_scroll",
             "done_btn",
@@ -2133,14 +2181,15 @@ mod tests {
             packages: vec![Package::new_dnf("glibc", "x86_64", "1", "updates")],
             soft_errors: vec![],
         };
-        let s = fedora_updater::state::reduce(s, Event::StartApply).unwrap();
+        fedora_updater::state::reduce(&mut s, Event::StartApply).unwrap();
         fedora_updater::state::reduce(
-            s,
+            &mut s,
             Event::SessionReady {
                 purpose: AuthPurpose::Apply,
             },
         )
-        .unwrap()
+        .unwrap();
+        s
     }
 
     #[test]

@@ -262,90 +262,6 @@ impl Package {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ConsoleBuffer {
-    lines: Vec<String>,
-    max_lines: usize,
-    /// Last entry is an in-progress `\r` update and the next one replaces it.
-    live_tail: bool,
-}
-
-impl ConsoleBuffer {
-    pub fn new(max_lines: usize) -> Self {
-        Self {
-            lines: Vec::new(),
-            max_lines,
-            live_tail: false,
-        }
-    }
-
-    pub fn push(&mut self, line: impl Into<String>) {
-        self.lines.push(line.into());
-        self.live_tail = false;
-        if self.lines.len() > self.max_lines {
-            let excess = self.lines.len() - self.max_lines;
-            self.lines.drain(0..excess);
-        }
-    }
-
-    /// Carriage-return progress. Replaces the open line instead of appending.
-    pub fn push_live_tagged(&mut self, tag: &str, line: &str) {
-        let formatted = format!("[{tag}] {line}");
-        if self.live_tail {
-            if let Some(last) = self.lines.last_mut() {
-                *last = formatted;
-                return;
-            }
-        }
-        self.lines.push(formatted);
-        self.live_tail = true;
-        self.trim();
-    }
-
-    /// Newline-terminated output. A following commit replaces the open `\r` line.
-    pub fn push_committed_tagged(&mut self, tag: &str, line: &str) {
-        let formatted = format!("[{tag}] {line}");
-        if self.live_tail {
-            if let Some(last) = self.lines.last_mut() {
-                *last = formatted;
-                self.live_tail = false;
-                return;
-            }
-        }
-        self.lines.push(formatted);
-        self.live_tail = false;
-        self.trim();
-    }
-
-    fn trim(&mut self) {
-        if self.lines.len() > self.max_lines {
-            let excess = self.lines.len() - self.max_lines;
-            self.lines.drain(0..excess);
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.lines.clear();
-        self.live_tail = false;
-    }
-
-    pub fn last_line(&self) -> &str {
-        self.lines.last().map(String::as_str).unwrap_or("")
-    }
-
-    pub fn full_text(&self) -> String {
-        self.lines.join("\n")
-    }
-
-    pub fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Stopwatch {
     start: Instant,
@@ -1025,21 +941,6 @@ mod tests {
         assert_eq!(idx, Some(1));
         assert_eq!(pkgs[0].status, PackageStatus::Completed);
         assert_eq!(pkgs[1].status, PackageStatus::Installing);
-    }
-
-    #[test]
-    fn carriage_return_replaces_the_open_console_line() {
-        let mut console = ConsoleBuffer::new(20);
-        console.push_live_tagged("dnf", "[26/26] grok-bot  10%");
-        console.push_live_tagged("dnf", "[26/26] grok-bot  40%");
-        assert_eq!(console.len(), 1);
-        assert!(console.last_line().contains("40%"));
-        console.push_committed_tagged("dnf", "[26/26] grok-bot 100%");
-        assert_eq!(console.len(), 1);
-        assert!(console.last_line().contains("100%"));
-        console.push_committed_tagged("dnf", "Complete!");
-        assert_eq!(console.len(), 2);
-        assert!(console.last_line().contains("Complete!"));
     }
 
     #[test]

@@ -1,14 +1,13 @@
 //! Pure state machine for the updater UI.
 //!
-//! All transitions are pure functions of `(AppState, Event) → Result<AppState, TransitionError>`.
+//! All transitions are pure functions of `(&mut AppState, Event) → Result<(), TransitionError>`.
 //! Side effects (spawning processes) live outside this module.
 
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::model::{
     apply_progress_hint, finalize_source, overall_progress, sort_for_apply, AuthPurpose,
-    ConsoleBuffer, IdleScreen, Package, PackageStatus, RetryAction, RunPass, StageCount, Stopwatch,
-    UpdateSource,
+    IdleScreen, Package, PackageStatus, RetryAction, RunPass, StageCount, Stopwatch, UpdateSource,
 };
 
 /// dnf rpm-reconcile latch. The view owns the clock and the probe thread.
@@ -78,7 +77,6 @@ pub const UPDATE_LIST_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub phase: Phase,
-    pub console: ConsoleBuffer,
     pub stopwatch: Option<Stopwatch>,
     /// When the current Ready list was produced by a check.
     /// `None` before a successful check, after an empty check, and for preview
@@ -99,7 +97,6 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             phase: Phase::Idle(IdleScreen::Fresh),
-            console: ConsoleBuffer::new(8_000),
             stopwatch: None,
             updates_listed_at: None,
             apply_when_ready: false,
@@ -173,16 +170,6 @@ pub enum Event {
     SessionReady {
         purpose: AuthPurpose,
     },
-    /// Console line from a backend.
-    ConsoleLine {
-        tag: String,
-        text: String,
-    },
-    /// In-progress `\r` update. Replaces the open console line.
-    ConsoleDraw {
-        tag: String,
-        text: String,
-    },
     /// One backend finished its check portion.
     BackendCheckDone {
         source: UpdateSource,
@@ -242,7 +229,7 @@ pub enum Event {
     },
 }
 
-pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionError> {
+pub fn reduce(state: &mut AppState, event: Event) -> Result<(), TransitionError> {
     match event {
         Event::ReleaseNoted {
             version,
@@ -250,7 +237,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
         } => {
             state.release_upgrade = version;
             state.release_age_days = version.and(days_since_release);
-            Ok(state)
+            Ok(())
         }
         Event::StartCheck { then_apply } => {
             let last_checked = match &state.phase {
@@ -259,35 +246,38 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
             };
             state.apply_when_ready = then_apply;
             state.updates_listed_at = None;
-            state.console.clear();
             state.stopwatch = Some(Stopwatch::start());
             state.phase = Phase::Authenticating {
                 purpose: AuthPurpose::Check,
                 packages: Vec::new(),
                 last_checked,
             };
-            Ok(state)
+            Ok(())
         }
-        Event::StartApply => match state.phase {
-            Phase::Ready { packages, .. } if !packages.is_empty() => {
-                state.apply_when_ready = false;
-                state.console.clear();
-                state.stopwatch = Some(Stopwatch::start());
-                state.phase = Phase::Authenticating {
-                    purpose: AuthPurpose::Apply,
-                    packages,
-                    last_checked: None,
-                };
-                Ok(state)
+        Event::StartApply => {
+            if !matches!(&state.phase, Phase::Ready { packages, .. } if !packages.is_empty()) {
+                return Err(invalid(state, "StartApply"));
             }
-            _ => Err(invalid(&state, "StartApply")),
-        },
-        Event::SessionReady { purpose } => match state.phase {
+            let packages = match &mut state.phase {
+                Phase::Ready { packages, .. } => std::mem::take(packages),
+                _ => unreachable!(),
+            };
+            state.apply_when_ready = false;
+            state.stopwatch = Some(Stopwatch::start());
+            state.phase = Phase::Authenticating {
+                purpose: AuthPurpose::Apply,
+                packages,
+                last_checked: None,
+            };
+            Ok(())
+        }
+        Event::SessionReady { purpose } => match &mut state.phase {
             Phase::Authenticating {
                 purpose: p,
                 packages,
                 ..
-            } if p == purpose => {
+            } if *p == purpose => {
+                let mut packages = std::mem::take(packages);
                 match purpose {
                     AuthPurpose::Check => {
                         state.phase = Phase::Checking {
@@ -297,7 +287,6 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                         };
                     }
                     AuthPurpose::Apply => {
-                        let mut packages = packages;
                         sort_for_apply(&mut packages);
                         state.phase = Phase::Running {
                             packages,
@@ -315,24 +304,13 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                         };
                     }
                 }
-                Ok(state)
+                Ok(())
             }
             // Idempotent if already advanced past auth
-            Phase::Checking { .. } if purpose == AuthPurpose::Check => Ok(state),
-            Phase::Running { .. } if purpose == AuthPurpose::Apply => Ok(state),
-            other => {
-                state.phase = other;
-                Err(invalid(&state, "SessionReady"))
-            }
+            Phase::Checking { .. } if purpose == AuthPurpose::Check => Ok(()),
+            Phase::Running { .. } if purpose == AuthPurpose::Apply => Ok(()),
+            _ => Err(invalid(state, "SessionReady")),
         },
-        Event::ConsoleLine { tag, text } => {
-            state.console.push_committed_tagged(&tag, &text);
-            Ok(state)
-        }
-        Event::ConsoleDraw { tag, text } => {
-            state.console.push_live_tagged(&tag, &text);
-            Ok(state)
-        }
         Event::BackendCheckDone {
             source,
             packages,
@@ -350,41 +328,41 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 if let Some(e) = soft_error {
                     soft_errors.push(e);
                 }
-                Ok(state)
+                Ok(())
             }
-            _ => Err(invalid(&state, "BackendCheckDone")),
+            _ => Err(invalid(state, "BackendCheckDone")),
         },
         Event::CheckComplete {
             packages,
             soft_errors,
             listed_at,
-        } => match state.phase {
-            Phase::Checking { .. } => {
-                if packages.is_empty() {
-                    let detail = if soft_errors.is_empty() {
-                        None
-                    } else {
-                        Some(format!("No updates available ({})", soft_errors.join("; ")))
-                    };
-                    state.apply_when_ready = false;
-                    state.updates_listed_at = None;
-                    state.phase = Phase::Idle(IdleScreen::Current {
-                        checked_at: "just now".into(),
-                        detail,
-                    });
-                } else {
-                    let mut packages = packages;
-                    sort_for_apply(&mut packages);
-                    state.updates_listed_at = Some(listed_at);
-                    state.phase = Phase::Ready {
-                        packages,
-                        soft_errors,
-                    };
-                }
-                Ok(state)
+        } => {
+            if !matches!(&state.phase, Phase::Checking { .. }) {
+                return Err(invalid(state, "CheckComplete"));
             }
-            _ => Err(invalid(&state, "CheckComplete")),
-        },
+            if packages.is_empty() {
+                let detail = if soft_errors.is_empty() {
+                    None
+                } else {
+                    Some(format!("No updates available ({})", soft_errors.join("; ")))
+                };
+                state.apply_when_ready = false;
+                state.updates_listed_at = None;
+                state.phase = Phase::Idle(IdleScreen::Current {
+                    checked_at: "just now".into(),
+                    detail,
+                });
+            } else {
+                let mut packages = packages;
+                sort_for_apply(&mut packages);
+                state.updates_listed_at = Some(listed_at);
+                state.phase = Phase::Ready {
+                    packages,
+                    soft_errors,
+                };
+            }
+            Ok(())
+        }
         Event::ApplyProgress {
             source,
             package_hint,
@@ -488,9 +466,9 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 if stage.is_none() && *pass == RunPass::Apply {
                     *op = overall_progress(packages);
                 }
-                Ok(state)
+                Ok(())
             }
-            _ => Err(invalid(&state, "ApplyProgress")),
+            _ => Err(invalid(state, "ApplyProgress")),
         },
         Event::BackendApplyDone {
             source,
@@ -514,56 +492,59 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 }
                 *stage = None;
                 *op = overall_progress(packages);
-                Ok(state)
+                Ok(())
             }
-            _ => Err(invalid(&state, "BackendApplyDone")),
+            _ => Err(invalid(state, "BackendApplyDone")),
         },
-        Event::ApplyComplete { needs_reboot } => match state.phase {
-            Phase::Running {
+        Event::ApplyComplete { needs_reboot } => {
+            let Phase::Running {
                 packages,
                 needs_reboot: nr,
                 failed_sources,
                 ..
-            } => {
-                let duration = state
-                    .stopwatch
-                    .as_ref()
-                    .map(|s| s.elapsed_label())
-                    .unwrap_or_else(|| "?".into());
-                let mut packages = packages;
-                for p in packages.iter_mut() {
-                    if !p.status.is_done() {
-                        if failed_sources.contains(&p.source) {
-                            p.status = PackageStatus::Failed;
-                        } else {
-                            p.status = PackageStatus::Completed;
-                        }
+            } = &mut state.phase
+            else {
+                return Err(invalid(state, "ApplyComplete"));
+            };
+            let mut packages = std::mem::take(packages);
+            let nr = *nr;
+            let failed_sources = std::mem::take(failed_sources);
+            let duration = state
+                .stopwatch
+                .as_ref()
+                .map(|s| s.elapsed_label())
+                .unwrap_or_else(|| "?".into());
+            for p in packages.iter_mut() {
+                if !p.status.is_done() {
+                    if failed_sources.contains(&p.source) {
+                        p.status = PackageStatus::Failed;
+                    } else {
+                        p.status = PackageStatus::Completed;
                     }
                 }
-                let failed = packages
-                    .iter()
-                    .filter(|p| p.status == PackageStatus::Failed)
-                    .count();
-                let hard_fail = failed == packages.len() && !packages.is_empty();
-                if hard_fail {
-                    state.apply_when_ready = false;
-                    state.phase = Phase::Failed {
-                        title: "All updates failed".into(),
-                        detail: state.console.full_text(),
-                        retry: RetryAction::CheckAgain,
-                    };
-                } else {
-                    state.phase = Phase::Done {
-                        packages,
-                        duration,
-                        needs_reboot: nr || needs_reboot,
-                        failed,
-                    };
-                }
-                Ok(state)
             }
-            _ => Err(invalid(&state, "ApplyComplete")),
-        },
+            let failed = packages
+                .iter()
+                .filter(|p| p.status == PackageStatus::Failed)
+                .count();
+            let hard_fail = failed == packages.len() && !packages.is_empty();
+            if hard_fail {
+                state.apply_when_ready = false;
+                state.phase = Phase::Failed {
+                    title: "All updates failed".into(),
+                    detail: "All updates failed. Open View Log for details.".into(),
+                    retry: RetryAction::CheckAgain,
+                };
+            } else {
+                state.phase = Phase::Done {
+                    packages,
+                    duration,
+                    needs_reboot: nr || needs_reboot,
+                    failed,
+                };
+            }
+            Ok(())
+        }
         Event::Fail {
             title,
             detail,
@@ -575,7 +556,7 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 detail,
                 retry,
             };
-            Ok(state)
+            Ok(())
         }
         Event::ResetToIdle => {
             let screen = match &state.phase {
@@ -587,51 +568,51 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 _ => IdleScreen::Fresh,
             };
             state.apply_when_ready = false;
-            state.console.clear();
             state.stopwatch = None;
             state.phase = Phase::Idle(screen);
-            Ok(state)
+            Ok(())
         }
-        Event::StopApply { during_transaction } => match state.phase {
-            Phase::Running { mut packages, .. } => {
-                state.apply_when_ready = false;
-                if during_transaction {
-                    state.phase = Phase::Failed {
-                        title: "Update stopped during install".into(),
-                        detail: "Stopping dnf while it is applying packages can leave the rpm database half-applied. Check `dnf history` before running Update All again.".into(),
-                        retry: RetryAction::CheckAgain,
-                    };
-                } else {
-                    for package in packages.iter_mut() {
-                        package.status = PackageStatus::Pending;
-                    }
-                    state.phase = Phase::Ready {
-                        packages,
-                        soft_errors: vec![
-                            "Stopped before install. Downloaded packages were not applied.".into(),
-                        ],
-                    };
+        Event::StopApply { during_transaction } => {
+            let Phase::Running { packages, .. } = &mut state.phase else {
+                return Err(invalid(state, "StopApply"));
+            };
+            let mut packages = std::mem::take(packages);
+            state.apply_when_ready = false;
+            if during_transaction {
+                state.phase = Phase::Failed {
+                    title: "Update stopped during install".into(),
+                    detail: "Stopping dnf while it is applying packages can leave the rpm database half-applied. Check `dnf history` before running Update All again.".into(),
+                    retry: RetryAction::CheckAgain,
+                };
+            } else {
+                for package in packages.iter_mut() {
+                    package.status = PackageStatus::Pending;
                 }
-                Ok(state)
+                state.phase = Phase::Ready {
+                    packages,
+                    soft_errors: vec![
+                        "Stopped before install. Downloaded packages were not applied.".into(),
+                    ],
+                };
             }
-            _ => Err(invalid(&state, "StopApply")),
-        },
-        Event::CancelAuth => match state.phase {
-            Phase::Authenticating { last_checked, .. } => {
-                state.apply_when_ready = false;
-                state.console.clear();
-                state.stopwatch = None;
-                state.phase = Phase::Idle(match last_checked {
-                    Some(checked_at) => IdleScreen::Current {
-                        checked_at,
-                        detail: None,
-                    },
-                    None => IdleScreen::Fresh,
-                });
-                Ok(state)
-            }
-            _ => Err(invalid(&state, "CancelAuth")),
-        },
+            Ok(())
+        }
+        Event::CancelAuth => {
+            let Phase::Authenticating { last_checked, .. } = &mut state.phase else {
+                return Err(invalid(state, "CancelAuth"));
+            };
+            let last_checked = last_checked.take();
+            state.apply_when_ready = false;
+            state.stopwatch = None;
+            state.phase = Phase::Idle(match last_checked {
+                Some(checked_at) => IdleScreen::Current {
+                    checked_at,
+                    detail: None,
+                },
+                None => IdleScreen::Fresh,
+            });
+            Ok(())
+        }
         Event::RecoveryProbeStarted => match &mut state.phase {
             Phase::Running { recovery, .. } => {
                 let start = match *recovery {
@@ -642,9 +623,9 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                 if start {
                     *recovery = RecoveryLatch::InFlight;
                 }
-                Ok(state)
+                Ok(())
             }
-            _ => Err(invalid(&state, "RecoveryProbeStarted")),
+            _ => Err(invalid(state, "RecoveryProbeStarted")),
         },
         Event::RecoveryProbeUnknown => match &mut state.phase {
             Phase::Running { recovery, .. } => {
@@ -654,18 +635,18 @@ pub fn reduce(mut state: AppState, event: Event) -> Result<AppState, TransitionE
                         not_before: Instant::now() + Duration::from_secs(30),
                     };
                 }
-                Ok(state)
+                Ok(())
             }
-            _ => Err(invalid(&state, "RecoveryProbeUnknown")),
+            _ => Err(invalid(state, "RecoveryProbeUnknown")),
         },
         Event::RecoveryProbeSettled => match &mut state.phase {
             Phase::Running { recovery, .. } => {
                 if !matches!(*recovery, RecoveryLatch::Settled) {
                     *recovery = RecoveryLatch::Settled;
                 }
-                Ok(state)
+                Ok(())
             }
-            _ => Err(invalid(&state, "RecoveryProbeSettled")),
+            _ => Err(invalid(state, "RecoveryProbeSettled")),
         },
     }
 }
@@ -759,6 +740,11 @@ pub fn phase_name(phase: &Phase) -> &'static str {
 mod tests {
     use super::*;
 
+    fn apply(mut state: AppState, event: Event) -> Result<AppState, TransitionError> {
+        reduce(&mut state, event)?;
+        Ok(state)
+    }
+
     fn pkg(name: &str, source: UpdateSource) -> Package {
         let mut p = Package::new_dnf(name, "x86_64", "1.0", "updates");
         p.source = source;
@@ -771,7 +757,7 @@ mod tests {
     #[test]
     fn a_release_note_stays_across_a_check_and_does_not_change_phase() {
         let s = AppState::default();
-        let s = reduce(
+        let s = apply(
             s,
             Event::ReleaseNoted {
                 version: Some(45),
@@ -783,12 +769,12 @@ mod tests {
         assert_eq!(s.release_age_days, Some(12));
         assert!(matches!(s.phase, Phase::Idle(_)));
 
-        let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
+        let s = apply(s, Event::StartCheck { then_apply: false }).unwrap();
         assert_eq!(s.release_upgrade, Some(45));
         assert_eq!(s.release_age_days, Some(12));
         assert!(matches!(s.phase, Phase::Authenticating { .. }));
 
-        let s = reduce(
+        let s = apply(
             s,
             Event::ReleaseNoted {
                 version: Some(45),
@@ -799,7 +785,7 @@ mod tests {
         assert_eq!(s.release_upgrade, Some(45));
         assert_eq!(s.release_age_days, None);
 
-        let s = reduce(
+        let s = apply(
             s,
             Event::ReleaseNoted {
                 version: None,
@@ -815,7 +801,7 @@ mod tests {
     #[test]
     fn check_flow_to_ready() {
         let s = AppState::default();
-        let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
+        let s = apply(s, Event::StartCheck { then_apply: false }).unwrap();
         assert!(matches!(
             s.phase,
             Phase::Authenticating {
@@ -823,7 +809,7 @@ mod tests {
                 ..
             }
         ));
-        let s = reduce(
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Check,
@@ -832,7 +818,7 @@ mod tests {
         .unwrap();
         assert!(matches!(s.phase, Phase::Checking { .. }));
 
-        let s = reduce(
+        let s = apply(
             s,
             Event::BackendCheckDone {
                 source: UpdateSource::Dnf,
@@ -842,7 +828,7 @@ mod tests {
         )
         .unwrap();
         let packages = s.packages().to_vec();
-        let s = reduce(
+        let s = apply(
             s,
             Event::CheckComplete {
                 packages,
@@ -858,15 +844,15 @@ mod tests {
     #[test]
     fn check_flow_no_updates() {
         let s = AppState::default();
-        let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
-        let s = reduce(
+        let s = apply(s, Event::StartCheck { then_apply: false }).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Check,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::CheckComplete {
                 packages: vec![],
@@ -905,8 +891,8 @@ mod tests {
             ],
             soft_errors: vec![],
         };
-        let s = reduce(s, Event::StartApply).unwrap();
-        let s = reduce(
+        let s = apply(s, Event::StartApply).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Apply,
@@ -915,7 +901,7 @@ mod tests {
         .unwrap();
         assert!(matches!(s.phase, Phase::Running { .. }));
 
-        let s = reduce(
+        let s = apply(
             s,
             Event::ApplyProgress {
                 source: UpdateSource::Dnf,
@@ -928,7 +914,7 @@ mod tests {
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::BackendApplyDone {
                 source: UpdateSource::Dnf,
@@ -937,7 +923,7 @@ mod tests {
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::BackendApplyDone {
                 source: UpdateSource::FlatpakUser,
@@ -946,7 +932,7 @@ mod tests {
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::ApplyComplete {
                 needs_reboot: false,
@@ -973,7 +959,7 @@ mod tests {
     #[test]
     fn apply_rejects_from_idle() {
         let s = AppState::default();
-        assert!(reduce(s, Event::StartApply).is_err());
+        assert!(apply(s, Event::StartApply).is_err());
     }
 
     #[test]
@@ -986,15 +972,15 @@ mod tests {
             ],
             soft_errors: vec![],
         };
-        let s = reduce(s, Event::StartApply).unwrap();
-        let s = reduce(
+        let s = apply(s, Event::StartApply).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Apply,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::BackendApplyDone {
                 source: UpdateSource::Dnf,
@@ -1003,7 +989,7 @@ mod tests {
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::BackendApplyDone {
                 source: UpdateSource::Firmware,
@@ -1012,7 +998,7 @@ mod tests {
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::ApplyComplete {
                 needs_reboot: false,
@@ -1032,15 +1018,15 @@ mod tests {
             packages: vec![pkg("kernel", UpdateSource::Dnf)],
             soft_errors: vec![],
         };
-        let s = reduce(s, Event::StartApply).unwrap();
-        let s = reduce(
+        let s = apply(s, Event::StartApply).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Apply,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::BackendApplyDone {
                 source: UpdateSource::Dnf,
@@ -1049,7 +1035,7 @@ mod tests {
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::ApplyComplete {
                 needs_reboot: false,
@@ -1058,32 +1044,20 @@ mod tests {
         .unwrap();
         match s.phase {
             Phase::Failed {
+                detail,
                 retry: RetryAction::CheckAgain,
                 ..
-            } => {}
+            } => {
+                assert_eq!(detail, "All updates failed. Open View Log for details.");
+            }
             other => panic!("expected Failed CheckAgain, got {other:?}"),
         }
     }
 
     #[test]
-    fn console_lines_accumulate() {
-        let s = AppState::default();
-        let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
-        let s = reduce(
-            s,
-            Event::ConsoleLine {
-                tag: "dnf".into(),
-                text: "hello".into(),
-            },
-        )
-        .unwrap();
-        assert!(s.console.last_line().contains("[dnf] hello"));
-    }
-
-    #[test]
     fn fail_from_anywhere() {
         let s = AppState::default();
-        let s = reduce(
+        let s = apply(
             s,
             Event::Fail {
                 title: "x".into(),
@@ -1104,7 +1078,7 @@ mod tests {
             needs_reboot: false,
             failed: 0,
         };
-        let s = reduce(s, Event::ResetToIdle).unwrap();
+        let s = apply(s, Event::ResetToIdle).unwrap();
         let Phase::Idle(IdleScreen::Current {
             checked_at,
             detail: None,
@@ -1130,7 +1104,7 @@ mod tests {
             checked_at: "just now".into(),
             detail: Some("No updates available".into()),
         });
-        let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
+        let s = apply(s, Event::StartCheck { then_apply: false }).unwrap();
         assert!(matches!(
             s.phase,
             Phase::Authenticating {
@@ -1138,7 +1112,7 @@ mod tests {
                 ..
             } if t == "just now"
         ));
-        let s = reduce(s, Event::CancelAuth).unwrap();
+        let s = apply(s, Event::CancelAuth).unwrap();
         match s.phase {
             Phase::Idle(IdleScreen::Current {
                 checked_at,
@@ -1155,15 +1129,15 @@ mod tests {
             packages: vec![pkg("System Firmware", UpdateSource::Firmware)],
             soft_errors: vec![],
         };
-        let s = reduce(s, Event::StartApply).unwrap();
-        let s = reduce(
+        let s = apply(s, Event::StartApply).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Apply,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::ApplyProgress {
                 source: UpdateSource::Firmware,
@@ -1176,7 +1150,7 @@ mod tests {
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::ApplyProgress {
                 source: UpdateSource::Firmware,
@@ -1242,7 +1216,7 @@ mod tests {
         };
 
         for (name, cur) in [("wireplumber", 1), ("glibc", 2), ("kernel", 3)] {
-            s = reduce(
+            s = apply(
                 s,
                 dnf_progress(
                     Some(name),
@@ -1289,7 +1263,7 @@ mod tests {
             other => panic!("expected Running, got {other:?}"),
         }
 
-        s = reduce(
+        s = apply(
             s,
             dnf_progress(None, None, None, "Running transaction", None, None),
         )
@@ -1313,7 +1287,7 @@ mod tests {
             other => panic!("expected Running, got {other:?}"),
         }
 
-        s = reduce(
+        s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1354,7 +1328,7 @@ mod tests {
             other => panic!("expected Running, got {other:?}"),
         }
 
-        s = reduce(
+        s = apply(
             s,
             dnf_progress(
                 Some("kernel"),
@@ -1381,7 +1355,7 @@ mod tests {
             other => panic!("expected Running, got {other:?}"),
         }
 
-        s = reduce(
+        s = apply(
             s,
             dnf_progress(
                 Some("libswscale-free"),
@@ -1429,15 +1403,15 @@ mod tests {
             packages: vec![pkg("System Firmware", UpdateSource::Firmware)],
             soft_errors: vec![],
         };
-        let s = reduce(s, Event::StartApply).unwrap();
-        let s = reduce(
+        let s = apply(s, Event::StartApply).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Apply,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::ApplyProgress {
                 source: UpdateSource::Firmware,
@@ -1466,15 +1440,15 @@ mod tests {
     #[test]
     fn ready_list_expires_after_24_hours() {
         let listed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
-        let s = reduce(
+        let s = apply(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Check,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::CheckComplete {
                 packages: vec![pkg("kernel", UpdateSource::Dnf)],
@@ -1503,7 +1477,7 @@ mod tests {
             soft_errors: vec![],
             checked_sources: vec![],
         };
-        let s = reduce(
+        let s = apply(
             s,
             Event::CheckComplete {
                 packages: vec![],
@@ -1529,7 +1503,7 @@ mod tests {
         };
         assert!(s.update_list_needs_refresh(SystemTime::now()));
 
-        let s = reduce(s, Event::StartCheck { then_apply: false }).unwrap();
+        let s = apply(s, Event::StartCheck { then_apply: false }).unwrap();
         assert!(s.updates_listed_at.is_none());
         assert!(!s.update_list_needs_refresh(SystemTime::now()));
     }
@@ -1542,20 +1516,20 @@ mod tests {
             soft_errors: vec![],
         };
         assert!(!s.update_list_needs_refresh(SystemTime::now()));
-        assert!(reduce(s, Event::StartApply).is_ok());
+        assert!(apply(s, Event::StartApply).is_ok());
     }
 
     #[test]
     fn backend_check_records_sources() {
-        let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
-        let s = reduce(
+        let s = apply(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Check,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::BackendCheckDone {
                 source: UpdateSource::Dnf,
@@ -1603,7 +1577,7 @@ mod tests {
         {
             return state;
         }
-        reduce(
+        apply(
             state,
             Event::ApplyProgress {
                 source: UpdateSource::Dnf,
@@ -1685,7 +1659,7 @@ mod tests {
     #[test]
     fn bare_installing_status_does_not_start_the_apply_pass() {
         let mut s = running_dnf(vec![dnf_pkg("tzdata-java")]);
-        s = reduce(
+        s = apply(
             s,
             dnf_progress(
                 None,
@@ -1697,7 +1671,7 @@ mod tests {
             ),
         )
         .unwrap();
-        s = reduce(
+        s = apply(
             s,
             dnf_progress(
                 None,
@@ -1726,8 +1700,8 @@ mod tests {
             packages,
             soft_errors: vec![],
         };
-        let s = reduce(s, Event::StartApply).unwrap();
-        reduce(
+        let s = apply(s, Event::StartApply).unwrap();
+        apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Apply,
@@ -1750,7 +1724,7 @@ mod tests {
     #[test]
     fn stage_count_requires_a_positive_total() {
         let s = started_apply(vec![dnf_pkg("glibc")]);
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1764,7 +1738,7 @@ mod tests {
         .unwrap();
         assert_download_without_stage(&s);
 
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1778,7 +1752,7 @@ mod tests {
         .unwrap();
         assert_download_without_stage(&s);
 
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1792,7 +1766,7 @@ mod tests {
         .unwrap();
         assert_download_without_stage(&s);
 
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1817,7 +1791,7 @@ mod tests {
             other => panic!("expected Running, got {other:?}"),
         }
 
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1831,7 +1805,7 @@ mod tests {
         .unwrap();
         assert_download_without_stage(&s);
 
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1843,7 +1817,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1862,7 +1836,7 @@ mod tests {
     fn stage_count_sets_both() {
         let mut s = started_apply(vec![dnf_pkg("glibc")]);
         s.apply_when_ready = true;
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1895,7 +1869,7 @@ mod tests {
             other => panic!("expected Running, got {other:?}"),
         }
 
-        let kept = reduce(
+        let kept = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1932,7 +1906,7 @@ mod tests {
     fn source_switch_returns_to_download() {
         let mut s = started_apply(vec![dnf_pkg("glibc")]);
         s.apply_when_ready = true;
-        let s = reduce(
+        let s = apply(
             s,
             dnf_progress(
                 Some("glibc"),
@@ -1958,7 +1932,7 @@ mod tests {
             }
             other => panic!("expected Running, got {other:?}"),
         }
-        let s = reduce(
+        let s = apply(
             s,
             Event::ApplyProgress {
                 source: UpdateSource::FlatpakUser,
@@ -1996,7 +1970,7 @@ mod tests {
     #[test]
     fn stop_before_install_returns_every_package_to_pending() {
         let mut s = running_dnf(vec![dnf_pkg("tzdata-java"), dnf_pkg("grok-bot")]);
-        s = reduce(
+        s = apply(
             s,
             dnf_progress(
                 Some("tzdata-java"),
@@ -2008,7 +1982,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::StopApply {
                 during_transaction: false,
@@ -2032,12 +2006,12 @@ mod tests {
     #[test]
     fn stop_during_install_warns_that_the_rpm_database_may_be_half_applied() {
         let mut s = running_dnf(vec![dnf_pkg("tzdata-java")]);
-        s = reduce(
+        s = apply(
             s,
             dnf_progress(None, None, None, "Running transaction", None, None),
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::StopApply {
                 during_transaction: true,
@@ -2060,7 +2034,7 @@ mod tests {
 
     #[test]
     fn stop_outside_a_run_is_rejected() {
-        let err = reduce(
+        let err = apply(
             AppState::default(),
             Event::StopApply {
                 during_transaction: false,
@@ -2072,9 +2046,9 @@ mod tests {
 
     #[test]
     fn apply_when_ready_survives_until_ready() {
-        let s = reduce(AppState::default(), Event::StartCheck { then_apply: true }).unwrap();
+        let s = apply(AppState::default(), Event::StartCheck { then_apply: true }).unwrap();
         assert!(s.apply_when_ready);
-        let s = reduce(
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Check,
@@ -2083,16 +2057,17 @@ mod tests {
         .unwrap();
         assert!(s.apply_when_ready);
         assert!(matches!(s.phase, Phase::Checking { .. }));
-        let s = reduce(
+        let s = apply(
             s,
-            Event::ConsoleLine {
-                tag: "dnf".into(),
-                text: "loading".into(),
+            Event::BackendCheckDone {
+                source: UpdateSource::Dnf,
+                packages: vec![],
+                soft_error: None,
             },
         )
         .unwrap();
         assert!(s.apply_when_ready);
-        let s = reduce(
+        let s = apply(
             s,
             Event::CheckComplete {
                 packages: vec![pkg("kernel", UpdateSource::Dnf)],
@@ -2107,15 +2082,15 @@ mod tests {
 
     #[test]
     fn empty_check_clears_apply_when_ready() {
-        let s = reduce(AppState::default(), Event::StartCheck { then_apply: true }).unwrap();
-        let s = reduce(
+        let s = apply(AppState::default(), Event::StartCheck { then_apply: true }).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Check,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::CheckComplete {
                 packages: vec![],
@@ -2136,15 +2111,15 @@ mod tests {
 
     #[test]
     fn soft_error_check_puts_the_parenthetical_in_detail() {
-        let s = reduce(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
-        let s = reduce(
+        let s = apply(AppState::default(), Event::StartCheck { then_apply: false }).unwrap();
+        let s = apply(
             s,
             Event::SessionReady {
                 purpose: AuthPurpose::Check,
             },
         )
         .unwrap();
-        let s = reduce(
+        let s = apply(
             s,
             Event::CheckComplete {
                 packages: vec![],
@@ -2175,9 +2150,9 @@ mod tests {
             checked_at: "yesterday".into(),
             detail: Some("No updates available (fwupd)".into()),
         });
-        let s = reduce(s, Event::StartCheck { then_apply: true }).unwrap();
+        let s = apply(s, Event::StartCheck { then_apply: true }).unwrap();
         assert!(s.apply_when_ready);
-        let s = reduce(s, Event::CancelAuth).unwrap();
+        let s = apply(s, Event::CancelAuth).unwrap();
         assert!(!s.apply_when_ready);
         match s.phase {
             Phase::Idle(IdleScreen::Current {
@@ -2190,9 +2165,9 @@ mod tests {
 
     #[test]
     fn fail_clears_apply_when_ready() {
-        let s = reduce(AppState::default(), Event::StartCheck { then_apply: true }).unwrap();
+        let s = apply(AppState::default(), Event::StartCheck { then_apply: true }).unwrap();
         assert!(s.apply_when_ready);
-        let s = reduce(
+        let s = apply(
             s,
             Event::Fail {
                 title: "Authentication cancelled".into(),
@@ -2219,7 +2194,7 @@ mod tests {
             packages: vec![pkg("kernel", UpdateSource::Dnf)],
             soft_errors: vec![],
         };
-        let applied = reduce(ready, Event::StartApply).unwrap();
+        let applied = apply(ready, Event::StartApply).unwrap();
         assert!(!applied.apply_when_ready);
 
         let mut idle = AppState::default();
@@ -2228,7 +2203,7 @@ mod tests {
             checked_at: "just now".into(),
             detail: None,
         });
-        let reset = reduce(idle, Event::ResetToIdle).unwrap();
+        let reset = apply(idle, Event::ResetToIdle).unwrap();
         assert!(!reset.apply_when_ready);
         assert!(matches!(
             reset.phase,
@@ -2237,7 +2212,7 @@ mod tests {
 
         let mut running = running_dnf(vec![pkg("kernel", UpdateSource::Dnf)]);
         running.apply_when_ready = true;
-        let stopped = reduce(
+        let stopped = apply(
             running.clone(),
             Event::StopApply {
                 during_transaction: false,
@@ -2247,7 +2222,7 @@ mod tests {
         assert!(!stopped.apply_when_ready);
 
         running.apply_when_ready = true;
-        let stopped_tx = reduce(
+        let stopped_tx = apply(
             running,
             Event::StopApply {
                 during_transaction: true,
@@ -2270,7 +2245,7 @@ mod tests {
             packages: vec![],
             last_checked: None,
         };
-        let session = reduce(
+        let session = apply(
             auth,
             Event::SessionReady {
                 purpose: AuthPurpose::Check,
@@ -2337,7 +2312,7 @@ mod tests {
     fn reboot_fail_event_retries_reboot() {
         use crate::orchestrator::REBOOT_FAILED_TITLE;
 
-        let reboot = reduce(
+        let reboot = apply(
             AppState::default(),
             Event::Fail {
                 title: REBOOT_FAILED_TITLE.into(),
@@ -2358,7 +2333,7 @@ mod tests {
             "got {:?}",
             reboot.phase
         );
-        let normal = reduce(
+        let normal = apply(
             AppState::default(),
             Event::Fail {
                 title: "All updates failed".into(),
@@ -2383,7 +2358,7 @@ mod tests {
     #[test]
     fn recovery_starts_once() {
         let s = started_apply(vec![dnf_pkg("glibc")]);
-        let s = reduce(s, Event::RecoveryProbeStarted).unwrap();
+        let s = apply(s, Event::RecoveryProbeStarted).unwrap();
         match &s.phase {
             Phase::Running {
                 recovery: RecoveryLatch::InFlight,
@@ -2391,7 +2366,7 @@ mod tests {
             } => {}
             other => panic!("expected in flight, got {other:?}"),
         }
-        let s = reduce(s, Event::RecoveryProbeStarted).unwrap();
+        let s = apply(s, Event::RecoveryProbeStarted).unwrap();
         match &s.phase {
             Phase::Running {
                 recovery: RecoveryLatch::InFlight,
@@ -2404,9 +2379,9 @@ mod tests {
     #[test]
     fn recovery_unknown_waits_thirty_seconds() {
         let s = started_apply(vec![dnf_pkg("glibc")]);
-        let s = reduce(s, Event::RecoveryProbeStarted).unwrap();
+        let s = apply(s, Event::RecoveryProbeStarted).unwrap();
         let started = std::time::Instant::now();
-        let s = reduce(s, Event::RecoveryProbeUnknown).unwrap();
+        let s = apply(s, Event::RecoveryProbeUnknown).unwrap();
         match &s.phase {
             Phase::Running {
                 recovery: RecoveryLatch::Backoff { not_before },
@@ -2419,7 +2394,7 @@ mod tests {
             }
             other => panic!("expected backoff, got {other:?}"),
         }
-        let s = reduce(s, Event::RecoveryProbeStarted).unwrap();
+        let s = apply(s, Event::RecoveryProbeStarted).unwrap();
         match &s.phase {
             Phase::Running {
                 recovery: RecoveryLatch::Backoff { .. },
@@ -2441,8 +2416,8 @@ mod tests {
             } => {}
             other => panic!("apply session starts idle on download, got {other:?}"),
         }
-        let s = reduce(s, Event::RecoveryProbeSettled).unwrap();
-        let s = reduce(
+        let s = apply(s, Event::RecoveryProbeSettled).unwrap();
+        let s = apply(
             s,
             Event::ApplyProgress {
                 source: UpdateSource::FlatpakUser,
@@ -2463,5 +2438,65 @@ mod tests {
             } => {}
             other => panic!("expected settled download, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn failed_transition_leaves_state_unchanged() {
+        let mut s = AppState {
+            apply_when_ready: true,
+            release_upgrade: Some(45),
+            release_age_days: Some(7),
+            ..Default::default()
+        };
+        let original_phase = s.phase.clone();
+
+        let err = reduce(&mut s, Event::StartApply).unwrap_err();
+        assert!(err.to_string().contains("StartApply"));
+        assert_eq!(s.phase, original_phase);
+        assert!(s.apply_when_ready);
+        assert_eq!(s.release_upgrade, Some(45));
+        assert_eq!(s.release_age_days, Some(7));
+        assert!(s.updates_listed_at.is_none());
+        assert!(s.stopwatch.is_none());
+
+        s.phase = Phase::Ready {
+            packages: vec![],
+            soft_errors: vec!["err".into()],
+        };
+        s.updates_listed_at = Some(SystemTime::UNIX_EPOCH);
+        let empty_ready = s.phase.clone();
+        assert!(reduce(&mut s, Event::StartApply).is_err());
+        assert_eq!(s.phase, empty_ready);
+        assert!(s.apply_when_ready);
+        assert_eq!(s.updates_listed_at, Some(SystemTime::UNIX_EPOCH));
+
+        let mut auth = apply(AppState::default(), Event::StartCheck { then_apply: true }).unwrap();
+        let auth_phase = auth.phase.clone();
+        assert!(reduce(
+            &mut auth,
+            Event::SessionReady {
+                purpose: AuthPurpose::Apply,
+            },
+        )
+        .is_err());
+        assert_eq!(auth.phase, auth_phase);
+        assert!(auth.apply_when_ready);
+        assert!(auth.stopwatch.is_some());
+
+        let mut checking = apply(
+            auth,
+            Event::SessionReady {
+                purpose: AuthPurpose::Check,
+            },
+        )
+        .unwrap();
+        let checking_phase = checking.phase.clone();
+        assert!(reduce(
+            &mut checking,
+            Event::ApplyComplete { needs_reboot: true },
+        )
+        .is_err());
+        assert_eq!(checking.phase, checking_phase);
+        assert!(checking.apply_when_ready);
     }
 }
