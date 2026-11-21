@@ -7,7 +7,8 @@ use std::time::SystemTime;
 
 use async_channel::Sender;
 
-use crate::backend::{self, dnf, flatpak, fwupd};
+use crate::backend::{self, dnf, flatpak, fwupd, fwupd_dbus, logind, ProgressHint};
+pub use crate::backend::NativeOutcome;
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
 use crate::model::{AuthPurpose, Package, RetryAction, UpdateSource};
 use crate::privilege::{
@@ -113,12 +114,35 @@ pub trait OrchestratorRuntime: Send + 'static {
         self.run_local(program, args, on_line)
     }
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String>;
+    fn fwupd_dbus_available(&self) -> bool {
+        false
+    }
+    fn check_fwupd_dbus(&self, _on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        NativeOutcome::Unavailable("fwupd D-Bus unavailable in test runtime".into())
+    }
+    fn apply_fwupd_dbus(
+        &self,
+        _packages: &[Package],
+        _on_line: &mut dyn FnMut(String),
+        _on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<fwupd_dbus::FwupdApplyOutcome> {
+        NativeOutcome::Unavailable("fwupd D-Bus unavailable in test runtime".into())
+    }
+    fn check_fwupd_reboot_dbus(&self) -> NativeOutcome<bool> {
+        NativeOutcome::Unavailable("fwupd D-Bus unavailable in test runtime".into())
+    }
+    fn reboot_preflight(&self) -> NativeOutcome<logind::RebootPreflight> {
+        NativeOutcome::Unavailable("logind D-Bus unavailable in test runtime".into())
+    }
+    fn reboot_via_logind(&self, _on_line: &mut dyn FnMut(String)) -> NativeOutcome<()> {
+        NativeOutcome::Unavailable("logind D-Bus unavailable in test runtime".into())
+    }
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }
 }
 
-/// Production [`OrchestratorRuntime`] backed by OS processes, polkit helper, and libflatpak.
+/// Production [`OrchestratorRuntime`] backed by OS processes, polkit helper, D-Bus, and libflatpak.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemRuntime;
 
@@ -161,6 +185,35 @@ impl OrchestratorRuntime for SystemRuntime {
 
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String> {
         flatpak::query_updates(user)
+    }
+
+    fn fwupd_dbus_available(&self) -> bool {
+        fwupd_dbus::is_available()
+    }
+
+    fn check_fwupd_dbus(&self, on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        fwupd_dbus::check_updates(on_line)
+    }
+
+    fn apply_fwupd_dbus(
+        &self,
+        packages: &[Package],
+        on_line: &mut dyn FnMut(String),
+        on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<fwupd_dbus::FwupdApplyOutcome> {
+        fwupd_dbus::apply_updates(packages, on_line, on_progress)
+    }
+
+    fn check_fwupd_reboot_dbus(&self) -> NativeOutcome<bool> {
+        fwupd_dbus::check_reboot_needed()
+    }
+
+    fn reboot_preflight(&self) -> NativeOutcome<logind::RebootPreflight> {
+        logind::query_reboot_preflight()
+    }
+
+    fn reboot_via_logind(&self, on_line: &mut dyn FnMut(String)) -> NativeOutcome<()> {
+        logind::request_reboot_interactive(on_line)
     }
 
     fn now(&self) -> SystemTime {
@@ -359,36 +412,41 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
         &mut soft_errors,
     );
 
-    // 5) fwupd
+    // 5) fwupd — prefer native org.freedesktop.fwupd D-Bus, falling back cleanly
+    // to the Phase 1 privileged fwupdmgr CLI helper when unavailable.
     if !ch.is_current() {
         return;
     }
-    let _ = run_helper_check(
-        &ch,
-        runtime,
-        HelperCommand::CheckFwupdRefresh,
-        "fwupd",
-        |_log, _code| Ok(Vec::new()),
-    );
-    if !ch.is_current() {
-        return;
-    }
-
-    let fwupd_res =
-        run_helper_check(&ch, runtime, HelperCommand::CheckFwupd, "fwupd", |log, code| {
-            let pkgs = fwupd::parse_get_updates(log);
-            if code != 0 && pkgs.is_empty() {
-                let lower = log.to_ascii_lowercase();
-                if lower.contains("not found") || lower.contains("no such file") {
-                    return Err("fwupd not available".into());
-                }
-                if fwupd::check_output_is_no_updates(log, code) {
-                    return Ok(vec![]);
-                }
-                return Err(format!("fwupdmgr get-updates exit {code}"));
+    let fwupd_res = match runtime.check_fwupd_dbus(&mut |l| ch.line("fwupd", l)) {
+        NativeOutcome::Handled(res) => res,
+        NativeOutcome::Unavailable(_) => {
+            let _ = run_helper_check(
+                &ch,
+                runtime,
+                HelperCommand::CheckFwupdRefresh,
+                "fwupd",
+                |_log, _code| Ok(Vec::new()),
+            );
+            if !ch.is_current() {
+                return;
             }
-            Ok(pkgs)
-        });
+
+            run_helper_check(&ch, runtime, HelperCommand::CheckFwupd, "fwupd", |log, code| {
+                let pkgs = fwupd::parse_get_updates(log);
+                if code != 0 && pkgs.is_empty() {
+                    let lower = log.to_ascii_lowercase();
+                    if lower.contains("not found") || lower.contains("no such file") {
+                        return Err("fwupd not available".into());
+                    }
+                    if fwupd::check_output_is_no_updates(log, code) {
+                        return Ok(vec![]);
+                    }
+                    return Err(format!("fwupdmgr get-updates exit {code}"));
+                }
+                Ok(pkgs)
+            })
+        }
+    };
     if !ch.is_current() {
         return;
     }
@@ -568,16 +626,18 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
         return;
     }
 
-    // Flatpak runs as the current user (its own polkit). Only dnf/fwupd need helper.
-    let needs_session = sources
-        .iter()
-        .any(|s| matches!(s, UpdateSource::Dnf | UpdateSource::Firmware));
+    // Flatpak runs as the current user; native fwupd D-Bus uses its own polkit.
+    // Only DNF (and CLI fwupdmgr fallback when fwupd D-Bus is absent) requires our helper.
+    let needs_session = sources.contains(&UpdateSource::Dnf)
+        || (sources.contains(&UpdateSource::Firmware) && !runtime.fwupd_dbus_available());
+    let mut session_ensured = false;
 
     if needs_session {
         if let Err(e) = runtime.ensure_session() {
             map_session_start_err(&ch, e, RetryAction::RetryApply);
             return;
         }
+        session_ensured = true;
     }
     if !ch.is_current() {
         return;
@@ -608,8 +668,11 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
             stage_total: None,
         });
 
-        let (code, log) = match source {
-            UpdateSource::Dnf => run_helper_apply(&ch, runtime, HelperCommand::ApplyDnf, tag, source),
+        let (code, log, native_reboot) = match source {
+            UpdateSource::Dnf => {
+                let (c, l) = run_helper_apply(&ch, runtime, HelperCommand::ApplyDnf, tag, source);
+                (c, l, false)
+            }
             UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
                 // Apply the exact refs we listed at Check time, as the user.
                 // (Running system flatpak as root via helper can disagree with
@@ -622,7 +685,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                     .collect();
                 if refs.is_empty() {
                     ch.line(tag, "No flatpak refs to update".into());
-                    (0, String::new())
+                    (0, String::new(), false)
                 } else {
                     ch.line(
                         tag,
@@ -630,11 +693,54 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                     );
                     let args = flatpak::update_args_for_refs(user, &refs);
                     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                    run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source)
+                    let (c, l) = run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source);
+                    (c, l, false)
                 }
             }
             UpdateSource::Firmware => {
-                run_helper_apply(&ch, runtime, HelperCommand::ApplyFwupd, tag, source)
+                let fw_pkgs: Vec<Package> = packages
+                    .iter()
+                    .filter(|p| p.source == UpdateSource::Firmware)
+                    .cloned()
+                    .collect();
+                let outcome = runtime.apply_fwupd_dbus(
+                    &fw_pkgs,
+                    &mut |l| ch.line(tag, l),
+                    &mut |hint| emit_progress_hint(&ch, source, hint),
+                );
+                match outcome {
+                    NativeOutcome::Handled(Ok(res)) => (0, String::new(), res.needs_reboot),
+                    NativeOutcome::Handled(Err(reason)) => (1, reason, false),
+                    NativeOutcome::Unavailable(_) => {
+                        let ready = if session_ensured {
+                            Ok(())
+                        } else {
+                            match runtime.ensure_session() {
+                                Ok(()) => {
+                                    session_ensured = true;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        };
+                        match ready {
+                            Ok(()) => {
+                                let (c, l) = run_helper_apply(
+                                    &ch,
+                                    runtime,
+                                    HelperCommand::ApplyFwupd,
+                                    tag,
+                                    source,
+                                );
+                                (c, l, false)
+                            }
+                            Err(e) => {
+                                ch.line(tag, format!("error: {e}"));
+                                (-1, e.to_string(), false)
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -642,7 +748,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
             return;
         }
 
-        let reboot = code == 0 && backend::detect_reboot(source, &log, &packages);
+        let reboot = code == 0 && (native_reboot || backend::detect_reboot(source, &log, &packages));
         if reboot {
             overall_reboot = true;
         }
@@ -665,13 +771,27 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
     }
 
     if sources.contains(&UpdateSource::Firmware) {
-        ch.line("fwupd", "Checking whether a reboot is needed…".into());
-        let mut log = String::new();
-        if let Ok(code) = runtime.run_helper(HelperCommand::CheckFwupdReboot, &mut |l| {
-            accept_helper_line(&ch, "fwupd", &mut log, &l);
-        }) {
-            if fwupd::parse_reboot_needed_output(&log, code) {
+        match runtime.check_fwupd_reboot_dbus() {
+            NativeOutcome::Handled(Ok(true)) => {
                 overall_reboot = true;
+            }
+            NativeOutcome::Handled(Ok(false)) => {}
+            NativeOutcome::Handled(Err(e)) => {
+                ch.line("fwupd", format!("Reboot status check skipped: {e}"));
+            }
+            NativeOutcome::Unavailable(_) => {
+                let ensure_ok = session_ensured || runtime.ensure_session().is_ok();
+                if ensure_ok {
+                    ch.line("fwupd", "Checking whether a reboot is needed…".into());
+                    let mut log = String::new();
+                    if let Ok(code) = runtime.run_helper(HelperCommand::CheckFwupdReboot, &mut |l| {
+                        accept_helper_line(&ch, "fwupd", &mut log, &l);
+                    }) {
+                        if fwupd::parse_reboot_needed_output(&log, code) {
+                            overall_reboot = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -686,8 +806,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
     });
 }
 
-fn emit_progress_from_line(ch: &WorkChannel, source: UpdateSource, l: &str) {
-    let hint = backend::parse_progress(source, l);
+fn emit_progress_hint(ch: &WorkChannel, source: UpdateSource, hint: ProgressHint) {
     if hint.package_name.is_none()
         && hint.status.is_none()
         && hint.progress.is_none()
@@ -704,6 +823,11 @@ fn emit_progress_from_line(ch: &WorkChannel, source: UpdateSource, l: &str) {
         stage_current: hint.stage_current,
         stage_total: hint.stage_total,
     });
+}
+
+fn emit_progress_from_line(ch: &WorkChannel, source: UpdateSource, l: &str) {
+    let hint = backend::parse_progress(source, l);
+    emit_progress_hint(ch, source, hint);
 }
 
 fn run_helper_apply<R: OrchestratorRuntime>(
@@ -769,6 +893,15 @@ fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
         .then(|| &s[prefix.len()..])
 }
 
+fn prefix_source(source: UpdateSource, msg: &str) -> String {
+    let label_prefix = format!("{}:", source.label());
+    if strip_prefix_ascii_ci(msg, &label_prefix).is_some() {
+        msg.to_string()
+    } else {
+        format!("{label_prefix} {msg}")
+    }
+}
+
 /// Extract a concise, user-facing failure reason from a backend apply log.
 pub fn summarize_apply_failure(source: UpdateSource, log: &str, exit_code: i32) -> String {
     let lower_full = log.to_ascii_lowercase();
@@ -809,10 +942,13 @@ pub fn summarize_apply_failure(source: UpdateSource, log: &str, exit_code: i32) 
     if source == UpdateSource::Firmware {
         if let Some(batt) = log.lines().map(str::trim).find(|line| {
             let l = line.to_ascii_lowercase();
-            l.contains("battery")
-                && (l.contains("ac power") || l.contains("threshold") || l.contains("too low"))
+            (l.contains("battery") || l.contains("ac power"))
+                && (l.contains("ac power")
+                    || l.contains("threshold")
+                    || l.contains("too low")
+                    || l.contains("required"))
         }) {
-            return format!("Firmware: {}", truncate_summary(batt, 160));
+            return prefix_source(source, &truncate_summary(batt, 160));
         }
         if lower_full.contains("battery")
             && (lower_full.contains("ac power")
@@ -827,7 +963,7 @@ pub fn summarize_apply_failure(source: UpdateSource, log: &str, exit_code: i32) 
         if let Some(rest) = strip_prefix_ascii_ci(line, "error:") {
             let rest = rest.trim();
             if !rest.is_empty() {
-                return format!("{}: {}", source.label(), truncate_summary(rest, 160));
+                return prefix_source(source, &truncate_summary(rest, 160));
             }
         }
     }
@@ -836,11 +972,11 @@ pub fn summarize_apply_failure(source: UpdateSource, log: &str, exit_code: i32) 
         let l = line.to_ascii_lowercase();
         l.starts_with("failed") || l.starts_with("cannot ")
     }) {
-        return format!("{}: {}", source.label(), truncate_summary(line, 160));
+        return prefix_source(source, &truncate_summary(line, 160));
     }
 
     if let Some(last) = log.lines().map(str::trim).rfind(|l| !l.is_empty()) {
-        return format!("{}: {}", source.label(), truncate_summary(last, 160));
+        return prefix_source(source, &truncate_summary(last, 160));
     }
 
     format!("{} update failed (exit {exit_code})", source.label())
@@ -880,8 +1016,21 @@ pub fn run_systemctl_reboot_with<R: OrchestratorRuntime>(tx: Sender<WorkerMsg>, 
     });
 }
 
-/// Synchronously run `systemctl reboot` against `runtime`.
+/// Synchronously run native `systemd-logind` reboot with inhibitor pre-flight,
+/// falling back to `systemctl reboot` when D-Bus is unavailable.
 pub fn execute_systemctl_reboot<R: OrchestratorRuntime>(tx: &Sender<WorkerMsg>, runtime: &R) {
+    match runtime.reboot_via_logind(&mut |l| line(tx, "logind", l)) {
+        NativeOutcome::Handled(Ok(())) => return,
+        NativeOutcome::Handled(Err(detail)) => {
+            send(
+                tx,
+                WorkerMsg::Event(reboot_fail_event(REBOOT_FAILED_TITLE, detail)),
+            );
+            return;
+        }
+        NativeOutcome::Unavailable(_) => {}
+    }
+
     let mut log = String::new();
     match runtime.run_local("systemctl", &["reboot"], &mut |l| {
         if !log.is_empty() {

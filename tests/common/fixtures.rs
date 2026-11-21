@@ -34,6 +34,8 @@ pub const ALL_FIXTURES: &[&str] = &[
     "fwupd/apply_battery_error.txt",
     "fwupd/check_reboot_needed_true.json",
     "fwupd/check_reboot_needed_false.json",
+    "fwupd/dbus_devices_and_upgrades.json",
+    "fwupd/dbus_history.json",
     // release_upgrade/
     "release_upgrade/collections_f45_active.json",
     "release_upgrade/collections_already_current.json",
@@ -43,6 +45,7 @@ pub const ALL_FIXTURES: &[&str] = &[
     "release_upgrade/os_release_bare.txt",
     "release_upgrade/os_release_missing_version.txt",
     // systemctl/
+    "systemctl/logind_inhibitors.json",
     "systemctl/reboot_block_inhibitor.txt",
     "systemctl/reboot_logind_error.txt",
 ];

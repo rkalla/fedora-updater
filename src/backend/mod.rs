@@ -4,8 +4,19 @@
 pub mod dnf;
 pub mod flatpak;
 pub mod fwupd;
+pub mod fwupd_dbus;
+pub mod logind;
 
 use crate::model::{Package, PackageStatus, UpdateSource};
+
+/// Result of attempting a native Fedora D-Bus or library operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeOutcome<T> {
+    /// Native daemon answered (either succeeded or returned an actionable domain error).
+    Handled(Result<T, String>),
+    /// Native daemon or system D-Bus is unavailable — fall back to CLI path.
+    Unavailable(String),
+}
 
 /// Best-effort progress extracted from a single log line.
 #[derive(Debug, Clone, Default, PartialEq)]

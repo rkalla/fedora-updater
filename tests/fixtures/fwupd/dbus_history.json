@@ -1,0 +1,23 @@
+[
+  {
+    "DeviceId": "5a2b1c9d00112233445566778899aabbccddeeff",
+    "Name": "System Firmware",
+    "Version": "0.1.31",
+    "TargetVersion": "0.1.32",
+    "UpdateState": 2,
+    "Plugin": "uefi_capsule",
+    "Created": 1788900000,
+    "Modified": 1788900320
+  },
+  {
+    "DeviceId": "362301da643102b9f38477387e2193e57abaa590",
+    "Name": "UEFI dbx",
+    "Version": "20260402",
+    "TargetVersion": "20260707",
+    "UpdateState": 3,
+    "UpdateError": "failed to run update on reboot: expected 20260707 and got (null)",
+    "Plugin": "uefi_dbx",
+    "Created": 1789080555,
+    "Modified": 1789080623
+  }
+]

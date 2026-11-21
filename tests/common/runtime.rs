@@ -5,7 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fedora_updater::backend::flatpak::{packages_from_flatpak_updates, FlatpakCheck};
+use fedora_updater::backend::fwupd_dbus::FwupdApplyOutcome;
+use fedora_updater::backend::logind::RebootPreflight;
+use fedora_updater::backend::{NativeOutcome, ProgressHint};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
+use fedora_updater::model::Package;
 use fedora_updater::orchestrator::OrchestratorRuntime;
 use fedora_updater::privilege::SessionError;
 
@@ -61,6 +65,12 @@ pub struct LocalStep {
     pub hook_after_line: Option<(usize, Box<dyn FnMut() + Send>)>,
 }
 
+pub struct FwupdDbusApplyStep {
+    pub lines: Vec<String>,
+    pub hints: Vec<ProgressHint>,
+    pub outcome: NativeOutcome<FwupdApplyOutcome>,
+}
+
 struct LocalMatcher {
     program: String,
     required_args: Vec<String>,
@@ -83,11 +93,22 @@ struct FakeState {
     helper_calls: Vec<HelperCommand>,
     local_calls: Vec<(String, Vec<String>)>,
     flatpak_queries: Vec<bool>,
+    fwupd_dbus_available: bool,
+    fwupd_dbus_check_calls: usize,
+    fwupd_dbus_apply_calls: usize,
+    fwupd_dbus_reboot_calls: usize,
+    logind_preflight_calls: usize,
+    logind_reboot_calls: usize,
     ensure_session_steps: VecDeque<EnsureSessionStep>,
     helper_steps: HashMap<HelperCommand, VecDeque<HelperStep>>,
     local_steps: VecDeque<LocalMatcher>,
     flatpak_user_steps: VecDeque<Result<FlatpakCheck, String>>,
     flatpak_system_steps: VecDeque<Result<FlatpakCheck, String>>,
+    fwupd_dbus_check_steps: VecDeque<NativeOutcome<Vec<Package>>>,
+    fwupd_dbus_apply_steps: VecDeque<FwupdDbusApplyStep>,
+    fwupd_dbus_reboot_steps: VecDeque<NativeOutcome<bool>>,
+    logind_preflight_steps: VecDeque<NativeOutcome<RebootPreflight>>,
+    logind_reboot_steps: VecDeque<(Vec<String>, NativeOutcome<()>)>,
 }
 
 /// Deterministic offline [`OrchestratorRuntime`] for functional tests.
@@ -111,11 +132,22 @@ impl FakeRuntime {
                 helper_calls: Vec::new(),
                 local_calls: Vec::new(),
                 flatpak_queries: Vec::new(),
+                fwupd_dbus_available: false,
+                fwupd_dbus_check_calls: 0,
+                fwupd_dbus_apply_calls: 0,
+                fwupd_dbus_reboot_calls: 0,
+                logind_preflight_calls: 0,
+                logind_reboot_calls: 0,
                 ensure_session_steps: VecDeque::new(),
                 helper_steps: HashMap::new(),
                 local_steps: VecDeque::new(),
                 flatpak_user_steps: VecDeque::new(),
                 flatpak_system_steps: VecDeque::new(),
+                fwupd_dbus_check_steps: VecDeque::new(),
+                fwupd_dbus_apply_steps: VecDeque::new(),
+                fwupd_dbus_reboot_steps: VecDeque::new(),
+                logind_preflight_steps: VecDeque::new(),
+                logind_reboot_steps: VecDeque::new(),
             })),
         }
     }
@@ -274,6 +306,66 @@ impl FakeRuntime {
     pub fn flatpak_queries(&self) -> Vec<bool> {
         self.inner.lock().unwrap().flatpak_queries.clone()
     }
+
+    pub fn set_fwupd_dbus_available(&self, available: bool) {
+        self.inner.lock().unwrap().fwupd_dbus_available = available;
+    }
+
+    pub fn push_fwupd_dbus_check(&self, outcome: NativeOutcome<Vec<Package>>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fwupd_dbus_check_steps
+            .push_back(outcome);
+    }
+
+    pub fn push_fwupd_dbus_apply(&self, step: FwupdDbusApplyStep) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fwupd_dbus_apply_steps
+            .push_back(step);
+    }
+
+    pub fn push_fwupd_dbus_reboot_needed(&self, outcome: NativeOutcome<bool>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fwupd_dbus_reboot_steps
+            .push_back(outcome);
+    }
+
+    pub fn push_logind_preflight(&self, outcome: NativeOutcome<RebootPreflight>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .logind_preflight_steps
+            .push_back(outcome);
+    }
+
+    pub fn push_logind_reboot(&self, lines: Vec<String>, outcome: NativeOutcome<()>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .logind_reboot_steps
+            .push_back((lines, outcome));
+    }
+
+    pub fn fwupd_dbus_check_calls(&self) -> usize {
+        self.inner.lock().unwrap().fwupd_dbus_check_calls
+    }
+
+    pub fn fwupd_dbus_apply_calls(&self) -> usize {
+        self.inner.lock().unwrap().fwupd_dbus_apply_calls
+    }
+
+    pub fn fwupd_dbus_reboot_calls(&self) -> usize {
+        self.inner.lock().unwrap().fwupd_dbus_reboot_calls
+    }
+
+    pub fn logind_reboot_calls(&self) -> usize {
+        self.inner.lock().unwrap().logind_reboot_calls
+    }
 }
 
 impl OrchestratorRuntime for FakeRuntime {
@@ -369,6 +461,72 @@ impl OrchestratorRuntime for FakeRuntime {
         res.unwrap_or_else(|| {
             panic!("FakeRuntime: unscripted flatpak query user={user}")
         })
+    }
+
+    fn fwupd_dbus_available(&self) -> bool {
+        self.inner.lock().unwrap().fwupd_dbus_available
+    }
+
+    fn check_fwupd_dbus(&self, _on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        let mut s = self.inner.lock().unwrap();
+        s.fwupd_dbus_check_calls += 1;
+        s.fwupd_dbus_check_steps
+            .pop_front()
+            .unwrap_or_else(|| NativeOutcome::Unavailable("fwupd D-Bus not scripted".into()))
+    }
+
+    fn apply_fwupd_dbus(
+        &self,
+        _packages: &[Package],
+        on_line: &mut dyn FnMut(String),
+        on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<FwupdApplyOutcome> {
+        let step = {
+            let mut s = self.inner.lock().unwrap();
+            s.fwupd_dbus_apply_calls += 1;
+            s.fwupd_dbus_apply_steps.pop_front()
+        };
+        let Some(step) = step else {
+            return NativeOutcome::Unavailable("fwupd D-Bus apply not scripted".into());
+        };
+        for l in step.lines {
+            on_line(l);
+        }
+        for h in step.hints {
+            on_progress(h);
+        }
+        step.outcome
+    }
+
+    fn check_fwupd_reboot_dbus(&self) -> NativeOutcome<bool> {
+        let mut s = self.inner.lock().unwrap();
+        s.fwupd_dbus_reboot_calls += 1;
+        s.fwupd_dbus_reboot_steps
+            .pop_front()
+            .unwrap_or_else(|| NativeOutcome::Unavailable("fwupd D-Bus reboot check not scripted".into()))
+    }
+
+    fn reboot_preflight(&self) -> NativeOutcome<RebootPreflight> {
+        let mut s = self.inner.lock().unwrap();
+        s.logind_preflight_calls += 1;
+        s.logind_preflight_steps
+            .pop_front()
+            .unwrap_or_else(|| NativeOutcome::Unavailable("logind preflight not scripted".into()))
+    }
+
+    fn reboot_via_logind(&self, on_line: &mut dyn FnMut(String)) -> NativeOutcome<()> {
+        let step = {
+            let mut s = self.inner.lock().unwrap();
+            s.logind_reboot_calls += 1;
+            s.logind_reboot_steps.pop_front()
+        };
+        let Some((lines, outcome)) = step else {
+            return NativeOutcome::Unavailable("logind D-Bus not scripted".into());
+        };
+        for l in lines {
+            on_line(l);
+        }
+        outcome
     }
 
     fn now(&self) -> SystemTime {

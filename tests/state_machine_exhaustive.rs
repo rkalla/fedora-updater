@@ -48,6 +48,7 @@ fn flatpak(name: &str) -> Package {
         summary: None,
         install_size_delta: None,
         advisories: Vec::new(),
+        preflight_warning: None,
     }
 }
 
@@ -66,6 +67,7 @@ fn firmware(name: &str) -> Package {
         summary: None,
         install_size_delta: None,
         advisories: Vec::new(),
+        preflight_warning: None,
     }
 }
 

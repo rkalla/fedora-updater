@@ -1,0 +1,26 @@
+[
+  {
+    "what": "sleep",
+    "who": "signal-desktop",
+    "why": "Application cleanup before suspend",
+    "mode": "delay",
+    "uid": 1000,
+    "pid": 38987
+  },
+  {
+    "what": "handle-power-key:handle-lid-switch",
+    "who": "GNOME Shell",
+    "why": "GNOME handles keypresses",
+    "mode": "block",
+    "uid": 1000,
+    "pid": 36391
+  },
+  {
+    "what": "shutdown",
+    "who": "dnf5daemon-server",
+    "why": "Installing system updates",
+    "mode": "block",
+    "uid": 0,
+    "pid": 41200
+  }
+]

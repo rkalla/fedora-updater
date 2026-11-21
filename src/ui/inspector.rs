@@ -23,6 +23,7 @@ pub struct InspectorViewModel {
     pub status_label: Option<&'static str>,
     pub needs_reboot: bool,
     pub reboot_reason: Option<String>,
+    pub preflight_warning: Option<String>,
     pub related_extensions: Vec<String>,
     pub summary: Option<String>,
     pub advisories: Vec<PackageAdvisory>,
@@ -66,6 +67,12 @@ impl InspectorViewModel {
                 package.name
             )
         });
+        let preflight_warning = package
+            .preflight_warning
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
         let summary = package
             .summary
             .as_deref()
@@ -88,6 +95,7 @@ impl InspectorViewModel {
             status_label,
             needs_reboot,
             reboot_reason,
+            preflight_warning,
             related_extensions: package.related_extensions(),
             summary,
             advisories: package.advisories.clone(),
@@ -150,6 +158,8 @@ pub struct PackageInspector {
     summary_label: gtk::Label,
     reboot_card: gtk::Box,
     reboot_body: gtk::Label,
+    warning_card: gtk::Box,
+    warning_body: gtk::Label,
     source_field: MetadataField,
     repo_field: MetadataField,
     arch_field: MetadataField,
@@ -253,41 +263,22 @@ impl PackageInspector {
         body.append(&summary_label);
 
         // Restart warning card (when package_implies_reboot is true).
-        let reboot_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        reboot_card.add_css_class("card");
-        reboot_card.add_css_class("inspector-reboot-card");
-        reboot_card.set_visible(false);
-
-        let reboot_inner = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        reboot_inner.set_margin_top(12);
-        reboot_inner.set_margin_bottom(12);
-        reboot_inner.set_margin_start(14);
-        reboot_inner.set_margin_end(14);
-
-        let reboot_head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let reboot_icon = gtk::Image::from_icon_name("system-reboot-symbolic");
-        reboot_icon.add_css_class("warning");
-        let reboot_title = gtk::Label::builder()
-            .label("Restart Required")
-            .xalign(0.0)
-            .halign(gtk::Align::Start)
-            .css_classes(["heading"])
-            .build();
-        reboot_head.append(&reboot_icon);
-        reboot_head.append(&reboot_title);
-
-        let reboot_body = gtk::Label::builder()
-            .label("")
-            .xalign(0.0)
-            .halign(gtk::Align::Start)
-            .wrap(true)
-            .css_classes(["caption", "dimmed"])
-            .build();
-
-        reboot_inner.append(&reboot_head);
-        reboot_inner.append(&reboot_body);
-        reboot_card.append(&reboot_inner);
+        let (reboot_card, reboot_body) = build_callout_card(
+            "inspector-reboot-card",
+            "system-reboot-symbolic",
+            "warning",
+            "Restart Required",
+        );
         body.append(&reboot_card);
+
+        // Pre-flight power safety warning card (when battery/AC requirements are unmet).
+        let (warning_card, warning_body) = build_callout_card(
+            "inspector-warning-card",
+            "battery-caution-symbolic",
+            "error",
+            "Power Safety Warning",
+        );
+        body.append(&warning_card);
 
         // Metadata key-value card.
         let meta_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -408,6 +399,8 @@ impl PackageInspector {
             summary_label,
             reboot_card,
             reboot_body,
+            warning_card,
+            warning_body,
             source_field,
             repo_field,
             arch_field,
@@ -457,6 +450,14 @@ impl PackageInspector {
         } else {
             self.reboot_body.set_label("");
             self.reboot_card.set_visible(false);
+        }
+
+        if let Some(warning) = vm.preflight_warning.as_deref() {
+            self.warning_body.set_label(warning);
+            self.warning_card.set_visible(true);
+        } else {
+            self.warning_body.set_label("");
+            self.warning_card.set_visible(false);
         }
 
         self.source_field.set_optional(Some(vm.source_title));
@@ -588,6 +589,16 @@ impl PackageInspector {
     }
 
     #[cfg(test)]
+    pub fn warning_card_visible(&self) -> bool {
+        self.warning_card.get_visible()
+    }
+
+    #[cfg(test)]
+    pub fn warning_body_text(&self) -> String {
+        self.warning_body.text().to_string()
+    }
+
+    #[cfg(test)]
     pub fn extensions_card_visible(&self) -> bool {
         self.extensions_card.get_visible()
     }
@@ -614,6 +625,49 @@ impl PackageInspector {
     pub fn advisories_card_visible(&self) -> bool {
         self.advisories_card.get_visible()
     }
+}
+
+fn build_callout_card(
+    css_class: &str,
+    icon_name: &str,
+    icon_css_class: &str,
+    title: &str,
+) -> (gtk::Box, gtk::Label) {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("card");
+    card.add_css_class(css_class);
+    card.set_visible(false);
+
+    let inner = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    inner.set_margin_top(12);
+    inner.set_margin_bottom(12);
+    inner.set_margin_start(14);
+    inner.set_margin_end(14);
+
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let icon = gtk::Image::from_icon_name(icon_name);
+    icon.add_css_class(icon_css_class);
+    let title_lbl = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .css_classes(["heading"])
+        .build();
+    head.append(&icon);
+    head.append(&title_lbl);
+
+    let body_lbl = gtk::Label::builder()
+        .label("")
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .css_classes(["caption", "dimmed"])
+        .build();
+
+    inner.append(&head);
+    inner.append(&body_lbl);
+    card.append(&inner);
+    (card, body_lbl)
 }
 
 fn clear_box(container: &gtk::Box) {
@@ -676,5 +730,15 @@ mod tests {
         assert!(fw_vm.arch.is_none());
         assert!(fw_vm.size_label.is_none());
         assert_eq!(fw_vm.status_label, Some("Installed"));
+        assert!(fw_vm.preflight_warning.is_none());
+
+        fw.preflight_warning =
+            Some("System Firmware requires AC power to install safely. Connect AC power and try again.".into());
+        let warn_vm = InspectorViewModel::from_package(&fw);
+        assert!(warn_vm
+            .preflight_warning
+            .as_deref()
+            .unwrap()
+            .contains("AC power"));
     }
 }

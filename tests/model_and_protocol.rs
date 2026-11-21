@@ -25,6 +25,7 @@ fn apply_order_is_dnf_flatpak_firmware() {
             summary: None,
             install_size_delta: None,
             advisories: Vec::new(),
+            preflight_warning: None,
         },
         Package::new_dnf("kernel", "x86_64", "1", "updates"),
         Package {
@@ -41,6 +42,7 @@ fn apply_order_is_dnf_flatpak_firmware() {
             summary: None,
             install_size_delta: None,
             advisories: Vec::new(),
+            preflight_warning: None,
         },
     ];
     sort_for_apply(&mut pkgs);

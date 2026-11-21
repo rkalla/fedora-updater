@@ -2,7 +2,7 @@
 
 Checked-in, deterministic, offline test inputs for unit, functional, and end-to-end suites ([rkalla/fedora-updater#20](https://github.com/rkalla/fedora-updater/issues/20)).
 
-All 31 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
+All 34 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
 
 ## Usage in Tests
 
@@ -37,7 +37,7 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `flatpak/apply_nothing_to_update.txt` | `flatpak update --noninteractive` (exit 0) | No-op apply output (`Nothing to update.`) |
 | `flatpak/apply_remote_error.txt` | `flatpak update --noninteractive` (exit 1) | Network remote pull failure (`Socket I/O timed out`) |
 
-### `fwupd/` (9 fixtures)
+### `fwupd/` (11 fixtures)
 
 | File | Simulated Command & Exit | Scenario & Edge-Case Signals |
 |---|---|---|
@@ -50,6 +50,8 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `fwupd/apply_battery_error.txt` | `fwupdmgr update -y ...` (exit 1) | Low-battery / missing AC power abort mid-run after download/decompress |
 | `fwupd/check_reboot_needed_true.json` | `fwupdmgr check-reboot-needed --json` (exit 0) | JSON device carrying `"needs-reboot"` flag under exit 0 |
 | `fwupd/check_reboot_needed_false.json` | `fwupdmgr check-reboot-needed --json` (exit 2) | Empty `"Devices"` array under non-zero exit code |
+| `fwupd/dbus_devices_and_upgrades.json` | `org.freedesktop.fwupd` (`GetDevices`/`GetUpgrades`) | Devices with `REQUIRE_AC` flag, host & peripheral `BatteryLevel`/`BatteryThreshold`, HTML `<p>` release notes, and `NEEDS_REBOOT` device |
+| `fwupd/dbus_history.json` | `org.freedesktop.fwupd` (`GetHistory`) | Realistic `Success` and `Failed` firmware history entries with target versions and error reasons |
 
 ### `release_upgrade/` (7 fixtures)
 
@@ -63,9 +65,10 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `release_upgrade/os_release_bare.txt` | `/etc/os-release` | Unquoted `VERSION_ID=44` |
 | `release_upgrade/os_release_missing_version.txt` | `/etc/os-release` | Snapshot manifest missing `VERSION_ID` |
 
-### `systemctl/` (2 fixtures)
+### `systemctl/` (3 fixtures)
 
 | File | Simulated Command & Exit | Scenario & Edge-Case Signals |
 |---|---|---|
+| `systemctl/logind_inhibitors.json` | `org.freedesktop.login1.Manager.ListInhibitors` | Mix of `delay`, `handle-power-key` block, and `shutdown` block inhibitors |
 | `systemctl/reboot_block_inhibitor.txt` | `systemctl reboot` (exit 1) | logind `Operation denied due to active block inhibitor` output triggering user-friendly try-again recovery message |
 | `systemctl/reboot_logind_error.txt` | `systemctl reboot` (exit 1) | Generic logind DBus/timeout failure preserved verbatim |

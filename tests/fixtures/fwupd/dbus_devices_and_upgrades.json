@@ -1,0 +1,65 @@
+{
+  "HostPower": {
+    "HostBatteryLevel": 18,
+    "HostBatteryThreshold": 25,
+    "OnExternalPower": false
+  },
+  "Devices": [
+    {
+      "DeviceId": "5a2b1c9d00112233445566778899aabbccddeeff",
+      "Name": "System Firmware",
+      "Version": "0.1.32",
+      "Summary": "UEFI System BIOS",
+      "Plugin": "uefi_capsule",
+      "Vendor": "ThinkPad",
+      "Flags": 11,
+      "UpdateState": 1,
+      "Releases": [
+        {
+          "Version": "0.1.33",
+          "Summary": "UEFI System Firmware Update",
+          "Description": "<p>Addresses CVE-2026-1144 and improves USB4 dock stability.</p>",
+          "Size": 18874368,
+          "RemoteId": "lvfs",
+          "Locations": [
+            "https://fwupd.org/downloads/system-0.1.33.cab"
+          ]
+        }
+      ]
+    },
+    {
+      "DeviceId": "11223344556677889900aabbccddeeff00112233",
+      "Name": "Wireless Receiver",
+      "Version": "12.01.0033",
+      "Summary": "USB Unifying Receiver",
+      "Plugin": "unifying",
+      "Vendor": "Logitech",
+      "Flags": 2,
+      "UpdateState": 1,
+      "BatteryLevel": 12,
+      "BatteryThreshold": 20,
+      "Releases": [
+        {
+          "Version": "12.01.0035",
+          "Summary": "HID protocol security hardening",
+          "Size": 65536,
+          "RemoteId": "lvfs",
+          "Locations": [
+            "https://fwupd.org/downloads/unifying-12.01.0035.cab"
+          ]
+        }
+      ]
+    },
+    {
+      "DeviceId": "fedcba98765432100123456789abcdefdeadbeef",
+      "Name": "WD_BLACK SN850X NVMe SSD",
+      "Version": "624361WD",
+      "Summary": "NVMe Solid State Drive",
+      "Plugin": "nvme",
+      "Vendor": "Sandisk Corp",
+      "Flags": 259,
+      "UpdateState": 4,
+      "Releases": []
+    }
+  ]
+}

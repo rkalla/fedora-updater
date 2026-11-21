@@ -29,9 +29,10 @@ use fedora_updater::orchestrator::{
 use fedora_updater::presenter::{
     about_time_left, activity_log_subtitle, cache_activity_note, check_progress, checking_footnote,
     done_clean_summary, done_header_subtitle, fail_retry_label, idle_chrome,
-    now_playing_subtitle, now_playing_title, pipeline_stage, quiet_ui, ready_banner_title,
-    reboot_trigger_summary, run_heading, running_progress_captions, source_summary_line,
-    window_header, HeaderView, PipelineStage, QuietInput, AUTH_DESCRIPTION,
+    now_playing_subtitle, now_playing_title, phase_completion_notification, pipeline_stage,
+    quiet_ui, ready_banner_title, reboot_trigger_summary, run_heading,
+    running_progress_captions, source_summary_line, window_header, DesktopNotification,
+    HeaderView, PipelineStage, QuietInput, AUTH_DESCRIPTION, COMPLETION_NOTIFICATION_ID,
 };
 use fedora_updater::privilege::{
     dnf_daemon_is_running, kill_recorded_helper, kill_recorded_local_command,
@@ -158,6 +159,8 @@ struct Widgets {
     /// `None` until this run paints the Running page, so auth time is not quiet time.
     last_output: Cell<Option<Instant>>,
     cache_cursor: RefCell<Option<(PathBuf, u64)>>,
+    notification_sent: Cell<bool>,
+    reboot_blocker_detail: RefCell<Option<String>>,
 }
 
 fn set_accessible_label(widget: &impl IsA<gtk::Accessible>, label: &str) {
@@ -336,6 +339,8 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         fail_retry: obj(builder, "fail_retry"),
         last_output: Cell::new(None),
         cache_cursor: RefCell::new(None),
+        notification_sent: Cell::new(false),
+        reboot_blocker_detail: RefCell::new(None),
     })
 }
 
@@ -765,6 +770,14 @@ pub fn build(app: &Application) {
     {
         let widgets = widgets.clone();
         window.connect_default_height_notify(move |_| schedule_prefs_save(&widgets));
+    }
+    {
+        let widgets = widgets.clone();
+        window.connect_is_active_notify(move |win| {
+            if win.is_active() {
+                withdraw_completion_notification(&widgets);
+            }
+        });
     }
 
     {
@@ -1206,6 +1219,7 @@ fn prepare_for_operation(
     console: &Rc<RefCell<ConsoleBuffer>>,
     widgets: &Widgets,
 ) {
+    *widgets.reboot_blocker_detail.borrow_mut() = None;
     close_inspector(widgets);
     reset_filters(widgets, 0);
     widgets.detail_view.set(DetailView::Updates);
@@ -1299,6 +1313,67 @@ fn commit_session_started(state: &Rc<RefCell<AppState>>) -> Result<bool, state::
     Ok(true)
 }
 
+fn maybe_send_completion_notification(
+    w: &Widgets,
+    notif: Option<DesktopNotification>,
+) -> bool {
+    let Some(notif) = notif else {
+        return false;
+    };
+    if w.window.is_active() {
+        return false;
+    }
+    if let Some(app) = w.window.application() {
+        let g_notif = gio::Notification::new(&notif.title);
+        g_notif.set_body(Some(&notif.body));
+        app.send_notification(Some(notif.id), &g_notif);
+    }
+    w.notification_sent.set(true);
+    true
+}
+
+fn withdraw_completion_notification(w: &Widgets) {
+    if let Some(app) = w.window.application() {
+        app.withdraw_notification(COMPLETION_NOTIFICATION_ID);
+    }
+    w.notification_sent.set(false);
+}
+
+fn spawn_reboot_preflight(
+    state: &Rc<RefCell<AppState>>,
+    console: &Rc<RefCell<ConsoleBuffer>>,
+    widgets: &Rc<Widgets>,
+) {
+    if preview::initial_config().is_some() {
+        return;
+    }
+    let (tx, rx) = async_channel::bounded::<Option<String>>(1);
+    std::thread::spawn(move || {
+        let detail = match fedora_updater::backend::logind::query_reboot_preflight() {
+            fedora_updater::backend::NativeOutcome::Handled(Ok(pf)) => pf.blocking_detail(),
+            _ => None,
+        };
+        let _ = tx.send_blocking(detail);
+    });
+    let state = state.clone();
+    let console = console.clone();
+    let widgets = widgets.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(detail) = rx.recv().await {
+            *widgets.reboot_blocker_detail.borrow_mut() = detail;
+            if matches!(
+                state.borrow().phase,
+                Phase::Done {
+                    needs_reboot: true,
+                    ..
+                }
+            ) {
+                render(&state.borrow(), &console.borrow(), &widgets);
+            }
+        }
+    });
+}
+
 fn handle_worker(
     state: &Rc<RefCell<AppState>>,
     console: &Rc<RefCell<ConsoleBuffer>>,
@@ -1313,6 +1388,7 @@ fn handle_worker(
         msg,
         || begin_apply(state, console, widgets, tx.clone()),
         || spawn_release_lookup(state, console, widgets),
+        || spawn_reboot_preflight(state, console, widgets),
     );
 }
 
@@ -1323,6 +1399,7 @@ fn handle_worker_with(
     msg: WorkerMsg,
     on_auto_apply: impl FnOnce(),
     on_release_lookup: impl FnOnce(),
+    on_reboot_preflight: impl FnOnce(),
 ) {
     let ev = match msg {
         WorkerMsg::SessionStarted => {
@@ -1344,7 +1421,10 @@ fn handle_worker_with(
         WorkerMsg::Event(ev) => ev,
     };
 
+    let was_running = matches!(state.borrow().phase, Phase::Running(_));
     let check_finished = matches!(ev, Event::CheckComplete { .. });
+    let apply_finished =
+        matches!(ev, Event::ApplyComplete { .. }) || (was_running && matches!(ev, Event::Fail { .. }));
     if matches!(ev, Event::ApplyProgress { .. }) {
         widgets.last_output.set(Some(Instant::now()));
     }
@@ -1359,9 +1439,26 @@ fn handle_worker_with(
     };
     if apply_now {
         on_auto_apply();
+    } else {
+        let notif = {
+            let borrowed = state.borrow();
+            phase_completion_notification(&borrowed.phase, check_finished, apply_finished)
+        };
+        maybe_send_completion_notification(widgets, notif);
     }
     if check_finished {
         on_release_lookup();
+    }
+    if apply_finished
+        && matches!(
+            state.borrow().phase,
+            Phase::Done {
+                needs_reboot: true,
+                ..
+            }
+        )
+    {
+        on_reboot_preflight();
     }
 }
 
@@ -1952,6 +2049,15 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
     if !matches!(state.phase, Phase::Running(_)) {
         w.progress_ring.set_progress(None, false);
     }
+    if !matches!(
+        state.phase,
+        Phase::Done {
+            needs_reboot: true,
+            ..
+        }
+    ) {
+        *w.reboot_blocker_detail.borrow_mut() = None;
+    }
     let elapsed = state
         .stopwatch
         .as_ref()
@@ -2095,8 +2201,13 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             w.done_summary_detail
                 .set_text(&done_clean_summary(upgraded, duration));
             w.done_summary_clamp.set_visible(!*needs_reboot && *failed == 0);
-            w.done_reboot_detail
-                .set_text(&reboot_trigger_summary(packages));
+            let base_reboot = reboot_trigger_summary(packages);
+            let blocker = w.reboot_blocker_detail.borrow().clone();
+            let reboot_text = match blocker {
+                Some(b) if *needs_reboot => format!("{base_reboot}\n{b}"),
+                _ => base_reboot,
+            };
+            w.done_reboot_detail.set_text(&reboot_text);
             w.done_reboot_clamp.set_visible(*needs_reboot);
 
             w.done_retry_btn.set_visible(*failed > 0);
@@ -3272,10 +3383,12 @@ mod tests {
 
         let auto_apply_calls = Rc::new(Cell::new(0usize));
         let release_lookup_calls = Rc::new(Cell::new(0usize));
+        let reboot_preflight_calls = Rc::new(Cell::new(0usize));
 
         let feed = |msg: WorkerMsg| {
             let aa = auto_apply_calls.clone();
             let rl = release_lookup_calls.clone();
+            let rp = reboot_preflight_calls.clone();
             super::handle_worker_with(
                 &state,
                 &console,
@@ -3283,6 +3396,7 @@ mod tests {
                 msg,
                 move || aa.set(aa.get() + 1),
                 move || rl.set(rl.get() + 1),
+                move || rp.set(rp.get() + 1),
             );
         };
 
@@ -3337,6 +3451,9 @@ mod tests {
         }));
         assert_eq!(release_lookup_calls.get(), 1);
         assert_eq!(auto_apply_calls.get(), 0);
+        assert!(widgets.notification_sent.get());
+        super::withdraw_completion_notification(&widgets);
+        assert!(!widgets.notification_sent.get());
         assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("ready"));
         assert_eq!(widgets.ready_queue.total_count(), 2);
 
@@ -3371,14 +3488,31 @@ mod tests {
             error: None,
         }));
         feed(WorkerMsg::Event(Event::ApplyComplete { needs_reboot: true }));
+        assert_eq!(reboot_preflight_calls.get(), 1);
+        assert!(widgets.notification_sent.get());
         assert_eq!(widgets.stack.visible_child_name().as_deref(), Some("done"));
         assert!(widgets.done_reboot_clamp.get_visible());
         assert!(widgets.done_reboot_detail.label().contains("kernel-core"));
         assert!(widgets.done_reboot_btn.has_css_class("suggested-action"));
         assert_eq!(widgets.done_queue.total_count(), 2);
 
-        // Stale refresh replay (then_apply: true) invokes auto-apply callback cleanly on CheckComplete.
+        // Simulated reboot pre-flight blocker surfaces cleanly on done_reboot_detail.
+        *widgets.reboot_blocker_detail.borrow_mut() = Some(
+            "Restart is currently blocked by Steam (Finishing cloud sync). Wait for it to finish, then try again."
+                .into(),
+        );
+        super::render(&state.borrow(), &console.borrow(), &widgets);
+        assert!(widgets.done_reboot_detail.label().contains("Steam"));
+        assert!(widgets
+            .done_reboot_detail
+            .label()
+            .contains("Finishing cloud sync"));
+
+        // Stale refresh replay (then_apply: true) invokes auto-apply callback cleanly on CheckComplete
+        // without emitting a premature Ready notification.
+        super::withdraw_completion_notification(&widgets);
         super::dispatch(&state, &console, &widgets, Event::ResetToIdle, false);
+        assert!(widgets.reboot_blocker_detail.borrow().is_none());
         super::dispatch(&state, &console, &widgets, Event::StartCheck { then_apply: true }, false);
         feed(WorkerMsg::SessionStarted);
         feed(WorkerMsg::Event(Event::CheckComplete {
@@ -3388,6 +3522,7 @@ mod tests {
         }));
         assert_eq!(auto_apply_calls.get(), 1);
         assert_eq!(release_lookup_calls.get(), 2);
+        assert!(!widgets.notification_sent.get());
 
         gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
@@ -3814,6 +3949,17 @@ mod tests {
         assert!(!widgets.inspector.extensions_card_visible());
         assert!(!widgets.inspector.summary_visible());
         assert!(!widgets.inspector.advisories_card_visible());
+
+        // Inspector shows Power Safety Warning card for battery-blocked firmware and hides it otherwise.
+        assert!(!widgets.inspector.warning_card_visible());
+        let mut warn_fw = uefi.clone();
+        warn_fw.preflight_warning = Some(
+            "System Firmware requires AC power to install safely. Connect AC power and try again."
+                .into(),
+        );
+        widgets.inspector.paint(&warn_fw);
+        assert!(widgets.inspector.warning_card_visible());
+        assert!(widgets.inspector.warning_body_text().contains("AC power"));
 
         // Re-activating active row closes Inspector.
         widgets.ready_queue.activate_filtered(0);

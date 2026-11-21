@@ -50,6 +50,10 @@ fn run_gui() {
     let app = builder.build();
 
     app.connect_activate(|app| {
+        if let Some(win) = app.active_window() {
+            win.present();
+            return;
+        }
         ui::window::build(app);
     });
 

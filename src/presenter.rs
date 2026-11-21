@@ -1,6 +1,7 @@
 //! Pure UI presentation helpers and view-model copy (no GTK).
 
 use crate::backend::dnf::package_implies_reboot;
+use crate::state::Phase;
 use crate::model::{
     count_by_source, format_bytes, total_download_bytes, AuthPurpose, IdleScreen, Package,
     PackageStatus, RetryAction, RunPass, UpdateSource,
@@ -558,6 +559,98 @@ pub fn reboot_trigger_summary(packages: &[Package]) -> String {
 pub fn done_clean_summary(upgraded: usize, duration: &str) -> String {
     let noun = if upgraded == 1 { "update" } else { "updates" };
     format!("{upgraded} {noun} installed in {duration}. No restart needed.")
+}
+
+/// Fixed desktop notification ID replaced/withdrawn across check and apply cycles.
+pub const COMPLETION_NOTIFICATION_ID: &str = "fedora-updater-status";
+
+/// Planned desktop completion notification emitted when the window is unfocused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopNotification {
+    pub id: &'static str,
+    pub title: String,
+    pub body: String,
+}
+
+/// Plan a desktop notification right after Check or Apply completes.
+pub fn phase_completion_notification(
+    phase: &Phase,
+    just_finished_check: bool,
+    just_finished_apply: bool,
+) -> Option<DesktopNotification> {
+    if just_finished_check {
+        if let Phase::Ready { packages, .. } = phase {
+            if !packages.is_empty() {
+                let count = if packages.len() == 1 {
+                    "1 update available".to_string()
+                } else {
+                    format!("{} updates available", packages.len())
+                };
+                let summary = source_summary_line(packages);
+                let body = if summary.is_empty() {
+                    count
+                } else {
+                    format!("{count} ({summary})")
+                };
+                return Some(DesktopNotification {
+                    id: COMPLETION_NOTIFICATION_ID,
+                    title: "Updates Ready to Review".into(),
+                    body,
+                });
+            }
+        }
+        return None;
+    }
+
+    if !just_finished_apply {
+        return None;
+    }
+
+    match phase {
+        Phase::Done {
+            packages,
+            needs_reboot,
+            failed,
+            ..
+        } => {
+            if *failed > 0 {
+                let total = packages.len();
+                let body = if *needs_reboot {
+                    format!("{failed} of {total} updates failed. Restart recommended for applied updates.")
+                } else {
+                    format!("{failed} of {total} updates failed. Review the Activity Log for details.")
+                };
+                Some(DesktopNotification {
+                    id: COMPLETION_NOTIFICATION_ID,
+                    title: "Updates Finished With Problems".into(),
+                    body,
+                })
+            } else if *needs_reboot {
+                Some(DesktopNotification {
+                    id: COMPLETION_NOTIFICATION_ID,
+                    title: "Updates Installed — Restart Recommended".into(),
+                    body: reboot_trigger_summary(packages),
+                })
+            } else {
+                let upgraded = packages
+                    .iter()
+                    .filter(|p| p.status == PackageStatus::Completed)
+                    .count();
+                let noun = if upgraded == 1 { "update" } else { "updates" };
+                Some(DesktopNotification {
+                    id: COMPLETION_NOTIFICATION_ID,
+                    title: "Updates Installed".into(),
+                    body: format!("{upgraded} {noun} applied cleanly."),
+                })
+            }
+        }
+        Phase::Failed { detail, .. } => Some(DesktopNotification {
+            id: COMPLETION_NOTIFICATION_ID,
+            title: "Update Failed".into(),
+            body: detail.clone(),
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1402,5 +1495,83 @@ mod tests {
             reboot_trigger_summary(&[failed_kernel, failed_fw, mesa]),
             "Restart to finish applying system updates."
         );
+    }
+
+    #[test]
+    fn phase_completion_notification_covers_check_and_apply_outcomes() {
+        let dnf = Package::new_dnf("firefox", "x86_64", "140.0", "updates");
+        let ready = Phase::Ready {
+            packages: vec![dnf.clone()],
+            soft_errors: vec![],
+        };
+        let check_notif =
+            phase_completion_notification(&ready, true, false).expect("ready notification");
+        assert_eq!(check_notif.id, COMPLETION_NOTIFICATION_ID);
+        assert_eq!(check_notif.title, "Updates Ready to Review");
+        assert!(check_notif.body.contains("1 update available"), "{}", check_notif.body);
+
+        // No notification when check produced nothing or flags are unset.
+        assert_eq!(phase_completion_notification(&ready, false, false), None);
+        let empty_ready = Phase::Ready {
+            packages: vec![],
+            soft_errors: vec![],
+        };
+        assert_eq!(
+            phase_completion_notification(&empty_ready, true, false),
+            None
+        );
+
+        let mut completed_pkg = dnf;
+        completed_pkg.status = PackageStatus::Completed;
+        let done_clean = Phase::Done {
+            packages: vec![completed_pkg.clone()],
+            duration: "8s".into(),
+            needs_reboot: false,
+            failed: 0,
+            failure_reasons: vec![],
+        };
+        let clean_notif =
+            phase_completion_notification(&done_clean, false, true).expect("clean done");
+        assert_eq!(clean_notif.title, "Updates Installed");
+        assert_eq!(clean_notif.body, "1 update applied cleanly.");
+
+        let mut kernel = Package::new_dnf("kernel", "x86_64", "7.1.12", "updates");
+        kernel.status = PackageStatus::Completed;
+        let done_reboot = Phase::Done {
+            packages: vec![kernel],
+            duration: "24s".into(),
+            needs_reboot: true,
+            failed: 0,
+            failure_reasons: vec![],
+        };
+        let reboot_notif =
+            phase_completion_notification(&done_reboot, false, true).expect("reboot done");
+        assert_eq!(reboot_notif.title, "Updates Installed — Restart Recommended");
+        assert!(reboot_notif.body.contains("kernel"), "{}", reboot_notif.body);
+
+        let mut failed_pkg = completed_pkg;
+        failed_pkg.status = PackageStatus::Failed;
+        let done_partial = Phase::Done {
+            packages: vec![failed_pkg],
+            duration: "5s".into(),
+            needs_reboot: true,
+            failed: 1,
+            failure_reasons: vec!["Firmware: Connect AC power".into()],
+        };
+        let partial_notif =
+            phase_completion_notification(&done_partial, false, true).expect("partial done");
+        assert_eq!(partial_notif.title, "Updates Finished With Problems");
+        assert!(partial_notif.body.contains("1 of 1"), "{}", partial_notif.body);
+        assert!(partial_notif.body.contains("Restart recommended"), "{}", partial_notif.body);
+
+        let failed = Phase::Failed {
+            title: "All updates failed".into(),
+            detail: "System: dependency conflict".into(),
+            retry: RetryAction::CheckAgain,
+        };
+        let fail_notif =
+            phase_completion_notification(&failed, false, true).expect("apply failed");
+        assert_eq!(fail_notif.title, "Update Failed");
+        assert_eq!(fail_notif.body, "System: dependency conflict");
     }
 }

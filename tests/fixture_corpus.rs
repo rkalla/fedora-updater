@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 31, "expected 31 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 34, "expected 34 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(
@@ -225,6 +225,13 @@ fn fwupd_fixtures_contain_expected_signals() {
         reboot_false["Devices"].as_array().map(Vec::len),
         Some(0)
     );
+
+    let dbus_devs = read_fixture_value("fwupd/dbus_devices_and_upgrades.json");
+    assert_eq!(dbus_devs["Devices"].as_array().map(Vec::len), Some(3));
+    assert_eq!(dbus_devs["HostPower"]["OnExternalPower"], false);
+
+    let dbus_hist = read_fixture_value("fwupd/dbus_history.json");
+    assert_eq!(dbus_hist.as_array().map(Vec::len), Some(2));
 }
 
 #[test]
@@ -264,4 +271,7 @@ fn release_upgrade_and_systemctl_fixtures_contain_expected_signals() {
 
     let logind_err = read_fixture("systemctl/reboot_logind_error.txt");
     assert!(logind_err.contains("Failed to talk to logind"));
+
+    let logind_inhibit = read_fixture_value("systemctl/logind_inhibitors.json");
+    assert_eq!(logind_inhibit.as_array().map(Vec::len), Some(3));
 }

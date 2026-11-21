@@ -204,6 +204,7 @@ pub struct Package {
     pub summary: Option<String>,
     pub install_size_delta: Option<i64>,
     pub advisories: Vec<PackageAdvisory>,
+    pub preflight_warning: Option<String>,
 }
 
 impl Package {
@@ -232,6 +233,7 @@ impl Package {
             summary: None,
             install_size_delta: None,
             advisories: Vec::new(),
+            preflight_warning: None,
         }
     }
 
@@ -569,6 +571,7 @@ mod tests {
             summary: None,
             install_size_delta: None,
             advisories: Vec::new(),
+            preflight_warning: None,
         };
         assert!(fp.matches_progress_name("Thunderbird"));
         assert!(fp.matches_progress_name("org.mozilla.Thunderbird"));
@@ -611,6 +614,7 @@ mod tests {
             summary: None,
             install_size_delta: None,
             advisories: Vec::new(),
+            preflight_warning: None,
         }
     }
 

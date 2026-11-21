@@ -150,6 +150,7 @@ pub fn packages_from_flatpak_updates(
             summary: None,
             install_size_delta: None,
             advisories: Vec::new(),
+            preflight_warning: None,
         });
     }
     packages
@@ -706,6 +707,7 @@ mod tests {
             summary: None,
             install_size_delta: None,
             advisories: Vec::new(),
+            preflight_warning: None,
         };
         assert_eq!(
             update_ref_from_package(&p).as_deref(),

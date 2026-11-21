@@ -8,9 +8,18 @@ use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 use async_channel::Receiver;
-use common::fixtures::read_fixture;
-use common::runtime::{fixture_to_helper_lines, flatpak_check_from_fixture, FakeRuntime, HelperStep};
-use fedora_updater::backend::dnf;
+use common::fixtures::{read_fixture, read_fixture_value};
+use common::runtime::{
+    fixture_to_helper_lines, flatpak_check_from_fixture, FakeRuntime, FwupdDbusApplyStep,
+    HelperStep,
+};
+use fedora_updater::backend::fwupd_dbus::{
+    devices_need_reboot, evaluate_battery_safety, package_from_device_and_release,
+    FwupdApplyOutcome, FwupdDevice, FwupdHistoryEntry, FwupdHostPower, FwupdStatus,
+    FwupdUpdateState,
+};
+use fedora_updater::backend::logind::{RebootPreflight, ShutdownInhibitor};
+use fedora_updater::backend::{dnf, NativeOutcome};
 use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
 use fedora_updater::model::{
@@ -1451,5 +1460,229 @@ fn systemctl_reboot_inhibitor_logind_spawn_error_and_retry_recovery() {
             ("systemctl".into(), vec!["reboot".into()]),
             ("systemctl".into(), vec!["reboot".into()]),
         ]
+    );
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct FwupdDbusCheckFixture {
+    host_power: FwupdHostPower,
+    devices: Vec<FwupdDevice>,
+}
+
+#[test]
+fn native_fwupd_dbus_check_apply_history_and_battery_safety_flows() {
+    // 1) Parse offline D-Bus fixtures (`fwupd/dbus_devices_and_upgrades.json` + `dbus_history.json`).
+    let check_fx: FwupdDbusCheckFixture = serde_json::from_value(read_fixture_value(
+        "fwupd/dbus_devices_and_upgrades.json",
+    ))
+    .expect("deserialize fwupd dbus fixture");
+    assert_eq!(check_fx.devices.len(), 3);
+    assert!(devices_need_reboot(&check_fx.devices));
+
+    // Device 0 (`System Firmware` with REQUIRE_AC & OnExternalPower=false) and Device 1
+    // (`Wireless Receiver` with 12% < 20%) both trigger battery safety warnings.
+    let sys_pkg = package_from_device_and_release(
+        &check_fx.devices[0],
+        &check_fx.devices[0].releases[0],
+        &check_fx.host_power,
+    );
+    assert!(sys_pkg
+        .preflight_warning
+        .as_deref()
+        .unwrap()
+        .contains("requires AC power"));
+    assert!(sys_pkg
+        .summary
+        .as_deref()
+        .unwrap()
+        .contains("CVE-2026-1144"));
+
+    let usb_safety = evaluate_battery_safety(&check_fx.devices[1], &check_fx.host_power);
+    let usb_warn = usb_safety.reason().expect("low battery warning");
+    assert!(usb_warn.contains("12% < 20%"), "{usb_warn}");
+
+    let history: Vec<FwupdHistoryEntry> =
+        serde_json::from_value(read_fixture_value("fwupd/dbus_history.json"))
+            .expect("deserialize fwupd history fixture");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].update_state, FwupdUpdateState::Success);
+    assert_eq!(history[1].update_state, FwupdUpdateState::Failed);
+    assert_eq!(history[1].target_version.as_deref(), Some("20260707"));
+
+    // 2) Full Check + Firmware-only Native D-Bus Apply skips helper ensure_session on apply and runs 0 fwupdmgr CLI calls!
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let rt = FakeRuntime::new();
+    rt.set_now(t0);
+    rt.set_fwupd_dbus_available(true);
+
+    // Check scripts: DNF & Flatpak return empty, fwupd D-Bus returns plugged-in firmware package.
+    let plugged = FwupdHostPower {
+        host_battery_level: 85,
+        host_battery_threshold: 25,
+        on_external_power: Some(true),
+    };
+    let clean_sys_pkg = package_from_device_and_release(
+        &check_fx.devices[0],
+        &check_fx.devices[0].releases[0],
+        &plugged,
+    );
+    assert!(clean_sys_pkg.preflight_warning.is_none());
+
+    rt.push_helper_fixture(HelperCommand::CheckDnf, "dnf/check_update_empty.txt", 0);
+    rt.push_flatpak_appstream_ok();
+    rt.push_flatpak_empty(true);
+    rt.push_flatpak_empty(false);
+    rt.push_fwupd_dbus_check(NativeOutcome::Handled(Ok(vec![clean_sys_pkg.clone()])));
+
+    let mut h = FlowHarness::default();
+    h.run_check(&rt, false);
+    assert_eq!(rt.fwupd_dbus_check_calls(), 1);
+    assert!(
+        !rt.helper_calls().contains(&HelperCommand::CheckFwupd)
+            && !rt.helper_calls().contains(&HelperCommand::CheckFwupdRefresh),
+        "native fwupd D-Bus must bypass fwupdmgr helper checks: {:?}",
+        rt.helper_calls()
+    );
+    assert_eq!(h.state.packages().len(), 1);
+
+    // Apply Firmware-only update via D-Bus: `ensure_session` stays at 1 (from check, NOT 2).
+    rt.push_fwupd_dbus_apply(FwupdDbusApplyStep {
+        lines: vec!["Installing firmware for System Firmware…".into()],
+        hints: vec![
+            FwupdStatus::Downloading.to_progress_hint(50.0, Some("System Firmware")),
+            FwupdStatus::DeviceWrite.to_progress_hint(80.0, Some("System Firmware")),
+            FwupdStatus::DeviceVerify.to_progress_hint(100.0, Some("System Firmware")),
+        ],
+        outcome: NativeOutcome::Handled(Ok(FwupdApplyOutcome { needs_reboot: true })),
+    });
+    rt.push_fwupd_dbus_reboot_needed(NativeOutcome::Handled(Ok(true)));
+
+    h.run_apply(&rt);
+    assert_eq!(rt.ensure_session_calls(), 1);
+    assert_eq!(rt.fwupd_dbus_apply_calls(), 1);
+    assert_eq!(rt.fwupd_dbus_reboot_calls(), 1);
+    assert!(
+        !rt.helper_calls().contains(&HelperCommand::ApplyFwupd)
+            && !rt.helper_calls().contains(&HelperCommand::CheckFwupdReboot),
+        "native fwupd D-Bus apply must bypass fwupdmgr helper: {:?}",
+        rt.helper_calls()
+    );
+    assert!(matches!(
+        &h.state.phase,
+        Phase::Done {
+            needs_reboot: true,
+            failed: 0,
+            ..
+        }
+    ));
+
+    // 3) Mixed DNF + Battery-blocked Firmware apply -> DNF succeeds while Firmware fails with actionable AC power reason.
+    let rt_mixed = FakeRuntime::new();
+    rt_mixed.set_fwupd_dbus_available(true);
+    let dnf_pkg = Package::new_dnf("firefox", "x86_64", "140.0-1.fc44", "updates");
+    rt_mixed.push_helper_lines(HelperCommand::ApplyDnf, vec!["Complete!".into()], Ok(0));
+    let blocked_msg = sys_pkg.preflight_warning.clone().unwrap();
+    rt_mixed.push_fwupd_dbus_apply(FwupdDbusApplyStep {
+        lines: vec![blocked_msg.clone()],
+        hints: vec![],
+        outcome: NativeOutcome::Handled(Err(blocked_msg)),
+    });
+    rt_mixed.push_fwupd_dbus_reboot_needed(NativeOutcome::Handled(Ok(false)));
+
+    let mut h_mixed = FlowHarness::ready(vec![dnf_pkg, sys_pkg]);
+    h_mixed.run_apply(&rt_mixed);
+    match &h_mixed.state.phase {
+        Phase::Done {
+            failed,
+            failure_reasons,
+            needs_reboot,
+            ..
+        } => {
+            assert_eq!(*failed, 1);
+            assert!(!*needs_reboot);
+            assert_eq!(failure_reasons.len(), 1);
+            assert!(
+                failure_reasons[0].starts_with("Firmware: ")
+                    && !failure_reasons[0].starts_with("Firmware: Firmware:"),
+                "{:?}",
+                failure_reasons
+            );
+            assert!(failure_reasons[0].contains("AC power"), "{:?}", failure_reasons);
+        }
+        other => panic!("expected partial-failure Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_logind_reboot_inhibitor_guard_and_cli_fallback() {
+    let inhibitors: Vec<ShutdownInhibitor> =
+        serde_json::from_value(read_fixture_value("systemctl/logind_inhibitors.json"))
+            .expect("deserialize logind inhibitors fixture");
+    let preflight = RebootPreflight::from_raw("yes", inhibitors);
+    assert_eq!(preflight.blockers.len(), 1);
+    let detail = preflight.blocking_detail().expect("shutdown blocker detail");
+    assert!(detail.contains("dnf5daemon-server"), "{detail}");
+    assert!(detail.contains("Installing system updates"), "{detail}");
+
+    let rt = FakeRuntime::new();
+    // 1) Native logind blocks shutdown with actionable who/why -> RetryAction::Reboot, 0 systemctl calls.
+    rt.push_logind_reboot(
+        vec!["logind CanReboot=yes, shutdown blockers=1".into()],
+        NativeOutcome::Handled(Err(detail.clone())),
+    );
+    // 2) Native logind CanReboot="no" -> RetryAction::Reboot, 0 systemctl calls.
+    rt.push_logind_reboot(
+        vec![],
+        NativeOutcome::Handled(Err(RebootPreflight::from_raw("no", vec![])
+            .blocking_detail()
+            .unwrap())),
+    );
+    // 3) Native logind Reboot(true) succeeds -> 0 Fail events, 0 systemctl calls.
+    rt.push_logind_reboot(
+        vec!["Requesting interactive system restart via systemd-logind…".into()],
+        NativeOutcome::Handled(Ok(())),
+    );
+    // 4) Fourth call has nothing scripted -> Unavailable -> falls back to `systemctl reboot`.
+    rt.push_local_lines("systemctl", &["reboot"], vec![], Ok(0));
+
+    let mut h = FlowHarness::default();
+    h.run_reboot(&rt);
+    assert!(matches!(
+        &h.state.phase,
+        Phase::Failed {
+            title,
+            detail: d,
+            retry: RetryAction::Reboot,
+        } if title == REBOOT_FAILED_TITLE && d.contains("dnf5daemon-server")
+    ));
+    assert!(rt.local_calls().is_empty());
+
+    h.run_reboot(&rt);
+    assert!(matches!(
+        &h.state.phase,
+        Phase::Failed {
+            title,
+            detail: d,
+            retry: RetryAction::Reboot,
+        } if title == REBOOT_FAILED_TITLE && d.contains("not permitted")
+    ));
+    assert!(rt.local_calls().is_empty());
+
+    let mut h_ok = FlowHarness::default();
+    h_ok.run_reboot(&rt);
+    assert_eq!(h_ok.phases, vec!["Idle"]);
+    assert!(h_ok
+        .console
+        .full_text()
+        .contains("[logind] Requesting interactive system restart"));
+    assert!(rt.local_calls().is_empty());
+
+    // Fallback when logind D-Bus is unavailable invokes `systemctl reboot`.
+    h_ok.run_reboot(&rt);
+    assert_eq!(rt.logind_reboot_calls(), 4);
+    assert_eq!(
+        rt.local_calls(),
+        vec![("systemctl".into(), vec!["reboot".into()])]
     );
 }

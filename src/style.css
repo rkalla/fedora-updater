@@ -276,6 +276,14 @@ window.is-dark .inspector-reboot-card {
   background-color: alpha(@warning_bg_color, 0.16);
 }
 
+.inspector-warning-card {
+  background-color: alpha(@error_bg_color, 0.10);
+}
+
+window.is-dark .inspector-warning-card {
+  background-color: alpha(@error_bg_color, 0.15);
+}
+
 /* Embedded Activity Log */
 .activity-log-bar {
   border-bottom: 1px solid alpha(@window_fg_color, 0.10);
