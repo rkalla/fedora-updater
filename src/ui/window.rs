@@ -1208,19 +1208,24 @@ fn register_view_actions(
     }
     widgets.window.add_action(&view_history);
 
-    let apply_mode_action = gio::SimpleAction::new("apply-mode", Some(glib::VariantTy::STRING));
+    let apply_mode_action = gio::SimpleAction::new_stateful(
+        "apply-mode",
+        Some(glib::VariantTy::STRING),
+        &"live".to_variant(),
+    );
     {
         let widgets = widgets.clone();
-        apply_mode_action.connect_activate(move |_, param| {
+        apply_mode_action.connect_activate(move |action, param| {
             let Some(name) = param.and_then(|v| v.str()) else {
                 return;
             };
-            let mode = match name {
-                "live-reboot" => ApplyMode::LiveAndReboot,
-                "offline" => ApplyMode::OfflineOnReboot,
-                "download-only" => ApplyMode::DownloadOnly,
-                _ => ApplyMode::Live,
+            let (mode, canonical) = match name {
+                "live-reboot" => (ApplyMode::LiveAndReboot, "live-reboot"),
+                "offline" => (ApplyMode::OfflineOnReboot, "offline"),
+                "download-only" => (ApplyMode::DownloadOnly, "download-only"),
+                _ => (ApplyMode::Live, "live"),
             };
+            action.set_state(&canonical.to_variant());
             widgets.apply_mode.set(mode);
             update_ready_selection_chrome(&widgets);
         });
@@ -2033,7 +2038,7 @@ fn paint_now_playing_status(
         w.now_playing_status_stack.set_visible_child_name("spinner");
     } else if running.work_progress.is_some_and(|frac| frac >= 0.999) {
         w.now_playing_status_icon
-            .set_icon_name(Some("emblem-ok-symbolic"));
+            .set_icon_name(Some("object-select-symbolic"));
         w.now_playing_status_icon.add_css_class("success");
         w.now_playing_status_stack.set_visible_child_name("status");
     } else if running.pass == RunPass::Download {
@@ -2663,7 +2668,7 @@ mod tests {
         assert!(split_block.contains("max-sidebar-width"));
         assert!(split_block.contains("sidebar-width-fraction"));
 
-        assert!(object_block(xml, "sidebar_toggle").contains("sidebar-show-left-symbolic"));
+        assert!(object_block(xml, "sidebar_toggle").contains("sidebar-show-symbolic"));
         assert!(
             !xml.contains("id=\"upgrade_notice\""),
             "persistent top toolbar upgrade_notice must be removed in Observatory"
@@ -4039,7 +4044,6 @@ mod tests {
             widgets.detail_toolbar.top_bar_style(),
             libadwaita::ToolbarStyle::Flat
         );
-        assert_eq!(widgets.sidebar.pulse_headline_text(), "Err");
         assert_eq!(widgets.progress_ring.displayed_fraction(), 0.0);
         assert_eq!(widgets.progress_ring.label_text(), "");
 
@@ -4653,6 +4657,47 @@ mod tests {
         assert!(!widgets.ready_select_all.is_inconsistent());
         assert!(widgets.ready_select_all.is_active());
 
+        let menu_model = widgets
+            .ready_split_update
+            .menu_model()
+            .expect("ready_split_update menu-model should be set");
+        let section = menu_model
+            .item_link(0, gtk::gio::MENU_LINK_SECTION)
+            .expect("ready_split_update menu-model should contain a section");
+        let expected_items = [
+            ("Update All", "live"),
+            ("Update & Restart", "live-reboot"),
+            ("Prepare Offline Update", "offline"),
+            ("Download Only", "download-only"),
+        ];
+        assert_eq!(section.n_items(), expected_items.len() as i32);
+        for (idx, (expected_label, expected_target)) in expected_items.iter().enumerate() {
+            let idx = idx as i32;
+            let label = section
+                .item_attribute_value(idx, gtk::gio::MENU_ATTRIBUTE_LABEL, None)
+                .and_then(|v| v.str().map(str::to_string));
+            let action = section
+                .item_attribute_value(idx, gtk::gio::MENU_ATTRIBUTE_ACTION, None)
+                .and_then(|v| v.str().map(str::to_string));
+            let target = section
+                .item_attribute_value(idx, gtk::gio::MENU_ATTRIBUTE_TARGET, None)
+                .and_then(|v| v.str().map(str::to_string));
+            assert_eq!(label.as_deref(), Some(*expected_label));
+            assert_eq!(action.as_deref(), Some("win.apply-mode"));
+            assert_eq!(target.as_deref(), Some(*expected_target));
+        }
+
+        let apply_mode_action = gtk::gio::prelude::ActionMapExt::lookup_action(&widgets.window, "apply-mode")
+            .expect("win.apply-mode action should be registered");
+        assert!(apply_mode_action.is_enabled());
+        assert_eq!(
+            apply_mode_action
+                .state()
+                .and_then(|v| v.str().map(str::to_string))
+                .as_deref(),
+            Some("live")
+        );
+
         for (mode_str, expected_mode, expected_prefix) in [
             ("offline", ApplyMode::OfflineOnReboot, "Prepare Offline Update"),
             ("download-only", ApplyMode::DownloadOnly, "Download Only"),
@@ -4666,6 +4711,13 @@ mod tests {
             )
             .is_ok());
             assert_eq!(widgets.apply_mode.get(), expected_mode);
+            assert_eq!(
+                apply_mode_action
+                    .state()
+                    .and_then(|v| v.str().map(str::to_string))
+                    .as_deref(),
+                Some(mode_str)
+            );
             let label = widgets
                 .ready_split_update
                 .label()

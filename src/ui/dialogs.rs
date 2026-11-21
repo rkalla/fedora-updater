@@ -97,7 +97,7 @@ pub(super) fn command_row(command: &str, copy_name: &str) -> gtk::Box {
     let idle_tip = copy_name.to_string();
     copy.connect_clicked(move |btn| {
         btn.clipboard().set_text(&text);
-        btn.set_icon_name("emblem-ok-symbolic");
+        btn.set_icon_name("object-select-symbolic");
         btn.set_tooltip_text(Some("Copied"));
         let btn = btn.clone();
         let idle_tip = idle_tip.clone();

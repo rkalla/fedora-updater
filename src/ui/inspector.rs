@@ -191,7 +191,6 @@ impl PackageInspector {
 
         // Header bar inside the OverlaySplitView sidebar.
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        header.add_css_class("inspector-header");
         header.set_margin_top(10);
         header.set_margin_bottom(10);
         header.set_margin_start(14);

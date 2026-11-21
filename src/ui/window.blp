@@ -63,7 +63,7 @@ Adw.ApplicationWindow window {
 
             [start]
             Gtk.ToggleButton sidebar_toggle {
-              icon-name: "sidebar-show-left-symbolic";
+              icon-name: "sidebar-show-symbolic";
               tooltip-text: "Hide Sidebar (F9)";
               active: true;
             }
@@ -533,10 +533,26 @@ Adw.ApplicationWindow window {
 
                             menu-model: menu {
                               section {
-                                item ("Update All", "win.apply-mode::live")
-                                item ("Update & Restart", "win.apply-mode::live-reboot")
-                                item ("Prepare Offline Update", "win.apply-mode::offline")
-                                item ("Download Only", "win.apply-mode::download-only")
+                                item {
+                                  label: "Update All";
+                                  action: "win.apply-mode";
+                                  target: "live";
+                                }
+                                item {
+                                  label: "Update & Restart";
+                                  action: "win.apply-mode";
+                                  target: "live-reboot";
+                                }
+                                item {
+                                  label: "Prepare Offline Update";
+                                  action: "win.apply-mode";
+                                  target: "offline";
+                                }
+                                item {
+                                  label: "Download Only";
+                                  action: "win.apply-mode";
+                                  target: "download-only";
+                                }
                               }
                             };
                           }
@@ -1084,7 +1100,6 @@ Adw.ApplicationWindow window {
                 margin-bottom: 8;
                 margin-start: 14;
                 margin-end: 10;
-                styles ["inspector-header"]
 
                 Gtk.Label {
                   label: "Live Output";

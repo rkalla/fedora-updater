@@ -136,33 +136,6 @@ row:selected .sidebar-count-pill {
   color: @accent_color;
 }
 
-.pulse-dot {
-  min-width: 8px;
-  min-height: 8px;
-  border-radius: 999px;
-  background-color: #1a8345;
-}
-
-window.is-dark .pulse-dot {
-  background-color: #57e389;
-}
-
-.pulse-dot.pulse-warn {
-  background-color: #9e5a00;
-}
-
-window.is-dark .pulse-dot.pulse-warn {
-  background-color: #f8c555;
-}
-
-.pulse-dot.pulse-err {
-  background-color: #c01c28;
-}
-
-window.is-dark .pulse-dot.pulse-err {
-  background-color: #ff7b72;
-}
-
 .source-dot {
   min-width: 8px;
   min-height: 8px;
@@ -277,10 +250,6 @@ window.is-dark .tag-ext {
   border-left: 1px solid alpha(@window_fg_color, 0.12);
 }
 
-.inspector-header {
-  border-bottom: 1px solid alpha(@window_fg_color, 0.10);
-}
-
 .inspector-reboot-card {
   background-color: alpha(@warning_bg_color, 0.12);
 }
@@ -298,10 +267,6 @@ window.is-dark .inspector-warning-card {
 }
 
 /* Embedded Activity Log */
-.activity-log-bar {
-  border-bottom: 1px solid alpha(@window_fg_color, 0.10);
-}
-
 .activity-log-view {
   background-color: @view_bg_color;
   color: @view_fg_color;

@@ -110,7 +110,6 @@ impl HistoryView {
         root.set_vexpand(true);
 
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        bar.add_css_class("activity-log-bar");
         bar.set_margin_top(10);
         bar.set_margin_bottom(10);
         bar.set_margin_start(14);

@@ -6,14 +6,9 @@ use std::rc::Rc;
 use gtk::prelude::*;
 
 use fedora_updater::model::{count_by_source, count_security, DetailView, PackageStatus, UpdateSource};
-use fedora_updater::presenter::{
-    about_time_left, check_progress, format_elapsed, run_heading, QuietUi,
-};
-use fedora_updater::release_upgrade::{
-    banner_title, os_release_version, release_age_caption, upgrade_button_name,
-};
+use fedora_updater::presenter::{about_time_left, format_elapsed, QuietUi};
+use fedora_updater::release_upgrade::{banner_title, release_age_caption, upgrade_button_name};
 use fedora_updater::state::{AppState, Phase, RunningState};
-use fedora_updater::IdleScreen;
 
 use super::charts::ThroughputSparkline;
 
@@ -28,27 +23,11 @@ pub enum SourceFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PulseTone {
-    Ready,
-    Attention,
-    Error,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InlineUpgradeSlot {
     None,
     Idle,
     Ready,
     Done,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SidebarPulse {
-    pub tone: PulseTone,
-    pub headline: String,
-    pub detail: String,
-    pub timestamp: Option<String>,
-    pub spinning: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,32 +93,6 @@ pub fn running_source_checklist(running: &RunningState) -> [SourcePipelineItem; 
     ]
 }
 
-/// Extract a compact host label from `/etc/os-release` contents (for example
-/// `"Fedora Linux 44"`).
-pub fn format_host_label(os_release: &str) -> String {
-    for line in os_release.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("PRETTY_NAME=") else {
-            continue;
-        };
-        let stripped = rest.trim().trim_matches('"').trim_matches('\'');
-        let short = stripped.split(" (").next().unwrap_or(stripped).trim();
-        if !short.is_empty() {
-            return short.to_string();
-        }
-    }
-    if let Some(version) = os_release_version(os_release) {
-        return format!("Fedora Linux {version}");
-    }
-    "Fedora Linux".to_string()
-}
-
-pub fn installed_host_label() -> String {
-    std::fs::read_to_string("/etc/os-release")
-        .map(|text| format_host_label(&text))
-        .unwrap_or_else(|_| "Fedora Linux".to_string())
-}
-
 pub fn release_upgrade_allowed_in_sidebar(phase: &Phase) -> bool {
     !matches!(phase, Phase::Authenticating { .. } | Phase::Running(_))
 }
@@ -153,168 +106,6 @@ pub fn release_upgrade_inline_slot(phase: &Phase) -> InlineUpgradeSlot {
         | Phase::Checking { .. }
         | Phase::Running(_)
         | Phase::Failed { .. } => InlineUpgradeSlot::None,
-    }
-}
-
-pub fn pulse_summary(state: &AppState, host_label: &str) -> SidebarPulse {
-    match &state.phase {
-        Phase::Idle(IdleScreen::Fresh) => SidebarPulse {
-            tone: PulseTone::Attention,
-            headline: host_label.to_string(),
-            detail: "Not checked this session".to_string(),
-            timestamp: None,
-            spinning: false,
-        },
-        Phase::Idle(IdleScreen::Current { checked_at, detail }) => SidebarPulse {
-            tone: PulseTone::Ready,
-            headline: host_label.to_string(),
-            detail: detail
-                .clone()
-                .unwrap_or_else(|| "System is up to date".to_string()),
-            timestamp: Some(format!("Checked {checked_at}")),
-            spinning: false,
-        },
-        Phase::Idle(IdleScreen::Warning {
-            title, checked_at, ..
-        }) => SidebarPulse {
-            tone: PulseTone::Attention,
-            headline: (*title).to_string(),
-            detail: "Review Activity Log for details".to_string(),
-            timestamp: checked_at
-                .as_ref()
-                .map(|checked| format!("Checked {checked}")),
-            spinning: false,
-        },
-        Phase::Authenticating { purpose, .. } => SidebarPulse {
-            tone: PulseTone::Attention,
-            headline: "Authorizing…".to_string(),
-            detail: format!("Waiting to {purpose}"),
-            timestamp: None,
-            spinning: true,
-        },
-        Phase::Checking {
-            packages_so_far,
-            checked_sources,
-            ..
-        } => {
-            let (_, groups_done, _) = check_progress(checked_sources);
-            let found = packages_so_far.len();
-            let detail = if found == 0 {
-                format!("{groups_done} of 3 sources complete")
-            } else {
-                format!("{groups_done} of 3 sources · {found} found")
-            };
-            SidebarPulse {
-                tone: PulseTone::Attention,
-                headline: "Checking Sources".to_string(),
-                detail,
-                timestamp: None,
-                spinning: true,
-            }
-        }
-        Phase::Ready {
-            packages,
-            soft_errors,
-        } => {
-            let count = packages.len();
-            let count_text = if count == 1 {
-                "1 update".to_string()
-            } else {
-                format!("{count} updates")
-            };
-            let detail = match fedora_updater::total_download_bytes(packages) {
-                Some(bytes) if bytes > 0 => {
-                    format!("{count_text} · {}", fedora_updater::format_bytes(bytes))
-                }
-                _ => count_text,
-            };
-            let warning_count = soft_errors.len();
-            let timestamp = if warning_count > 0 {
-                let noun = if warning_count == 1 {
-                    "warning"
-                } else {
-                    "warnings"
-                };
-                Some(format!("{warning_count} {noun}"))
-            } else if count == 0 {
-                None
-            } else {
-                Some("Ready to review".to_string())
-            };
-            SidebarPulse {
-                tone: if count == 0 && soft_errors.is_empty() {
-                    PulseTone::Ready
-                } else {
-                    PulseTone::Attention
-                },
-                headline: if count == 0 && !soft_errors.is_empty() {
-                    "Check Problem".to_string()
-                } else {
-                    host_label.to_string()
-                },
-                detail,
-                timestamp,
-                spinning: false,
-            }
-        }
-        Phase::Running(running) => {
-            let (done, total) = running.done_and_total();
-            let pct = (running.overall_progress.clamp(0.0, 1.0) * 100.0).round() as u32;
-            SidebarPulse {
-                tone: PulseTone::Attention,
-                headline: run_heading(&running.phase_label, running.pass).to_string(),
-                detail: format!("{pct}% · {done} of {total}"),
-                timestamp: running
-                    .current_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string),
-                spinning: true,
-            }
-        }
-        Phase::Done {
-            packages,
-            duration,
-            needs_reboot,
-            failed,
-            ..
-        } => {
-            let upgraded = packages
-                .iter()
-                .filter(|p| p.status == fedora_updater::PackageStatus::Completed)
-                .count();
-            let headline = if *failed > 0 {
-                "Finished With Problems"
-            } else if *needs_reboot {
-                "Restart Pending"
-            } else {
-                "Updates Complete"
-            };
-            let detail = if *failed > 0 {
-                format!("{upgraded} applied · {failed} failed · {duration}")
-            } else {
-                format!("{upgraded} upgraded in {duration}")
-            };
-            SidebarPulse {
-                tone: if *failed > 0 || *needs_reboot {
-                    PulseTone::Attention
-                } else {
-                    PulseTone::Ready
-                },
-                headline: headline.to_string(),
-                detail,
-                timestamp: (*needs_reboot).then(|| "Restart recommended".to_string()),
-                spinning: false,
-            }
-        }
-        Phase::Failed { title, .. } => SidebarPulse {
-            tone: PulseTone::Error,
-            headline: title.clone(),
-            detail: "No changes committed".to_string(),
-            timestamp: None,
-            spinning: false,
-        },
     }
 }
 
@@ -475,12 +266,6 @@ impl UpgradeCard {
 
 pub struct Sidebar {
     root: gtk::Box,
-    host_label: String,
-    pulse_indicator_stack: gtk::Stack,
-    pulse_dot: gtk::Box,
-    pulse_headline: gtk::Label,
-    pulse_detail: gtk::Label,
-    pulse_timestamp: gtk::Label,
     sparkline_card: gtk::Box,
     sparkline: ThroughputSparkline,
     sources_list: gtk::ListBox,
@@ -510,81 +295,6 @@ pub struct Sidebar {
 
 impl Sidebar {
     pub fn new() -> Self {
-        let host_label = installed_host_label();
-
-        // System Pulse card (padded 14×16 inner box inside .card).
-        let pulse_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        pulse_card.add_css_class("card");
-        pulse_card.add_css_class("pulse-card");
-
-        let pulse_inner = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        pulse_inner.set_margin_top(14);
-        pulse_inner.set_margin_bottom(14);
-        pulse_inner.set_margin_start(16);
-        pulse_inner.set_margin_end(16);
-
-        let pulse_top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        pulse_top.set_valign(gtk::Align::Center);
-
-        let pulse_dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        pulse_dot.set_size_request(8, 8);
-        pulse_dot.set_halign(gtk::Align::Center);
-        pulse_dot.set_valign(gtk::Align::Center);
-        pulse_dot.add_css_class("pulse-dot");
-
-        let pulse_spinner = libadwaita::Spinner::builder()
-            .width_request(14)
-            .height_request(14)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .build();
-
-        let pulse_indicator_stack = gtk::Stack::builder()
-            .width_request(16)
-            .height_request(16)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .transition_type(gtk::StackTransitionType::Crossfade)
-            .transition_duration(150)
-            .build();
-        pulse_indicator_stack.add_named(&pulse_dot, Some("dot"));
-        pulse_indicator_stack.add_named(&pulse_spinner, Some("spinner"));
-        pulse_indicator_stack.set_visible_child_name("dot");
-
-        let pulse_headline = gtk::Label::builder()
-            .label(&host_label)
-            .xalign(0.0)
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["heading"])
-            .build();
-        pulse_top.append(&pulse_indicator_stack);
-        pulse_top.append(&pulse_headline);
-
-        let pulse_detail = gtk::Label::builder()
-            .label("Not checked this session")
-            .xalign(0.0)
-            .halign(gtk::Align::Start)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .css_classes(["caption", "dimmed", "numeric"])
-            .build();
-
-        let pulse_timestamp = gtk::Label::builder()
-            .label("")
-            .xalign(0.0)
-            .halign(gtk::Align::Start)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .visible(false)
-            .css_classes(["caption", "dimmed"])
-            .build();
-
-        pulse_inner.append(&pulse_top);
-        pulse_inner.append(&pulse_detail);
-        pulse_inner.append(&pulse_timestamp);
-        pulse_card.append(&pulse_inner);
-
         // Hidden Phase-2 ThroughputSparkline card (zero dead UI in Phase 1).
         let sparkline = ThroughputSparkline::new();
         let sparkline_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -725,7 +435,6 @@ impl Sidebar {
         body.set_margin_bottom(12);
         body.set_margin_start(10);
         body.set_margin_end(10);
-        body.append(&pulse_card);
         body.append(&sparkline_card);
         body.append(&nav_context_stack);
         body.append(&views_section);
@@ -757,12 +466,6 @@ impl Sidebar {
 
         Self {
             root,
-            host_label,
-            pulse_indicator_stack,
-            pulse_dot,
-            pulse_headline,
-            pulse_detail,
-            pulse_timestamp,
             sparkline_card,
             sparkline,
             sources_list,
@@ -878,28 +581,6 @@ impl Sidebar {
     }
 
     pub fn paint(&self, state: &AppState) {
-        let pulse = pulse_summary(state, &self.host_label);
-        self.pulse_headline.set_text(&pulse.headline);
-        self.pulse_detail.set_text(&pulse.detail);
-        if let Some(ts) = pulse.timestamp {
-            self.pulse_timestamp.set_text(&ts);
-            self.pulse_timestamp.set_visible(true);
-        } else {
-            self.pulse_timestamp.set_text("");
-            self.pulse_timestamp.set_visible(false);
-        }
-
-        for class in ["pulse-warn", "pulse-err"] {
-            self.pulse_dot.remove_css_class(class);
-        }
-        match pulse.tone {
-            PulseTone::Ready => {}
-            PulseTone::Attention => self.pulse_dot.add_css_class("pulse-warn"),
-            PulseTone::Error => self.pulse_dot.add_css_class("pulse-err"),
-        }
-        self.pulse_indicator_stack
-            .set_visible_child_name(if pulse.spinning { "spinner" } else { "dot" });
-
         let packages = state.packages();
         let (dnf, flatpak, firmware) = count_by_source(packages);
         let sec = count_security(packages);
@@ -1028,11 +709,6 @@ impl Sidebar {
         self.telemetry_eta
             .get_visible()
             .then(|| self.telemetry_eta.text().to_string())
-    }
-
-    #[cfg(test)]
-    pub fn pulse_headline_text(&self) -> String {
-        self.pulse_headline.text().to_string()
     }
 
     #[cfg(test)]
@@ -1186,19 +862,9 @@ fn view_row(widget_name: &str, label: &str, icon_name: &str) -> gtk::ListBoxRow 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fedora_updater::model::{AuthPurpose, Package, PackageStatus, RetryAction, RunPass, UpdateSource};
+    use fedora_updater::model::{AuthPurpose, Package, PackageStatus, RetryAction, UpdateSource};
     use fedora_updater::state::RunningState;
-
-    #[test]
-    fn format_host_label_extracts_fedora_name_and_version_cleanly() {
-        let os_ws = "NAME=\"Fedora Linux\"\nVERSION_ID=44\nPRETTY_NAME=\"Fedora Linux 44 (Workstation Edition)\"\n";
-        assert_eq!(format_host_label(os_ws), "Fedora Linux 44");
-
-        let os_fallback = "NAME=\"Fedora Linux\"\nVERSION_ID=45\n";
-        assert_eq!(format_host_label(os_fallback), "Fedora Linux 45");
-
-        assert_eq!(format_host_label(""), "Fedora Linux");
-    }
+    use fedora_updater::IdleScreen;
 
     #[test]
     fn release_upgrade_visibility_rules_never_leak_into_auth_or_running() {
@@ -1258,96 +924,6 @@ mod tests {
             release_upgrade_inline_slot(&failed),
             InlineUpgradeSlot::None
         );
-    }
-
-    #[test]
-    fn pulse_summary_covers_all_phases() {
-        let fresh = pulse_summary(&AppState::default(), "Fedora Linux 44");
-        assert_eq!(fresh.tone, PulseTone::Attention);
-        assert_eq!(fresh.headline, "Fedora Linux 44");
-        assert!(!fresh.spinning);
-
-        let current = AppState {
-            phase: Phase::Idle(IdleScreen::Current {
-                checked_at: "just now".into(),
-                detail: None,
-            }),
-            ..Default::default()
-        };
-        let p = pulse_summary(&current, "Fedora Linux 44");
-        assert_eq!(p.tone, PulseTone::Ready);
-        assert_eq!(p.detail, "System is up to date");
-        assert_eq!(p.timestamp.as_deref(), Some("Checked just now"));
-
-        let mut pkg = Package::new_dnf("openssl", "x86_64", "3.2.2", "updates");
-        pkg.size_bytes = Some(2 * 1024 * 1024);
-        let ready = AppState {
-            phase: Phase::Ready {
-                packages: vec![pkg.clone()],
-                soft_errors: vec![],
-            },
-            ..Default::default()
-        };
-        let p = pulse_summary(&ready, "Fedora Linux 44");
-        assert_eq!(p.tone, PulseTone::Attention);
-        assert_eq!(p.detail, "1 update · 2.0 MB");
-
-        let mut running = RunningState::new(vec![pkg.clone()]);
-        running.overall_progress = 0.5;
-        running.pass = RunPass::Apply;
-        running.phase_label = "Installing".into();
-        running.current_name = Some("openssl".into());
-        let p = pulse_summary(
-            &AppState {
-                phase: Phase::Running(running),
-                ..Default::default()
-            },
-            "Fedora Linux 44",
-        );
-        assert!(p.spinning);
-        assert_eq!(p.headline, "Applying");
-        assert_eq!(p.detail, "50% · 0 of 1");
-        assert_eq!(p.timestamp.as_deref(), Some("openssl"));
-
-        let mut done_pkg = pkg;
-        done_pkg.status = PackageStatus::Completed;
-        let done_reboot = AppState {
-            phase: Phase::Done {
-                packages: vec![done_pkg],
-                duration: "1m 12s".into(),
-                needs_reboot: true,
-                failed: 0,
-                failure_reasons: vec![],
-            },
-            ..Default::default()
-        };
-        let p = pulse_summary(&done_reboot, "Fedora Linux 44");
-        assert_eq!(p.headline, "Restart Pending");
-        assert_eq!(p.timestamp.as_deref(), Some("Restart recommended"));
-
-        let failed = AppState {
-            phase: Phase::Failed {
-                title: "All updates failed".into(),
-                detail: "dnf failed".into(),
-                retry: RetryAction::CheckAgain,
-            },
-            ..Default::default()
-        };
-        let p = pulse_summary(&failed, "Fedora Linux 44");
-        assert_eq!(p.tone, PulseTone::Error);
-        assert_eq!(p.headline, "All updates failed");
-
-        let checking = AppState {
-            phase: Phase::Checking {
-                packages_so_far: vec![Package::new_dnf("firefox", "x86_64", "140", "updates")],
-                soft_errors: vec![],
-                checked_sources: vec![UpdateSource::Dnf],
-            },
-            ..Default::default()
-        };
-        let p = pulse_summary(&checking, "Fedora Linux 44");
-        assert!(p.spinning);
-        assert_eq!(p.detail, "1 of 3 sources · 1 found");
     }
 
     #[test]
