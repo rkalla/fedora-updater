@@ -1,0 +1,9 @@
+Updating and loading repositories:
+Repositories loaded.
+Failed to resolve the transaction:
+Problem 1: package mesa-va-drivers-freeworld-26.2.5-1.fc44.x86_64 from @System requires mesa-filesystem(x86-64) = 26.2.5, but none of the providers can be installed
+  - cannot install both mesa-filesystem-26.2.6-1.fc44.x86_64 from updates and mesa-filesystem-26.2.5-1.fc44.x86_64 from @System
+  - cannot install the best update candidate for package mesa-filesystem-26.2.5-1.fc44.x86_64
+Problem 2: problem with installed package ffmpeg-libs-7.1-2.fc44.x86_64
+  - nothing provides libplacebo.so.351()(64bit) needed by libavfilter-freeworld-7.1.1-1.fc44.x86_64 from rpmfusion-free-updates
+You can try to add '--skip-broken' to skip uninstallable packages

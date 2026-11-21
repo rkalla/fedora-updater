@@ -1,0 +1,10 @@
+Downloading…: 100.0%
+Decompressing…: 50.0%
+Writing… Percentage=60
+Verifying…: 80.0%
+Restarting device…: 99.0%
+Waiting…: 100.0%
+Successfully installed firmware
+Devices with no available firmware updates:
+ • UEFI dbx
+An update requires a reboot to complete.

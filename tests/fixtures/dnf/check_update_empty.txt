@@ -1,0 +1,5 @@
+Updating and loading repositories:
+Fedora 44 - x86_64                              100% |   9.1 MiB/s |  28.1 MiB |  00m03s
+Fedora 44 - x86_64 - Updates                    100% |   6.4 MiB/s |   4.5 MiB |  00m01s
+Repositories loaded.
+Last metadata expiration check: 0:00:01 ago on Sat 21 Nov 2026 07:48:12 AM MST.

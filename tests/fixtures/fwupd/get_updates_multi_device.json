@@ -1,0 +1,39 @@
+{
+  "Devices": [
+    {
+      "Name": "UEFI System Firmware",
+      "DeviceId": "1a2b3c4d5e6f708192a3b4c5d6e7f80910213141",
+      "Version": "1.18.0",
+      "Releases": [
+        {
+          "Version": "1.19.2",
+          "Summary": "Security fixes and EC stability improvements"
+        }
+      ]
+    },
+    {
+      "Name": "UEFI dbx",
+      "DeviceId": "362301da643102b9f38477387e2193e57abaa590",
+      "Version": "20240101",
+      "Releases": [
+        {
+          "Version": "20250501",
+          "Summary": "UEFI Secure Boot Forbidden Signature Database update"
+        }
+      ]
+    },
+    {
+      "Name": "WD_BLACK SN850X NVMe SSD",
+      "DeviceId": "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432",
+      "Version": "620361WD",
+      "Releases": [
+        {
+          "Version": "620461WD"
+        },
+        {
+          "Version": "620381WD"
+        }
+      ]
+    }
+  ]
+}

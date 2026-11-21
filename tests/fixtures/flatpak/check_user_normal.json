@@ -1,0 +1,49 @@
+{
+  "scope": "user",
+  "refs": [
+    {
+      "formatted_ref": "app/org.signal.Signal/x86_64/stable",
+      "name": "Signal",
+      "arch": "x86_64",
+      "branch": "stable",
+      "version": "8.40.0",
+      "origin": "flathub"
+    },
+    {
+      "formatted_ref": "app/org.mozilla.Thunderbird/x86_64/stable",
+      "name": "Thunderbird",
+      "arch": "x86_64",
+      "branch": "stable",
+      "version": "128.5.0",
+      "origin": "flathub"
+    },
+    {
+      "formatted_ref": "runtime/org.gnome.Platform/x86_64/48",
+      "name": "GNOME Application Platform version 48",
+      "arch": "x86_64",
+      "branch": "48",
+      "version": "",
+      "origin": "flathub"
+    }
+  ],
+  "ops": [
+    {
+      "formatted_ref": "app/org.signal.Signal/x86_64/stable",
+      "kind": "Update",
+      "download_bytes": 44040192,
+      "related_to": []
+    },
+    {
+      "formatted_ref": "app/org.mozilla.Thunderbird/x86_64/stable",
+      "kind": "Update",
+      "download_bytes": 89128960,
+      "related_to": []
+    },
+    {
+      "formatted_ref": "runtime/org.gnome.Platform/x86_64/48",
+      "kind": "Update",
+      "download_bytes": 12582912,
+      "related_to": []
+    }
+  ]
+}

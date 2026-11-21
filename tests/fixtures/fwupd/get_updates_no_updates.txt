@@ -1,0 +1,4 @@
+Devices with no available firmware updates:
+ • System Firmware
+ • UEFI dbx
+ • TPM 2.0

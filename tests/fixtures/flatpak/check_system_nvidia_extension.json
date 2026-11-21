@@ -1,0 +1,56 @@
+{
+  "scope": "system",
+  "refs": [
+    {
+      "formatted_ref": "app/com.valvesoftware.Steam/x86_64/stable",
+      "name": "Steam",
+      "arch": "x86_64",
+      "branch": "stable",
+      "version": "1.0.0.87",
+      "origin": "flathub"
+    },
+    {
+      "formatted_ref": "runtime/org.gnome.Platform/x86_64/48",
+      "name": "GNOME Application Platform version 48",
+      "arch": "x86_64",
+      "branch": "48",
+      "version": "",
+      "origin": "flathub"
+    },
+    {
+      "formatted_ref": "runtime/org.freedesktop.Platform/x86_64/24.08",
+      "name": "Freedesktop Platform",
+      "arch": "x86_64",
+      "branch": "24.08",
+      "version": "freedesktop-sdk-24.08.16",
+      "origin": "flathub"
+    }
+  ],
+  "ops": [
+    {
+      "formatted_ref": "runtime/org.freedesktop.Platform.GL32.nvidia-570-133-07/x86_64/1.4",
+      "kind": "Install",
+      "download_bytes": 251000000,
+      "related_to": [
+        "app/com.valvesoftware.Steam/x86_64/stable"
+      ]
+    },
+    {
+      "formatted_ref": "runtime/org.freedesktop.Platform.GL.nvidia-570-133-07/x86_64/1.4",
+      "kind": "Install",
+      "download_bytes": 391118848,
+      "related_to": [
+        "runtime/org.gnome.Platform/x86_64/48",
+        "runtime/org.freedesktop.Platform/x86_64/24.08"
+      ]
+    },
+    {
+      "formatted_ref": "runtime/org.freedesktop.Platform.GL.nvidia-565-77/x86_64/1.4",
+      "kind": "Uninstall",
+      "download_bytes": 0,
+      "related_to": [
+        "runtime/org.freedesktop.Platform/x86_64/24.08"
+      ]
+    }
+  ]
+}

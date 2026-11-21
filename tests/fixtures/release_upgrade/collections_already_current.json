@@ -1,0 +1,28 @@
+{
+  "collections": [
+    {
+      "name": "Fedora Linux",
+      "status": "Under Development",
+      "version": "devel",
+      "date_updated": "2026-11-20 00:00:00"
+    },
+    {
+      "name": "Fedora Linux",
+      "status": "Active",
+      "version": "44",
+      "date_updated": "2026-04-28 14:30:00"
+    },
+    {
+      "name": "Fedora Linux",
+      "status": "Active",
+      "version": "43",
+      "date_updated": "2025-10-28 14:00:00"
+    },
+    {
+      "name": "Fedora Linux",
+      "status": "EOL",
+      "version": "42",
+      "date_updated": "2025-04-15 12:00:00"
+    }
+  ]
+}

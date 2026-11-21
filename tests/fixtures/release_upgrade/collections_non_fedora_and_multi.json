@@ -1,0 +1,33 @@
+{
+  "collections": [
+    {
+      "name": "Fedora EPEL",
+      "status": "Active",
+      "version": "99",
+      "date_updated": "2026-11-10 09:00:00"
+    },
+    {
+      "name": "Fedora ELN",
+      "status": "Active",
+      "version": "100",
+      "date_updated": "2026-11-12 09:00:00"
+    },
+    {
+      "name": "Fedora Linux",
+      "status": "Active",
+      "version": "44",
+      "date_updated": "2026-04-28 14:30:00"
+    },
+    {
+      "name": "Fedora Linux",
+      "status": "Active",
+      "version": "45"
+    },
+    {
+      "name": "Fedora Linux",
+      "status": "Active",
+      "version": "46",
+      "date_updated": "2026-11-18 10:15:00"
+    }
+  ]
+}

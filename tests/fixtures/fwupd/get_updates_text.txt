@@ -1,0 +1,10 @@
+UEFI System Firmware
+  Device ID: 1a2b3c4d5e6f708192a3b4c5d6e7f80910213141
+  Version: 1.19.2
+  Bootloader Version: 1.0.2
+  ├─ Summary: Firmware update for system BIOS
+
+UEFI dbx
+  Device ID: 362301da643102b9f38477387e2193e57abaa590
+  New version: 20250501
+  └─ Summary: Forbidden Signature Database update

@@ -1,0 +1,7 @@
+Updating and loading repositories:
+Fedora 44 - x86_64 - Updates
+Errors during downloading metadata for repository 'updates':
+  - Curl error (6): Couldn't resolve host name for https://mirrors.fedoraproject.org/metalink?repo=updates-released-f44&arch=x86_64 [Could not resolve host: mirrors.fedoraproject.org]
+  - Curl error (60): SSL peer certificate or SSH remote key was not OK for https://thirdparty.example.com/fedora/repodata/repomd.xml
+Failed to download metadata (baseurl: "https://mirrors.fedoraproject.org/") for repo 'updates': Cannot prepare internal mirrorlist: Curl error (6): Could not resolve host name
+Error: Failed to synchronize cache for repo 'updates'

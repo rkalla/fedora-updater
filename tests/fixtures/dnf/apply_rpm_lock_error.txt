@@ -1,0 +1,5 @@
+Updating and loading repositories:
+Repositories loaded.
+Waiting for process with pid 4821 (/usr/bin/dnf5daemon-server) to finish.
+Error: Could not acquire lock on /var/lib/rpm/.rpm.lock: Resource temporarily unavailable (held by pid 4821)
+Transaction aborted before any packages were modified.

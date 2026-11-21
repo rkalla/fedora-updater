@@ -1,0 +1,3 @@
+Downloading…: 100.0%
+Decompressing…: 100.0%
+Cannot update firmware while on battery power (battery level 18% < 25%); connect AC power and try again.

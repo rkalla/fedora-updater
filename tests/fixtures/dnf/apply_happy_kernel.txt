@@ -1,0 +1,28 @@
+Updating and loading repositories:
+Repositories loaded.
+Package                   Arch   Version                Repository       Size
+Upgrading:
+ openssl                  x86_64 1:3.2.2-3.fc44         updates       2.1 MiB
+ firefox                  x86_64 140.0-1.fc44           updates     112.0 MiB
+ kernel-tools             x86_64 7.1.12-200.fc44        updates     420.0 KiB
+Installing:
+ kernel-core              x86_64 7.1.12-200.fc44        updates      20.7 MiB
+Transaction Summary:
+ Installing:        1 package
+ Upgrading:         3 packages
+
+[1/4] openssl-1:3.2.2-3.fc44.x86_64           10% |   1.1 MiB/s | 215.0 KiB |  00m01s[1/4] openssl-1:3.2.2-3.fc44.x86_64          100% |   4.2 MiB/s |   2.1 MiB |  00m00s
+[2/4] firefox-0:140.0-1.fc44.x86_64           35% |  16.0 MiB/s |  39.2 MiB |  00m04s[2/4] firefox-0:140.0-1.fc44.x86_64          100% |  18.6 MiB/s | 112.0 MiB |  00m06s
+[3/4] kernel-core-0:7.1.12-200.fc44.x86_64    62% |   9.8 MiB/s |  12.8 MiB |  00m01s[3/4] kernel-core-0:7.1.12-200.fc44.x86_64   100% |  10.4 MiB/s |  20.7 MiB |  00m02s
+[4/4] kernel-tools-0:7.1.12-200.fc44.x86_64   50% |   1.2 MiB/s | 210.0 KiB |  00m00s[4/4] kernel-tools-0:7.1.12-200.fc44.x86_64  100% |   1.2 MiB/s | 420.0 KiB |  00m00s
+--------------------------------------------------------------------------------
+Running transaction
+[1/8] Verify package files                    100% |   0.0 B/s |   4.0   B |  00m00s
+[2/8] Prepare transaction                     100% |   0.0 B/s |   4.0   B |  00m00s
+[3/8] Upgrading openssl-1:3.2.2-3.fc44.x86_64  40% |  80.0 MiB/s | 860.0 KiB |  00m00s[3/8] Upgrading openssl-1:3.2.2-3.fc44.x86_64 100% | 120.0 MiB/s |   2.1 MiB |  00m00s
+[4/8] Installing kernel-core-0:7.1.12-200.fc44.x86_64 100% |  85.0 MiB/s |  20.7 MiB |  00m00s
+[5/8] Upgrading firefox-0:140.0-1.fc44.x86_64 100% | 140.0 MiB/s | 112.0 MiB |  00m01s
+[6/8] Upgrading kernel-tools-0:7.1.12-200.fc44.x86_64 100% |  22.0 MiB/s | 420.0 KiB |  00m00s
+[7/8] Running scriptlet: kernel-core-0:7.1.12-200.fc44.x86_64 100%
+[8/8] Cleanup / Verifying                     100%
+Complete!

@@ -1,0 +1,2 @@
+The operation is inhibited by "PackageKit" (PID 2410 "packagekitd", user root), reason is "A system update transaction is in progress".
+Call to Reboot failed: Operation denied due to active block inhibitor

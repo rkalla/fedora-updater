@@ -1,0 +1,165 @@
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+
+use fedora_updater::backend::flatpak::{FlatpakListedRef, FlatpakOpKind, FlatpakResolvedOp};
+use fedora_updater::model::UpdateSource;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+
+/// Complete list of checked-in offline fixture files relative to `tests/fixtures/`.
+pub const ALL_FIXTURES: &[&str] = &[
+    // dnf/
+    "dnf/check_update_classic.txt",
+    "dnf/check_update_dnf5_table.txt",
+    "dnf/check_update_empty.txt",
+    "dnf/check_update_repo_error.txt",
+    "dnf/repoquery_sizes.txt",
+    "dnf/apply_happy_kernel.txt",
+    "dnf/apply_dep_conflict.txt",
+    "dnf/apply_rpm_lock_error.txt",
+    // flatpak/
+    "flatpak/check_user_normal.json",
+    "flatpak/check_system_nvidia_extension.json",
+    "flatpak/apply_progress_happy.txt",
+    "flatpak/apply_nothing_to_update.txt",
+    "flatpak/apply_remote_error.txt",
+    // fwupd/
+    "fwupd/get_updates_multi_device.json",
+    "fwupd/get_updates_empty.json",
+    "fwupd/get_updates_corrupt.txt",
+    "fwupd/get_updates_text.txt",
+    "fwupd/get_updates_no_updates.txt",
+    "fwupd/apply_happy_reboot.txt",
+    "fwupd/apply_battery_error.txt",
+    "fwupd/check_reboot_needed_true.json",
+    "fwupd/check_reboot_needed_false.json",
+    // release_upgrade/
+    "release_upgrade/collections_f45_active.json",
+    "release_upgrade/collections_already_current.json",
+    "release_upgrade/collections_non_fedora_and_multi.json",
+    "release_upgrade/collections_malformed.txt",
+    "release_upgrade/os_release_quoted.txt",
+    "release_upgrade/os_release_bare.txt",
+    "release_upgrade/os_release_missing_version.txt",
+    // systemctl/
+    "systemctl/reboot_block_inhibitor.txt",
+    "systemctl/reboot_logind_error.txt",
+];
+
+#[derive(Debug, Clone)]
+pub struct FlatpakFixture {
+    pub scope: String,
+    pub refs: Vec<FlatpakListedRef>,
+    pub ops: Vec<FlatpakResolvedOp>,
+}
+
+impl FlatpakFixture {
+    pub fn update_source(&self) -> UpdateSource {
+        match self.scope.as_str() {
+            "user" => UpdateSource::FlatpakUser,
+            "system" => UpdateSource::FlatpakSystem,
+            other => panic!("unexpected flatpak fixture scope `{other}`"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FlatpakFixtureDoc {
+    scope: String,
+    refs: Vec<FlatpakListedRefDto>,
+    ops: Vec<FlatpakResolvedOpDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlatpakListedRefDto {
+    formatted_ref: String,
+    name: String,
+    arch: String,
+    branch: String,
+    version: String,
+    origin: String,
+}
+
+#[derive(Debug, Deserialize)]
+enum FlatpakOpKindDto {
+    Install,
+    Update,
+    Uninstall,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlatpakResolvedOpDto {
+    formatted_ref: String,
+    kind: FlatpakOpKindDto,
+    download_bytes: u64,
+    #[serde(default)]
+    related_to: Vec<String>,
+}
+
+pub fn fixtures_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+}
+
+pub fn fixture_path(rel: &str) -> PathBuf {
+    fixtures_root().join(rel)
+}
+
+pub fn read_fixture(rel: &str) -> String {
+    let path = fixture_path(rel);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read fixture `{}` ({}): {e}", rel, path.display()))
+}
+
+pub fn read_fixture_bytes(rel: &str) -> Vec<u8> {
+    let path = fixture_path(rel);
+    std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("failed to read fixture bytes `{}` ({}): {e}", rel, path.display()))
+}
+
+pub fn read_fixture_json<T: DeserializeOwned>(rel: &str) -> T {
+    let raw = read_fixture(rel);
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("failed to parse JSON fixture `{rel}`: {e}"))
+}
+
+pub fn read_fixture_value(rel: &str) -> serde_json::Value {
+    read_fixture_json(rel)
+}
+
+pub fn read_flatpak_fixture(rel: &str) -> FlatpakFixture {
+    let doc: FlatpakFixtureDoc = read_fixture_json(rel);
+    let refs = doc
+        .refs
+        .into_iter()
+        .map(|r| FlatpakListedRef {
+            formatted_ref: r.formatted_ref,
+            name: r.name,
+            arch: r.arch,
+            branch: r.branch,
+            version: r.version,
+            origin: r.origin,
+        })
+        .collect();
+    let ops = doc
+        .ops
+        .into_iter()
+        .map(|o| FlatpakResolvedOp {
+            formatted_ref: o.formatted_ref,
+            kind: match o.kind {
+                FlatpakOpKindDto::Install => FlatpakOpKind::Install,
+                FlatpakOpKindDto::Update => FlatpakOpKind::Update,
+                FlatpakOpKindDto::Uninstall => FlatpakOpKind::Uninstall,
+            },
+            download_bytes: o.download_bytes,
+            related_to: o.related_to,
+        })
+        .collect();
+    FlatpakFixture {
+        scope: doc.scope,
+        refs,
+        ops,
+    }
+}

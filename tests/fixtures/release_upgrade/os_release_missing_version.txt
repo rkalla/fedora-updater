@@ -1,0 +1,4 @@
+NAME="Fedora Linux"
+ID=fedora
+PRETTY_NAME="Fedora Linux (Custom Snapshot)"
+HOME_URL="https://fedoraproject.org/"

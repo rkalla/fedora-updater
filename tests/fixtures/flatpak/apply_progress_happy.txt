@@ -1,0 +1,7 @@
+Looking for updates…
+Downloading org.signal.Signal/x86_64/stable 45%
+Downloading org.signal.Signal/x86_64/stable 100%
+Updating org.signal.Signal/x86_64/stable 100%
+Downloading app/org.mozilla.Thunderbird/x86_64/stable 60%
+Installing app/org.mozilla.Thunderbird/x86_64/stable 100%
+Updates complete.

@@ -1,0 +1,16 @@
+Updating and loading repositories:
+Fedora 44 - x86_64 - Updates                    100% |   8.2 MiB/s |   4.5 MiB |  00m01s
+Repositories loaded.
+Package                   Arch   Version                Repository       Size
+==============================================================================
+Upgrading:
+ systemd                  x86_64 258.4-2.fc44           updates      14.2 MiB
+ glibc                    x86_64 2.43-9.fc44            updates       3.1 MiB
+ kernel-core              x86_64 7.1.12-200.fc44        updates      20.7 MiB
+ dbus-broker              x86_64 36-3.fc44              updates     412.0 KiB
+ firefox                  x86_64 140.0-1.fc44           updates     112.0 MiB
+Obsoleting packages:
+ pipewire-pulseaudio      x86_64 1.4.2-1.fc44           updates     310.0 KiB
+Transaction Summary:
+ Upgrading:         6 packages
+Total size of inbound packages is 151 MiB. Need to download 151 MiB.
