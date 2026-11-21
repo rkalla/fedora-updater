@@ -138,41 +138,160 @@ pub fn format_end_line(code: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    const ALL_COMMANDS: [HelperCommand; 6] = [
+        HelperCommand::CheckDnf,
+        HelperCommand::ApplyDnf,
+        HelperCommand::CheckFwupdRefresh,
+        HelperCommand::CheckFwupd,
+        HelperCommand::ApplyFwupd,
+        HelperCommand::CheckFwupdReboot,
+    ];
 
     #[test]
     fn roundtrip_commands() {
-        for cmd in [
-            HelperCommand::CheckDnf,
-            HelperCommand::ApplyDnf,
-            HelperCommand::CheckFwupdRefresh,
-            HelperCommand::CheckFwupd,
-            HelperCommand::ApplyFwupd,
-            HelperCommand::CheckFwupdReboot,
-        ] {
-            assert_eq!(HelperCommand::parse(cmd.as_id()), Some(cmd));
+        let mut seen_ids = HashSet::new();
+        for cmd in ALL_COMMANDS {
+            let id = cmd.as_id();
+            assert!(seen_ids.insert(id), "duplicate command id: {id}");
+            assert_eq!(HelperCommand::parse(id), Some(cmd));
+
             let req = ClientRequest::parse(&cmd.encode_run()).unwrap();
             assert_eq!(req, ClientRequest::Run(cmd));
-            assert!(!cmd.argv().is_empty());
+
+            let argv = cmd.argv();
+            assert!(!argv.is_empty(), "{cmd:?} argv must not be empty");
+            assert!(
+                argv[0].starts_with("/usr/bin/"),
+                "{cmd:?} binary must be an absolute /usr/bin/* path: {}",
+                argv[0]
+            );
+            assert!(
+                argv[0] == "/usr/bin/dnf" || argv[0] == "/usr/bin/fwupdmgr",
+                "{cmd:?} unexpected privileged binary: {}",
+                argv[0]
+            );
+            assert!(
+                !argv[0].contains(' ') && !argv[0].contains(".."),
+                "{cmd:?} binary path must be clean: {}",
+                argv[0]
+            );
+
+            match cmd {
+                HelperCommand::CheckDnf => {
+                    assert_eq!(argv, &["/usr/bin/dnf", "check-update", "--refresh"]);
+                }
+                HelperCommand::ApplyDnf => {
+                    assert_eq!(argv, &["/usr/bin/dnf", "update", "-y"]);
+                    assert!(!argv.contains(&"upgrade"));
+                }
+                HelperCommand::CheckFwupdRefresh => {
+                    assert_eq!(argv, &["/usr/bin/fwupdmgr", "refresh"]);
+                }
+                HelperCommand::CheckFwupd => {
+                    assert_eq!(argv, &["/usr/bin/fwupdmgr", "get-updates", "--json"]);
+                }
+                HelperCommand::ApplyFwupd => {
+                    assert_eq!(
+                        argv,
+                        &[
+                            "/usr/bin/fwupdmgr",
+                            "update",
+                            "-y",
+                            "--no-reboot-check",
+                            "--no-unreported-check",
+                            "--no-device-prompt",
+                        ]
+                    );
+                }
+                HelperCommand::CheckFwupdReboot => {
+                    assert_eq!(argv, &["/usr/bin/fwupdmgr", "check-reboot-needed", "--json"]);
+                }
+            }
         }
     }
 
     #[test]
     fn rejects_unknown_and_injection() {
-        assert!(ClientRequest::parse("RUN rm -rf /").is_err());
-        assert!(ClientRequest::parse("RUN check-dnf; reboot").is_err());
-        assert!(ClientRequest::parse("RUN dnf update").is_err());
-        assert!(ClientRequest::parse("RUN apply-flatpak-system").is_err());
+        for bad in [
+            "",
+            "   \t\r\n",
+            "RUN",
+            "RUN ",
+            "RUN\tcheck-dnf",
+            "run check-dnf",
+            "Run check-dnf",
+            "EXEC check-dnf",
+            "RUN rm -rf /",
+            "RUN check-dnf; reboot",
+            "RUN check-dnf && id",
+            "RUN check-dnf | cat",
+            "RUN $(id)",
+            "RUN check-dnf --refresh",
+            "RUN apply-dnf extra",
+            "QUIT extra",
+            "RUN ../bin/sh",
+            "RUN /usr/bin/dnf",
+            "RUN dnf update",
+            "RUN apply-flatpak-system",
+            "RUN check-dnf\nRUN apply-dnf",
+            "RUN check-dnf\rQUIT",
+            "RUN check-dnf\0",
+            "QUIT\nRUN check-dnf",
+        ] {
+            assert!(
+                ClientRequest::parse(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+
         assert!(HelperCommand::parse("apply-flatpak-system").is_none());
-        assert!(ClientRequest::parse("").is_err());
+        assert!(HelperCommand::parse("check-dnf extra").is_none());
+
+        for quit in ["QUIT", "quit", "Quit", "  QUIT \r\n"] {
+            assert_eq!(
+                ClientRequest::parse(quit),
+                Ok(ClientRequest::Quit),
+                "expected QUIT parse for {quit:?}"
+            );
+        }
+        assert_eq!(
+            ClientRequest::parse("RUN check-dnf\r\n"),
+            Ok(ClientRequest::Run(HelperCommand::CheckDnf))
+        );
+        assert_eq!(
+            ClientRequest::parse("RUN  check-dnf"),
+            Ok(ClientRequest::Run(HelperCommand::CheckDnf))
+        );
     }
 
     #[test]
     fn quit_and_end() {
         assert_eq!(ClientRequest::parse("QUIT").unwrap(), ClientRequest::Quit);
+        for code in [0, 1, 2, 100, 127, -1, -15, i32::MIN, i32::MAX] {
+            let encoded = format_end_line(code);
+            assert_eq!(parse_end_line(&encoded), Some(code));
+        }
         assert_eq!(parse_end_line("__END__ 100"), Some(100));
         assert_eq!(parse_end_line("__END__ 0"), Some(0));
-        assert_eq!(parse_end_line("not an end"), None);
-        assert_eq!(parse_end_line("__DRAW__ [1/2] grok-bot 40%"), None);
+        assert_eq!(parse_end_line("__END__  42  "), Some(42));
+
+        for bad in [
+            "__END__ abc",
+            "__END__ 0 extra",
+            "__END__ 1.5",
+            "__END__ 99999999999999999999",
+            "__END__ ",
+            "__END__",
+            "END 0",
+            "__END_ 0",
+            " __END__ 0",
+            "not an end",
+            "__DRAW__ [1/2] grok-bot 40%",
+        ] {
+            assert_eq!(parse_end_line(bad), None, "expected None for {bad:?}");
+        }
     }
 
     #[test]
@@ -181,6 +300,23 @@ mod tests {
             split_helper_line("__DRAW__ [26/26] grok-bot 40%"),
             HelperOutput::Draw("[26/26] grok-bot 40%".into())
         );
+        assert_eq!(
+            split_helper_line("__DRAW__ "),
+            HelperOutput::Draw(String::new())
+        );
+        assert_eq!(
+            split_helper_line("__DRAW__"),
+            HelperOutput::Line("__DRAW__".into())
+        );
+        assert_eq!(
+            split_helper_line("prefix __DRAW__ text"),
+            HelperOutput::Line("prefix __DRAW__ text".into())
+        );
+        assert_eq!(
+            split_helper_line("__DRAW__ __DRAW__ nested"),
+            HelperOutput::Draw("__DRAW__ nested".into())
+        );
+        assert_eq!(split_helper_line(""), HelperOutput::Line(String::new()));
         assert_eq!(
             split_helper_line("[26/26] grok-bot 100%"),
             HelperOutput::Line("[26/26] grok-bot 100%".into())
@@ -193,17 +329,23 @@ mod tests {
 
     #[test]
     fn argv_never_uses_shell_metacharacters() {
-        for cmd in [
-            HelperCommand::CheckDnf,
-            HelperCommand::ApplyDnf,
-            HelperCommand::ApplyFwupd,
-        ] {
+        const FORBIDDEN: [char; 15] = [
+            ';', '|', '&', '`', '$', '>', '<', '(', ')', '"', '\'', '\\', '\n', '\r', '\0',
+        ];
+        for cmd in ALL_COMMANDS {
             for arg in cmd.argv() {
-                assert!(!arg.contains(';'));
-                assert!(!arg.contains('|'));
-                assert!(!arg.contains('&'));
-                assert!(!arg.contains('`'));
-                assert!(!arg.contains('$'));
+                assert!(!arg.is_empty(), "{cmd:?} contains empty arg");
+                assert_eq!(
+                    arg.trim(),
+                    *arg,
+                    "{cmd:?} arg has leading/trailing whitespace: {arg:?}"
+                );
+                for ch in FORBIDDEN {
+                    assert!(
+                        !arg.contains(ch),
+                        "{cmd:?} arg {arg:?} contains forbidden char {ch:?}"
+                    );
+                }
             }
         }
     }

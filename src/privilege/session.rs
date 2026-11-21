@@ -146,10 +146,19 @@ impl PrivilegedSession {
             .map_err(|e| SessionError::Io(e.to_string()))?;
         let hello = hello.trim_end();
         if hello.is_empty() {
-            let _ = child.try_wait();
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(SessionError::AuthDenied);
         }
         if hello != HELLO_LINE && !hello.contains("fedora-updater-helper") {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(SessionError::Protocol(format!("unexpected hello: {hello}")));
         }
 
@@ -378,6 +387,11 @@ fn run_local_command_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helper_protocol::DRAW_PREFIX;
+    use crate::privilege::test_support::{
+        start_direct_retry, write_fake_helper, PRIVILEGE_TEST_LOCK,
+    };
+    use std::time::Duration;
 
     #[test]
     fn helper_path_respects_env() {
@@ -424,7 +438,7 @@ printf 'stdout-done\n'
         });
 
         let (res, lines) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(5))
             .expect("run_local_command deadlocked with >128 KiB on stderr");
         let code = res.expect("run_local_command should succeed");
         assert_eq!(code, 0);
@@ -439,12 +453,261 @@ printf 'stdout-done\n'
     }
 
     #[test]
-    fn helper_flag_is_stable() {
-        assert_eq!(HELPER_FLAG, "--helper");
+    fn run_local_command_handles_nonzero_missing_empty_and_large_both_streams() {
+        // Non-zero exit preserves both streams and exact status code.
+        let mut lines = Vec::new();
+        let code = run_local_command(
+            "/bin/sh",
+            &["-c", "echo local-out; echo local-err >&2; exit 23"],
+            |line| lines.push(line),
+        )
+        .expect("run_local_command /bin/sh exit 23");
+        assert_eq!(code, 23);
+        assert!(lines.contains(&"local-out".to_string()));
+        assert!(lines.contains(&"local-err".to_string()));
+
+        // Missing executable returns Spawn error.
+        let missing = run_local_command(
+            "/nonexistent-fedora-updater-test-bin-xyz",
+            &[],
+            |_| panic!("should not emit lines"),
+        );
+        assert!(matches!(missing, Err(SessionError::Spawn(_))));
+
+        // Empty output with exit 0 emits zero lines.
+        let mut empty_lines = Vec::new();
+        let code = run_local_command("/bin/sh", &["-c", "exit 0"], |l| empty_lines.push(l))
+            .expect("empty exit 0");
+        assert_eq!(code, 0);
+        assert!(empty_lines.is_empty());
+
+        // Concurrent >128 KiB on BOTH stdout and stderr completes without deadlock.
+        let script = r#"
+s="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+s="$s$s$s$s"
+s="$s$s$s$s"
+(
+  i=0
+  while [ "$i" -lt 160 ]; do
+    printf 'out-%03d-%s\n' "$i" "$s"
+    i=$((i + 1))
+  done
+) &
+(
+  j=0
+  while [ "$j" -lt 160 ]; do
+    printf 'err-%03d-%s\n' "$j" "$s" >&2
+    j=$((j + 1))
+  done
+) &
+wait
+"#;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut both = Vec::new();
+            let res = run_local_command("/bin/sh", &["-c", script], |l| both.push(l));
+            let _ = tx.send((res, both));
+        });
+        let (res, both) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run_local_command deadlocked with >128 KiB on stdout+stderr");
+        assert_eq!(res.expect("ok"), 0);
+        let out_lines: Vec<&String> = both.iter().filter(|l| l.starts_with("out-")).collect();
+        let err_lines: Vec<&String> = both.iter().filter(|l| l.starts_with("err-")).collect();
+        assert_eq!(out_lines.len(), 160);
+        assert_eq!(err_lines.len(), 160);
+        let out_bytes: usize = out_lines.iter().map(|l| l.len() + 1).sum();
+        let err_bytes: usize = err_lines.iter().map(|l| l.len() + 1).sum();
+        assert!(out_bytes > 128 * 1024, "stdout {out_bytes} <= 128 KiB");
+        assert!(err_bytes > 128 * 1024, "stderr {err_bytes} <= 128 KiB");
+    }
+
+    #[test]
+    fn start_direct_empty_stdout_returns_auth_denied() {
+        let _lock = PRIVILEGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_fake_helper(dir.path(), "deny-helper", "#!/bin/sh\nexit 1\n");
+        let res = start_direct_retry(&script);
+        assert!(
+            matches!(res, Err(SessionError::AuthDenied)),
+            "expected AuthDenied on empty stdout, got {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn start_direct_unexpected_hello_returns_protocol_error() {
+        let _lock = PRIVILEGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_fake_helper(
+            dir.path(),
+            "bad-hello-helper",
+            "#!/bin/sh\nprintf 'WRONG HELLO\\n'\nsleep 30\n",
+        );
+        let res = start_direct_retry(&script);
+        assert!(
+            matches!(res, Err(SessionError::Protocol(ref msg)) if msg.contains("WRONG HELLO")),
+            "expected Protocol error mentioning WRONG HELLO, got {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn start_direct_missing_paths_report_helper_not_found_or_spawn() {
+        let rel = PrivilegedSession::start_direct(Path::new("nonexistent-fedora-updater-helper-xyz"));
+        assert!(
+            matches!(rel, Err(SessionError::HelperNotFound(_))),
+            "expected HelperNotFound for relative path, got {:?}",
+            rel.err()
+        );
+        let abs = PrivilegedSession::start_direct(Path::new(
+            "/nonexistent-fedora-updater-helper-dir/bin",
+        ));
+        assert!(
+            matches!(abs, Err(SessionError::Spawn(_))),
+            "expected Spawn for missing absolute path, got {:?}",
+            abs.err()
+        );
+    }
+
+    #[test]
+    fn session_reuses_single_helper_and_streams_draw_and_committed_lines() {
+        let _lock = PRIVILEGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "#!/bin/sh\n\
+printf '%s\\n' '{HELLO_LINE}'\n\
+while IFS= read -r line; do\n\
+  case \"$line\" in\n\
+    'RUN check-dnf')\n\
+      printf 'pid=%s\\n' \"$$\"\n\
+      printf '{DRAW_PREFIX}dl 50%%\\n'\n\
+      printf 'committed-line\\n'\n\
+      printf '__END__ 100\\n'\n\
+      ;;\n\
+    'RUN check-fwupd')\n\
+      printf 'pid=%s\\n' \"$$\"\n\
+      printf 'fwupd-ok\\n'\n\
+      printf '__END__ 0\\n'\n\
+      ;;\n\
+    QUIT)\n\
+      printf '__BYE__\\n'\n\
+      exit 0\n\
+      ;;\n\
+  esac\n\
+done\n"
+        );
+        let script = write_fake_helper(dir.path(), "reuse-helper", &body);
+        let mut session = start_direct_retry(&script).expect("start_direct");
+        assert!(session.is_running());
+
+        let mut events1 = Vec::new();
+        let code1 = session
+            .run_command(HelperCommand::CheckDnf, |ev| events1.push(ev))
+            .expect("first run_command");
+        assert_eq!(code1, 100);
+        assert!(session.is_running());
+
+        let lines1: Vec<&str> = events1
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Line(l) => Some(l.as_str()),
+                _ => None,
+            })
+            .collect();
+        let pid1 = lines1
+            .iter()
+            .find_map(|l| l.strip_prefix("pid="))
+            .expect("pid= line in first call")
+            .to_string();
+        assert_eq!(
+            lines1,
+            vec![
+                format!("pid={pid1}").as_str(),
+                "__DRAW__ dl 50%",
+                "committed-line"
+            ]
+        );
+        assert!(matches!(
+            events1.last(),
+            Some(SessionEvent::Finished { exit_code: 100 })
+        ));
+
+        let mut events2 = Vec::new();
+        let code2 = session
+            .run_command(HelperCommand::CheckFwupd, |ev| events2.push(ev))
+            .expect("second run_command");
+        assert_eq!(code2, 0);
+        assert!(session.is_running());
+
+        let pid2 = events2
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Line(l) => l.strip_prefix("pid="),
+                _ => None,
+            })
+            .expect("pid= line in second call");
+        assert_eq!(pid1, pid2, "second command must reuse the same helper PID");
+        assert!(events2
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Line(l) if l == "fwupd-ok")));
+        assert!(matches!(
+            events2.last(),
+            Some(SessionEvent::Finished { exit_code: 0 })
+        ));
+    }
+
+    #[test]
+    fn session_mid_command_eof_returns_closed_and_marks_not_running() {
+        let _lock = PRIVILEGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "#!/bin/sh\n\
+printf '%s\\n' '{HELLO_LINE}'\n\
+IFS= read -r _line\n\
+printf 'partial-line\\n'\n\
+exit 1\n"
+        );
+        let script = write_fake_helper(dir.path(), "eof-helper", &body);
+        let mut session = start_direct_retry(&script).expect("start_direct");
+
+        let mut lines = Vec::new();
+        let res = session.run_command(HelperCommand::CheckDnf, |ev| {
+            if let SessionEvent::Line(l) = ev {
+                lines.push(l);
+            }
+        });
+        assert!(
+            matches!(res, Err(SessionError::Closed)),
+            "expected SessionError::Closed, got {res:?}"
+        );
+        assert_eq!(lines, vec!["partial-line".to_string()]);
+
+        for _ in 0..50 {
+            if !session.is_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !session.is_running(),
+            "session should report not running after unexpected EOF"
+        );
     }
 
     #[test]
     fn kill_recorded_local_command_terminates_running_local_process() {
+        let _lock = PRIVILEGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
 
@@ -462,13 +725,13 @@ printf 'stdout-done\n'
         });
 
         started_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(2))
             .expect("local process did not emit ready");
 
         kill_recorded_local_command();
 
         let res = done_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(2))
             .expect("kill_recorded_local_command did not stop the local process promptly");
         assert!(res.is_ok(), "unexpected error: {res:?}");
         assert_ne!(res.unwrap(), 0);

@@ -337,10 +337,11 @@ fn stdbuf_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_child, StreamPiece, StreamSplitter, STDBUF_ARGS};
-    use crate::helper_protocol::HelperCommand;
+    use super::{drain_child, emit_piece, spawn_unbuffered, StreamPiece, StreamSplitter, STDBUF_ARGS};
+    use crate::helper_protocol::{split_helper_line, HelperOutput};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     struct ProcessGroupGuard(i32);
@@ -394,20 +395,140 @@ mod tests {
     }
 
     #[test]
-    fn stdbuf_disables_block_buffering() {
-        assert_eq!(STDBUF_ARGS, ["-o0", "-e0"]);
-        assert!(!STDBUF_ARGS.contains(&"-oL"));
+    fn splitter_reassembles_split_multibyte_utf8_across_reads() {
+        let sample = "Verifying… 50%\rUpdating — 🚀\n".as_bytes();
+        // Split 1 byte at a time: multi-byte '…' (E2 80 A6), '—' (E2 80 94), and '🚀' (F0 9F 9A 80)
+        // are torn across reads and must reassemble losslessly at the separator.
+        let mut splitter = StreamSplitter::new();
+        let mut pieces = Vec::new();
+        for chunk in sample.chunks(1) {
+            pieces.extend(splitter.push(chunk));
+        }
+        if let Some(last) = splitter.finish() {
+            pieces.push(last);
+        }
+        assert_eq!(
+            pieces,
+            vec![
+                StreamPiece::Live("Verifying… 50%".into()),
+                StreamPiece::Line("Updating — 🚀".into()),
+            ]
+        );
+
+        // Repeat with 2-byte reads so CRLF and multi-byte sequences span boundaries differently.
+        let mut splitter2 = StreamSplitter::new();
+        let mut pieces2 = Vec::new();
+        for chunk in "Verifying… 50%\r\nDone 🚀\r".as_bytes().chunks(2) {
+            pieces2.extend(splitter2.push(chunk));
+        }
+        if let Some(last) = splitter2.finish() {
+            pieces2.push(last);
+        }
+        assert_eq!(
+            pieces2,
+            vec![
+                StreamPiece::Line("Verifying… 50%".into()),
+                StreamPiece::Line("Done 🚀".into()),
+            ]
+        );
+
+        // Invalid UTF-8 bytes must not panic and must substitute cleanly inside a single Line.
+        let mut bad_splitter = StreamSplitter::new();
+        let bad_pieces = bad_splitter.push(b"bad \xff\xfe byte\n");
+        assert_eq!(bad_pieces.len(), 1);
+        match &bad_pieces[0] {
+            StreamPiece::Line(s) => {
+                assert!(s.starts_with("bad "));
+                assert!(s.ends_with(" byte"));
+                assert!(s.contains('\u{FFFD}'));
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
     }
 
     #[test]
-    fn only_allowlisted_argv() {
-        let argv = HelperCommand::CheckDnf.argv();
-        assert_eq!(argv, &["/usr/bin/dnf", "check-update", "--refresh"]);
-        let argv = HelperCommand::ApplyDnf.argv();
-        assert_eq!(argv, &["/usr/bin/dnf", "update", "-y"]);
-        let argv = HelperCommand::ApplyFwupd.argv();
-        assert!(argv.contains(&"--no-reboot-check"));
-        assert!(argv.contains(&"-y"));
+    fn splitter_handles_consecutive_live_draws_empty_lines_and_eof() {
+        let mut splitter = StreamSplitter::new();
+        let mut pieces = Vec::new();
+        pieces.extend(splitter.push(b"10%\r20%\r"));
+        pieces.extend(splitter.push(b"30%\r100%\n"));
+        assert_eq!(
+            pieces,
+            vec![
+                StreamPiece::Live("10%".into()),
+                StreamPiece::Live("20%".into()),
+                StreamPiece::Live("30%".into()),
+                StreamPiece::Line("100%".into()),
+            ]
+        );
+
+        let mut bare_cr = StreamSplitter::new();
+        assert!(bare_cr.push(b"\r").is_empty());
+        assert_eq!(bare_cr.finish(), None);
+
+        let mut multi_empty = StreamSplitter::new();
+        assert!(multi_empty.push(b"\r\r\n").is_empty());
+        assert_eq!(multi_empty.finish(), None);
+
+        let mut unterminated = StreamSplitter::new();
+        assert!(unterminated.push(b"unterminated").is_empty());
+        assert_eq!(
+            unterminated.finish(),
+            Some(StreamPiece::Line("unterminated".into()))
+        );
+        assert_eq!(unterminated.finish(), None);
+    }
+
+    #[test]
+    fn emit_piece_frames_live_and_committed_lines() {
+        let mut out = Vec::new();
+        emit_piece(&mut out, StreamPiece::Live("dl 40%".into()));
+        emit_piece(&mut out, StreamPiece::Line("dl 100%".into()));
+
+        let text = String::from_utf8(out).expect("utf-8 output");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, vec!["__DRAW__ dl 40%", "dl 100%"]);
+        assert_eq!(
+            split_helper_line(lines[0]),
+            HelperOutput::Draw("dl 40%".into())
+        );
+        assert_eq!(
+            split_helper_line(lines[1]),
+            HelperOutput::Line("dl 100%".into())
+        );
+    }
+
+    #[test]
+    fn stdbuf_disables_block_buffering() {
+        assert_eq!(STDBUF_ARGS, ["-o0", "-e0"]);
+        assert!(!STDBUF_ARGS.contains(&"-oL"));
+
+        let child = spawn_unbuffered(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"read _unused || true; printf 'py=%s\n' "$PYTHONUNBUFFERED"; printf 'step 1\rstep 2\rdone\n'"#,
+            ],
+        )
+        .expect("spawn_unbuffered /bin/sh");
+        let _guard = ProcessGroupGuard(child.id() as i32);
+
+        let mut out = Vec::new();
+        let code = drain_child(child, &mut out);
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.contains(&"py=1"), "expected PYTHONUNBUFFERED=1 in {lines:?}");
+        assert!(
+            lines.contains(&"__DRAW__ step 1"),
+            "expected '__DRAW__ step 1' in {lines:?}"
+        );
+        assert!(
+            lines.contains(&"__DRAW__ step 2"),
+            "expected '__DRAW__ step 2' in {lines:?}"
+        );
+        assert!(lines.contains(&"done"), "expected 'done' in {lines:?}");
     }
 
     #[test]
@@ -459,5 +580,107 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines.contains(&"out_line"), "missing out_line in {lines:?}");
         assert!(lines.contains(&"err_line"), "missing err_line in {lines:?}");
+    }
+
+    #[test]
+    fn drain_child_handles_large_concurrent_stdout_and_stderr_without_deadlock() {
+        let script = r#"
+s="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+s="$s$s$s$s"
+s="$s$s$s$s"
+(
+  i=0
+  while [ "$i" -lt 160 ]; do
+    printf 'out-%03d-%s\n' "$i" "$s"
+    i=$((i + 1))
+  done
+) &
+(
+  j=0
+  while [ "$j" -lt 160 ]; do
+    printf 'err-%03d-%s\n' "$j" "$s" >&2
+    j=$((j + 1))
+  done
+) &
+wait
+"#;
+        let child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pgid = child.id() as i32;
+        let _guard = ProcessGroupGuard(pgid);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let code = drain_child(child, &mut out);
+            let _ = tx.send((code, out));
+        });
+
+        let (code, out) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("drain_child deadlocked on >128 KiB concurrent stdout+stderr");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf-8");
+        let out_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("out-")).collect();
+        let err_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("err-")).collect();
+        assert_eq!(out_lines.len(), 160);
+        assert_eq!(err_lines.len(), 160);
+
+        let out_bytes: usize = out_lines.iter().map(|l| l.len() + 1).sum();
+        let err_bytes: usize = err_lines.iter().map(|l| l.len() + 1).sum();
+        assert!(out_bytes > 128 * 1024, "stdout {out_bytes} <= 128 KiB");
+        assert!(err_bytes > 128 * 1024, "stderr {err_bytes} <= 128 KiB");
+    }
+
+    #[test]
+    fn drain_child_handles_empty_output_and_nonzero_exit() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 42"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn /bin/sh");
+        let _guard = ProcessGroupGuard(child.id() as i32);
+
+        let mut out = Vec::new();
+        let code = drain_child(child, &mut out);
+        assert_eq!(code, 42);
+        assert!(out.is_empty(), "expected empty output, got {:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn drain_child_streams_interleaved_cr_draws_and_crlf_lines() {
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"printf 'dl 25%%\rdl 75%%\rdl 100%%\r\n'; printf 'warn\n' >&2"#,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn /bin/sh");
+        let _guard = ProcessGroupGuard(child.id() as i32);
+
+        let mut out = Vec::new();
+        let code = drain_child(child, &mut out);
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.contains(&"__DRAW__ dl 25%"), "missing draw 25% in {lines:?}");
+        assert!(lines.contains(&"__DRAW__ dl 75%"), "missing draw 75% in {lines:?}");
+        assert!(lines.contains(&"dl 100%"), "missing committed crlf line in {lines:?}");
+        assert!(lines.contains(&"warn"), "missing stderr line in {lines:?}");
     }
 }

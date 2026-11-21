@@ -81,21 +81,34 @@ fn protocol_rejects_path_traversal_and_shell() {
         "RUN check-dnf && reboot",
         "RUN ../evil",
         "RUN check-dnf\nRUN apply-dnf",
+        "RUN check-dnf\rQUIT",
+        "RUN check-dnf\0",
+        "RUN check-dnf --refresh",
+        "   \t\n",
+        "QUIT extra",
+        "RUN",
         "EXEC check-dnf",
         "run check-dnf",
     ] {
-        assert!(ClientRequest::parse(bad).is_err(), "should reject: {bad}");
+        assert!(ClientRequest::parse(bad).is_err(), "should reject: {bad:?}");
     }
 }
 
 #[test]
 fn end_line_roundtrip() {
-    for code in [0, 1, 100, -1, 127] {
+    for code in [0, 1, 2, 100, 127, -1, -15, i32::MIN, i32::MAX] {
         let line = format_end_line(code);
-        // negative codes still format; parse may fail for negative depending on parse
-        if code >= 0 {
-            assert_eq!(parse_end_line(&line), Some(code));
-        }
+        assert_eq!(parse_end_line(&line), Some(code));
+    }
+    for bad in [
+        "__END__ abc",
+        "__END__ 0 extra",
+        "__END__ 99999999999999999999",
+        "__END__",
+        "END 0",
+        "__END_ 0",
+    ] {
+        assert_eq!(parse_end_line(bad), None, "should reject: {bad:?}");
     }
 }
 
@@ -112,9 +125,28 @@ fn every_helper_command_has_nonempty_safe_argv() {
     for cmd in all {
         let argv = cmd.argv();
         assert!(!argv.is_empty());
-        // First token is the program name — no absolute weirdness required, but no spaces
-        assert!(!argv[0].contains(' '));
+        assert!(
+            argv[0].starts_with("/usr/bin/"),
+            "{cmd:?} must invoke an absolute /usr/bin/* binary, got {}",
+            argv[0]
+        );
+        assert!(
+            argv[0] == "/usr/bin/dnf" || argv[0] == "/usr/bin/fwupdmgr",
+            "{cmd:?} must target /usr/bin/dnf or /usr/bin/fwupdmgr, got {}",
+            argv[0]
+        );
+        for arg in argv {
+            assert!(!arg.is_empty(), "{cmd:?} has empty arg");
+            assert!(
+                !arg.contains([';', '|', '&', '`', '$', '>', '<', '\n', '\r', '\0']),
+                "{cmd:?} arg contains forbidden metacharacter: {arg:?}"
+            );
+        }
         assert_eq!(HelperCommand::parse(cmd.as_id()), Some(cmd));
+        assert_eq!(
+            ClientRequest::parse(&cmd.encode_run()),
+            Ok(ClientRequest::Run(cmd))
+        );
     }
 }
 
