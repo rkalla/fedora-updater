@@ -3,623 +3,710 @@ using Adw 1;
 
 Adw.ApplicationWindow window {
   title: "Fedora Updater";
-  default-width: 760;
-  default-height: 660;
+  default-width: 960;
+  default-height: 676;
+  width-request: 360;
+  height-request: 360;
+
+  // Listed widest-first: libadwaita applies only the last matching breakpoint.
+  Adw.Breakpoint compact_breakpoint {
+    condition ("max-width: 720px")
+  }
 
   Adw.Breakpoint narrow_breakpoint {
     condition ("max-width: 500px")
   }
 
   content: Adw.ToastOverlay toast {
-    child: Adw.ToolbarView {
-      [top]
-      Adw.HeaderBar {
-        [start]
-        Gtk.Button header_refresh {
-          icon-name: "view-refresh-symbolic";
-          tooltip-text: "Refresh";
-          visible: false;
-        }
+    child: Adw.NavigationSplitView split_view {
+      min-sidebar-width: 210;
+      max-sidebar-width: 260;
+      sidebar-width-fraction: 0.24;
+      show-content: true;
 
-        title-widget: Adw.WindowTitle window_title {
-          title: "Fedora Updater";
-        };
+      sidebar: Adw.NavigationPage sidebar_page {
+        title: "Observatory";
+        tag: "sidebar";
 
-        // pack_end prepends, so the first end child is the trailing one.
-        // The menu is listed first so Stop sits before it.
-        [end]
-        Gtk.MenuButton header_menu {
-          icon-name: "open-menu-symbolic";
-          tooltip-text: "Main Menu";
-          primary: true;
+        child: Adw.ToolbarView {
+          top-bar-style: flat;
 
-          menu-model: menu {
-            section {
-              item ("About Fedora Updater", "win.about")
-            }
-          };
-        }
-
-        [end]
-        Gtk.Button run_stop {
-          label: "Stop";
-          tooltip-text: "Stop this update";
-          visible: false;
-        }
-      }
-
-      [top]
-      Gtk.Box upgrade_notice {
-        visible: false;
-        margin-start: 12;
-        margin-end: 12;
-        margin-top: 8;
-        margin-bottom: 4;
-        styles ["upgrade-notice"]
-
-        Gtk.Button upgrade_action {
-          hexpand: true;
-          tooltip-text: "How to upgrade";
-          styles ["upgrade-offer"]
-
-          child: Gtk.Box {
-            spacing: 12;
-            margin-start: 14;
-            margin-end: 12;
-            margin-top: 10;
-            margin-bottom: 10;
-
-            Gtk.Box {
-              orientation: vertical;
-              spacing: 2;
-              hexpand: true;
-              valign: center;
-
-              Gtk.Label upgrade_title {
-                label: "A new Fedora Linux release is available";
-                xalign: 0;
-                halign: start;
-                ellipsize: end;
-              }
-
-              Gtk.Label upgrade_age {
-                visible: false;
-                xalign: 0;
-                halign: start;
-                ellipsize: end;
-                styles ["dimmed", "caption"]
-              }
-            }
-
-            Gtk.Label {
-              label: "How to upgrade";
-              valign: center;
-            }
-
-            Gtk.Image {
+          [top]
+          Adw.HeaderBar {
+            [end]
+            Gtk.Button sidebar_close_btn {
               icon-name: "go-next-symbolic";
-              valign: center;
+              tooltip-text: "Return to Updates";
+              visible: false;
             }
-          };
-        }
-      }
+          }
 
-      content: Gtk.Stack stack {
-        transition-type: crossfade;
-        hexpand: true;
-        vexpand: true;
-        hhomogeneous: true;
-        vhomogeneous: true;
-
-        Gtk.StackPage {
-          name: "idle";
-          child: Adw.StatusPage idle_page {
-            vexpand: true;
-            icon-name: "software-update-available-symbolic";
-            title: "Check for Updates";
-            description: "System packages, apps, and firmware. Nothing changes until the list is reviewed.";
-
-            child: Gtk.Box {
-              orientation: vertical;
-              spacing: 12;
-              halign: center;
-
-              Gtk.Button idle_btn {
-                label: "Check for Updates";
-                styles ["suggested-action", "pill"]
-                halign: center;
-              }
-
-              Gtk.Button idle_log {
-                label: "View Log";
-                action-name: "win.view-log";
-                visible: false;
-                styles ["flat"]
-                halign: center;
-              }
-            };
-          };
-        }
-
-        Gtk.StackPage {
-          name: "auth";
-          child: Adw.StatusPage auth_page {
-            vexpand: true;
-            icon-name: "dialog-password-symbolic";
-            title: "Authentication Required";
-            description: "A system dialog asks for an administrator password. The password is not stored in this window.";
-
-            child: Gtk.Box {
-              orientation: vertical;
-              spacing: 12;
-              halign: center;
-
-              Gtk.Box {
-                orientation: horizontal;
-                spacing: 8;
-                halign: center;
-
-                Adw.Spinner {
-                  width-request: 20;
-                  height-request: 20;
-                  valign: center;
-                }
-
-                Gtk.Label {
-                  label: "Waiting for authentication";
-                  styles ["dimmed"]
-                }
-              }
-
-              Gtk.Button auth_cancel {
-                label: "Cancel";
-                styles ["flat"]
-                halign: center;
-              }
-            };
-          };
-        }
-
-        Gtk.StackPage {
-          name: "checking";
-          child: Adw.ToolbarView {
-            vexpand: true;
+          content: Gtk.Box sidebar_host {
+            orientation: vertical;
             hexpand: true;
+            vexpand: true;
+          };
+        };
+      };
 
-            content: Gtk.Box {
-              orientation: vertical;
-              vexpand: true;
-              hexpand: true;
-              styles ["page-fill"]
+      content: Adw.NavigationPage content_page {
+        title: "Fedora Updater";
+        tag: "content";
 
-              Gtk.Box {
+        child: Adw.ToolbarView detail_toolbar {
+          top-bar-style: flat;
+          bottom-bar-style: flat;
+
+          [top]
+          Adw.HeaderBar detail_header {
+            show-back-button: false;
+
+            [start]
+            Gtk.ToggleButton sidebar_toggle {
+              icon-name: "sidebar-show-left-symbolic";
+              tooltip-text: "Hide Sidebar (F9)";
+              active: true;
+            }
+
+            [start]
+            Gtk.Button header_refresh {
+              icon-name: "view-refresh-symbolic";
+              tooltip-text: "Refresh";
+              visible: false;
+            }
+
+            title-widget: Adw.WindowTitle window_title {
+              title: "Fedora Updater";
+            };
+
+            // pack_end prepends, so the first end child is the trailing one.
+            // The menu is listed first so Stop sits before it.
+            [end]
+            Gtk.MenuButton header_menu {
+              icon-name: "open-menu-symbolic";
+              tooltip-text: "Main Menu";
+              primary: true;
+
+              menu-model: menu {
+                section {
+                  item ("About Fedora Updater", "win.about")
+                }
+              };
+            }
+
+            [end]
+            Gtk.Button run_stop {
+              label: "Stop";
+              tooltip-text: "Stop this update";
+              visible: false;
+            }
+          }
+
+          content: Gtk.Stack stack {
+            transition-type: crossfade;
+            hexpand: true;
+            vexpand: true;
+            hhomogeneous: true;
+            vhomogeneous: true;
+
+            Gtk.StackPage {
+              name: "idle";
+              child: Gtk.Box {
                 orientation: vertical;
-                spacing: 6;
-                styles ["progress-block"]
-
-                Gtk.ProgressBar check_progress {
-                  fraction: 0.05;
-                  hexpand: true;
-                }
-
-                Gtk.Box {
-                  orientation: horizontal;
-                  spacing: 8;
-
-                  Gtk.Label check_progress_meta {
-                    label: "System in progress · Apps queued · Firmware queued";
-                    halign: start;
-                    hexpand: true;
-                    ellipsize: end;
-                    styles ["dimmed", "caption"]
-                  }
-
-                  Gtk.Label check_progress_pct {
-                    label: "0%";
-                    styles ["dimmed", "caption", "numeric"]
-                  }
-                }
-              }
-
-              Gtk.ScrolledWindow check_list_scroll {
                 vexpand: true;
                 hexpand: true;
-                hscrollbar-policy: never;
-                vscrollbar-policy: automatic;
-                propagate-natural-height: false;
-                styles ["list-scroll"]
 
-                child: Adw.Clamp {
-                  maximum-size: 700;
-                  tightening-threshold: 500;
-                  margin-start: 12;
-                  margin-end: 12;
-                  margin-bottom: 8;
+                Adw.StatusPage idle_page {
+                  vexpand: true;
+                  icon-name: "software-update-available-symbolic";
+                  title: "Check for Updates";
+                  description: "System packages, apps, and firmware. Nothing changes until the list is reviewed.";
 
-                  child: Adw.PreferencesGroup check_group {
-                    title: "Found so far";
+                  child: Gtk.Box {
+                    orientation: vertical;
+                    spacing: 12;
+                    halign: center;
+
+                    Gtk.Button idle_btn {
+                      label: "Check for Updates";
+                      styles ["suggested-action", "pill"]
+                      halign: center;
+                    }
+
+                    Gtk.Button idle_log {
+                      label: "View Log";
+                      action-name: "win.view-log";
+                      visible: false;
+                      styles ["flat"]
+                      halign: center;
+                    }
                   };
-                };
-              }
-            };
-          };
-        }
+                }
 
-        Gtk.StackPage {
-          name: "ready";
-          child: Adw.ToolbarView {
-            vexpand: true;
-            hexpand: true;
-
-            content: Gtk.Box {
-              orientation: vertical;
-              vexpand: true;
-              hexpand: true;
-              styles ["page-fill"]
-
-              Adw.Banner ready_banner {
-                revealed: false;
-                button-label: "View Log";
-              }
-
-              Gtk.ScrolledWindow {
-                vexpand: true;
-                hexpand: true;
-                hscrollbar-policy: never;
-                vscrollbar-policy: automatic;
-                propagate-natural-height: false;
-                styles ["list-scroll"]
-
-                child: Adw.Clamp {
-                  maximum-size: 700;
+                Adw.Clamp {
+                  maximum-size: 680;
                   tightening-threshold: 500;
                   margin-start: 12;
                   margin-end: 12;
-                  margin-bottom: 8;
 
-                  child: Adw.PreferencesGroup ready_group {};
-                };
-              }
-
-              Gtk.Label {
-                label: "Nothing is applied until Update All is chosen";
-                halign: start;
-                margin-start: 12;
-                margin-end: 12;
-                margin-bottom: 10;
-                styles ["dimmed", "caption"]
-              }
-            };
-
-            [bottom]
-            Gtk.Box {
-              orientation: horizontal;
-              halign: end;
-              margin-start: 12;
-              margin-end: 12;
-              margin-top: 8;
-              margin-bottom: 8;
-
-              Gtk.Button ready_update {
-                label: "Update All";
-                styles ["suggested-action"]
-              }
+                  child: Gtk.Box idle_upgrade_slot {
+                    orientation: vertical;
+                    visible: false;
+                    margin-top: 4;
+                    margin-bottom: 16;
+                  };
+                }
+              };
             }
-          };
-        }
 
-        Gtk.StackPage {
-          name: "running";
-          child: Adw.ToolbarView {
-            vexpand: true;
-            hexpand: true;
+            Gtk.StackPage {
+              name: "auth";
+              child: Adw.StatusPage auth_page {
+                vexpand: true;
+                icon-name: "dialog-password-symbolic";
+                title: "Authentication Required";
+                description: "A system dialog asks for an administrator password. The password is not stored in this window.";
 
-            content: Gtk.Box {
-              orientation: vertical;
-              vexpand: true;
-              hexpand: true;
-              styles ["page-fill"]
-
-              Gtk.Box {
-                orientation: vertical;
-                spacing: 6;
-                styles ["progress-block"]
-
-                Gtk.ProgressBar run_progress {
-                  fraction: 0.0;
-                  hexpand: true;
-                }
-
-                Gtk.Box {
-                  orientation: horizontal;
-                  spacing: 8;
-
-                  Gtk.Label run_progress_meta {
-                    label: "Starting…";
-                    halign: start;
-                    hexpand: true;
-                    ellipsize: end;
-                    styles ["dimmed", "caption"]
-                  }
-
-                  Gtk.Label run_progress_pct {
-                    label: "0%";
-                    styles ["dimmed", "caption", "numeric"]
-                  }
-                }
-              }
-
-              Adw.Banner run_stall {
-                revealed: false;
-              }
-
-              Adw.Clamp {
-                maximum-size: 700;
-                tightening-threshold: 500;
-                hexpand: true;
-                margin-start: 12;
-                margin-end: 12;
-                margin-bottom: 8;
-
-                child: Gtk.Box current_package {
+                child: Gtk.Box {
                   orientation: vertical;
-                  spacing: 8;
-                  hexpand: true;
-                  styles ["card"]
+                  spacing: 12;
+                  halign: center;
 
                   Gtk.Box {
                     orientation: horizontal;
-                    spacing: 10;
+                    spacing: 8;
+                    halign: center;
 
-                    Gtk.Label now_playing_badge {
-                      visible: false;
+                    Adw.Spinner {
+                      width-request: 20;
+                      height-request: 20;
                       valign: center;
-                      halign: center;
                     }
 
-                    Adw.Spinner now_playing_spinner {
-                      width-request: 18;
-                      height-request: 18;
-                      valign: center;
-                      halign: center;
+                    Gtk.Label {
+                      label: "Waiting for authentication";
+                      styles ["dimmed"]
                     }
+                  }
 
-                    Gtk.Box {
+                  Gtk.Button auth_cancel {
+                    label: "Cancel";
+                    styles ["flat"]
+                    halign: center;
+                  }
+                };
+              };
+            }
+
+            Gtk.StackPage {
+              name: "checking";
+              child: Adw.ToolbarView {
+                vexpand: true;
+                hexpand: true;
+
+                content: Gtk.Box {
+                  orientation: vertical;
+                  vexpand: true;
+                  hexpand: true;
+                  styles ["page-fill"]
+
+                  Adw.Clamp {
+                    maximum-size: 680;
+                    tightening-threshold: 500;
+                    hexpand: true;
+                    margin-start: 12;
+                    margin-end: 12;
+                    margin-top: 12;
+                    margin-bottom: 8;
+
+                    child: Gtk.Box {
                       orientation: vertical;
-                      spacing: 2;
+                      spacing: 6;
+                      styles ["progress-block"]
+
+                      Gtk.ProgressBar check_progress {
+                        fraction: 0.05;
+                        hexpand: true;
+                      }
+
+                      Gtk.Box {
+                        orientation: horizontal;
+                        spacing: 8;
+
+                        Gtk.Label check_progress_meta {
+                          label: "System in progress · Apps queued · Firmware queued";
+                          halign: start;
+                          hexpand: true;
+                          ellipsize: end;
+                          styles ["dimmed", "caption"]
+                        }
+
+                        Gtk.Label check_progress_pct {
+                          label: "0%";
+                          styles ["dimmed", "caption", "numeric"]
+                        }
+                      }
+                    };
+                  }
+
+                  Gtk.ScrolledWindow check_list_scroll {
+                    vexpand: true;
+                    hexpand: true;
+                    hscrollbar-policy: never;
+                    vscrollbar-policy: automatic;
+                    propagate-natural-height: false;
+                    styles ["list-scroll"]
+
+                    child: Adw.Clamp {
+                      maximum-size: 680;
+                      tightening-threshold: 500;
+                      margin-start: 12;
+                      margin-end: 12;
+                      margin-bottom: 8;
+
+                      child: Adw.PreferencesGroup check_group {
+                        title: "Found so far";
+                      };
+                    };
+                  }
+                };
+              };
+            }
+
+            Gtk.StackPage {
+              name: "ready";
+              child: Adw.ToolbarView ready_toolbar {
+                vexpand: true;
+                hexpand: true;
+                top-bar-style: flat;
+                bottom-bar-style: raised;
+
+                content: Gtk.Box {
+                  orientation: vertical;
+                  vexpand: true;
+                  hexpand: true;
+                  styles ["page-fill"]
+
+                  Adw.Banner ready_banner {
+                    revealed: false;
+                    button-label: "View Log";
+                  }
+
+                  Gtk.ScrolledWindow {
+                    vexpand: true;
+                    hexpand: true;
+                    hscrollbar-policy: never;
+                    vscrollbar-policy: automatic;
+                    propagate-natural-height: false;
+                    styles ["list-scroll"]
+
+                    child: Adw.Clamp {
+                      maximum-size: 680;
+                      tightening-threshold: 500;
+                      margin-start: 12;
+                      margin-end: 12;
+                      margin-top: 12;
+                      margin-bottom: 12;
+
+                      child: Gtk.Box {
+                        orientation: vertical;
+                        spacing: 14;
+
+                        Adw.PreferencesGroup ready_group {}
+
+                        Gtk.Box ready_upgrade_slot {
+                          orientation: vertical;
+                          visible: false;
+                        }
+                      };
+                    };
+                  }
+                };
+
+                [bottom]
+                Adw.Clamp {
+                  maximum-size: 680;
+                  tightening-threshold: 500;
+                  hexpand: true;
+                  margin-start: 12;
+                  margin-end: 12;
+
+                  child: Gtk.Box {
+                    orientation: horizontal;
+                    spacing: 12;
+                    margin-top: 10;
+                    margin-bottom: 10;
+
+                    Gtk.Label {
+                      label: "Nothing is applied until Update All is chosen";
+                      halign: start;
+                      xalign: 0;
                       hexpand: true;
                       valign: center;
-
-                      Gtk.Label now_playing_title {
-                        label: "Starting…";
-                        halign: start;
-                        ellipsize: end;
-                        xalign: 0;
-                        styles ["heading"]
-                      }
-
-                      Gtk.Label now_playing_subtitle {
-                        label: "";
-                        halign: start;
-                        ellipsize: end;
-                        xalign: 0;
-                        styles ["dimmed", "caption"]
-                      }
-                    }
-
-                    Gtk.Label now_playing_size {
-                      label: "";
-                      valign: center;
-                      visible: false;
+                      wrap: true;
                       styles ["dimmed", "caption"]
                     }
 
-                    Gtk.Label now_playing_pct {
-                      label: "";
+                    Gtk.Button ready_update {
+                      label: "Update All";
                       valign: center;
-                      width-chars: 4;
-                      styles ["numeric", "caption", "dimmed"]
+                      styles ["suggested-action"]
                     }
-                  }
-                };
-              }
+                  };
+                }
+              };
+            }
 
-              Gtk.ScrolledWindow run_list_scroll {
+            Gtk.StackPage {
+              name: "running";
+              child: Adw.ToolbarView {
                 vexpand: true;
                 hexpand: true;
-                hscrollbar-policy: never;
-                vscrollbar-policy: automatic;
-                propagate-natural-height: false;
-                styles ["list-scroll"]
 
-                child: Adw.Clamp {
-                  maximum-size: 700;
-                  tightening-threshold: 500;
-                  margin-start: 12;
-                  margin-end: 12;
-                  margin-bottom: 8;
+                content: Gtk.Box {
+                  orientation: vertical;
+                  vexpand: true;
+                  hexpand: true;
+                  styles ["page-fill"]
 
-                  child: Adw.PreferencesGroup run_list_group {
-                  };
-                };
-              }
+                  Adw.Clamp {
+                    maximum-size: 680;
+                    tightening-threshold: 500;
+                    hexpand: true;
+                    margin-start: 12;
+                    margin-end: 12;
+                    margin-top: 12;
+                    margin-bottom: 8;
 
-              Adw.Clamp {
-                maximum-size: 700;
-                tightening-threshold: 500;
-                hexpand: true;
-                margin-start: 12;
-                margin-end: 12;
-                margin-bottom: 8;
+                    child: Gtk.Box {
+                      orientation: vertical;
+                      spacing: 6;
+                      styles ["progress-block"]
 
-                child: Adw.PreferencesGroup run_completed_group {
-                  Adw.ExpanderRow run_completed {
-                    title: "0 completed";
-                    expanded: false;
-                    enable-expansion: true;
+                      Gtk.ProgressBar run_progress {
+                        fraction: 0.0;
+                        hexpand: true;
+                      }
+
+                      Gtk.Box {
+                        orientation: horizontal;
+                        spacing: 8;
+
+                        Gtk.Label run_progress_meta {
+                          label: "Starting…";
+                          halign: start;
+                          hexpand: true;
+                          ellipsize: end;
+                          styles ["dimmed", "caption"]
+                        }
+
+                        Gtk.Label run_progress_pct {
+                          label: "0%";
+                          styles ["dimmed", "caption", "numeric"]
+                        }
+                      }
+                    };
+                  }
+
+                  Adw.Banner run_stall {
+                    revealed: false;
+                  }
+
+                  Adw.Clamp {
+                    maximum-size: 680;
+                    tightening-threshold: 500;
+                    hexpand: true;
+                    margin-start: 12;
+                    margin-end: 12;
+                    margin-bottom: 10;
+
+                    child: Gtk.Box current_package {
+                      orientation: vertical;
+                      hexpand: true;
+                      styles ["card"]
+
+                      Gtk.Box {
+                        orientation: horizontal;
+                        spacing: 12;
+                        margin-top: 16;
+                        margin-bottom: 16;
+                        margin-start: 18;
+                        margin-end: 18;
+
+                        Gtk.Box now_playing_ring_slot {
+                          valign: center;
+                        }
+
+                        Gtk.Label now_playing_badge {
+                          visible: false;
+                          valign: center;
+                          halign: center;
+                        }
+
+                        Adw.Spinner now_playing_spinner {
+                          width-request: 18;
+                          height-request: 18;
+                          valign: center;
+                          halign: center;
+                        }
+
+                        Gtk.Box {
+                          orientation: vertical;
+                          spacing: 2;
+                          hexpand: true;
+                          valign: center;
+
+                          Gtk.Label now_playing_title {
+                            label: "Starting…";
+                            halign: start;
+                            ellipsize: end;
+                            xalign: 0;
+                            styles ["heading"]
+                          }
+
+                          Gtk.Label now_playing_subtitle {
+                            label: "";
+                            halign: start;
+                            ellipsize: end;
+                            xalign: 0;
+                            styles ["dimmed", "caption"]
+                          }
+                        }
+
+                        Gtk.Label now_playing_size {
+                          label: "";
+                          valign: center;
+                          visible: false;
+                          styles ["dimmed", "caption"]
+                        }
+
+                        Gtk.Label now_playing_pct {
+                          label: "";
+                          valign: center;
+                          width-chars: 4;
+                          styles ["numeric", "caption", "dimmed"]
+                        }
+                      }
+                    };
+                  }
+
+                  Gtk.ScrolledWindow run_list_scroll {
+                    vexpand: true;
+                    hexpand: true;
+                    hscrollbar-policy: never;
+                    vscrollbar-policy: automatic;
+                    propagate-natural-height: false;
+                    styles ["list-scroll"]
+
+                    child: Adw.Clamp {
+                      maximum-size: 680;
+                      tightening-threshold: 500;
+                      margin-start: 12;
+                      margin-end: 12;
+                      margin-bottom: 8;
+
+                      child: Adw.PreferencesGroup run_list_group {
+                      };
+                    };
+                  }
+
+                  Adw.Clamp {
+                    maximum-size: 680;
+                    tightening-threshold: 500;
+                    hexpand: true;
+                    margin-start: 12;
+                    margin-end: 12;
+                    margin-bottom: 8;
+
+                    child: Adw.PreferencesGroup run_completed_group {
+                      Adw.ExpanderRow run_completed {
+                        title: "0 completed";
+                        expanded: false;
+                        enable-expansion: true;
+                      }
+                    };
                   }
                 };
-              }
-            };
-          };
-        }
+              };
+            }
 
-        Gtk.StackPage {
-          name: "done";
-          child: Adw.ToolbarView {
-            vexpand: true;
-            hexpand: true;
-
-            content: Gtk.Box {
-              orientation: vertical;
-              vexpand: true;
-              hexpand: true;
-              styles ["page-fill"]
-
-              Adw.Banner reboot_banner {
-                title: "Restart recommended to finish installing";
-                button-label: "Restart Now";
-                revealed: false;
-              }
-
-              Adw.Banner done_problem_banner {
-                revealed: false;
-                button-label: "View Log";
-              }
-
-              Gtk.ScrolledWindow done_installed_scroll {
+            Gtk.StackPage {
+              name: "done";
+              child: Adw.ToolbarView done_toolbar {
                 vexpand: true;
                 hexpand: true;
-                hscrollbar-policy: never;
-                vscrollbar-policy: automatic;
-                propagate-natural-height: false;
-                styles ["list-scroll"]
+                top-bar-style: flat;
+                bottom-bar-style: raised;
 
-                child: Adw.Clamp {
-                  maximum-size: 700;
+                content: Gtk.Box {
+                  orientation: vertical;
+                  vexpand: true;
+                  hexpand: true;
+                  styles ["page-fill"]
+
+                  Adw.Banner reboot_banner {
+                    title: "Restart recommended to finish installing";
+                    button-label: "Restart Now";
+                    revealed: false;
+                  }
+
+                  Adw.Banner done_problem_banner {
+                    revealed: false;
+                    button-label: "View Log";
+                  }
+
+                  Gtk.ScrolledWindow done_installed_scroll {
+                    vexpand: true;
+                    hexpand: true;
+                    hscrollbar-policy: never;
+                    vscrollbar-policy: automatic;
+                    propagate-natural-height: false;
+                    styles ["list-scroll"]
+
+                    child: Adw.Clamp {
+                      maximum-size: 680;
+                      tightening-threshold: 500;
+                      margin-start: 12;
+                      margin-end: 12;
+                      margin-top: 12;
+                      margin-bottom: 12;
+
+                      child: Gtk.Box {
+                        orientation: vertical;
+                        spacing: 14;
+
+                        Adw.PreferencesGroup done_installed {
+                          title: "Installed";
+                        }
+
+                        Gtk.Box done_upgrade_slot {
+                          orientation: vertical;
+                          visible: false;
+                        }
+                      };
+                    };
+                  }
+                };
+
+                [bottom]
+                Adw.Clamp {
+                  maximum-size: 680;
                   tightening-threshold: 500;
+                  hexpand: true;
                   margin-start: 12;
                   margin-end: 12;
-                  margin-bottom: 8;
 
-                  child: Adw.PreferencesGroup done_installed {
-                    title: "Installed";
+                  child: Gtk.Box {
+                    orientation: horizontal;
+                    spacing: 8;
+                    halign: end;
+                    margin-top: 10;
+                    margin-bottom: 10;
+
+                    Gtk.Button done_log_btn {
+                      label: "View Full Log";
+                      action-name: "win.view-log";
+                      styles ["flat"]
+                    }
+
+                    Gtk.Button done_retry_btn {
+                      label: "Check Again";
+                      visible: false;
+                    }
+
+                    Gtk.Button done_btn {
+                      label: "Done";
+                    }
                   };
+                }
+              };
+            }
+
+            Gtk.StackPage {
+              name: "failed";
+              child: Adw.StatusPage fail_page {
+                vexpand: true;
+                icon-name: "dialog-error-symbolic";
+                title: "Update failed";
+
+                child: Gtk.Box {
+                  orientation: vertical;
+                  spacing: 12;
+                  halign: center;
+
+                  Gtk.Button fail_retry {
+                    label: "Check Again";
+                    styles ["suggested-action", "pill"]
+                    halign: center;
+                  }
+
+                  Gtk.Button fail_log {
+                    label: "View Log";
+                    action-name: "win.view-log";
+                    styles ["flat"]
+                    halign: center;
+                  }
                 };
-              }
-            };
-
-            [bottom]
-            Gtk.Box {
-              orientation: horizontal;
-              spacing: 8;
-              halign: end;
-              margin-start: 12;
-              margin-end: 12;
-              margin-top: 8;
-              margin-bottom: 8;
-
-              Gtk.Button done_log_btn {
-                label: "View Full Log";
-                action-name: "win.view-log";
-                styles ["flat"]
-              }
-
-              Gtk.Button done_retry_btn {
-                label: "Check Again";
-                visible: false;
-              }
-
-              Gtk.Button done_btn {
-                label: "Done";
-              }
+              };
             }
           };
-        }
 
-        Gtk.StackPage {
-          name: "failed";
-          child: Adw.StatusPage fail_page {
-            vexpand: true;
-            icon-name: "dialog-error-symbolic";
-            title: "Update failed";
+          [bottom]
+          Gtk.Box console_drawer {
+            orientation: vertical;
+            visible: false;
 
-            child: Gtk.Box {
+            Gtk.Revealer console_reveal {
+              transition-type: slide_up;
+              reveal-child: false;
+
+              child: Gtk.ScrolledWindow {
+                max-content-height: 160;
+                propagate-natural-height: true;
+
+                child: Gtk.TextView console_full {
+                  editable: false;
+                  cursor-visible: false;
+                  monospace: true;
+                  wrap-mode: word_char;
+                  left-margin: 12;
+                  right-margin: 12;
+                  top-margin: 8;
+                  bottom-margin: 8;
+                  styles ["caption"]
+                };
+              };
+            }
+
+            Gtk.Box {
               orientation: vertical;
-              spacing: 12;
-              halign: center;
+              styles ["console-bar"]
 
-              Gtk.Button fail_retry {
-                label: "Check Again";
-                styles ["suggested-action", "pill"]
-                halign: center;
-              }
-
-              Gtk.Button fail_log {
-                label: "View Log";
-                action-name: "win.view-log";
+              Gtk.Button console_toggle {
                 styles ["flat"]
-                halign: center;
-              }
-            };
-          };
-        }
-      };
-
-      [bottom]
-      Gtk.Box console_drawer {
-        orientation: vertical;
-        visible: false;
-
-        Gtk.Revealer console_reveal {
-          transition-type: slide_up;
-          reveal-child: false;
-
-          child: Gtk.ScrolledWindow {
-            max-content-height: 160;
-            propagate-natural-height: true;
-
-            child: Gtk.TextView console_full {
-              editable: false;
-              cursor-visible: false;
-              monospace: true;
-              wrap-mode: word_char;
-              left-margin: 12;
-              right-margin: 12;
-              top-margin: 8;
-              bottom-margin: 8;
-              styles ["caption"]
-            };
-          };
-        }
-
-        Gtk.Box {
-          orientation: vertical;
-          styles ["console-bar"]
-
-          Gtk.Button console_toggle {
-            styles ["flat"]
-            hexpand: true;
-
-            child: Gtk.Box {
-              orientation: horizontal;
-              spacing: 8;
-
-              Gtk.Image console_chevron {
-                icon-name: "pan-end-symbolic";
-              }
-
-              Gtk.Label console_line {
-                label: "Starting…";
                 hexpand: true;
-                halign: start;
-                ellipsize: end;
-                styles ["monospace", "caption", "dimmed"]
+
+                child: Gtk.Box {
+                  orientation: horizontal;
+                  spacing: 8;
+
+                  Gtk.Image console_chevron {
+                    icon-name: "pan-end-symbolic";
+                  }
+
+                  Gtk.Label console_line {
+                    label: "Starting…";
+                    hexpand: true;
+                    halign: start;
+                    ellipsize: end;
+                    styles ["monospace", "caption", "dimmed"]
+                  }
+                };
               }
-            };
+            }
           }
-        }
-      }
+        };
+      };
     };
   };
 }

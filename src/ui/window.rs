@@ -8,11 +8,12 @@ use std::time::{Duration, Instant, SystemTime};
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
-use gtk::{Builder, Button, Label, ProgressBar, Revealer, Stack, TextView};
+use gtk::{Builder, Button, Label, ProgressBar, Revealer, Stack, TextView, ToggleButton};
 use libadwaita::prelude::*;
 use libadwaita::{
-    Application, ApplicationWindow, Banner, Breakpoint, ExpanderRow, PreferencesGroup, Spinner,
-    StatusPage, Toast, ToastOverlay, WindowTitle,
+    Application, ApplicationWindow, Banner, Breakpoint, ExpanderRow, NavigationSplitView,
+    PreferencesGroup, Spinner, StatusPage, StyleManager, Toast, ToastOverlay, ToolbarStyle,
+    ToolbarView, WindowTitle,
 };
 
 use fedora_updater::backend::dnf;
@@ -35,23 +36,43 @@ use fedora_updater::privilege::{
 };
 use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RunningState};
 
-use super::{dialogs, obj, preview, rows};
+use super::prefs::{DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH};
+use super::{charts, dialogs, obj, prefs, preview, rows, sidebar};
 
 const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
-const DEFAULT_WIDTH: i32 = 760;
-const DEFAULT_HEIGHT: i32 = 660;
 
 struct Widgets {
     window: ApplicationWindow,
+    split_view: NavigationSplitView,
+    detail_toolbar: ToolbarView,
+    #[cfg_attr(not(test), allow(dead_code))] // Verified by headless widget E2E tests.
+    ready_toolbar: ToolbarView,
+    #[cfg_attr(not(test), allow(dead_code))] // Verified by headless widget E2E tests.
+    done_toolbar: ToolbarView,
     window_title: WindowTitle,
     /// Un-narrowed subtitle. Header paint reads [`Widgets::narrow`] so a later render keeps it hidden.
     header_subtitle: RefCell<String>,
+    compact: Cell<bool>,
     narrow: Cell<bool>,
+    sidebar_open: Cell<bool>,
+    ignore_sidebar_toggle: Cell<bool>,
+    sidebar_toggle: ToggleButton,
+    sidebar_close_btn: Button,
+    sidebar: sidebar::Sidebar,
+    idle_upgrade_slot: gtk::Box,
+    ready_upgrade_slot: gtk::Box,
+    done_upgrade_slot: gtk::Box,
+    idle_upgrade: sidebar::UpgradeCard,
+    ready_upgrade: sidebar::UpgradeCard,
+    done_upgrade: sidebar::UpgradeCard,
+    release_upgrade_version: Cell<Option<u32>>,
+    release_upgrade_days: Cell<Option<u32>>,
+    sidebar_upgrade_allowed: Cell<bool>,
+    inline_upgrade_slot: Cell<sidebar::InlineUpgradeSlot>,
+    persist_prefs: Cell<bool>,
+    prefs: RefCell<prefs::UiPrefs>,
+    prefs_save_source: RefCell<Option<glib::SourceId>>,
     header_refresh: Button,
-    upgrade_notice: gtk::Box,
-    upgrade_action: Button,
-    upgrade_title: Label,
-    upgrade_age: Label,
     stack: Stack,
     toast: ToastOverlay,
     idle_page: StatusPage,
@@ -76,6 +97,7 @@ struct Widgets {
     run_progress: ProgressBar,
     run_progress_meta: Label,
     run_progress_pct: Label,
+    progress_ring: charts::ProgressRing,
     now_playing_badge: Label,
     now_playing_title: Label,
     now_playing_subtitle: Label,
@@ -112,17 +134,71 @@ struct Widgets {
     cache_cursor: RefCell<Option<(PathBuf, u64)>>,
 }
 
+fn set_accessible_label(widget: &impl IsA<gtk::Accessible>, label: &str) {
+    widget.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
 fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widgets> {
+    let sidebar_host: gtk::Box = obj(builder, "sidebar_host");
+    let sidebar = sidebar::Sidebar::new();
+    sidebar_host.append(sidebar.root());
+
+    let idle_upgrade_slot: gtk::Box = obj(builder, "idle_upgrade_slot");
+    let idle_upgrade = sidebar::UpgradeCard::new_inline();
+    idle_upgrade_slot.append(idle_upgrade.root());
+
+    let ready_upgrade_slot: gtk::Box = obj(builder, "ready_upgrade_slot");
+    let ready_upgrade = sidebar::UpgradeCard::new_inline();
+    ready_upgrade_slot.append(ready_upgrade.root());
+
+    let done_upgrade_slot: gtk::Box = obj(builder, "done_upgrade_slot");
+    let done_upgrade = sidebar::UpgradeCard::new_inline();
+    done_upgrade_slot.append(done_upgrade.root());
+
+    let now_playing_ring_slot: gtk::Box = obj(builder, "now_playing_ring_slot");
+    let progress_ring = charts::ProgressRing::new();
+    now_playing_ring_slot.append(progress_ring.widget());
+
+    let sidebar_toggle: ToggleButton = obj(builder, "sidebar_toggle");
+    let sidebar_close_btn: Button = obj(builder, "sidebar_close_btn");
+    let header_refresh: Button = obj(builder, "header_refresh");
+    let header_menu: gtk::MenuButton = obj(builder, "header_menu");
+    set_accessible_label(&sidebar_toggle, "Toggle Sidebar");
+    set_accessible_label(&sidebar_close_btn, "Return to Updates");
+    set_accessible_label(&header_refresh, "Refresh");
+    set_accessible_label(&header_menu, "Main Menu");
+
+    bind_style_manager(&window);
+
     Rc::new(Widgets {
         window,
+        split_view: obj(builder, "split_view"),
+        detail_toolbar: obj(builder, "detail_toolbar"),
+        ready_toolbar: obj(builder, "ready_toolbar"),
+        done_toolbar: obj(builder, "done_toolbar"),
         window_title: obj(builder, "window_title"),
         header_subtitle: RefCell::new(String::new()),
+        compact: Cell::new(false),
         narrow: Cell::new(false),
-        header_refresh: obj(builder, "header_refresh"),
-        upgrade_notice: obj(builder, "upgrade_notice"),
-        upgrade_action: obj(builder, "upgrade_action"),
-        upgrade_title: obj(builder, "upgrade_title"),
-        upgrade_age: obj(builder, "upgrade_age"),
+        sidebar_open: Cell::new(true),
+        ignore_sidebar_toggle: Cell::new(false),
+        sidebar_toggle,
+        sidebar_close_btn,
+        sidebar,
+        idle_upgrade_slot,
+        ready_upgrade_slot,
+        done_upgrade_slot,
+        idle_upgrade,
+        ready_upgrade,
+        done_upgrade,
+        release_upgrade_version: Cell::new(None),
+        release_upgrade_days: Cell::new(None),
+        sidebar_upgrade_allowed: Cell::new(true),
+        inline_upgrade_slot: Cell::new(sidebar::InlineUpgradeSlot::Idle),
+        persist_prefs: Cell::new(false),
+        prefs: RefCell::new(prefs::UiPrefs::default()),
+        prefs_save_source: RefCell::new(None),
+        header_refresh,
         stack: obj(builder, "stack"),
         toast: obj(builder, "toast"),
         idle_page: obj(builder, "idle_page"),
@@ -146,6 +222,7 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         run_progress: obj(builder, "run_progress"),
         run_progress_meta: obj(builder, "run_progress_meta"),
         run_progress_pct: obj(builder, "run_progress_pct"),
+        progress_ring,
         now_playing_badge: obj(builder, "now_playing_badge"),
         now_playing_title: obj(builder, "now_playing_title"),
         now_playing_subtitle: obj(builder, "now_playing_subtitle"),
@@ -181,6 +258,139 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
     })
 }
 
+fn sync_dark_class(style_mgr: &StyleManager, window: &ApplicationWindow) {
+    if style_mgr.is_dark() {
+        window.add_css_class("is-dark");
+    } else {
+        window.remove_css_class("is-dark");
+    }
+}
+
+fn bind_style_manager(window: &ApplicationWindow) {
+    let style_mgr = StyleManager::default();
+    sync_dark_class(&style_mgr, window);
+    let win_weak = window.downgrade();
+    let handler_id = style_mgr.connect_dark_notify(move |mgr| {
+        if let Some(win) = win_weak.upgrade() {
+            sync_dark_class(mgr, &win);
+        }
+    });
+    let mgr_for_destroy = style_mgr.clone();
+    let handler_cell = Cell::new(Some(handler_id));
+    window.connect_destroy(move |_| {
+        if let Some(id) = handler_cell.take() {
+            mgr_for_destroy.disconnect(id);
+        }
+    });
+}
+
+fn is_compact_viewport(w: &Widgets) -> bool {
+    w.compact.get() || w.narrow.get()
+}
+
+fn effective_sidebar_collapsed(w: &Widgets) -> bool {
+    is_compact_viewport(w) || !w.sidebar_open.get()
+}
+
+fn sync_shell_layout(w: &Widgets) {
+    let compact = is_compact_viewport(w);
+    let collapsed = compact || !w.sidebar_open.get();
+    w.split_view.set_collapsed(collapsed);
+    if !compact {
+        w.split_view.set_show_content(true);
+    }
+
+    let toggle_active = if collapsed {
+        !w.split_view.shows_content()
+    } else {
+        true
+    };
+    w.ignore_sidebar_toggle.set(true);
+    w.sidebar_toggle.set_active(toggle_active);
+    w.ignore_sidebar_toggle.set(false);
+    w.sidebar_toggle.set_tooltip_text(Some(if toggle_active {
+        "Hide Sidebar (F9)"
+    } else {
+        "Show Sidebar (F9)"
+    }));
+    w.sidebar_close_btn
+        .set_visible(collapsed && !w.split_view.shows_content());
+
+    sync_release_upgrade_cards(w);
+}
+
+fn capture_window_prefs(w: &Widgets) -> prefs::UiPrefs {
+    let mut current = *w.prefs.borrow();
+    current.sidebar_open = w.sidebar_open.get();
+    if !w.window.is_maximized() && !w.window.is_fullscreen() {
+        let (default_w, default_h) = w.window.default_size();
+        let width = if w.window.width() > 0 {
+            w.window.width()
+        } else {
+            default_w
+        };
+        let height = if w.window.height() > 0 {
+            w.window.height()
+        } else {
+            default_h
+        };
+        if width >= prefs::MIN_WINDOW_WIDTH {
+            current.window_width = width;
+        }
+        if height >= prefs::MIN_WINDOW_HEIGHT {
+            current.window_height = height;
+        }
+    }
+    let normalized = current.normalized();
+    *w.prefs.borrow_mut() = normalized;
+    normalized
+}
+
+fn schedule_prefs_save(w: &Rc<Widgets>) {
+    if !w.persist_prefs.get() {
+        return;
+    }
+    capture_window_prefs(w);
+    if let Some(source) = w.prefs_save_source.borrow_mut().take() {
+        source.remove();
+    }
+    let weak = Rc::downgrade(w);
+    let source = glib::timeout_add_local_once(Duration::from_millis(350), move || {
+        let Some(widgets) = weak.upgrade() else {
+            return;
+        };
+        *widgets.prefs_save_source.borrow_mut() = None;
+        if widgets.persist_prefs.get() {
+            let latest = capture_window_prefs(&widgets);
+            let _ = prefs::save(&latest);
+        }
+    });
+    *w.prefs_save_source.borrow_mut() = Some(source);
+}
+
+fn flush_prefs_on_close(w: &Widgets) {
+    if let Some(source) = w.prefs_save_source.borrow_mut().take() {
+        source.remove();
+    }
+    if !w.persist_prefs.get() {
+        return;
+    }
+    let latest = capture_window_prefs(w);
+    let _ = prefs::save(&latest);
+}
+
+fn toggle_sidebar(w: &Rc<Widgets>) {
+    if is_compact_viewport(w) {
+        w.split_view.set_show_content(!w.split_view.shows_content());
+        sync_shell_layout(w);
+    } else {
+        let next = !w.sidebar_open.get();
+        w.sidebar_open.set(next);
+        sync_shell_layout(w);
+        schedule_prefs_save(w);
+    }
+}
+
 #[cfg(test)]
 impl Widgets {
     fn for_test() -> Rc<Self> {
@@ -206,7 +416,13 @@ pub fn build(app: &Application) {
     let window: ApplicationWindow = obj(&builder, "window");
     window.set_application(Some(app));
 
+    let loaded_prefs = prefs::load();
+    window.set_default_size(loaded_prefs.window_width, loaded_prefs.window_height);
+
     let widgets = widgets_from_builder(&builder, window.clone());
+    widgets.sidebar_open.set(loaded_prefs.sidebar_open);
+    *widgets.prefs.borrow_mut() = loaded_prefs;
+    widgets.persist_prefs.set(!prefs::is_persistence_disabled());
 
     let about = gio::SimpleAction::new("about", None);
     {
@@ -225,22 +441,16 @@ pub fn build(app: &Application) {
     }
     window.add_action(&view_log);
 
+    let toggle_sidebar_action = gio::SimpleAction::new("toggle-sidebar", None);
     {
         let widgets = widgets.clone();
-        let breakpoint: Breakpoint = obj(&builder, "narrow_breakpoint");
-        breakpoint.connect_apply(move |_| {
-            widgets.narrow.set(true);
-            apply_header_subtitle(&widgets);
-        });
+        toggle_sidebar_action.connect_activate(move |_, _| toggle_sidebar(&widgets));
     }
-    {
-        let widgets = widgets.clone();
-        let breakpoint: Breakpoint = obj(&builder, "narrow_breakpoint");
-        breakpoint.connect_unapply(move |_| {
-            widgets.narrow.set(false);
-            apply_header_subtitle(&widgets);
-        });
-    }
+    window.add_action(&toggle_sidebar_action);
+    app.set_accels_for_action("win.toggle-sidebar", &["F9", "<Primary>backslash"]);
+
+    wire_breakpoints(&widgets, &builder);
+    wire_shell_controls(&widgets);
 
     let idle_btn = widgets.idle_btn.clone();
     let header_refresh = widgets.header_refresh.clone();
@@ -254,6 +464,26 @@ pub fn build(app: &Application) {
     wire_expander(&widgets);
 
     let (tx, rx) = async_channel::unbounded::<WorkerMsg>();
+
+    let refresh_action = gio::SimpleAction::new("refresh", None);
+    {
+        let state = state.clone();
+        let console = console.clone();
+        let widgets = widgets.clone();
+        let tx = tx.clone();
+        refresh_action.connect_activate(move |_, _| {
+            let can_refresh = matches!(
+                state.borrow().phase,
+                Phase::Ready { .. }
+                    | Phase::Idle(IdleScreen::Current { .. } | IdleScreen::Warning { .. })
+            );
+            if can_refresh {
+                start_check(&state, &console, &widgets, tx.clone(), false);
+            }
+        });
+    }
+    window.add_action(&refresh_action);
+    app.set_accels_for_action("win.refresh", &["<Primary>r", "F5"]);
 
     {
         let state = state.clone();
@@ -273,16 +503,7 @@ pub fn build(app: &Application) {
             start_check(&state, &console, &widgets, tx.clone(), false);
         });
     }
-    {
-        let state = state.clone();
-        let window = widgets.window.clone();
-        widgets.upgrade_action.connect_clicked(move |_| {
-            let Some(version) = state.borrow().release_upgrade else {
-                return;
-            };
-            dialogs::present_upgrade_dialog(&window, version);
-        });
-    }
+    wire_upgrade_buttons(&widgets, &state);
     {
         let state = state.clone();
         let console = console.clone();
@@ -428,11 +649,24 @@ pub fn build(app: &Application) {
         });
     }
 
-    window.connect_close_request(move |_| {
-        cancel_background_work();
-        release_privileges();
-        glib::Propagation::Proceed
-    });
+    {
+        let widgets = widgets.clone();
+        window.connect_default_width_notify(move |_| schedule_prefs_save(&widgets));
+    }
+    {
+        let widgets = widgets.clone();
+        window.connect_default_height_notify(move |_| schedule_prefs_save(&widgets));
+    }
+
+    {
+        let widgets = widgets.clone();
+        window.connect_close_request(move |_| {
+            flush_prefs_on_close(&widgets);
+            cancel_background_work();
+            release_privileges();
+            glib::Propagation::Proceed
+        });
+    }
 
     {
         let hooked = widgets.clone();
@@ -444,6 +678,7 @@ pub fn build(app: &Application) {
         });
     }
 
+    sync_shell_layout(&widgets);
     render(&state.borrow(), &console.borrow(), &widgets);
     spawn_release_lookup(&state, &console, &widgets);
     {
@@ -457,6 +692,143 @@ pub fn build(app: &Application) {
     maybe_open_preview_completed(&widgets);
     window.present();
     preview::maybe_schedule_screenshot(&window);
+}
+
+fn wire_breakpoints(widgets: &Rc<Widgets>, builder: &Builder) {
+    let compact_bp: Breakpoint = obj(builder, "compact_breakpoint");
+    {
+        let widgets = widgets.clone();
+        compact_bp.connect_apply(move |_| {
+            widgets.compact.set(true);
+            sync_shell_layout(&widgets);
+        });
+    }
+    {
+        let widgets = widgets.clone();
+        compact_bp.connect_unapply(move |_| {
+            widgets.compact.set(false);
+            sync_shell_layout(&widgets);
+        });
+    }
+
+    let narrow_bp: Breakpoint = obj(builder, "narrow_breakpoint");
+    {
+        let widgets = widgets.clone();
+        narrow_bp.connect_apply(move |_| {
+            widgets.narrow.set(true);
+            apply_header_subtitle(&widgets);
+            sync_shell_layout(&widgets);
+        });
+    }
+    {
+        let widgets = widgets.clone();
+        narrow_bp.connect_unapply(move |_| {
+            widgets.narrow.set(false);
+            apply_header_subtitle(&widgets);
+            sync_shell_layout(&widgets);
+        });
+    }
+}
+
+fn wire_shell_controls(widgets: &Rc<Widgets>) {
+    {
+        let sidebar_toggle = widgets.sidebar_toggle.clone();
+        let widgets = widgets.clone();
+        sidebar_toggle.connect_toggled(move |btn| {
+            if widgets.ignore_sidebar_toggle.get() {
+                return;
+            }
+            if is_compact_viewport(&widgets) {
+                widgets.split_view.set_show_content(!btn.is_active());
+                sync_shell_layout(&widgets);
+            } else {
+                widgets.sidebar_open.set(btn.is_active());
+                sync_shell_layout(&widgets);
+                schedule_prefs_save(&widgets);
+            }
+        });
+    }
+    {
+        let sidebar_close_btn = widgets.sidebar_close_btn.clone();
+        let widgets = widgets.clone();
+        sidebar_close_btn.connect_clicked(move |_| {
+            widgets.split_view.set_show_content(true);
+            sync_shell_layout(&widgets);
+        });
+    }
+    {
+        let split_view = widgets.split_view.clone();
+        let widgets = widgets.clone();
+        split_view.connect_show_content_notify(move |_| {
+            sync_shell_layout(&widgets);
+        });
+    }
+    {
+        let window = widgets.window.clone();
+        let widgets = widgets.clone();
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gtk::gdk::Key::Escape
+                && widgets.split_view.is_collapsed()
+                && !widgets.split_view.shows_content()
+            {
+                widgets.split_view.set_show_content(true);
+                sync_shell_layout(&widgets);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        window.add_controller(key);
+    }
+
+    let close_compact_drawer = |w: &Rc<Widgets>| {
+        if w.split_view.is_collapsed() {
+            w.split_view.set_show_content(true);
+            sync_shell_layout(w);
+        }
+    };
+
+    let on_source = {
+        let widgets = widgets.clone();
+        move |_filter: sidebar::SourceFilter| {
+            close_compact_drawer(&widgets);
+        }
+    };
+    let on_updates = {
+        let widgets = widgets.clone();
+        move || {
+            close_compact_drawer(&widgets);
+        }
+    };
+    let on_activity_log = {
+        let widgets = widgets.clone();
+        move || {
+            close_compact_drawer(&widgets);
+            let _ = WidgetExt::activate_action(&widgets.window, "win.view-log", None);
+        }
+    };
+    widgets
+        .sidebar
+        .wire_navigation(on_source, on_updates, on_activity_log);
+}
+
+fn wire_upgrade_buttons(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppState>>) {
+    for card in [
+        widgets.sidebar.upgrade_card(),
+        &widgets.idle_upgrade,
+        &widgets.ready_upgrade,
+        &widgets.done_upgrade,
+    ] {
+        let state = state.clone();
+        let window = widgets.window.clone();
+        card.action().connect_clicked(move |_| {
+            let Some(version) = state.borrow().release_upgrade else {
+                return;
+            };
+            dialogs::present_upgrade_dialog(&window, version);
+        });
+    }
 }
 
 fn start_check(
@@ -790,10 +1162,10 @@ fn restore_default_window_size(window: &ApplicationWindow) {
     }
     let width = window.width();
     let height = window.height();
-    if height > DEFAULT_HEIGHT + 24 {
+    if height > DEFAULT_WINDOW_HEIGHT + 24 {
         window.set_default_size(
-            if width > 0 { width } else { DEFAULT_WIDTH },
-            DEFAULT_HEIGHT,
+            if width > 0 { width } else { DEFAULT_WINDOW_WIDTH },
+            DEFAULT_WINDOW_HEIGHT,
         );
     }
 }
@@ -982,6 +1354,7 @@ fn render_running(running: &RunningState, elapsed: u64, last_console: &str, w: &
     } else {
         w.now_playing_size.set_visible(false);
     }
+    w.progress_ring.set_progress(running.work_progress, false);
     if let Some(frac) = running.work_progress {
         let frac = frac.clamp(0.0, 1.0);
         w.now_playing_spinner.set_opacity(0.0);
@@ -1069,25 +1442,54 @@ fn clear_idle_check_focus(w: &Widgets) {
     }
 }
 
-fn paint_release_upgrade(w: &Widgets, version: Option<u32>, days: Option<u32>) {
-    let Some(version) = version else {
-        w.upgrade_notice.set_visible(false);
-        return;
+fn sync_release_upgrade_cards(w: &Widgets) {
+    let version = w.release_upgrade_version.get();
+    let days = w.release_upgrade_days.get();
+    let collapsed = effective_sidebar_collapsed(w);
+    let sidebar_visible = version.is_some() && w.sidebar_upgrade_allowed.get() && !collapsed;
+    w.sidebar.paint_upgrade(version, days, sidebar_visible);
+
+    let slot = if version.is_some() && collapsed {
+        w.inline_upgrade_slot.get()
+    } else {
+        sidebar::InlineUpgradeSlot::None
     };
-    let title = fedora_updater::release_upgrade::banner_title(version);
-    let name = fedora_updater::release_upgrade::upgrade_button_name(version);
-    w.upgrade_title.set_label(&title);
-    w.upgrade_action.set_tooltip_text(Some(&name));
-    w.upgrade_action
-        .update_property(&[gtk::accessible::Property::Label(&name)]);
-    match days.map(fedora_updater::release_upgrade::release_age_caption) {
-        Some(caption) => {
-            w.upgrade_age.set_label(&caption);
-            w.upgrade_age.set_visible(true);
-        }
-        None => w.upgrade_age.set_visible(false),
+
+    w.idle_upgrade
+        .paint(version, days, slot == sidebar::InlineUpgradeSlot::Idle);
+    w.idle_upgrade_slot
+        .set_visible(w.idle_upgrade.root().get_visible());
+
+    w.ready_upgrade
+        .paint(version, days, slot == sidebar::InlineUpgradeSlot::Ready);
+    w.ready_upgrade_slot
+        .set_visible(w.ready_upgrade.root().get_visible());
+
+    w.done_upgrade
+        .paint(version, days, slot == sidebar::InlineUpgradeSlot::Done);
+    let done_upgrade_visible = w.done_upgrade.root().get_visible();
+    w.done_upgrade_slot.set_visible(done_upgrade_visible);
+    if done_upgrade_visible {
+        w.done_installed_scroll.set_visible(true);
     }
-    w.upgrade_notice.set_visible(true);
+}
+
+fn paint_release_upgrade(w: &Widgets, version: Option<u32>, days: Option<u32>) {
+    w.release_upgrade_version.set(version);
+    w.release_upgrade_days.set(days);
+    sync_release_upgrade_cards(w);
+}
+
+fn toolbar_styles_for_phase(phase: &Phase) -> (ToolbarStyle, ToolbarStyle) {
+    match phase {
+        Phase::Idle(_) | Phase::Authenticating { .. } | Phase::Failed { .. } => {
+            (ToolbarStyle::Flat, ToolbarStyle::Flat)
+        }
+        Phase::Checking { .. }
+        | Phase::Ready { .. }
+        | Phase::Running(_)
+        | Phase::Done { .. } => (ToolbarStyle::Raised, ToolbarStyle::Raised),
+    }
 }
 
 fn spawn_release_lookup(
@@ -1123,11 +1525,22 @@ fn spawn_release_lookup(
 fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
     w.run_stall.set_revealed(false);
     clear_idle_check_focus(w);
+    let (top_style, bottom_style) = toolbar_styles_for_phase(&state.phase);
+    w.detail_toolbar.set_top_bar_style(top_style);
+    w.detail_toolbar.set_bottom_bar_style(bottom_style);
+    w.sidebar_upgrade_allowed
+        .set(sidebar::release_upgrade_allowed_in_sidebar(&state.phase));
+    w.inline_upgrade_slot
+        .set(sidebar::release_upgrade_inline_slot(&state.phase));
     paint_release_upgrade(w, state.release_upgrade, state.release_age_days);
+    w.sidebar.paint(state);
     sync_console_drawer(
         w,
         matches!(state.phase, Phase::Checking { .. } | Phase::Running(_)),
     );
+    if !matches!(state.phase, Phase::Running(_)) {
+        w.progress_ring.set_progress(None, false);
+    }
     let elapsed = state
         .stopwatch
         .as_ref()
@@ -1223,6 +1636,7 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 w.ready_banner.set_revealed(false);
             }
             w.ready_update.set_sensitive(!packages.is_empty());
+            w.ready_group.set_visible(!packages.is_empty());
 
             rows::refill_group(
                 &w.ready_group,
@@ -1285,6 +1699,7 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             }
             w.done_installed
                 .set_title(if *failed > 0 { "Finished" } else { "Installed" });
+            w.done_installed.set_visible(!packages.is_empty());
             let mut listed: Vec<&fedora_updater::Package> = packages.iter().collect();
             listed.sort_by_key(|package| match package.status {
                 fedora_updater::PackageStatus::Failed => 0,
@@ -1298,7 +1713,8 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                     .into_iter()
                     .map(|package| rows::finished_row(package, false)),
             );
-            w.done_installed_scroll.set_visible(!packages.is_empty());
+            w.done_installed_scroll
+                .set_visible(!packages.is_empty() || w.done_upgrade_slot.get_visible());
         }
         Phase::Failed {
             title,
@@ -1369,6 +1785,39 @@ mod tests {
             );
         }
 
+        let compact_at = xml
+            .find("id=\"compact_breakpoint\"")
+            .expect("compact_breakpoint");
+        let narrow_at = xml
+            .find("id=\"narrow_breakpoint\"")
+            .expect("narrow_breakpoint");
+        assert!(
+            compact_at < narrow_at,
+            "widest breakpoint (720px) must precede narrower breakpoint (500px)"
+        );
+        assert!(object_block(xml, "compact_breakpoint").contains("max-width: 720px"));
+        assert!(object_block(xml, "narrow_breakpoint").contains("max-width: 500px"));
+
+        let split_block = object_block(xml, "split_view");
+        assert!(split_block.contains("AdwNavigationSplitView"));
+        assert!(split_block.contains("min-sidebar-width"));
+        assert!(split_block.contains("max-sidebar-width"));
+        assert!(split_block.contains("sidebar-width-fraction"));
+
+        assert!(object_block(xml, "sidebar_toggle").contains("sidebar-show-left-symbolic"));
+        assert!(
+            !xml.contains("id=\"upgrade_notice\""),
+            "persistent top toolbar upgrade_notice must be removed in Observatory"
+        );
+        assert!(
+            object_block(xml, "ready_toolbar")
+                .contains("<property name=\"bottom-bar-style\">1</property>")
+        );
+        assert!(
+            object_block(xml, "done_toolbar")
+                .contains("<property name=\"bottom-bar-style\">1</property>")
+        );
+
         assert!(
             object_block(xml, "stack").contains("vhomogeneous"),
             "stack must size every page to the window so Done/Idle fill after apply"
@@ -1378,14 +1827,7 @@ mod tests {
             "idle status page must expand to fill the stack"
         );
 
-        let action_at = xml.find("id=\"upgrade_action\"").expect("upgrade_action");
         let header_at = xml.find("id=\"header_menu\"").expect("header_menu");
-        let stack_at = xml.find("id=\"stack\"").expect("stack");
-        assert!(
-            header_at < action_at && action_at < stack_at,
-            "the release offer sits under the header and above the page stack"
-        );
-
         // AdwHeaderBar.pack_end prepends. The first end child is the trailing
         // app button, so the menu is emitted before Stop.
         let stop_at = xml.find("id=\"run_stop\"").expect("run_stop");
@@ -1766,17 +2208,28 @@ mod tests {
         assert!(!widgets.header_refresh.get_visible());
         assert!(!widgets.run_stop.get_visible());
         assert!(!widgets.console_drawer.get_visible());
-        assert!(widgets.upgrade_notice.get_visible());
-        assert!(widgets.upgrade_title.label().contains("Fedora Linux 45"));
-        assert!(widgets.upgrade_age.get_visible());
-        assert!(widgets.upgrade_age.label().contains("3 days"));
+        assert!(widgets.sidebar.upgrade_card().root().get_visible());
+        assert!(widgets
+            .sidebar
+            .upgrade_card()
+            .title()
+            .label()
+            .contains("Fedora Linux 45"));
+        assert!(widgets.sidebar.upgrade_card().age().get_visible());
+        assert!(widgets
+            .sidebar
+            .upgrade_card()
+            .age()
+            .label()
+            .contains("3 days"));
+        assert!(!widgets.idle_upgrade.root().get_visible());
 
-        // Release notice without age hides age label; None hides whole banner.
+        // Release notice without age hides age label; None hides whole card.
         super::paint_release_upgrade(&widgets, Some(45), None);
-        assert!(widgets.upgrade_notice.get_visible());
-        assert!(!widgets.upgrade_age.get_visible());
+        assert!(widgets.sidebar.upgrade_card().root().get_visible());
+        assert!(!widgets.sidebar.upgrade_card().age().get_visible());
         super::paint_release_upgrade(&widgets, None, None);
-        assert!(!widgets.upgrade_notice.get_visible());
+        assert!(!widgets.sidebar.upgrade_card().root().get_visible());
 
         // 2) Idle::Warning vs Idle::Current + Failed(RetryApply) & Done partial recovery.
         let warning_state = AppState {
@@ -2376,6 +2829,222 @@ mod tests {
         gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
 
+    fn verify_observatory_shell_theme_and_charts() {
+        use super::super::sidebar::SourceFilter;
+        use fedora_updater::console::ConsoleBuffer;
+        use fedora_updater::model::{AuthPurpose, IdleScreen, Package, RetryAction, RunPass, UpdateSource};
+        use fedora_updater::state::{AppState, Phase, RunningState};
+        use gtk::prelude::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // 1) All CSS rules in style.css parse with zero errors under GTK4.
+        let parse_errors = Rc::new(Cell::new(0usize));
+        let provider = gtk::CssProvider::new();
+        {
+            let parse_errors = parse_errors.clone();
+            provider.connect_parsing_error(move |_, section, err| {
+                parse_errors.set(parse_errors.get() + 1);
+                eprintln!("CSS parse error at {:?}: {err}", section.start_location());
+            });
+        }
+        provider.load_from_string(include_str!("../style.css"));
+        assert_eq!(parse_errors.get(), 0, "style.css must parse cleanly in GTK4");
+
+        // 2) StyleManager notify::dark toggles `.is-dark` on ApplicationWindow.
+        let widgets = super::Widgets::for_test();
+        super::wire_shell_controls(&widgets);
+        super::sync_shell_layout(&widgets);
+        let style_mgr = libadwaita::StyleManager::default();
+        let initial_scheme = style_mgr.color_scheme();
+        style_mgr.set_color_scheme(libadwaita::ColorScheme::ForceDark);
+        assert!(widgets.window.has_css_class("is-dark"));
+        style_mgr.set_color_scheme(libadwaita::ColorScheme::ForceLight);
+        assert!(!widgets.window.has_css_class("is-dark"));
+        style_mgr.set_color_scheme(initial_scheme);
+
+        let console = ConsoleBuffer::new(100);
+
+        // 3) Dual-mode Workbench <-> Focused Lumen collapse & upgrade card placement.
+        let dnf_pkg = Package::new_dnf("firefox", "x86_64", "140.0", "updates");
+        let mut fp_pkg = Package::new_dnf("Thunderbird", "", "128.2.0", "flathub");
+        fp_pkg.source = UpdateSource::FlatpakUser;
+        let mut fw_pkg = Package::new_dnf("UEFI dbx", "", "20241101", "fwupd");
+        fw_pkg.source = UpdateSource::Firmware;
+        let packages = vec![dnf_pkg.clone(), fp_pkg.clone(), fw_pkg.clone()];
+
+        let idle_upgrade = AppState {
+            phase: Phase::Idle(IdleScreen::Fresh),
+            release_upgrade: Some(45),
+            release_age_days: Some(7),
+            ..Default::default()
+        };
+        super::render(&idle_upgrade, &console, &widgets);
+        assert!(!widgets.split_view.is_collapsed());
+        assert!(widgets.sidebar_toggle.is_active());
+        assert!(widgets.sidebar.upgrade_card().root().get_visible());
+        assert!(!widgets.idle_upgrade.root().get_visible());
+        assert_eq!(
+            widgets.detail_toolbar.top_bar_style(),
+            libadwaita::ToolbarStyle::Flat
+        );
+
+        // Toggle into Focused "Lumen" mode.
+        widgets.sidebar_toggle.set_active(false);
+        assert!(!widgets.sidebar_open.get());
+        assert!(widgets.split_view.is_collapsed());
+        assert!(widgets.split_view.shows_content());
+        assert!(!widgets.sidebar.upgrade_card().root().get_visible());
+        assert!(widgets.idle_upgrade.root().get_visible());
+        assert!(!widgets.ready_upgrade.root().get_visible());
+        assert!(!widgets.done_upgrade.root().get_visible());
+
+        // Lumen mode surfaces inline upgrade card inside Ready and Done clamps too.
+        let ready_upgrade = AppState {
+            phase: Phase::Ready {
+                packages: packages.clone(),
+                soft_errors: vec![],
+            },
+            release_upgrade: Some(45),
+            ..Default::default()
+        };
+        super::render(&ready_upgrade, &console, &widgets);
+        assert_eq!(
+            widgets.detail_toolbar.top_bar_style(),
+            libadwaita::ToolbarStyle::Raised
+        );
+        assert_eq!(
+            widgets.detail_toolbar.bottom_bar_style(),
+            libadwaita::ToolbarStyle::Raised
+        );
+        assert_eq!(
+            widgets.ready_toolbar.bottom_bar_style(),
+            libadwaita::ToolbarStyle::Raised
+        );
+        assert!(widgets.ready_upgrade.root().get_visible());
+        assert!(!widgets.idle_upgrade.root().get_visible());
+        assert_eq!(
+            widgets.sidebar.count_texts(),
+            ("3".into(), "1".into(), "1".into(), "1".into())
+        );
+
+        // Phase-2 controls must remain hidden in Phase 1.
+        assert!(!widgets.sidebar.view_history_row().get_visible());
+        assert!(!widgets.sidebar.sparkline_card().get_visible());
+        assert!(!widgets.sidebar.sparkline().widget().get_visible());
+
+        let done_upgrade = AppState {
+            phase: Phase::Done {
+                packages: packages.clone(),
+                duration: "1m".into(),
+                needs_reboot: false,
+                failed: 0,
+                failure_reasons: vec![],
+            },
+            release_upgrade: Some(45),
+            ..Default::default()
+        };
+        super::render(&done_upgrade, &console, &widgets);
+        assert_eq!(
+            widgets.done_toolbar.bottom_bar_style(),
+            libadwaita::ToolbarStyle::Raised
+        );
+        assert!(widgets.done_upgrade.root().get_visible());
+
+        // Authenticating & Running hide BOTH sidebar and inline upgrade cards in both modes.
+        let auth_upgrade = AppState {
+            phase: Phase::Authenticating {
+                purpose: AuthPurpose::Apply,
+                packages: packages.clone(),
+                last_checked: None,
+            },
+            release_upgrade: Some(45),
+            ..Default::default()
+        };
+        let running_upgrade = AppState {
+            phase: Phase::Running(RunningState {
+                packages: packages.clone(),
+                active_index: Some(0),
+                overall_progress: 0.4,
+                phase_label: "Installing".into(),
+                current_source: Some(UpdateSource::Dnf),
+                current_name: Some("firefox".into()),
+                work_progress: Some(0.72),
+                pass: RunPass::Apply,
+                stage: None,
+                needs_reboot: false,
+                failed_sources: vec![],
+                failure_reasons: vec![],
+            }),
+            release_upgrade: Some(45),
+            ..Default::default()
+        };
+        for st in [&auth_upgrade, &running_upgrade] {
+            super::render(st, &console, &widgets);
+            assert!(!widgets.sidebar.upgrade_card().root().get_visible());
+            assert!(!widgets.idle_upgrade.root().get_visible());
+            assert!(!widgets.ready_upgrade.root().get_visible());
+            assert!(!widgets.done_upgrade.root().get_visible());
+        }
+
+        // ProgressRing reflects Running item fraction and clears outside Running.
+        assert!((widgets.progress_ring.displayed_fraction() - 0.72).abs() < 1e-6);
+        assert!((widgets.progress_ring.target_fraction() - 0.72).abs() < 1e-6);
+        assert_eq!(widgets.progress_ring.label_text(), "72%");
+
+        let failed_state = AppState {
+            phase: Phase::Failed {
+                title: "Err".into(),
+                detail: "Detail".into(),
+                retry: RetryAction::CheckAgain,
+            },
+            release_upgrade: Some(45),
+            ..Default::default()
+        };
+        super::render(&failed_state, &console, &widgets);
+        assert_eq!(
+            widgets.detail_toolbar.top_bar_style(),
+            libadwaita::ToolbarStyle::Flat
+        );
+        assert_eq!(widgets.sidebar.pulse_headline_text(), "Err");
+        assert_eq!(widgets.progress_ring.displayed_fraction(), 0.0);
+        assert_eq!(widgets.progress_ring.label_text(), "");
+
+        // 4) Compact (<= 720px) + Narrow (<= 500px) breakpoint precedence preserves collapse.
+        widgets.sidebar_toggle.set_active(true);
+        assert!(widgets.sidebar_open.get());
+        assert!(!widgets.split_view.is_collapsed());
+
+        widgets.compact.set(true);
+        super::sync_shell_layout(&widgets);
+        assert!(widgets.split_view.is_collapsed());
+
+        // Simulates libadwaita unapplying compact_breakpoint when narrow_breakpoint activates.
+        widgets.compact.set(false);
+        widgets.narrow.set(true);
+        super::sync_shell_layout(&widgets);
+        assert!(super::is_compact_viewport(&widgets));
+        assert!(widgets.split_view.is_collapsed());
+
+        // Widening back restores Workbench mode since sidebar_open remained true.
+        widgets.narrow.set(false);
+        super::sync_shell_layout(&widgets);
+        assert!(!widgets.split_view.is_collapsed());
+
+        // 5) Sidebar source navigation and sparkline scaffold API work cleanly.
+        if let Some(apps_row) = widgets.sidebar.sources_list().row_at_index(2) {
+            apps_row.activate();
+            assert_eq!(widgets.sidebar.selected_source(), SourceFilter::Apps);
+        }
+        widgets
+            .sidebar
+            .sparkline()
+            .push_sample(12.5 * 1024.0 * 1024.0, Some((100, 200)));
+        widgets.sidebar.sparkline().clear();
+
+        gtk::prelude::GtkWindowExt::destroy(&widgets.window);
+    }
+
     /// Serialized on a single thread because GTK4/Libadwaita asserts main-thread ownership.
     #[test]
     fn gtk_widget_window_rows_and_dialogs_e2e() {
@@ -2396,5 +3065,6 @@ mod tests {
         verify_all_phases_narrow_and_recovery();
         verify_console_drawer_and_deltas();
         verify_handle_worker_full_replay();
+        verify_observatory_shell_theme_and_charts();
     }
 }

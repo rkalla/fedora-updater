@@ -1,17 +1,4 @@
-/* Adwaita tokens, matching docs/mockups/boards/boards.css */
-
-/* Inset control, not a second header bar. The toolbar slot would otherwise
-   paint this strip like window chrome. */
-.upgrade-notice {
-  background: none;
-  box-shadow: none;
-}
-
-button.upgrade-offer {
-  border-radius: 12px;
-  background-color: @card_bg_color;
-  border: 1px solid alpha(@window_fg_color, 0.18);
-}
+/* Observatory design tokens — GTK 4 / libadwaita Light, Dark (.is-dark), and High-Contrast. */
 
 .upgrade-command {
   border-radius: 12px;
@@ -19,8 +6,16 @@ button.upgrade-offer {
   border: 1px solid alpha(@window_fg_color, 0.14);
 }
 
+.upgrade-card {
+  background-color: alpha(@accent_bg_color, 0.06);
+}
+
+window.is-dark .upgrade-card {
+  background-color: alpha(@accent_bg_color, 0.10);
+}
+
 .progress-block {
-  margin: 0 12px 12px;
+  margin: 0;
 }
 
 /* Let list viewports shrink inside the window instead of growing it. */
@@ -53,32 +48,152 @@ button.upgrade-offer {
 }
 
 .package-badge.src-dnf {
-  color: @accent_color;
-  background-color: alpha(@accent_bg_color, 0.15);
+  color: #1c71d8;
+  background-color: alpha(@accent_bg_color, 0.12);
+}
+
+window.is-dark .package-badge.src-dnf {
+  color: #78aeed;
+  background-color: alpha(@accent_bg_color, 0.16);
 }
 
 .package-badge.src-flatpak {
-  color: @purple_1;
-  background-color: alpha(@purple_1, 0.15);
+  color: #813d9c;
+  background-color: alpha(#813d9c, 0.12);
+}
+
+window.is-dark .package-badge.src-flatpak {
+  color: #dc8add;
+  background-color: alpha(#dc8add, 0.16);
 }
 
 .package-badge.src-firmware {
-  color: @warning_color;
-  background-color: alpha(@warning_color, 0.15);
+  color: #9e5a00;
+  background-color: alpha(@warning_bg_color, 0.16);
 }
 
-.pkg-row.pending {
-  opacity: 0.72;
+window.is-dark .package-badge.src-firmware {
+  color: #f8c555;
+  background-color: alpha(@warning_bg_color, 0.16);
+}
+
+.micro-tag {
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 0.72em;
+}
+
+.tag-sec {
+  color: #c01c28;
+  background-color: alpha(@error_bg_color, 0.11);
+}
+
+window.is-dark .tag-sec {
+  color: #ff7b72;
+  background-color: alpha(@error_bg_color, 0.16);
+}
+
+.tag-reboot {
+  color: #9e5a00;
+  background-color: alpha(@warning_bg_color, 0.15);
+}
+
+window.is-dark .tag-reboot {
+  color: #f8c555;
+  background-color: alpha(@warning_bg_color, 0.16);
 }
 
 .pkg-row.active {
   background-color: alpha(@accent_bg_color, 0.10);
 }
 
-.pkg-row.done {
-  opacity: 0.82;
+window.is-dark .pkg-row.active {
+  background-color: alpha(@accent_bg_color, 0.14);
 }
 
 .phase-tag {
   font-weight: 600;
+}
+
+.sidebar-section-label {
+  font-weight: 700;
+  font-size: 0.76em;
+  letter-spacing: 0.04em;
+}
+
+.sidebar-count-pill {
+  min-width: 1.4em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-weight: 700;
+  background-color: alpha(@window_fg_color, 0.08);
+  color: alpha(@window_fg_color, 0.78);
+}
+
+row:selected .sidebar-count-pill {
+  background-color: alpha(@accent_bg_color, 0.18);
+  color: @accent_color;
+}
+
+.pulse-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 999px;
+  background-color: #1a8345;
+}
+
+window.is-dark .pulse-dot {
+  background-color: #57e389;
+}
+
+.pulse-dot.pulse-warn {
+  background-color: #9e5a00;
+}
+
+window.is-dark .pulse-dot.pulse-warn {
+  background-color: #f8c555;
+}
+
+.pulse-dot.pulse-err {
+  background-color: #c01c28;
+}
+
+window.is-dark .pulse-dot.pulse-err {
+  background-color: #ff7b72;
+}
+
+.source-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 999px;
+}
+
+.source-dot.src-dnf {
+  background-color: #1c71d8;
+}
+
+window.is-dark .source-dot.src-dnf {
+  background-color: #78aeed;
+}
+
+.source-dot.src-flatpak {
+  background-color: #813d9c;
+}
+
+window.is-dark .source-dot.src-flatpak {
+  background-color: #dc8add;
+}
+
+.source-dot.src-firmware {
+  background-color: #9e5a00;
+}
+
+window.is-dark .source-dot.src-firmware {
+  background-color: #f8c555;
+}
+
+.progress-ring-label {
+  font-size: 11px;
+  font-weight: 700;
 }

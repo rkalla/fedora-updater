@@ -1,6 +1,9 @@
+mod charts;
 mod dialogs;
+mod prefs;
 mod preview;
 mod rows;
+mod sidebar;
 pub mod window;
 
 use gtk::glib;
