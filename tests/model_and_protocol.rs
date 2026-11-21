@@ -113,7 +113,6 @@ fn every_helper_command_has_nonempty_safe_argv() {
         HelperCommand::CheckFwupd,
         HelperCommand::ApplyFwupd,
         HelperCommand::CheckFwupdReboot,
-        HelperCommand::ApplyFlatpakSystem,
     ];
     for cmd in all {
         let argv = cmd.argv();

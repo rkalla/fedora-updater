@@ -3,19 +3,28 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT="$ROOT/scripts/$(basename "$0")"
 PREFIX="${PREFIX:-/usr}"
 BIN_DIR="${PREFIX}/bin"
 POLICY_DIR="${PREFIX}/share/polkit-1/actions"
 
 if [[ "${EUID}" -ne 0 ]]; then
+  "$ROOT/build"
   echo "Re-running with pkexec…"
-  exec pkexec env PREFIX="$PREFIX" bash "$0" "$@"
+  exec pkexec env PREFIX="$PREFIX" bash "$SCRIPT" "$@"
 fi
 
-cargo build --release --bin fedora-updater --manifest-path "$ROOT/Cargo.toml"
+BIN_SRC="$ROOT/target/release/fedora-updater"
+if [[ ! -x "$BIN_SRC" ]]; then
+  BIN_SRC="$ROOT/bin/fedora-updater"
+fi
+if [[ ! -x "$BIN_SRC" ]]; then
+  echo "error: release binary missing; run ./build as an unprivileged user first" >&2
+  exit 1
+fi
 
 install -d "$BIN_DIR" "$POLICY_DIR"
-install -m 755 "$ROOT/target/release/fedora-updater" "$BIN_DIR/fedora-updater"
+install -m 755 "$BIN_SRC" "$BIN_DIR/fedora-updater"
 install -m 644 "$ROOT/data/dev.fedora.Updater.policy" "$POLICY_DIR/dev.fedora.Updater.policy"
 
 # Clean up old split-helper install if present

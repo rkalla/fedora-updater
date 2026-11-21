@@ -10,13 +10,14 @@
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::thread;
 
 use crate::helper_protocol::{
     format_end_line, ClientRequest, HelperCommand, BYE_LINE, DRAW_PREFIX, HELLO_LINE,
 };
 
+const STDBUF_PATH: &str = "/usr/bin/stdbuf";
 /// Fully unbuffered stdio. `-oL` flushes on `\n` only, which hides `\r` updates.
 const STDBUF_ARGS: &[&str] = &["-o0", "-e0"];
 
@@ -215,7 +216,7 @@ fn drain_stream(mut reader: impl Read, tx: mpsc::Sender<StreamPiece>) {
 
 fn spawn_unbuffered(program: &str, args: &[&str]) -> io::Result<std::process::Child> {
     let mut cmd = if stdbuf_available() {
-        let mut cmd = Command::new("stdbuf");
+        let mut cmd = Command::new(STDBUF_PATH);
         cmd.args(STDBUF_ARGS);
         cmd.arg(program);
         cmd.args(args);
@@ -245,13 +246,16 @@ fn spawn_unbuffered(program: &str, args: &[&str]) -> io::Result<std::process::Ch
 }
 
 fn stdbuf_available() -> bool {
-    Command::new("stdbuf")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new(STDBUF_PATH)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -308,9 +312,9 @@ mod tests {
     #[test]
     fn only_allowlisted_argv() {
         let argv = HelperCommand::CheckDnf.argv();
-        assert_eq!(argv, &["dnf", "check-update", "--refresh"]);
+        assert_eq!(argv, &["/usr/bin/dnf", "check-update", "--refresh"]);
         let argv = HelperCommand::ApplyDnf.argv();
-        assert_eq!(argv, &["dnf", "update", "-y"]);
+        assert_eq!(argv, &["/usr/bin/dnf", "update", "-y"]);
         let argv = HelperCommand::ApplyFwupd.argv();
         assert!(argv.contains(&"--no-reboot-check"));
         assert!(argv.contains(&"-y"));

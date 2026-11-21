@@ -16,7 +16,7 @@
 -->
 <policyconfig>
   <vendor>Fedora Updater</vendor>
-  <vendor_url>https://github.com/example/fedora-updater</vendor_url>
+  <vendor_url>https://github.com/rkalla/fedora-updater</vendor_url>
   <icon_name>software-update-available</icon_name>
 
   <action id="dev.fedora.Updater.helper">
@@ -30,6 +30,5 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/fedora-updater</annotate>
-    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

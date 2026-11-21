@@ -66,11 +66,6 @@ where
     result
 }
 
-/// Whether `with_session` would need a new polkit prompt.
-pub fn would_prompt() -> bool {
-    !session_is_alive()
-}
-
 /// End the shared session. Must never block: GTK calls this from
 /// `close_request`, and a hung `fwupdmgr` can be holding the session lock
 /// inside `with_session` / `run_command`.

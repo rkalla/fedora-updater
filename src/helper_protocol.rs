@@ -43,7 +43,6 @@ pub enum HelperCommand {
     CheckFwupd,
     ApplyFwupd,
     CheckFwupdReboot,
-    ApplyFlatpakSystem,
 }
 
 impl HelperCommand {
@@ -55,7 +54,6 @@ impl HelperCommand {
             Self::CheckFwupd => "check-fwupd",
             Self::ApplyFwupd => "apply-fwupd",
             Self::CheckFwupdReboot => "check-fwupd-reboot",
-            Self::ApplyFlatpakSystem => "apply-flatpak-system",
         }
     }
 
@@ -67,7 +65,6 @@ impl HelperCommand {
             "check-fwupd" => Some(Self::CheckFwupd),
             "apply-fwupd" => Some(Self::ApplyFwupd),
             "check-fwupd-reboot" => Some(Self::CheckFwupdReboot),
-            "apply-flatpak-system" => Some(Self::ApplyFlatpakSystem),
             _ => None,
         }
     }
@@ -77,15 +74,15 @@ impl HelperCommand {
         match self {
             // --refresh forces repodata re-fetch (third-party repos like Brave)
             // so Check matches GNOME Software rather than a stale 48h cache.
-            Self::CheckDnf => &["dnf", "check-update", "--refresh"],
-            Self::ApplyDnf => &["dnf", "update", "-y"],
-            Self::CheckFwupdRefresh => &["fwupdmgr", "refresh"],
-            Self::CheckFwupd => &["fwupdmgr", "get-updates", "--json"],
+            Self::CheckDnf => &["/usr/bin/dnf", "check-update", "--refresh"],
+            Self::ApplyDnf => &["/usr/bin/dnf", "update", "-y"],
+            Self::CheckFwupdRefresh => &["/usr/bin/fwupdmgr", "refresh"],
+            Self::CheckFwupd => &["/usr/bin/fwupdmgr", "get-updates", "--json"],
             // --no-unreported-check / --no-device-prompt: post-update report and
             // device pickers block on stdin (the helper protocol pipe), same hang
             // as an interactive reboot prompt.
             Self::ApplyFwupd => &[
-                "fwupdmgr",
+                "/usr/bin/fwupdmgr",
                 "update",
                 "-y",
                 "--no-reboot-check",
@@ -94,10 +91,7 @@ impl HelperCommand {
             ],
             // --json disables the interactive "Restart now?" prompt. Without it
             // fwupdmgr waits on stdin after apply and the GUI never reaches Done.
-            Self::CheckFwupdReboot => &["fwupdmgr", "check-reboot-needed", "--json"],
-            Self::ApplyFlatpakSystem => {
-                &["flatpak", "update", "--system", "-y", "--noninteractive"]
-            }
+            Self::CheckFwupdReboot => &["/usr/bin/fwupdmgr", "check-reboot-needed", "--json"],
         }
     }
 
@@ -154,7 +148,6 @@ mod tests {
             HelperCommand::CheckFwupd,
             HelperCommand::ApplyFwupd,
             HelperCommand::CheckFwupdReboot,
-            HelperCommand::ApplyFlatpakSystem,
         ] {
             assert_eq!(HelperCommand::parse(cmd.as_id()), Some(cmd));
             let req = ClientRequest::parse(&cmd.encode_run()).unwrap();
@@ -168,6 +161,8 @@ mod tests {
         assert!(ClientRequest::parse("RUN rm -rf /").is_err());
         assert!(ClientRequest::parse("RUN check-dnf; reboot").is_err());
         assert!(ClientRequest::parse("RUN dnf update").is_err());
+        assert!(ClientRequest::parse("RUN apply-flatpak-system").is_err());
+        assert!(HelperCommand::parse("apply-flatpak-system").is_none());
         assert!(ClientRequest::parse("").is_err());
     }
 
@@ -201,7 +196,6 @@ mod tests {
         for cmd in [
             HelperCommand::CheckDnf,
             HelperCommand::ApplyDnf,
-            HelperCommand::ApplyFlatpakSystem,
             HelperCommand::ApplyFwupd,
         ] {
             for arg in cmd.argv() {
@@ -217,7 +211,7 @@ mod tests {
     #[test]
     fn check_fwupd_reboot_uses_json_so_it_cannot_prompt() {
         let argv = HelperCommand::CheckFwupdReboot.argv();
-        assert_eq!(argv[0], "fwupdmgr");
+        assert_eq!(argv[0], "/usr/bin/fwupdmgr");
         assert!(argv.contains(&"check-reboot-needed"));
         assert!(
             argv.contains(&"--json"),

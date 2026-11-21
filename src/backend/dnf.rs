@@ -385,21 +385,17 @@ fn split_name_from_vr(s: &str) -> Option<String> {
     if parts.len() < 2 {
         return None;
     }
-    while parts.len() >= 2 {
-        let last = parts[parts.len() - 1];
-        if last.chars().next()?.is_ascii_digit() || last.contains('.') {
+    let last = parts[parts.len() - 1];
+    if last.chars().next()?.is_ascii_digit() || last.contains('.') {
+        parts.pop();
+        if parts
+            .last()
+            .and_then(|p| p.chars().next())
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             parts.pop();
-            if parts
-                .last()
-                .and_then(|p| p.chars().next())
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false)
-            {
-                parts.pop();
-            }
-            break;
         }
-        break;
     }
     if parts.is_empty() {
         None

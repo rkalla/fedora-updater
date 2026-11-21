@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 use crate::helper_protocol::{parse_end_line, HelperCommand, HELLO_LINE};
 
@@ -58,17 +58,25 @@ pub enum SessionEvent {
 /// 2. `current_exe()` — normal case (GUI pkexec's itself with `--helper`)
 /// 3. `/usr/bin/fedora-updater` — system install
 pub fn helper_path() -> PathBuf {
-    if let Ok(p) = std::env::var("FEDORA_UPDATER_HELPER") {
-        return PathBuf::from(p);
+    let override_path = std::env::var_os("FEDORA_UPDATER_HELPER").map(PathBuf::from);
+    let current_exe = std::env::current_exe().ok().filter(|p| p.exists());
+    let usr_exists = Path::new("/usr/bin/fedora-updater").exists();
+    helper_path_with(override_path, current_exe, usr_exists)
+}
+
+fn helper_path_with(
+    override_path: Option<PathBuf>,
+    current_exe: Option<PathBuf>,
+    usr_exists: bool,
+) -> PathBuf {
+    if let Some(p) = override_path {
+        return p;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if exe.exists() {
-            return exe;
-        }
+    if let Some(exe) = current_exe {
+        return exe;
     }
-    let usr = PathBuf::from("/usr/bin/fedora-updater");
-    if usr.exists() {
-        return usr;
+    if usr_exists {
+        return PathBuf::from("/usr/bin/fedora-updater");
     }
     PathBuf::from("fedora-updater")
 }
@@ -77,8 +85,7 @@ pub fn helper_path() -> PathBuf {
 pub struct PrivilegedSession {
     child: Child,
     stdin: ChildStdin,
-    reader: Arc<Mutex<BufReader<std::process::ChildStdout>>>,
-    elevated: bool,
+    reader: BufReader<std::process::ChildStdout>,
 }
 
 impl PrivilegedSession {
@@ -141,13 +148,8 @@ impl PrivilegedSession {
         Ok(Self {
             child,
             stdin,
-            reader: Arc::new(Mutex::new(reader)),
-            elevated: !direct,
+            reader,
         })
-    }
-
-    pub fn is_elevated(&self) -> bool {
-        self.elevated
     }
 
     /// True while the helper child is still running (not exited/reaped).
@@ -172,14 +174,10 @@ impl PrivilegedSession {
             .flush()
             .map_err(|e| SessionError::Io(e.to_string()))?;
 
-        let mut reader = self
-            .reader
-            .lock()
-            .map_err(|_| SessionError::Io("reader lock poisoned".into()))?;
-
         loop {
             let mut line = String::new();
-            let n = reader
+            let n = self
+                .reader
                 .read_line(&mut line)
                 .map_err(|e| SessionError::Io(e.to_string()))?;
             if n == 0 {
@@ -194,19 +192,12 @@ impl PrivilegedSession {
         }
     }
 
-    pub fn quit(mut self) -> Result<(), SessionError> {
-        let _ = writeln!(self.stdin, "QUIT");
-        let _ = self.stdin.flush();
-        if let Ok(mut reader) = self.reader.try_lock() {
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line);
-        }
-        self.abort();
-        Ok(())
+    /// SIGKILL the helper. Does not wait for protocol BYE or a stuck `read_line`.
+    pub fn abort(self) {
+        drop(self);
     }
 
-    /// SIGKILL the helper. Does not wait for protocol BYE or a stuck `read_line`.
-    pub fn abort(mut self) {
+    fn kill_and_clear(&mut self) {
         let pid = self.child.id();
         let _ = self.child.kill();
         let _ = self.child.try_wait();
@@ -319,12 +310,15 @@ fn configure_helper_command(cmd: &mut Command) -> &mut Command {
 
 impl Drop for PrivilegedSession {
     fn drop(&mut self) {
-        let pid = self.child.id();
-        let _ = self.child.kill();
-        let _ = self.child.try_wait();
-        HELPER_PID
-            .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .ok();
+        self.kill_and_clear();
+    }
+}
+
+fn drain_lines(stream: impl std::io::Read, tx: mpsc::Sender<String>) {
+    for line in BufReader::new(stream).lines().flatten() {
+        if tx.send(line).is_err() {
+            break;
+        }
     }
 }
 
@@ -343,16 +337,27 @@ pub fn run_local_command(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    if let Some(out) = stdout {
-        for line in BufReader::new(out).lines().flatten() {
-            on_line(line);
+    let (tx, rx) = mpsc::channel::<String>();
+    let tx_err = tx.clone();
+
+    let t_out = std::thread::spawn(move || {
+        if let Some(out) = stdout {
+            drain_lines(out, tx);
         }
-    }
-    if let Some(err) = stderr {
-        for line in BufReader::new(err).lines().flatten() {
-            on_line(line);
+    });
+    let t_err = std::thread::spawn(move || {
+        if let Some(err) = stderr {
+            drain_lines(err, tx_err);
         }
+    });
+
+    for line in rx {
+        on_line(line);
     }
+
+    let _ = t_out.join();
+    let _ = t_err.join();
+
     let status = child.wait().map_err(|e| SessionError::Io(e.to_string()))?;
     Ok(status.code().unwrap_or(-1))
 }
@@ -363,9 +368,61 @@ mod tests {
 
     #[test]
     fn helper_path_respects_env() {
-        std::env::set_var("FEDORA_UPDATER_HELPER", "/tmp/fake-updater-xyz");
-        assert_eq!(helper_path(), PathBuf::from("/tmp/fake-updater-xyz"));
-        std::env::remove_var("FEDORA_UPDATER_HELPER");
+        assert_eq!(
+            helper_path_with(
+                Some(PathBuf::from("/tmp/fake-updater-xyz")),
+                Some(PathBuf::from("/some/exe")),
+                true,
+            ),
+            PathBuf::from("/tmp/fake-updater-xyz")
+        );
+        assert_eq!(
+            helper_path_with(None, Some(PathBuf::from("/some/exe")), true),
+            PathBuf::from("/some/exe")
+        );
+        assert_eq!(
+            helper_path_with(None, None, true),
+            PathBuf::from("/usr/bin/fedora-updater")
+        );
+        assert_eq!(
+            helper_path_with(None, None, false),
+            PathBuf::from("fedora-updater")
+        );
+    }
+
+    #[test]
+    fn run_local_command_drains_large_stderr_without_deadlock() {
+        let script = r#"
+s="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+s="$s$s$s$s"
+s="$s$s$s$s"
+i=0
+while [ "$i" -lt 160 ]; do
+  printf 'stderr-%03d-%s\n' "$i" "$s" >&2
+  i=$((i + 1))
+done
+printf 'stdout-done\n'
+"#;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            let res = run_local_command("/bin/sh", &["-c", script], |line| lines.push(line));
+            let _ = tx.send((res, lines));
+        });
+
+        let (res, lines) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("run_local_command deadlocked with >128 KiB on stderr");
+        let code = res.expect("run_local_command should succeed");
+        assert_eq!(code, 0);
+        assert!(lines.iter().any(|l| l == "stdout-done"));
+        let stderr_lines: Vec<&String> = lines.iter().filter(|l| l.starts_with("stderr-")).collect();
+        assert_eq!(stderr_lines.len(), 160);
+        let stderr_bytes: usize = stderr_lines.iter().map(|l| l.len() + 1).sum();
+        assert!(
+            stderr_bytes > 128 * 1024,
+            "expected >128 KiB of stderr, got {stderr_bytes}"
+        );
     }
 
     #[test]
