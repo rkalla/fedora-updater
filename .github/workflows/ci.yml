@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Test, Lint & Build (Fedora)
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+
+    steps:
+      - name: Install Fedora build and GTK4 dependencies
+        run: |
+          dnf install -y \
+            rust \
+            cargo \
+            clippy \
+            gtk4-devel \
+            libadwaita-devel \
+            blueprint-compiler \
+            gcc \
+            pkgconf-pkg-config
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Cargo registry, index, and target artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-fedora-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-fedora-cargo-
+
+      - name: Run offline unit, functional, and pipe E2E tests
+        run: cargo test
+
+      - name: Run headless GTK4 / Libadwaita E2E UI tests
+        run: ./scripts/test-ui-headless.sh
+
+      - name: Run Clippy lints
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build single multi-call release binary
+        run: ./build

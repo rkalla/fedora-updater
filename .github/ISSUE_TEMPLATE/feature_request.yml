@@ -1,0 +1,37 @@
+name: Feature Request
+description: Suggest an improvement, new capability, or UX refinement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea that would make Fedora Updater clearer, faster, or more useful? Share the problem and how you imagine it fitting into the Observatory workflow.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What workflow is missing, confusing, or slow right now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe how the feature or UI change should behave.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds or alternative designs you thought about.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Screenshots, mockups, Fedora tooling references (DNF5, Flatpak, fwupd), etc.

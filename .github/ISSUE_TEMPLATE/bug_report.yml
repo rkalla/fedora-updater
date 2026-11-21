@@ -1,0 +1,68 @@
+name: Bug Report
+description: Report a bug, crash, or unexpected behavior in Fedora Updater
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue! Please include as much context as you can so we can reproduce and fix it quickly.
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Pre-flight Checks
+      options:
+        - label: I reproduced this on a build from recent `main` (or the latest release).
+          required: true
+        - label: I searched open and closed issues to confirm this is not a duplicate.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Clear, concise description of the bug or unexpected UI/backend behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps showing how to trigger the issue.
+      placeholder: |
+        1. Launch `./bin/fedora-updater`
+        2. Click Check Updates (or Ctrl+R)
+        3. Click Update All -> ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+
+  - type: input
+    id: fedora_version
+    attributes:
+      label: Fedora version
+      description: Output of `cat /etc/fedora-release` (e.g., Fedora release 44 (Forty Four)).
+      placeholder: Fedora 44 Workstation
+    validations:
+      required: true
+
+  - type: input
+    id: session
+    attributes:
+      label: Desktop & session type
+      description: e.g., GNOME Wayland, GNOME X11, KDE Plasma Wayland.
+      placeholder: GNOME Wayland
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Activity Log / Terminal output
+      description: Copy relevant lines from the in-app **Activity Log** (View -> Activity Log -> Copy All) or terminal stderr/stdout.
+      render: text
