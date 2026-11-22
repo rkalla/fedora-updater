@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Fedora Updater
+Comment=Unified GTK4/Libadwaita updater for Fedora system, Flatpak, and firmware updates
+Exec=/usr/bin/fedora-updater
+Icon=dev.fedora.Updater
+Terminal=false
+Categories=System;PackageManager;
+Keywords=update;upgrade;dnf;flatpak;firmware;fwupd;packages;
+StartupNotify=true
+StartupWMClass=dev.fedora.Updater

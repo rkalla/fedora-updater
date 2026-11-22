@@ -1,6 +1,7 @@
 # Build outputs — clone the source and run ./build locally
 /target/
 /bin/
+/dist/
 
 # Editor / OS
 **/*.rs.bk

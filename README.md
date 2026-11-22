@@ -41,6 +41,29 @@ Fedora Updater talks to native Fedora platform daemons and libraries by default 
 
 ---
 
+## Download & Install
+
+Prebuilt packages for `x86_64` (Fedora 42+) are published on [GitHub Releases](https://github.com/rkalla/fedora-updater/releases):
+
+- **RPM package (recommended):**
+  Download `fedora-updater-<version>-1.x86_64.rpm` and install with DNF:
+  ```bash
+  sudo dnf install ./fedora-updater-*.rpm
+  ```
+  Installs `/usr/bin/fedora-updater`, the GNOME `.desktop` launcher, application icons, and the Polkit policy. Remove anytime with `sudo dnf remove fedora-updater`.
+
+- **Portable tarball (no system changes):**
+  Download and extract `fedora-updater-<version>-linux-x86_64.tar.gz`, then run directly or install a user-local launcher:
+  ```bash
+  tar -xzf fedora-updater-*-linux-x86_64.tar.gz
+  cd fedora-updater-*-linux-x86_64
+  ./bin/fedora-updater
+  # Optional user-local GNOME menu entry + icons:
+  ./install.sh
+  ```
+
+---
+
 ## Build & Run from Source
 
 ### Prerequisites (Fedora 42+ / Fedora 44 recommended)

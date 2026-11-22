@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Release Packages (Fedora 44)
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:44
+      options: --init
+
+    steps:
+      - name: Install Fedora build, GTK4, and RPM packaging dependencies
+        run: |
+          dnf install -y \
+            rust \
+            cargo \
+            gtk4-devel \
+            libadwaita-devel \
+            blueprint-compiler \
+            gcc \
+            pkgconf-pkg-config \
+            rpm-build \
+            desktop-file-utils \
+            python3-pillow
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Cargo registry, index, and target artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-fedora44-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-fedora44-release-
+
+      - name: Resolve and validate version
+        id: meta
+        run: |
+          CARGO_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+              echo "error: tag v${TAG_VERSION} does not match Cargo.toml version ${CARGO_VERSION}" >&2
+              exit 1
+            fi
+            VERSION="$TAG_VERSION"
+          else
+            VERSION="$CARGO_VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Run offline tests
+        run: cargo test
+
+      - name: Run headless GTK4 / Libadwaita UI tests
+        run: ./scripts/test-ui-headless.sh
+
+      - name: Package RPM, portable tarball, and SHA256SUMS
+        run: ./scripts/package-release.sh --version "${{ steps.meta.outputs.version }}"
+
+      - name: Inspect release packages
+        run: |
+          rpm -qip dist/*.rpm
+          rpm -qlp dist/*.rpm
+          rpm -qRp dist/*.rpm
+          tar -tzf dist/*.tar.gz
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "Fedora Updater $TAG" \
+              --generate-notes
+          fi
