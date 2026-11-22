@@ -5,7 +5,6 @@ edition = "2021"
 description = "A polished GNOME desktop front-end for Fedora system, Flatpak, and firmware updates"
 license = "Apache-2.0"
 repository = "https://github.com/rkalla/fedora-updater"
-homepage = "https://github.com/rkalla/fedora-updater"
 readme = "README.md"
 keywords = ["fedora", "dnf", "flatpak", "fwupd", "gtk4", "libadwaita"]
 categories = ["gui"]

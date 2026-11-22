@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: fedora:latest
+      options: --init
 
     steps:
       - name: Install Fedora build and GTK4 dependencies

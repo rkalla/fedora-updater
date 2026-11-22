@@ -219,6 +219,23 @@ fn helper_runs_check_dnf_if_present() {
     let _ = child.wait();
 }
 
+/// Returns true if `pid` no longer exists or is an unreaped zombie/dead task.
+fn process_is_dead_or_zombie(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1 {
+        return true;
+    }
+    // In containers whose PID 1 does not reap orphans (e.g. GitHub Actions
+    // running `tail -f /dev/null`), a SIGKILLed grandchild remains a zombie
+    // (`Z`) for which `kill(pid, 0)` still returns 0.
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rfind(')')
+            .and_then(|idx| stat[idx + 1..].split_whitespace().next())
+            .is_some_and(|state| matches!(state, "Z" | "X" | "x")),
+        Err(_) => unsafe { libc::kill(pid, 0) == -1 },
+    }
+}
+
 /// Window close runs `close_session` on the GTK thread. If a helper command is
 /// stuck (fwupdmgr waiting on "Restart now?"), that must not freeze the UI and
 /// must kill grandchildren in the helper's process group.
@@ -300,7 +317,7 @@ done
 
     let mut grandchild_dead = false;
     for _ in 0..100 {
-        if unsafe { libc::kill(grandchild_pid, 0) } == -1 {
+        if process_is_dead_or_zombie(grandchild_pid) {
             grandchild_dead = true;
             break;
         }
