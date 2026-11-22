@@ -232,8 +232,6 @@ src/
 
 </details>
 
-See [`docs/TEST-SUITE-AUDIT.md`](docs/TEST-SUITE-AUDIT.md) for the full coverage matrix and recovery flow audit.
-
 ---
 
 ## Contributing & Security
