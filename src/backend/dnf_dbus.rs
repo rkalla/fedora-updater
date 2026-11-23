@@ -95,6 +95,7 @@ pub const HISTORY_PACKAGE_ATTRS: &[&str] = &[
 
 #[derive(Clone)]
 struct ActiveDnfSession {
+    conn: Connection,
     path: String,
     cancelled: Arc<AtomicBool>,
     in_transaction: Arc<AtomicBool>,
@@ -124,12 +125,11 @@ pub fn cancel_active_transaction() -> bool {
         return false;
     }
     session.cancelled.store(true, Ordering::SeqCst);
-    cancel_goal_by_path(&session.path).unwrap_or(false)
+    cancel_goal_by_path(&session.conn, &session.path).unwrap_or(false)
 }
 
-fn cancel_goal_by_path(session_path: &str) -> Result<bool, String> {
-    let conn = Connection::system().map_err(|e| format!("System D-Bus unavailable: {e}"))?;
-    let proxy = Proxy::new(&conn, DNF_DEST, session_path, GOAL_IFACE)
+fn cancel_goal_by_path(conn: &Connection, session_path: &str) -> Result<bool, String> {
+    let proxy = Proxy::new(conn, DNF_DEST, session_path, GOAL_IFACE)
         .map_err(|e| format!("Goal proxy failed: {e}"))?;
     let (ok, err_msg): (bool, String) = proxy
         .call("cancel", &())
@@ -1479,6 +1479,27 @@ pub fn get_history(limit: i64) -> NativeOutcome<Vec<DnfHistoryTransaction>> {
     }
 }
 
+/// Format the concise opening log line for a native DNF5 apply transaction.
+pub fn format_apply_start_line(specs: &[String], mode: ApplyMode) -> String {
+    let mode_label = match mode {
+        ApplyMode::Live => "live",
+        ApplyMode::LiveAndReboot => "live + reboot",
+        ApplyMode::OfflineOnReboot => "offline on reboot",
+        ApplyMode::DownloadOnly => "download only",
+    };
+    let shown: Vec<&str> = specs.iter().take(8).map(String::as_str).collect();
+    let suffix = if specs.len() > 8 {
+        format!("… (+{} more)", specs.len() - 8)
+    } else {
+        String::new()
+    };
+    format!(
+        "Preparing DNF transaction ({mode_label}) for {} package(s): {}{suffix}",
+        specs.len(),
+        shown.join(", ")
+    )
+}
+
 /// Execute selective or full DNF5 update transaction via `org.rpm.dnf.v0`.
 pub fn apply_updates(
     packages: &[Package],
@@ -1507,6 +1528,8 @@ pub fn apply_updates(
         }));
     }
 
+    on_line(format_apply_start_line(&specs, mode));
+
     let conn = match Connection::system() {
         Ok(c) => c,
         Err(e) => return NativeOutcome::Unavailable(format!("System D-Bus unavailable: {e}")),
@@ -1523,6 +1546,7 @@ pub fn apply_updates(
         Ok(p) => p,
         Err(e) => return NativeOutcome::Handled(Err(format!("Base proxy failed: {e}"))),
     };
+    on_line("Loading repository metadata via dnf5daemon…".into());
     match base_proxy.call::<_, _, bool>("read_all_repos", &()) {
         Ok(true) => {}
         Ok(false) => {
@@ -1556,7 +1580,8 @@ pub fn apply_updates(
         HashMap<String, OwnedValue>,
         HashMap<String, OwnedValue>,
     );
-    let (_items, resolve_result): (Vec<ResolveItem>, u32) =
+    on_line("Resolving transaction dependencies…".into());
+    let (items, resolve_result): (Vec<ResolveItem>, u32) =
         match goal_proxy.call("resolve", &(resolve_options(),)) {
             Ok(res) => res,
             Err(e) if is_dbus_unavailable(&e) => return NativeOutcome::Unavailable(e.to_string()),
@@ -1575,6 +1600,16 @@ pub fn apply_updates(
         return NativeOutcome::Handled(Err(detail));
     }
 
+    let action = match mode {
+        ApplyMode::DownloadOnly => "download",
+        ApplyMode::OfflineOnReboot => "offline update download",
+        ApplyMode::Live | ApplyMode::LiveAndReboot => "transaction",
+    };
+    on_line(format!(
+        "Resolved transaction ({} item(s)); starting {action}…",
+        items.len()
+    ));
+
     let planned_bytes: u64 = packages
         .iter()
         .filter(|p| p.source == UpdateSource::Dnf)
@@ -1585,11 +1620,13 @@ pub fn apply_updates(
     let active_cancelled = Arc::new(AtomicBool::new(false));
     let active_in_txn = Arc::new(AtomicBool::new(false));
     set_active_session(Some(ActiveDnfSession {
+        conn: conn.clone(),
         path: session_path.clone(),
         cancelled: active_cancelled.clone(),
         in_transaction: active_in_txn.clone(),
     }));
     {
+        let cancel_conn = conn.clone();
         let cancel_path = session_path.clone();
         let flag_txn = active_in_txn.clone();
         let flag_can = active_cancelled.clone();
@@ -1597,7 +1634,7 @@ pub fn apply_updates(
             if !flag_txn.load(Ordering::SeqCst) {
                 flag_can.store(true, Ordering::SeqCst);
                 std::thread::spawn(move || {
-                    let _ = cancel_goal_by_path(&cancel_path);
+                    let _ = cancel_goal_by_path(&cancel_conn, &cancel_path);
                 });
             }
         });
@@ -1613,6 +1650,7 @@ pub fn apply_updates(
     });
 
     let exec_res = run_transaction_with_signals(
+        &conn,
         &session_path,
         mode,
         cancel,
@@ -1688,6 +1726,7 @@ pub fn apply_updates(
 
 #[allow(clippy::too_many_arguments)]
 fn run_transaction_with_signals(
+    conn: &Connection,
     session_path: &str,
     mode: ApplyMode,
     cancel: &WorkCancel,
@@ -1704,10 +1743,11 @@ fn run_transaction_with_signals(
 
     let ctx = glib::MainContext::new();
     let call_res = ctx.block_on(async {
-        let conn = zbus::Connection::system()
-            .await
-            .map_err(|e| format!("System D-Bus connection failed: {e}"))?;
-        let goal_proxy = zbus::Proxy::new(&conn, DNF_DEST, session_path, GOAL_IFACE)
+        // Reuse the owning blocking Connection's underlying async Connection so
+        // `Goal.do_transaction` and `Goal.cancel` come from the same D-Bus unique sender
+        // that opened the `dnf5daemon` session.
+        let async_conn = conn.inner();
+        let goal_proxy = zbus::Proxy::new(async_conn, DNF_DEST, session_path, GOAL_IFACE)
             .await
             .map_err(|e| format!("Goal async proxy failed: {e}"))?;
 
@@ -1724,10 +1764,10 @@ fn run_transaction_with_signals(
             .build()
             .to_owned();
 
-        let mut base_stream = MessageStream::for_match_rule(base_rule, &conn, None)
+        let mut base_stream = MessageStream::for_match_rule(base_rule, async_conn, None)
             .await
             .map_err(|e| format!("Could not subscribe to Base signals: {e}"))?;
-        let mut rpm_stream = MessageStream::for_match_rule(rpm_rule, &conn, None)
+        let mut rpm_stream = MessageStream::for_match_rule(rpm_rule, async_conn, None)
             .await
             .map_err(|e| format!("Could not subscribe to Rpm signals: {e}"))?;
 
@@ -1743,9 +1783,10 @@ fn run_transaction_with_signals(
             {
                 cancel_sent = true;
                 active_cancelled.store(true, Ordering::SeqCst);
+                let cancel_conn = conn.clone();
                 let cancel_path = session_path.to_string();
                 std::thread::spawn(move || {
-                    let _ = cancel_goal_by_path(&cancel_path);
+                    let _ = cancel_goal_by_path(&cancel_conn, &cancel_path);
                 });
             }
 
@@ -2559,6 +2600,37 @@ mod tests {
     }
 
     #[test]
+    fn format_apply_start_line_formats_modes_and_truncates_long_lists() {
+        let two = vec!["libnbd.x86_64".to_string(), "m17n-db.noarch".to_string()];
+        assert_eq!(
+            format_apply_start_line(&two, ApplyMode::Live),
+            "Preparing DNF transaction (live) for 2 package(s): libnbd.x86_64, m17n-db.noarch"
+        );
+        assert_eq!(
+            format_apply_start_line(&two, ApplyMode::LiveAndReboot),
+            "Preparing DNF transaction (live + reboot) for 2 package(s): libnbd.x86_64, m17n-db.noarch"
+        );
+        assert_eq!(
+            format_apply_start_line(&two, ApplyMode::OfflineOnReboot),
+            "Preparing DNF transaction (offline on reboot) for 2 package(s): libnbd.x86_64, m17n-db.noarch"
+        );
+        assert_eq!(
+            format_apply_start_line(&two, ApplyMode::DownloadOnly),
+            "Preparing DNF transaction (download only) for 2 package(s): libnbd.x86_64, m17n-db.noarch"
+        );
+
+        let ten: Vec<String> = (1..=10).map(|i| format!("pkg{i}.x86_64")).collect();
+        let line = format_apply_start_line(&ten, ApplyMode::Live);
+        assert!(
+            line.starts_with("Preparing DNF transaction (live) for 10 package(s): pkg1.x86_64"),
+            "{line}"
+        );
+        assert!(line.contains("pkg8.x86_64"), "{line}");
+        assert!(!line.contains("pkg9.x86_64"), "{line}");
+        assert!(line.ends_with("… (+2 more)"), "{line}");
+    }
+
+    #[test]
     #[ignore = "Requires live org.rpm.dnf.v0 (dnf5daemon-server) on host system D-Bus"]
     fn live_dnf5daemon_zero_auth_check_and_history_probe() {
         assert!(
@@ -2588,6 +2660,22 @@ mod tests {
                     .any(|r| r.name == "bash" && !r.display_evr().is_empty()),
                 "expected installed bash via Rpm.list_fd, got {installed:?}"
             );
+
+            let ctx = glib::MainContext::new();
+            let read_ok: bool = ctx
+                .block_on(async {
+                    assert_eq!(
+                        conn.inner().unique_name(),
+                        conn.unique_name(),
+                        "inner async connection must share owning D-Bus sender"
+                    );
+                    let base_proxy =
+                        zbus::Proxy::new(conn.inner(), DNF_DEST, guard.path_str(), BASE_IFACE)
+                            .await?;
+                    base_proxy.call("read_all_repos", &()).await
+                })
+                .expect("session method via conn.inner() must succeed without sender mismatch");
+            assert!(read_ok, "Base.read_all_repos via conn.inner() should return true");
         }
 
         match get_history(5) {

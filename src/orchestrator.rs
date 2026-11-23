@@ -956,10 +956,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         (0, native_log, res.needs_reboot)
                     }
                     NativeOutcome::Handled(Err(reason)) => {
-                        if !native_log.contains(&reason) {
-                            native_log.push_str(&reason);
-                            native_log.push('\n');
-                        }
+                        log_native_apply_error(&ch, tag, &mut native_log, &reason);
                         (1, native_log, false)
                     }
                     NativeOutcome::Unavailable(_) => {
@@ -1033,10 +1030,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         match outcome {
                             NativeOutcome::Handled(Ok(_)) => (0, native_log, false),
                             NativeOutcome::Handled(Err(reason)) => {
-                                if !native_log.contains(&reason) {
-                                    native_log.push_str(&reason);
-                                    native_log.push('\n');
-                                }
+                                log_native_apply_error(&ch, tag, &mut native_log, &reason);
                                 (1, native_log, false)
                             }
                             NativeOutcome::Unavailable(_) => {
@@ -1063,14 +1057,22 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         .filter(|p| p.source == UpdateSource::Firmware)
                         .cloned()
                         .collect();
+                    let mut native_log = String::new();
                     let outcome = runtime.apply_fwupd_dbus(
                         &fw_pkgs,
-                        &mut |l| ch.line(tag, l),
+                        &mut |l| {
+                            native_log.push_str(&l);
+                            native_log.push('\n');
+                            ch.line(tag, l);
+                        },
                         &mut |hint| emit_progress_hint(&ch, source, hint),
                     );
                     match outcome {
-                        NativeOutcome::Handled(Ok(res)) => (0, String::new(), res.needs_reboot),
-                        NativeOutcome::Handled(Err(reason)) => (1, reason, false),
+                        NativeOutcome::Handled(Ok(res)) => (0, native_log, res.needs_reboot),
+                        NativeOutcome::Handled(Err(reason)) => {
+                            log_native_apply_error(&ch, tag, &mut native_log, &reason);
+                            (1, native_log, false)
+                        }
                         NativeOutcome::Unavailable(_) => {
                             let ready = if session_ensured {
                                 Ok(())
@@ -1257,6 +1259,34 @@ fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.get(..prefix.len())?;
     head.eq_ignore_ascii_case(prefix)
         .then(|| &s[prefix.len()..])
+}
+
+/// Emit a native backend error to the activity console once when the backend
+/// returned `Err(reason)` without having already logged it via `on_line`.
+fn log_native_apply_error(
+    ch: &WorkChannel,
+    tag: &str,
+    native_log: &mut String,
+    reason: &str,
+) {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !native_log.contains(trimmed) {
+        let mut emitted = false;
+        for line in trimmed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let text = if !emitted && strip_prefix_ascii_ci(line, "error:").is_none() {
+                format!("error: {line}")
+            } else {
+                line.to_string()
+            };
+            ch.line(tag, text);
+            emitted = true;
+        }
+        native_log.push_str(trimmed);
+        native_log.push('\n');
+    }
 }
 
 fn prefix_source(source: UpdateSource, msg: &str) -> String {

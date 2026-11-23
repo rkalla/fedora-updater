@@ -2401,3 +2401,146 @@ fn native_merged_dnf_and_fwupd_history_timeline() {
     let direct = merge_history(&dnf_txns, &fwupd_entries);
     assert_eq!(merged, direct);
 }
+
+#[test]
+fn native_apply_errors_are_logged_to_activity_console_without_duplication() {
+    let dnf_pkg = packages_from_dnf_dbus_fixtures().into_iter().next().expect("dnf pkg");
+    let fp_pkg = flatpak_check_from_fixture("flatpak/check_user_normal.json", None)
+        .packages
+        .into_iter()
+        .next()
+        .expect("flatpak pkg");
+    let fw_pkg = Package {
+        id: "fwupd:dev-1".into(),
+        name: "System Firmware".into(),
+        arch: String::new(),
+        version: "0.1.32".into(),
+        old_version: Some("0.1.31".into()),
+        source: UpdateSource::Firmware,
+        repo: "LVFS".into(),
+        size_bytes: Some(1_048_576),
+        install_size_delta: None,
+        summary: None,
+        advisories: Vec::new(),
+        preflight_warning: None,
+        detail: "0.1.31 → 0.1.32".into(),
+        status: PackageStatus::Pending,
+    };
+
+    // 1) Backends returning Handled(Err(...)) without calling on_line still emit to console.
+    let rt_unlogged = FakeRuntime::new();
+    rt_unlogged.set_dnf_dbus_available(true);
+    rt_unlogged.set_fwupd_dbus_available(true);
+    rt_unlogged.push_dnf_dbus_apply(DnfDbusApplyStep {
+        lines: vec!["Resolved transaction (1 item(s)); starting transaction…".into()],
+        draws: vec![],
+        hints: vec![],
+        throughput: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Handled(Err(
+            "org.rpm.dnf.v0.Error: Session method failed\nSecond detail line".into(),
+        )),
+    });
+    rt_unlogged.push_flatpak_native_apply(FlatpakNativeApplyStep {
+        lines: vec![],
+        draws: vec![],
+        hints: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Handled(Err("Socket I/O timed out".into())),
+    });
+    rt_unlogged.push_fwupd_dbus_apply(FwupdDbusApplyStep {
+        lines: vec!["Installing System Firmware 0.1.32…".into()],
+        hints: vec![],
+        outcome: NativeOutcome::Handled(Err(
+            "System battery is too low (10% < 25% required)".into(),
+        )),
+    });
+    rt_unlogged.push_fwupd_dbus_reboot_needed(NativeOutcome::Handled(Ok(false)));
+
+    let pkgs = vec![dnf_pkg.clone(), fp_pkg.clone(), fw_pkg.clone()];
+    let mut h1 = FlowHarness::ready(pkgs.clone());
+    h1.run_apply(&rt_unlogged);
+
+    let log_lines1: Vec<&str> = h1.console.lines().collect();
+    assert!(
+        log_lines1.contains(&"[dnf] error: org.rpm.dnf.v0.Error: Session method failed"),
+        "expected [dnf] error line in console, got: {log_lines1:#?}"
+    );
+    assert!(
+        log_lines1.contains(&"[dnf] Second detail line"),
+        "expected multi-line follow-up in console, got: {log_lines1:#?}"
+    );
+    assert!(
+        log_lines1.contains(&"[flatpak-user] error: Socket I/O timed out"),
+        "expected [flatpak-user] error line in console, got: {log_lines1:#?}"
+    );
+    assert!(
+        log_lines1.contains(&"[fwupd] error: System battery is too low (10% < 25% required)"),
+        "expected [fwupd] error line in console, got: {log_lines1:#?}"
+    );
+    assert!(matches!(
+        &h1.state.phase,
+        Phase::Failed { title, detail, .. }
+            if title == "All updates failed"
+                && detail.contains("Second detail line")
+                && detail.contains("Socket I/O timed out")
+                && detail.contains("System battery is too low")
+    ));
+
+    // 2) Backends that already logged the error via on_line do not duplicate it in console.
+    let rt_logged = FakeRuntime::new();
+    rt_logged.set_dnf_dbus_available(true);
+    rt_logged.set_fwupd_dbus_available(true);
+    rt_logged.push_dnf_dbus_apply(DnfDbusApplyStep {
+        lines: vec!["Problem: conflicting requests".into()],
+        draws: vec![],
+        hints: vec![],
+        throughput: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Handled(Err("Problem: conflicting requests".into())),
+    });
+    rt_logged.push_flatpak_native_apply(FlatpakNativeApplyStep {
+        lines: vec!["error: Failed to update org.signal.Signal: aborted".into()],
+        draws: vec![],
+        hints: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Handled(Err(
+            "Failed to update org.signal.Signal: aborted".into(),
+        )),
+    });
+    rt_logged.push_fwupd_dbus_apply(FwupdDbusApplyStep {
+        lines: vec!["error: Capsule rejected".into()],
+        hints: vec![],
+        outcome: NativeOutcome::Handled(Err("error: Capsule rejected".into())),
+    });
+    rt_logged.push_fwupd_dbus_reboot_needed(NativeOutcome::Handled(Ok(false)));
+
+    let mut h2 = FlowHarness::ready(pkgs);
+    h2.run_apply(&rt_logged);
+
+    let log_lines2: Vec<&str> = h2.console.lines().collect();
+    assert_eq!(
+        log_lines2
+            .iter()
+            .filter(|l| l.contains("conflicting requests"))
+            .count(),
+        1,
+        "dnf error should appear exactly once: {log_lines2:#?}"
+    );
+    assert_eq!(
+        log_lines2
+            .iter()
+            .filter(|l| l.contains("Failed to update org.signal.Signal: aborted"))
+            .count(),
+        1,
+        "flatpak error should appear exactly once: {log_lines2:#?}"
+    );
+    assert_eq!(
+        log_lines2
+            .iter()
+            .filter(|l| l.contains("Capsule rejected"))
+            .count(),
+        1,
+        "fwupd error should appear exactly once: {log_lines2:#?}"
+    );
+}
