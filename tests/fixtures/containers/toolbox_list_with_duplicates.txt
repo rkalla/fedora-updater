@@ -1,0 +1,4 @@
+CONTAINER ID  CONTAINER NAME        CREATED      STATUS   IMAGE NAME
+a1b2c3d4e5f6  arch-dev              2 weeks ago  running  quay.io/toolbx-images/archlinux-toolbox:latest
+b2c3d4e5f6a7  distrobox-fedora-dev  5 days ago   exited   registry.fedoraproject.org/fedora-toolbox:43
+c3d4e5f6a7b8  fedora-toolbox-43     3 days ago   running  registry.fedoraproject.org/fedora-toolbox:43

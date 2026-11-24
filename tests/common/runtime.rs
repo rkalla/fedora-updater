@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fedora_updater::backend::brew::LINUXBREW_SYSTEM_PATH;
+use fedora_updater::backend::containers::{DISTROBOX_DEFAULT_PATH, TOOLBOX_DEFAULT_PATH};
 
 use fedora_updater::backend::dnf_dbus::{
     upgrade_specs_from_packages, DnfApplyOutcome, DnfHistoryTransaction, ThroughputSample,
@@ -144,6 +145,8 @@ struct FakeState {
     rpm_ostree_status_steps: VecDeque<NativeOutcome<OstreeStatus>>,
     cancel_rpm_ostree_calls: usize,
     brew_binary: Option<PathBuf>,
+    distrobox_binary: Option<PathBuf>,
+    toolbox_binary: Option<PathBuf>,
     flatpak_queries: Vec<bool>,
     flatpak_native_apply_calls: Vec<(bool, Vec<String>)>,
     dnf_dbus_available: bool,
@@ -203,6 +206,8 @@ impl FakeRuntime {
                 rpm_ostree_status_steps: VecDeque::new(),
                 cancel_rpm_ostree_calls: 0,
                 brew_binary: None,
+                distrobox_binary: None,
+                toolbox_binary: None,
                 flatpak_queries: Vec::new(),
                 flatpak_native_apply_calls: Vec::new(),
                 dnf_dbus_available: false,
@@ -399,6 +404,22 @@ impl FakeRuntime {
 
     pub fn set_brew_binary(&self, path: Option<PathBuf>) {
         self.inner.lock().unwrap().brew_binary = path;
+    }
+
+    pub fn set_distrobox_available(&self, available: bool) {
+        self.set_distrobox_binary(available.then(|| PathBuf::from(DISTROBOX_DEFAULT_PATH)));
+    }
+
+    pub fn set_distrobox_binary(&self, path: Option<PathBuf>) {
+        self.inner.lock().unwrap().distrobox_binary = path;
+    }
+
+    pub fn set_toolbox_available(&self, available: bool) {
+        self.set_toolbox_binary(available.then(|| PathBuf::from(TOOLBOX_DEFAULT_PATH)));
+    }
+
+    pub fn set_toolbox_binary(&self, path: Option<PathBuf>) {
+        self.inner.lock().unwrap().toolbox_binary = path;
     }
 
     fn execute_local_step(
@@ -716,6 +737,14 @@ impl OrchestratorRuntime for FakeRuntime {
 
     fn brew_binary(&self) -> Option<PathBuf> {
         self.inner.lock().unwrap().brew_binary.clone()
+    }
+
+    fn distrobox_binary(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().distrobox_binary.clone()
+    }
+
+    fn toolbox_binary(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().toolbox_binary.clone()
     }
 
     fn query_flatpak(&self, user: bool) -> Result<FlatpakCheck, String> {

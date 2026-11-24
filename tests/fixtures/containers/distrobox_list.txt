@@ -1,0 +1,4 @@
+ID           | NAME                 | STATUS                 | IMAGE
+a1b2c3d4e5f6 | arch-dev             | Up 3 hours             | quay.io/toolbx-images/archlinux-toolbox:latest
+b2c3d4e5f6a7 | fedora-dev           | Exited (0) 2 days ago  | registry.fedoraproject.org/fedora-toolbox:43
+d4e5f6a7b8c9 | ubuntu-lts           | Exited (0) 5 days ago  | docker.io/library/ubuntu:24.04

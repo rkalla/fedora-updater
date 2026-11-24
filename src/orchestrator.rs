@@ -10,12 +10,12 @@ use std::time::SystemTime;
 use async_channel::Sender;
 
 use crate::backend::{
-    self, brew, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, gnome_extensions, logind, rpm_ostree,
-    ProgressHint,
+    self, brew, containers, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, gnome_extensions, logind,
+    rpm_ostree, ProgressHint,
 };
 pub use crate::backend::NativeOutcome;
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
-use crate::model::{ApplyMode, AuthPurpose, Package, RetryAction, UpdateSource};
+use crate::model::{ApplyMode, AuthPurpose, Package, PackageStatus, RetryAction, UpdateSource};
 use crate::privilege::{
     close_session, kill_recorded_local_command, run_cancellable_local_command,
     run_cancellable_local_command_env, run_local_command, session_is_alive, with_session,
@@ -23,31 +23,57 @@ use crate::privilege::{
 };
 use crate::state::Event as StateEvent;
 
+fn normalize_config_keys(keys: impl IntoIterator<Item = String>) -> BTreeSet<String> {
+    keys.into_iter()
+        .map(|key| key.trim().to_ascii_lowercase())
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
 /// Enabled/disabled source filter applied during check and apply pipelines.
+/// Opt-in sources (`Distrobox`, `Toolbx`) remain disabled unless explicitly enabled.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceConfig {
     pub disabled_keys: BTreeSet<String>,
+    pub enabled_opt_in_keys: BTreeSet<String>,
 }
 
 impl SourceConfig {
     pub fn all_enabled() -> Self {
-        Self::default()
+        let enabled_opt_in_keys = UpdateSource::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.is_opt_in())
+            .map(|s| s.pref_key().to_string())
+            .collect();
+        Self {
+            disabled_keys: BTreeSet::new(),
+            enabled_opt_in_keys,
+        }
     }
 
     pub fn from_disabled_keys(keys: impl IntoIterator<Item = String>) -> Self {
-        let mut disabled_keys = BTreeSet::new();
-        for key in keys {
-            let trimmed = key.trim().to_ascii_lowercase();
-            if !trimmed.is_empty() {
-                disabled_keys.insert(trimmed);
-            }
+        Self::from_prefs(keys, std::iter::empty())
+    }
+
+    pub fn from_prefs(
+        disabled_keys: impl IntoIterator<Item = String>,
+        enabled_opt_in_keys: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            disabled_keys: normalize_config_keys(disabled_keys),
+            enabled_opt_in_keys: normalize_config_keys(enabled_opt_in_keys),
         }
-        Self { disabled_keys }
     }
 
     pub fn is_key_enabled(&self, pref_key: &str) -> bool {
         let normalized = pref_key.trim().to_ascii_lowercase();
-        !self.disabled_keys.contains(&normalized)
+        if UpdateSource::pref_key_is_opt_in(&normalized) {
+            self.enabled_opt_in_keys.contains(&normalized)
+                && !self.disabled_keys.contains(&normalized)
+        } else {
+            !self.disabled_keys.contains(&normalized)
+        }
     }
 
     pub fn is_enabled(&self, source: UpdateSource) -> bool {
@@ -78,14 +104,25 @@ impl SourceConfig {
 
     pub fn disable(&mut self, pref_key: &str) {
         let normalized = pref_key.trim().to_ascii_lowercase();
-        if !normalized.is_empty() {
+        if normalized.is_empty() {
+            return;
+        }
+        if UpdateSource::pref_key_is_opt_in(&normalized) {
+            self.enabled_opt_in_keys.remove(&normalized);
+        } else {
             self.disabled_keys.insert(normalized);
         }
     }
 
     pub fn enable(&mut self, pref_key: &str) {
         let normalized = pref_key.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return;
+        }
         self.disabled_keys.remove(&normalized);
+        if UpdateSource::pref_key_is_opt_in(&normalized) {
+            self.enabled_opt_in_keys.insert(normalized);
+        }
     }
 }
 
@@ -108,6 +145,16 @@ fn command_exists(program: &str) -> bool {
     Path::new("/usr/bin").join(program).is_file()
 }
 
+/// Optional executable paths injected into [`probe_source_availability_for_host_with`]
+/// for deterministic offline tests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostBinaryPaths<'a> {
+    pub brew_bin: Option<&'a Path>,
+    pub rpm_ostree_bin: Option<&'a Path>,
+    pub distrobox_bin: Option<&'a Path>,
+    pub toolbox_bin: Option<&'a Path>,
+}
+
 /// Probe host availability of supported update sources without spawning processes.
 pub fn probe_source_availability(
     native_dnf: bool,
@@ -125,6 +172,8 @@ pub fn probe_source_availability_for_host(
     gnome_ext_available: bool,
 ) -> BTreeMap<String, SourceAvailability> {
     let brew_bin = brew::find_brew_binary();
+    let distrobox_bin = containers::find_distrobox_binary();
+    let toolbox_bin = containers::find_toolbox_binary();
     let rpm_ostree_bin = if ostree_booted {
         rpm_ostree::find_rpm_ostree_binary()
     } else {
@@ -134,9 +183,13 @@ pub fn probe_source_availability_for_host(
         ostree_booted,
         native_dnf,
         native_fwupd,
-        brew_bin.as_deref(),
-        rpm_ostree_bin.as_deref(),
         gnome_ext_available,
+        HostBinaryPaths {
+            brew_bin: brew_bin.as_deref(),
+            rpm_ostree_bin: rpm_ostree_bin.as_deref(),
+            distrobox_bin: distrobox_bin.as_deref(),
+            toolbox_bin: toolbox_bin.as_deref(),
+        },
     )
 }
 
@@ -151,9 +204,11 @@ pub fn probe_source_availability_with(
         false,
         native_dnf,
         native_fwupd,
-        brew_bin,
-        None,
         gnome_ext_available,
+        HostBinaryPaths {
+            brew_bin,
+            ..Default::default()
+        },
     )
 }
 
@@ -162,14 +217,13 @@ pub fn probe_source_availability_for_host_with(
     ostree_booted: bool,
     native_dnf: bool,
     native_fwupd: bool,
-    brew_bin: Option<&Path>,
-    rpm_ostree_bin: Option<&Path>,
     gnome_ext_available: bool,
+    paths: HostBinaryPaths<'_>,
 ) -> BTreeMap<String, SourceAvailability> {
     let mut map = BTreeMap::new();
     if ostree_booted {
-        let ostree_installed = rpm_ostree_bin.is_some();
-        let ostree_sub = match rpm_ostree_bin {
+        let ostree_installed = paths.rpm_ostree_bin.is_some();
+        let ostree_sub = match paths.rpm_ostree_bin {
             Some(path) => format!("Installed ({})", path.display()),
             None => "Not installed".into(),
         };
@@ -216,8 +270,8 @@ pub fn probe_source_availability_for_host_with(
         },
     );
 
-    let brew_installed = brew_bin.is_some();
-    let brew_sub = match brew_bin {
+    let brew_installed = paths.brew_bin.is_some();
+    let brew_sub = match paths.brew_bin {
         Some(path) => format!("Installed ({})", path.display()),
         None => "Not installed".into(),
     };
@@ -242,6 +296,26 @@ pub fn probe_source_availability_for_host_with(
             subtitle: brew_sub,
         },
     );
+
+    for (key, bin) in [
+        ("distrobox", paths.distrobox_bin),
+        ("toolbx", paths.toolbox_bin),
+    ] {
+        let installed = bin.is_some();
+        let subtitle = if installed {
+            "Updates installed containers when enabled"
+        } else {
+            "Not installed"
+        };
+        map.insert(
+            key.into(),
+            SourceAvailability {
+                pref_key: key,
+                installed,
+                subtitle: subtitle.into(),
+            },
+        );
+    }
 
     let fw_cli = command_exists("fwupdmgr");
     let fw_installed = native_fwupd || fw_cli;
@@ -491,6 +565,12 @@ pub trait OrchestratorRuntime: Send + 'static {
     fn brew_available(&self) -> bool {
         self.brew_binary().is_some()
     }
+    fn distrobox_binary(&self) -> Option<PathBuf> {
+        None
+    }
+    fn toolbox_binary(&self) -> Option<PathBuf> {
+        None
+    }
     fn gnome_extensions_available(&self) -> bool {
         false
     }
@@ -642,6 +722,14 @@ impl OrchestratorRuntime for SystemRuntime {
     }
     fn brew_binary(&self) -> Option<PathBuf> {
         brew::find_brew_binary()
+    }
+
+    fn distrobox_binary(&self) -> Option<PathBuf> {
+        containers::find_distrobox_binary()
+    }
+
+    fn toolbox_binary(&self) -> Option<PathBuf> {
+        containers::find_toolbox_binary()
     }
 
     fn gnome_extensions_available(&self) -> bool {
@@ -1074,6 +1162,64 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
         }
     }
 
+    // 6) Distrobox & Toolbx — unprivileged rootless container discovery when opted-in and installed.
+    let mut discovered_distrobox: Vec<containers::ContainerInfo> = Vec::new();
+    if config.is_enabled(UpdateSource::Distrobox) {
+        if let Some(dbox_bin) = container_program(runtime, UpdateSource::Distrobox) {
+            if !ch.is_current() {
+                return;
+            }
+            let dbox_res = match run_container_list_check(
+                &ch,
+                runtime,
+                UpdateSource::Distrobox,
+                &dbox_bin,
+                &[],
+            ) {
+                Ok((pkgs, infos)) => {
+                    discovered_distrobox = infos;
+                    Ok(pkgs)
+                }
+                Err(err) => Err(err),
+            };
+            if !ch.is_current() {
+                return;
+            }
+            emit_backend_check(
+                &ch,
+                UpdateSource::Distrobox,
+                dbox_res,
+                &mut all,
+                &mut soft_errors,
+            );
+        }
+    }
+    if config.is_enabled(UpdateSource::Toolbx) {
+        if let Some(tbx_bin) = container_program(runtime, UpdateSource::Toolbx) {
+            if !ch.is_current() {
+                return;
+            }
+            let tbx_res = run_container_list_check(
+                &ch,
+                runtime,
+                UpdateSource::Toolbx,
+                &tbx_bin,
+                &discovered_distrobox,
+            )
+            .map(|(pkgs, _)| pkgs);
+            if !ch.is_current() {
+                return;
+            }
+            emit_backend_check(
+                &ch,
+                UpdateSource::Toolbx,
+                tbx_res,
+                &mut all,
+                &mut soft_errors,
+            );
+        }
+    }
+
     // 5) fwupd — prefer native org.freedesktop.fwupd D-Bus, falling back cleanly
     // to the Phase 1 privileged fwupdmgr CLI helper when unavailable.
     if config.is_enabled(UpdateSource::Firmware) {
@@ -1359,6 +1505,314 @@ fn brew_program<R: OrchestratorRuntime>(runtime: &R) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+fn container_program<R: OrchestratorRuntime>(
+    runtime: &R,
+    source: UpdateSource,
+) -> Option<String> {
+    match source {
+        UpdateSource::Distrobox => runtime
+            .distrobox_binary()
+            .map(|path| path.to_string_lossy().into_owned()),
+        UpdateSource::Toolbx => runtime
+            .toolbox_binary()
+            .map(|path| path.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+fn run_container_list_check<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    source: UpdateSource,
+    bin: &str,
+    existing_distrobox: &[containers::ContainerInfo],
+) -> Result<(Vec<Package>, Vec<containers::ContainerInfo>), String> {
+    let tag = source.console_tag();
+    let (args, label) = match source {
+        UpdateSource::Distrobox => (&["list", "--no-color"][..], "Distrobox"),
+        UpdateSource::Toolbx => (&["list", "--containers"][..], "Toolbx"),
+        _ => return Ok((Vec::new(), Vec::new())),
+    };
+    let work_cancel = ch.cancel.work_cancel();
+    let mut log = String::new();
+    let code = runtime
+        .run_cancellable_local_env(
+            bin,
+            args,
+            containers::NONINTERACTIVE_ENV,
+            Some(&work_cancel),
+            &mut |l| {
+                log.push_str(&l);
+                log.push('\n');
+            },
+        )
+        .map_err(|e| format!("{tag}: {e}"))?;
+
+    if !ch.is_current() || work_cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
+
+    let infos = match source {
+        UpdateSource::Distrobox => containers::parse_distrobox_list(&log),
+        UpdateSource::Toolbx => {
+            let parsed = containers::parse_toolbox_list(&log);
+            containers::filter_toolbox_duplicates(parsed, existing_distrobox)
+        }
+        _ => Vec::new(),
+    };
+
+    if infos.is_empty() && !containers::list_exit_is_empty(code, &log) {
+        for line in log.lines().map(str::trim).filter(|l| !l.is_empty()).take(8) {
+            ch.line(tag, line.to_string());
+        }
+        return Err(format!("{tag}: {} list exited with {code}", label.to_ascii_lowercase()));
+    }
+
+    if !infos.is_empty() {
+        ch.line(tag, format!("{} {} container(s)", infos.len(), label));
+        for info in &infos {
+            ch.line(
+                tag,
+                format!("  {} ({} · {})", info.name, info.image, info.status),
+            );
+        }
+    }
+
+    let pkgs = infos
+        .iter()
+        .cloned()
+        .map(|info| info.into_package(source))
+        .collect();
+    Ok((pkgs, infos))
+}
+
+enum ContainerApplyOutcome {
+    Cancelled,
+    Finished {
+        code: i32,
+        log: String,
+        error: Option<String>,
+    },
+}
+
+fn run_container_apply<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    source: UpdateSource,
+    packages: &[Package],
+    mode: ApplyMode,
+) -> ContainerApplyOutcome {
+    let tag = source.console_tag();
+    let (display_name, bin_name) = match source {
+        UpdateSource::Distrobox => ("Distrobox containers", "distrobox"),
+        UpdateSource::Toolbx => ("Toolbx containers", "toolbox"),
+        _ => {
+            return ContainerApplyOutcome::Finished {
+                code: 0,
+                log: String::new(),
+                error: None,
+            }
+        }
+    };
+
+    if mode == ApplyMode::DownloadOnly {
+        ch.line(
+            tag,
+            format!("Skipping {display_name} during Download Only mode."),
+        );
+        return ContainerApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+    if mode == ApplyMode::OfflineOnReboot {
+        ch.line(
+            tag,
+            format!(
+                "Skipping {display_name} during offline reboot transaction (apply live instead)."
+            ),
+        );
+        return ContainerApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+
+    let Some(bin) = container_program(runtime, source) else {
+        let msg = format!("{bin_name} executable not found");
+        ch.line(tag, format!("error: {msg}"));
+        return ContainerApplyOutcome::Finished {
+            code: -1,
+            log: msg.clone(),
+            error: Some(format!("{}: {msg}", source.label())),
+        };
+    };
+
+    let targets = containers::container_names_from_packages(packages, source);
+    if targets.is_empty() {
+        return ContainerApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+
+    let work_cancel = ch.cancel.work_cancel();
+    let mut full_log = String::new();
+    let mut failed_errors = Vec::new();
+    let label_prefix = format!("{}: ", source.label());
+
+    for (_pkg_id, name) in targets {
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return ContainerApplyOutcome::Cancelled;
+        }
+
+        ch.line(tag, format!("── Upgrading {name} ──"));
+        emit_progress_hint(
+            ch,
+            source,
+            ProgressHint {
+                package_name: Some(name.clone()),
+                status: Some(PackageStatus::Installing),
+                progress: None,
+                phase_label: Some(format!("Upgrading {name}")),
+                stage_current: None,
+                stage_total: None,
+            },
+        );
+
+        let args: Vec<&str> = match source {
+            UpdateSource::Distrobox => vec!["upgrade", name.as_str()],
+            UpdateSource::Toolbx => vec![
+                "run",
+                "--container",
+                name.as_str(),
+                "sudo",
+                "dnf",
+                "upgrade",
+                "-y",
+            ],
+            _ => unreachable!(),
+        };
+
+        let mut per_log = String::new();
+        let exec_res = runtime.run_cancellable_local_env(
+            &bin,
+            &args,
+            containers::NONINTERACTIVE_ENV,
+            Some(&work_cancel),
+            &mut |l| {
+                per_log.push_str(&l);
+                per_log.push('\n');
+                full_log.push_str(&l);
+                full_log.push('\n');
+                ch.line(tag, l.clone());
+
+                let mut hint = containers::parse_progress_line(&l);
+                if hint.progress.is_some() || hint.phase_label.is_some() {
+                    hint.package_name = Some(name.clone());
+                    hint.status = match hint.status {
+                        Some(PackageStatus::Downloading) => Some(PackageStatus::Downloading),
+                        _ => Some(PackageStatus::Installing),
+                    };
+                    emit_progress_hint(ch, source, hint);
+                }
+            },
+        );
+
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return ContainerApplyOutcome::Cancelled;
+        }
+
+        match exec_res {
+            Ok(0) => {
+                ch.line(tag, format!("Container {name} upgraded."));
+                emit_progress_hint(
+                    ch,
+                    source,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Completed),
+                        progress: Some(1.0),
+                        phase_label: Some("Complete".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+            Ok(code) => {
+                let base_reason = summarize_apply_failure(source, &per_log, code);
+                let stripped = strip_prefix_ascii_ci(&base_reason, &label_prefix)
+                    .unwrap_or(&base_reason)
+                    .trim();
+                let reason = if stripped.contains(&name) {
+                    stripped.to_string()
+                } else {
+                    format!("{name}: {stripped}")
+                };
+                if !per_log
+                    .lines()
+                    .any(|l| strip_prefix_ascii_ci(l.trim(), "error:").is_some())
+                {
+                    ch.line(tag, format!("error: {reason}"));
+                }
+                failed_errors.push(reason);
+                emit_progress_hint(
+                    ch,
+                    source,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Failed),
+                        progress: None,
+                        phase_label: Some("Failed".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+            Err(err) => {
+                let reason = format!("{name}: {err}");
+                ch.line(tag, format!("error: {reason}"));
+                full_log.push_str(&reason);
+                full_log.push('\n');
+                failed_errors.push(reason);
+                emit_progress_hint(
+                    ch,
+                    source,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Failed),
+                        progress: None,
+                        phase_label: Some("Failed".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+        }
+    }
+
+    if !ch.is_current() || work_cancel.is_cancelled() {
+        return ContainerApplyOutcome::Cancelled;
+    }
+
+    if failed_errors.is_empty() {
+        ContainerApplyOutcome::Finished {
+            code: 0,
+            log: full_log,
+            error: None,
+        }
+    } else {
+        ContainerApplyOutcome::Finished {
+            code: 1,
+            log: full_log,
+            error: Some(format!("{}: {}", source.label(), failed_errors.join("; "))),
+        }
+    }
+}
+
 fn run_brew_check<R: OrchestratorRuntime>(
     ch: &WorkChannel,
     runtime: &R,
@@ -1636,7 +2090,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
             stage_total: None,
         });
 
-        let (code, log, native_reboot) = match source {
+        let (code, log, native_reboot, explicit_error) = match source {
             UpdateSource::Dnf => {
                 let dnf_pkgs: Vec<Package> = packages
                     .iter()
@@ -1669,11 +2123,11 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         if res.cancelled || !ch.is_current() {
                             return;
                         }
-                        (0, native_log, res.needs_reboot)
+                        (0, native_log, res.needs_reboot, None)
                     }
                     NativeOutcome::Handled(Err(reason)) => {
                         log_native_apply_error(&ch, tag, &mut native_log, &reason);
-                        (1, native_log, false)
+                        (1, native_log, false, None)
                     }
                     NativeOutcome::Unavailable(_) => {
                         let ready = if session_ensured {
@@ -1691,11 +2145,11 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                             Ok(()) => {
                                 let (c, l) =
                                     run_helper_apply(&ch, runtime, HelperCommand::ApplyDnf, tag, source);
-                                (c, l, false)
+                                (c, l, false, None)
                             }
                             Err(e) => {
                                 ch.line(tag, format!("error: {e}"));
-                                (-1, e.to_string(), false)
+                                (-1, e.to_string(), false, None)
                             }
                         }
                     }
@@ -1707,7 +2161,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         tag,
                         "Skipping Atomic OS deployment during Download Only mode.".into(),
                     );
-                    (0, String::new(), false)
+                    (0, String::new(), false, None)
                 } else {
                     if mode == ApplyMode::OfflineOnReboot {
                         ch.line(
@@ -1720,7 +2174,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         None => {
                             let msg = "rpm-ostree executable not found";
                             ch.line(tag, format!("error: {msg}"));
-                            (-1, msg.to_string(), false)
+                            (-1, msg.to_string(), false, None)
                         }
                         Some(ostree_bin) => {
                             let _active_guard = rpm_ostree::ApplyActiveGuard::enter();
@@ -1744,7 +2198,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                             }
                             let staged =
                                 c == 0 && rpm_ostree::detect_reboot_needed(&l, &packages);
-                            (c, l, staged)
+                            (c, l, staged, None)
                         }
                     }
                 }
@@ -1758,7 +2212,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                             source.label()
                         ),
                     );
-                    (0, String::new(), false)
+                    (0, String::new(), false, None)
                 } else {
                     // Apply the exact refs we listed at Check time, as the user.
                     // (Running system flatpak as root via helper can disagree with
@@ -1771,7 +2225,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         .collect();
                     if refs.is_empty() {
                         ch.line(tag, "No flatpak refs to update".into());
-                        (0, String::new(), false)
+                        (0, String::new(), false, None)
                     } else {
                         ch.line(
                             tag,
@@ -1792,17 +2246,17 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                             &mut |hint| emit_progress_hint(&ch, source, hint),
                         );
                         match outcome {
-                            NativeOutcome::Handled(Ok(_)) => (0, native_log, false),
+                            NativeOutcome::Handled(Ok(_)) => (0, native_log, false, None),
                             NativeOutcome::Handled(Err(reason)) => {
                                 log_native_apply_error(&ch, tag, &mut native_log, &reason);
-                                (1, native_log, false)
+                                (1, native_log, false, None)
                             }
                             NativeOutcome::Unavailable(_) => {
                                 let args = flatpak::update_args_for_refs(user, &refs);
                                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                                 let (c, l) =
                                     run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source);
-                                (c, l, false)
+                                (c, l, false, None)
                             }
                         }
                     }
@@ -1814,18 +2268,18 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         tag,
                         "Skipping GNOME Shell extension install during Download Only mode.".into(),
                     );
-                    (0, String::new(), false)
+                    (0, String::new(), false, None)
                 } else if mode == ApplyMode::OfflineOnReboot {
                     ch.line(
                         tag,
                         "Skipping GNOME Shell extensions during offline reboot transaction (apply live instead)."
                             .into(),
                     );
-                    (0, String::new(), false)
+                    (0, String::new(), false, None)
                 } else {
                     let uuids = gnome_extensions::extension_uuids_from_packages(&packages);
                     if uuids.is_empty() {
-                        (0, String::new(), false)
+                        (0, String::new(), false, None)
                     } else {
                         let work_cancel = ch.cancel.work_cancel();
                         let mut native_log = String::new();
@@ -1862,14 +2316,14 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                                             log_native_apply_error(&ch, tag, &mut native_log, err);
                                         }
                                     }
-                                    (1, native_log, false)
+                                    (1, native_log, false, None)
                                 } else {
-                                    (0, native_log, false)
+                                    (0, native_log, false, None)
                                 }
                             }
                             NativeOutcome::Handled(Err(reason)) => {
                                 log_native_apply_error(&ch, tag, &mut native_log, &reason);
-                                (1, native_log, false)
+                                (1, native_log, false, None)
                             }
                             NativeOutcome::Unavailable(reason) => {
                                 let msg = if reason.trim().is_empty() {
@@ -1878,7 +2332,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                                     reason
                                 };
                                 log_native_apply_error(&ch, tag, &mut native_log, &msg);
-                                (-1, native_log, false)
+                                (-1, native_log, false, None)
                             }
                         }
                     }
@@ -1891,18 +2345,18 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         "Skipping Homebrew during offline reboot transaction (apply live instead)."
                             .into(),
                     );
-                    (0, String::new(), false)
+                    (0, String::new(), false, None)
                 } else {
                     match brew_program(runtime) {
                         None => {
                             let msg = "Homebrew (brew) executable not found";
                             ch.line(tag, format!("error: {msg}"));
-                            (-1, msg.to_string(), false)
+                            (-1, msg.to_string(), false, None)
                         }
                         Some(brew_bin) => {
                             let names = brew::upgrade_names_from_packages(&packages);
                             if names.is_empty() {
-                                (0, String::new(), false)
+                                (0, String::new(), false, None)
                             } else {
                                 let subcmd = if mode == ApplyMode::DownloadOnly {
                                     "fetch"
@@ -1923,9 +2377,17 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                                     tag,
                                     source,
                                 );
-                                (c, l, false)
+                                (c, l, false, None)
                             }
                         }
+                    }
+                }
+            }
+            UpdateSource::Distrobox | UpdateSource::Toolbx => {
+                match run_container_apply(&ch, runtime, source, &packages, mode) {
+                    ContainerApplyOutcome::Cancelled => return,
+                    ContainerApplyOutcome::Finished { code, log, error } => {
+                        (code, log, false, error)
                     }
                 }
             }
@@ -1935,7 +2397,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         tag,
                         "Skipping firmware flash during Download Only mode.".into(),
                     );
-                    (0, String::new(), false)
+                    (0, String::new(), false, None)
                 } else {
                     let fw_pkgs: Vec<Package> = packages
                         .iter()
@@ -1953,10 +2415,10 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                         &mut |hint| emit_progress_hint(&ch, source, hint),
                     );
                     match outcome {
-                        NativeOutcome::Handled(Ok(res)) => (0, native_log, res.needs_reboot),
+                        NativeOutcome::Handled(Ok(res)) => (0, native_log, res.needs_reboot, None),
                         NativeOutcome::Handled(Err(reason)) => {
                             log_native_apply_error(&ch, tag, &mut native_log, &reason);
-                            (1, native_log, false)
+                            (1, native_log, false, None)
                         }
                         NativeOutcome::Unavailable(_) => {
                             let ready = if session_ensured {
@@ -1979,11 +2441,11 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                                         tag,
                                         source,
                                     );
-                                    (c, l, false)
+                                    (c, l, false, None)
                                 }
                                 Err(e) => {
                                     ch.line(tag, format!("error: {e}"));
-                                    (-1, e.to_string(), false)
+                                    (-1, e.to_string(), false, None)
                                 }
                             }
                         }
@@ -2008,7 +2470,7 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
         let error = if code == 0 {
             None
         } else {
-            Some(summarize_apply_failure(source, &log, code))
+            explicit_error.or_else(|| Some(summarize_apply_failure(source, &log, code)))
         };
 
         ch.event(StateEvent::BackendApplyDone {
@@ -2765,6 +3227,11 @@ mod tests {
 
     #[test]
     fn source_config_filters_and_detects_all_disabled() {
+        let default_cfg = SourceConfig::default();
+        assert!(!default_cfg.is_enabled(UpdateSource::Distrobox));
+        assert!(!default_cfg.is_enabled(UpdateSource::Toolbx));
+        assert!(default_cfg.is_enabled(UpdateSource::Dnf));
+
         let mut cfg = SourceConfig::all_enabled();
         assert!(!cfg.all_disabled());
         assert!(!cfg.all_disabled_for_host(true));
@@ -2774,6 +3241,8 @@ mod tests {
             UpdateSource::FlatpakSystem,
             UpdateSource::GnomeExtensions,
             UpdateSource::Homebrew,
+            UpdateSource::Distrobox,
+            UpdateSource::Toolbx,
             UpdateSource::Firmware,
         ];
         assert_eq!(cfg.enabled_sources(), expected_classic);
@@ -2786,6 +3255,8 @@ mod tests {
                 UpdateSource::FlatpakSystem,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Distrobox,
+                UpdateSource::Toolbx,
                 UpdateSource::Firmware,
             ]
         );
@@ -2797,6 +3268,8 @@ mod tests {
         assert!(cfg.is_enabled(UpdateSource::RpmOstree));
         assert!(cfg.is_enabled(UpdateSource::GnomeExtensions));
         assert!(cfg.is_enabled(UpdateSource::Homebrew));
+        assert!(cfg.is_enabled(UpdateSource::Distrobox));
+        assert!(cfg.is_enabled(UpdateSource::Toolbx));
         assert!(cfg.is_enabled(UpdateSource::Firmware));
         assert_eq!(
             cfg.enabled_sources(),
@@ -2804,6 +3277,8 @@ mod tests {
                 UpdateSource::Dnf,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Distrobox,
+                UpdateSource::Toolbx,
                 UpdateSource::Firmware,
             ]
         );
@@ -2811,6 +3286,8 @@ mod tests {
         cfg.disable("dnf");
         cfg.disable("gnome-extensions");
         cfg.disable("homebrew");
+        cfg.disable("distrobox");
+        cfg.disable("toolbx");
         cfg.disable("firmware");
         assert!(cfg.all_disabled());
         assert!(cfg.enabled_sources().is_empty());
@@ -2831,6 +3308,12 @@ mod tests {
         assert!(from_keys.is_enabled(UpdateSource::Dnf));
         assert!(from_keys.is_enabled(UpdateSource::GnomeExtensions));
         assert!(from_keys.is_enabled(UpdateSource::Homebrew));
+        assert!(!from_keys.is_enabled(UpdateSource::Distrobox));
+        assert!(!from_keys.is_enabled(UpdateSource::Toolbx));
+
+        let with_opt_in = SourceConfig::from_prefs([], ["  Toolbx  ".into()]);
+        assert!(with_opt_in.is_enabled(UpdateSource::Toolbx));
+        assert!(!with_opt_in.is_enabled(UpdateSource::Distrobox));
     }
 
     #[test]
@@ -2865,6 +3348,10 @@ mod tests {
         );
         assert!(!probed_no_brew.get("homebrew").unwrap().installed);
         assert_eq!(probed_no_brew.get("homebrew").unwrap().subtitle, "Not installed");
+        assert!(!probed_no_brew.get("distrobox").unwrap().installed);
+        assert_eq!(probed_no_brew.get("distrobox").unwrap().subtitle, "Not installed");
+        assert!(!probed_no_brew.get("toolbx").unwrap().installed);
+        assert_eq!(probed_no_brew.get("toolbx").unwrap().subtitle, "Not installed");
         assert!(probed_no_brew.contains_key("firmware"));
 
         let probed_with_brew_and_ext = probe_source_availability_with(
@@ -2891,15 +3378,29 @@ mod tests {
             true,
             false,
             true,
-            None,
-            Some(std::path::Path::new(rpm_ostree::RPM_OSTREE_DEFAULT_PATH)),
             false,
+            HostBinaryPaths {
+                rpm_ostree_bin: Some(std::path::Path::new(rpm_ostree::RPM_OSTREE_DEFAULT_PATH)),
+                distrobox_bin: Some(std::path::Path::new(containers::DISTROBOX_DEFAULT_PATH)),
+                toolbox_bin: Some(std::path::Path::new(containers::TOOLBOX_DEFAULT_PATH)),
+                ..Default::default()
+            },
         );
         assert!(!probed_ostree.contains_key("dnf"));
         assert!(probed_ostree["rpm-ostree"].installed);
         assert_eq!(
             probed_ostree["rpm-ostree"].subtitle,
             "Installed (/usr/bin/rpm-ostree)"
+        );
+        assert!(probed_ostree["distrobox"].installed);
+        assert_eq!(
+            probed_ostree["distrobox"].subtitle,
+            "Updates installed containers when enabled"
+        );
+        assert!(probed_ostree["toolbx"].installed);
+        assert_eq!(
+            probed_ostree["toolbx"].subtitle,
+            "Updates installed containers when enabled"
         );
         assert_eq!(
             probed_ostree["firmware"].subtitle,

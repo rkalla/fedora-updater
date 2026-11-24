@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use fedora_updater::model::UpdateSource;
 use fedora_updater::orchestrator::SourceConfig;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,13 @@ const MAX_WINDOW_EXTENT: i32 = 16_384;
 const APP_CONFIG_DIR: &str = "fedora-updater";
 const PREFS_FILE_NAME: &str = "ui.json";
 
+fn normalize_key_set(keys: BTreeSet<String>) -> BTreeSet<String> {
+    keys.into_iter()
+        .map(|key| key.trim().to_ascii_lowercase())
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiPrefs {
@@ -31,6 +39,8 @@ pub struct UiPrefs {
     pub window_height: i32,
     #[serde(default)]
     pub disabled_sources: BTreeSet<String>,
+    #[serde(default)]
+    pub enabled_opt_in_sources: BTreeSet<String>,
 }
 
 impl Default for UiPrefs {
@@ -40,13 +50,14 @@ impl Default for UiPrefs {
             window_width: DEFAULT_WINDOW_WIDTH,
             window_height: DEFAULT_WINDOW_HEIGHT,
             disabled_sources: BTreeSet::new(),
+            enabled_opt_in_sources: BTreeSet::new(),
         }
     }
 }
 
 impl UiPrefs {
     /// Clamp out-of-range dimensions back to Observatory defaults while keeping
-    /// the sidebar toggle and normalized disabled source keys intact.
+    /// the sidebar toggle and normalized source keys intact.
     pub fn normalized(self) -> Self {
         let window_width =
             if (MIN_WINDOW_WIDTH..=MAX_WINDOW_EXTENT).contains(&self.window_width) {
@@ -60,23 +71,23 @@ impl UiPrefs {
             } else {
                 DEFAULT_WINDOW_HEIGHT
             };
-        let disabled_sources = self
-            .disabled_sources
-            .into_iter()
-            .map(|key| key.trim().to_ascii_lowercase())
-            .filter(|key| !key.is_empty())
-            .collect();
         Self {
             sidebar_open: self.sidebar_open,
             window_width,
             window_height,
-            disabled_sources,
+            disabled_sources: normalize_key_set(self.disabled_sources),
+            enabled_opt_in_sources: normalize_key_set(self.enabled_opt_in_sources),
         }
     }
 
     pub fn is_source_enabled(&self, pref_key: &str) -> bool {
         let normalized = pref_key.trim().to_ascii_lowercase();
-        !self.disabled_sources.contains(&normalized)
+        if UpdateSource::pref_key_is_opt_in(&normalized) {
+            self.enabled_opt_in_sources.contains(&normalized)
+                && !self.disabled_sources.contains(&normalized)
+        } else {
+            !self.disabled_sources.contains(&normalized)
+        }
     }
 
     pub fn set_source_enabled(&mut self, pref_key: &str, enabled: bool) {
@@ -84,7 +95,14 @@ impl UiPrefs {
         if normalized.is_empty() {
             return;
         }
-        if enabled {
+        if UpdateSource::pref_key_is_opt_in(&normalized) {
+            self.disabled_sources.remove(&normalized);
+            if enabled {
+                self.enabled_opt_in_sources.insert(normalized);
+            } else {
+                self.enabled_opt_in_sources.remove(&normalized);
+            }
+        } else if enabled {
             self.disabled_sources.remove(&normalized);
         } else {
             self.disabled_sources.insert(normalized);
@@ -92,7 +110,10 @@ impl UiPrefs {
     }
 
     pub fn source_config(&self) -> SourceConfig {
-        SourceConfig::from_disabled_keys(self.disabled_sources.iter().cloned())
+        SourceConfig::from_prefs(
+            self.disabled_sources.iter().cloned(),
+            self.enabled_opt_in_sources.iter().cloned(),
+        )
     }
 }
 
@@ -207,9 +228,12 @@ mod tests {
         assert_eq!(prefs.window_width, 960);
         assert_eq!(prefs.window_height, 676);
         assert!(prefs.disabled_sources.is_empty());
+        assert!(prefs.enabled_opt_in_sources.is_empty());
         assert!(prefs.is_source_enabled("dnf"));
         assert!(prefs.is_source_enabled("flatpak"));
         assert!(prefs.is_source_enabled("firmware"));
+        assert!(!prefs.is_source_enabled("distrobox"));
+        assert!(!prefs.is_source_enabled("toolbx"));
     }
 
     #[test]
@@ -242,13 +266,17 @@ mod tests {
             window_width: 1120,
             window_height: 740,
             disabled_sources: BTreeSet::new(),
+            enabled_opt_in_sources: BTreeSet::new(),
         };
         prefs.set_source_enabled("firmware", false);
+        prefs.set_source_enabled("toolbx", true);
 
         save_to(&path, &prefs).expect("save ui prefs");
         assert!(path.is_file());
         assert_eq!(load_from(&path), prefs);
         assert!(!load_from(&path).is_source_enabled("firmware"));
+        assert!(load_from(&path).is_source_enabled("toolbx"));
+        assert!(!load_from(&path).is_source_enabled("distrobox"));
     }
 
     #[test]
@@ -275,6 +303,7 @@ mod tests {
                 window_width: DEFAULT_WINDOW_WIDTH,
                 window_height: DEFAULT_WINDOW_HEIGHT,
                 disabled_sources: BTreeSet::new(),
+                enabled_opt_in_sources: BTreeSet::new(),
             }
         );
 
@@ -291,6 +320,7 @@ mod tests {
                 window_width: DEFAULT_WINDOW_WIDTH,
                 window_height: DEFAULT_WINDOW_HEIGHT,
                 disabled_sources: BTreeSet::new(),
+                enabled_opt_in_sources: BTreeSet::new(),
             }
         );
     }
@@ -315,22 +345,34 @@ mod tests {
         assert_eq!(loaded.window_width, 1080);
         assert_eq!(loaded.window_height, 720);
         assert!(loaded.disabled_sources.is_empty());
+        assert!(loaded.enabled_opt_in_sources.is_empty());
         assert!(loaded.is_source_enabled("dnf"));
         assert!(loaded.is_source_enabled("flatpak"));
         assert!(loaded.is_source_enabled("firmware"));
+        assert!(!loaded.is_source_enabled("distrobox"));
+        assert!(!loaded.is_source_enabled("toolbx"));
 
         loaded.set_source_enabled("  Flatpak  ", false);
         loaded.set_source_enabled("dnf", false);
         loaded.set_source_enabled("dnf", true);
+        loaded.set_source_enabled("  Distrobox ", true);
         loaded.set_source_enabled("   ", false);
         assert!(!loaded.is_source_enabled("flatpak"));
         assert!(loaded.is_source_enabled("dnf"));
+        assert!(loaded.is_source_enabled("distrobox"));
+        assert!(!loaded.is_source_enabled("toolbx"));
 
         save_to(&legacy_path, &loaded).expect("save updated prefs");
         let reloaded = load_from(&legacy_path);
         assert_eq!(reloaded.disabled_sources, BTreeSet::from(["flatpak".into()]));
+        assert_eq!(
+            reloaded.enabled_opt_in_sources,
+            BTreeSet::from(["distrobox".into()])
+        );
         assert!(!reloaded.is_source_enabled("FLATPAK"));
         assert!(reloaded.is_source_enabled("firmware"));
+        assert!(reloaded.is_source_enabled("DISTROBOX"));
+        assert!(!reloaded.is_source_enabled("TOOLBX"));
     }
 
     #[test]
@@ -349,6 +391,7 @@ mod tests {
             window_width: 1024,
             window_height: 700,
             disabled_sources: BTreeSet::from(["firmware".into()]),
+            enabled_opt_in_sources: BTreeSet::from(["toolbx".into()]),
         };
 
         assert!(!save_if_enabled(Some(&path), &custom, true));

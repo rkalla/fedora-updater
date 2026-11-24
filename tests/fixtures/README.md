@@ -2,7 +2,7 @@
 
 Checked-in, deterministic, offline test inputs for unit, functional, and end-to-end suites ([rkalla/fedora-updater#20](https://github.com/rkalla/fedora-updater/issues/20)).
 
-All 45 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
+All 61 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
 
 ## Usage in Tests
 
@@ -112,3 +112,15 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `rpm_ostree/status.json` | `rpm-ostree status --json` (exit 0) | Silverblue deployment metadata (`booted: true`, layered `htop`/`distrobox`, `origin`, and `cached-update`) |
 | `rpm_ostree/upgrade_apply_log.txt` | `rpm-ostree upgrade` (exit 0) | Full staged apply stream (`Receiving metadata objects`, `Receiving objects: N%`, `Checking out tree`, `Overlaying`, `Writing OSTree commit`, `Staging deployment... done`, `systemctl reboot`) |
 | `rpm_ostree/upgrade_error.txt` | `rpm-ostree upgrade` (exit 1) | Active daemon transaction lock (`Transaction in progress; please wait or run rpm-ostree cancel`) |
+
+### `containers/` (7 fixtures)
+
+| File | Simulated Command & Exit | Scenario & Edge-Case Signals |
+|---|---|---|
+| `containers/distrobox_list.txt` | `distrobox list --no-color` (exit 0) | Pipe-delimited container table with running Arch Linux (`Up 3 hours`) and exited Fedora/Ubuntu containers |
+| `containers/toolbox_list.txt` | `toolbox list --containers` (exit 0) | Columnar 5-column table (`CONTAINER ID`, `CONTAINER NAME`, `CREATED`, `STATUS`, `IMAGE NAME`) with unique Toolbx containers |
+| `containers/toolbox_list_with_duplicates.txt` | `toolbox list --containers` (exit 0) | Mixed listing overlapping Distrobox containers by ID/name and ID prefix plus one unique Toolbx container for deduplication |
+| `containers/empty.txt` | `distrobox list --no-color` (exit 0) | Header-only empty container listing yielding zero discovered containers |
+| `containers/distrobox_upgrade_log.txt` | `distrobox upgrade arch-dev` (exit 0) | Unprivileged rootless Distrobox upgrade stream ending cleanly with `Container arch-dev upgraded successfully.` |
+| `containers/toolbox_upgrade_log.txt` | `toolbox run --container fedora-toolbox-43 sudo dnf upgrade -y` (exit 0) | Unprivileged rootless Toolbx inner DNF upgrade stream ending cleanly with `Complete!` |
+| `containers/upgrade_error.txt` | `distrobox upgrade ubuntu-lts` (exit 1) | Non-zero container upgrade failure log preserved for per-container error isolation |

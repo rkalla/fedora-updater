@@ -1,0 +1,10 @@
+Updating and loading repositories:
+Fedora 43 - x86_64 - Updates
+Repositories loaded.
+Package                  Arch   Version        Repository      Size
+Upgrading:
+ curl                    x86_64 8.11.1-2.fc43  updates       1.1 MiB
+Transaction Summary:
+ Upgrading:          1 package
+[1/1] Upgrading curl-0:8.11.1-2.fc43.x86_64
+Complete!

@@ -72,6 +72,14 @@ pub const ALL_FIXTURES: &[&str] = &[
     "rpm_ostree/status.json",
     "rpm_ostree/upgrade_apply_log.txt",
     "rpm_ostree/upgrade_error.txt",
+    // containers/
+    "containers/distrobox_list.txt",
+    "containers/toolbox_list.txt",
+    "containers/toolbox_list_with_duplicates.txt",
+    "containers/empty.txt",
+    "containers/distrobox_upgrade_log.txt",
+    "containers/toolbox_upgrade_log.txt",
+    "containers/upgrade_error.txt",
 ];
 
 #[derive(Debug, Clone)]

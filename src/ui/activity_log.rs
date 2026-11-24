@@ -19,6 +19,7 @@ pub enum LogSourceFilter {
     Flatpak,
     Extensions,
     Brew,
+    Containers,
     Fwupd,
 }
 
@@ -31,6 +32,7 @@ impl LogSourceFilter {
             Self::Flatpak => "flatpak",
             Self::Extensions => "gnome-ext",
             Self::Brew => "brew",
+            Self::Containers => "containers",
             Self::Fwupd => "fwupd",
         }
     }
@@ -41,6 +43,7 @@ impl LogSourceFilter {
             Some("flatpak") => Self::Flatpak,
             Some("gnome-ext") => Self::Extensions,
             Some("brew") => Self::Brew,
+            Some("containers") => Self::Containers,
             Some("fwupd") => Self::Fwupd,
             _ => Self::All,
         }
@@ -77,6 +80,7 @@ pub fn line_matches_source(line: &str, filter: LogSourceFilter) -> bool {
         }
         LogSourceFilter::Extensions => matches!(parse_log_tag(line), Some("gnome-ext")),
         LogSourceFilter::Brew => matches!(parse_log_tag(line), Some("brew")),
+        LogSourceFilter::Containers => matches!(parse_log_tag(line), Some("distrobox" | "toolbx")),
         LogSourceFilter::Fwupd => matches!(parse_log_tag(line), Some("fwupd")),
     }
 }
@@ -193,6 +197,7 @@ impl ActivityLogView {
             ("flatpak", "Flatpak"),
             ("gnome-ext", "Ext"),
             ("brew", "Brew"),
+            ("containers", "Containers"),
             ("fwupd", "fwupd"),
         ] {
             let toggle = libadwaita::Toggle::builder().name(name).label(label).build();
@@ -504,6 +509,8 @@ mod tests {
             "Updating Blur my Shell (blur-my-shell@aunetx)",
         );
         console.push_committed_tagged("brew", "==> Upgrading ripgrep 14.1.0 -> 14.1.1");
+        console.push_committed_tagged("distrobox", "Updating fedora-dev container");
+        console.push_committed_tagged("toolbx", "Upgrading fedora-toolbox-43");
         console.push_committed_tagged("fwupd", "UEFI dbx 20241101");
         assert_eq!(LogSourceFilter::All.name(), "all");
         assert_eq!(
@@ -515,16 +522,20 @@ mod tests {
             LogSourceFilter::Extensions
         );
         assert_eq!(LogSourceFilter::from_name(Some("brew")), LogSourceFilter::Brew);
+        assert_eq!(
+            LogSourceFilter::from_name(Some("containers")),
+            LogSourceFilter::Containers
+        );
 
         let (all_text, all_m, all_t) = filter_console_lines(&console, LogSourceFilter::All, "");
-        assert_eq!(all_m, 8);
-        assert_eq!(all_t, 8);
+        assert_eq!(all_m, 10);
+        assert_eq!(all_t, 10);
         assert!(!all_text.contains("40%"));
         assert!(all_text.contains("[1/2] openssl 100%"));
 
         let (dnf_text, dnf_m, dnf_t) =
             filter_console_lines(&console, LogSourceFilter::Dnf, "openssl");
-        assert_eq!((dnf_m, dnf_t), (1, 8));
+        assert_eq!((dnf_m, dnf_t), (1, 10));
         assert_eq!(dnf_text, "[dnf] [1/2] openssl 100%");
 
         assert!(line_matches_source(
@@ -538,13 +549,13 @@ mod tests {
 
         let (fp_text, fp_m, fp_t) =
             filter_console_lines(&console, LogSourceFilter::Flatpak, "");
-        assert_eq!((fp_m, fp_t), (2, 8));
+        assert_eq!((fp_m, fp_t), (2, 10));
         assert!(fp_text.contains("[flatpak-user]"));
         assert!(fp_text.contains("[flatpak-system]"));
 
         let (ext_text, ext_m, ext_t) =
             filter_console_lines(&console, LogSourceFilter::Extensions, "blur");
-        assert_eq!((ext_m, ext_t), (1, 8));
+        assert_eq!((ext_m, ext_t), (1, 10));
         assert_eq!(
             ext_text,
             "[gnome-ext] Updating Blur my Shell (blur-my-shell@aunetx)"
@@ -552,17 +563,28 @@ mod tests {
 
         let (brew_text, brew_m, brew_t) =
             filter_console_lines(&console, LogSourceFilter::Brew, "ripgrep");
-        assert_eq!((brew_m, brew_t), (1, 8));
+        assert_eq!((brew_m, brew_t), (1, 10));
         assert_eq!(brew_text, "[brew] ==> Upgrading ripgrep 14.1.0 -> 14.1.1");
+
+        let (ctr_text, ctr_m, ctr_t) =
+            filter_console_lines(&console, LogSourceFilter::Containers, "");
+        assert_eq!((ctr_m, ctr_t), (2, 10));
+        assert!(ctr_text.contains("[distrobox] Updating fedora-dev container"));
+        assert!(ctr_text.contains("[toolbx] Upgrading fedora-toolbox-43"));
+
+        let (dbox_text, dbox_m, dbox_t) =
+            filter_console_lines(&console, LogSourceFilter::Containers, "fedora-dev");
+        assert_eq!((dbox_m, dbox_t), (1, 10));
+        assert_eq!(dbox_text, "[distrobox] Updating fedora-dev container");
 
         let (fw_text, fw_m, fw_t) =
             filter_console_lines(&console, LogSourceFilter::Fwupd, "dbx");
-        assert_eq!((fw_m, fw_t), (1, 8));
+        assert_eq!((fw_m, fw_t), (1, 10));
         assert_eq!(fw_text, "[fwupd] UEFI dbx 20241101");
 
         let (none_text, none_m, none_t) =
             filter_console_lines(&console, LogSourceFilter::Fwupd, "thunderbird");
-        assert_eq!((none_m, none_t), (0, 8));
+        assert_eq!((none_m, none_t), (0, 10));
         assert_eq!(none_text, "");
     }
 }

@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 54, "expected 54 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 61, "expected 61 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(
@@ -373,4 +373,31 @@ fn rpm_ostree_fixtures_contain_expected_signals() {
 
     let err = read_fixture("rpm_ostree/upgrade_error.txt");
     assert!(err.contains("Transaction in progress"));
+}
+
+#[test]
+fn containers_fixtures_contain_expected_signals() {
+    let dbox = read_fixture("containers/distrobox_list.txt");
+    assert!(dbox.contains("arch-dev"));
+    assert!(dbox.contains("ubuntu-lts"));
+
+    let tbx = read_fixture("containers/toolbox_list.txt");
+    assert!(tbx.contains("CONTAINER ID"));
+    assert!(tbx.contains("fedora-toolbox-43"));
+
+    let tbx_dup = read_fixture("containers/toolbox_list_with_duplicates.txt");
+    assert!(tbx_dup.contains("distrobox-fedora-dev"));
+    assert!(tbx_dup.contains("fedora-toolbox-43"));
+
+    let empty = read_fixture("containers/empty.txt");
+    assert!(empty.contains("ID"));
+
+    let dbox_log = read_fixture("containers/distrobox_upgrade_log.txt");
+    assert!(dbox_log.contains("Container arch-dev upgraded successfully."));
+
+    let tbx_log = read_fixture("containers/toolbox_upgrade_log.txt");
+    assert!(tbx_log.contains("Complete!"));
+
+    let err = read_fixture("containers/upgrade_error.txt");
+    assert!(err.contains("could not upgrade container"));
 }

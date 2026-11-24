@@ -557,7 +557,9 @@ fn can_selective_apply(packages: &[Package], native_dnf: bool, native_fwupd: boo
             UpdateSource::FlatpakUser
             | UpdateSource::FlatpakSystem
             | UpdateSource::GnomeExtensions
-            | UpdateSource::Homebrew => pkg.source.supports_selective_apply(),
+            | UpdateSource::Homebrew
+            | UpdateSource::Distrobox
+            | UpdateSource::Toolbx => pkg.source.supports_selective_apply(),
         })
 }
 
@@ -578,7 +580,7 @@ fn sync_sidebar_categories(w: &Widgets, state: &AppState) {
                 .get(src.pref_key())
                 .is_none_or(|info| info.installed);
             let has_packages = state.packages().iter().any(|p| p.source == *src);
-            (installed || has_packages) && cfg.is_enabled(*src)
+            has_packages || (installed && cfg.is_enabled(*src))
         })
         .map(UpdateSource::category)
         .collect();
@@ -3147,6 +3149,8 @@ mod tests {
             (UpdateSource::FlatpakSystem, "FP", "src-flatpak"),
             (UpdateSource::GnomeExtensions, "EXT", "src-ext"),
             (UpdateSource::Homebrew, "BREW", "src-brew"),
+            (UpdateSource::Distrobox, "DBOX", "src-container"),
+            (UpdateSource::Toolbx, "TBX", "src-container"),
             (UpdateSource::Firmware, "FW", "src-firmware"),
         ] {
             let lbl = rows::source_badge(source);
@@ -4774,6 +4778,7 @@ mod tests {
             "history",
             "ready-ostree",
             "ready-ostree-mixed",
+            "ready-containers",
             "running-ostree",
             "done-ostree",
         ];
@@ -4876,6 +4881,27 @@ mod tests {
                     assert!(widgets.ready_queue.is_selectable());
                     assert!(widgets.ready_selection_bar.get_visible());
                     assert!(widgets.ready_split_update.get_visible());
+                }
+                "ready-containers" => {
+                    assert!(!widgets.ostree_booted.get());
+                    assert!(widgets.ready_queue.is_selectable());
+                    assert_eq!(widgets.ready_queue.filtered_count(), 2);
+                    assert!(widgets.ready_selection_bar.get_visible());
+                    assert!(widgets
+                        .sidebar
+                        .category_row(fedora_updater::model::SourceCategory::DevAndContainers)
+                        .get_visible());
+                    if let Some(ctr_pkg) = cfg.state.packages().first() {
+                        widgets.inspector.paint(ctr_pkg);
+                        assert_eq!(widgets.inspector.repo_label_text(), "Base Image");
+                        assert_eq!(widgets.inspector.version_label_text(), "Container State");
+                        assert!(widgets.inspector.note_card_visible());
+                        assert_eq!(widgets.inspector.note_title_text(), "Container Note");
+                        assert!(widgets
+                            .inspector
+                            .note_body_text()
+                            .contains("inside the container when run"));
+                    }
                 }
                 "running-ostree" => {
                     assert!(widgets.ostree_booted.get());
@@ -5306,6 +5332,22 @@ mod tests {
             },
         );
         availability.insert(
+            "distrobox".into(),
+            SourceAvailability {
+                pref_key: "distrobox",
+                installed: false,
+                subtitle: "Not installed".into(),
+            },
+        );
+        availability.insert(
+            "toolbx".into(),
+            SourceAvailability {
+                pref_key: "toolbx",
+                installed: true,
+                subtitle: "Updates installed containers when enabled".into(),
+            },
+        );
+        availability.insert(
             "firmware".into(),
             SourceAvailability {
                 pref_key: "firmware",
@@ -5333,7 +5375,7 @@ mod tests {
             )
         };
 
-        assert_eq!(handle.switches.len(), 5);
+        assert_eq!(handle.switches.len(), 7);
         assert_eq!(
             handle.switches["dnf"].subtitle().as_deref(),
             Some("Installed (dnf5daemon D-Bus)")
@@ -5347,6 +5389,16 @@ mod tests {
             Some("Not installed")
         );
         assert_eq!(
+            handle.switches["distrobox"].subtitle().as_deref(),
+            Some("Not installed")
+        );
+        assert_eq!(
+            handle.switches["toolbx"].subtitle().as_deref(),
+            Some("Updates installed containers when enabled")
+        );
+        assert!(!handle.switches["distrobox"].is_active());
+        assert!(!handle.switches["toolbx"].is_active());
+        assert_eq!(
             handle.switches["firmware"].subtitle().as_deref(),
             Some("Not installed")
         );
@@ -5354,6 +5406,27 @@ mod tests {
         assert!(!widgets
             .sidebar
             .category_row(SourceCategory::Extensions)
+            .get_visible());
+        assert!(!widgets
+            .sidebar
+            .category_row(SourceCategory::DevAndContainers)
+            .get_visible());
+
+        // Enabling opt-in Toolbx persists into enabled_opt_in_sources and reveals Dev & Containers.
+        handle.switches["toolbx"].set_active(true);
+        assert!(widgets.prefs.borrow().is_source_enabled("toolbx"));
+        assert!(super::prefs::load_from(&prefs_path)
+            .enabled_opt_in_sources
+            .contains("toolbx"));
+        assert!(widgets
+            .sidebar
+            .category_row(SourceCategory::DevAndContainers)
+            .get_visible());
+        handle.switches["toolbx"].set_active(false);
+        assert!(!widgets.prefs.borrow().is_source_enabled("toolbx"));
+        assert!(!widgets
+            .sidebar
+            .category_row(SourceCategory::DevAndContainers)
             .get_visible());
 
         // Toggling Flatpak off updates UiPrefs, persists to temp ui.json, and hides Apps row.
@@ -5429,14 +5502,22 @@ mod tests {
             "homebrew/core",
             false,
         );
+        let dbox_pkg = fedora_updater::model::Package::new_container(
+            fedora_updater::model::UpdateSource::Distrobox,
+            "a1b2c3d4e5f6",
+            "fedora-dev",
+            "Up 2 hours",
+            "registry.fedoraproject.org/fedora-toolbox:43",
+            None,
+        );
         assert!(super::can_selective_apply(
-            &[ext_pkg.clone(), brew_pkg.clone()],
+            &[ext_pkg.clone(), brew_pkg.clone(), dbox_pkg.clone()],
             false,
             false
         ));
         *state.borrow_mut() = AppState {
             phase: Phase::Ready {
-                packages: vec![ext_pkg, brew_pkg],
+                packages: vec![ext_pkg, brew_pkg, dbox_pkg],
                 soft_errors: vec![],
             },
             ..Default::default()
@@ -5503,9 +5584,11 @@ mod tests {
         let prefs = super::prefs::UiPrefs::default();
         let pref_handle =
             super::preferences::build_preferences_dialog(&prefs, &ostree_avail, |_, _| {});
-        assert_eq!(pref_handle.switches.len(), 5);
+        assert_eq!(pref_handle.switches.len(), 7);
         assert!(pref_handle.switches.contains_key("rpm-ostree"));
         assert!(!pref_handle.switches.contains_key("dnf"));
+        assert!(!pref_handle.switches["distrobox"].is_active());
+        assert!(!pref_handle.switches["toolbx"].is_active());
         assert!(!pref_handle.all_disabled_group.get_visible());
         for key in [
             "rpm-ostree",

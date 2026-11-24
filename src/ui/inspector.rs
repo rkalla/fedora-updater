@@ -15,9 +15,11 @@ pub struct InspectorViewModel {
     pub source_title: &'static str,
     pub subtitle: String,
     pub name: String,
+    pub repo_label: &'static str,
     pub repo: Option<String>,
     pub arch: Option<String>,
     pub old_version: Option<String>,
+    pub version_label: &'static str,
     pub version: String,
     pub version_display: String,
     pub size_label: Option<String>,
@@ -26,6 +28,7 @@ pub struct InspectorViewModel {
     pub needs_reboot: bool,
     pub reboot_reason: Option<String>,
     pub preflight_warning: Option<String>,
+    pub note_title: &'static str,
     pub session_note: Option<String>,
     pub uuid: Option<String>,
     pub url: Option<String>,
@@ -43,7 +46,28 @@ impl InspectorViewModel {
             UpdateSource::FlatpakSystem => "Apps (Flatpak · System)",
             UpdateSource::GnomeExtensions => "Extensions (GNOME Shell)",
             UpdateSource::Homebrew => "Dev & Containers (Homebrew)",
+            UpdateSource::Distrobox => "Dev & Containers (Distrobox)",
+            UpdateSource::Toolbx => "Dev & Containers (Toolbx)",
             UpdateSource::Firmware => "Firmware (LVFS)",
+        };
+        let is_container = matches!(
+            package.source,
+            UpdateSource::Distrobox | UpdateSource::Toolbx
+        );
+        let repo_label = if is_container {
+            "Base Image"
+        } else {
+            "Repository"
+        };
+        let version_label = if is_container {
+            "Container State"
+        } else {
+            "Available"
+        };
+        let note_title = if is_container {
+            "Container Note"
+        } else {
+            "Session Note"
         };
         let repo = (!package.repo.trim().is_empty()).then(|| package.repo.trim().to_string());
         let subtitle = match &repo {
@@ -86,13 +110,17 @@ impl InspectorViewModel {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToString::to_string);
-        let session_note = (package.source == UpdateSource::GnomeExtensions).then(|| {
-            match package.status {
+        let session_note = if package.source == UpdateSource::GnomeExtensions {
+            Some(match package.status {
                 PackageStatus::Completed => GNOME_EXT_RELOGIN_NOTE.to_string(),
                 _ => "Log out and back in after updating to activate GNOME Shell extensions."
                     .to_string(),
-            }
-        });
+            })
+        } else if is_container {
+            Some("Container updates check and apply packages inside the container when run.".to_string())
+        } else {
+            None
+        };
         let uuid = (package.source == UpdateSource::GnomeExtensions)
             .then(|| {
                 package
@@ -126,9 +154,11 @@ impl InspectorViewModel {
             source_title,
             subtitle,
             name: package.name.clone(),
+            repo_label,
             repo,
             arch,
             old_version,
+            version_label,
             version: package.version.clone(),
             version_display,
             size_label: package.size_label(),
@@ -137,6 +167,7 @@ impl InspectorViewModel {
             needs_reboot,
             reboot_reason,
             preflight_warning,
+            note_title,
             session_note,
             uuid,
             url,
@@ -149,14 +180,15 @@ impl InspectorViewModel {
 
 struct MetadataField {
     row: gtk::Box,
+    key: gtk::Label,
     value: gtk::Label,
 }
 
 impl MetadataField {
-    fn new(key: &str) -> Self {
+    fn new(key_text: &str) -> Self {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let key_lbl = gtk::Label::builder()
-            .label(key)
+        let key = gtk::Label::builder()
+            .label(key_text)
             .xalign(0.0)
             .halign(gtk::Align::Start)
             .valign(gtk::Align::Center)
@@ -173,9 +205,9 @@ impl MetadataField {
             .can_focus(false)
             .css_classes(["caption", "numeric"])
             .build();
-        row.append(&key_lbl);
+        row.append(&key);
         row.append(&value);
-        Self { row, value }
+        Self { row, key, value }
     }
 
     fn set_optional(&self, val: Option<&str>) {
@@ -189,6 +221,11 @@ impl MetadataField {
                 self.row.set_visible(false);
             }
         }
+    }
+
+    fn set_optional_with_label(&self, key_text: &str, val: Option<&str>) {
+        self.key.set_label(key_text);
+        self.set_optional(val);
     }
 }
 
@@ -205,6 +242,7 @@ pub struct PackageInspector {
     warning_card: gtk::Box,
     warning_body: gtk::Label,
     note_card: gtk::Box,
+    note_title: gtk::Label,
     note_body: gtk::Label,
     source_field: MetadataField,
     repo_field: MetadataField,
@@ -311,7 +349,7 @@ impl PackageInspector {
         body.append(&summary_label);
 
         // Restart warning card (when package_implies_reboot is true).
-        let (reboot_card, reboot_body) = build_callout_card(
+        let (reboot_card, _, reboot_body) = build_callout_card(
             "inspector-reboot-card",
             "system-reboot-symbolic",
             "warning",
@@ -320,7 +358,7 @@ impl PackageInspector {
         body.append(&reboot_card);
 
         // Pre-flight power safety warning card (when battery/AC requirements are unmet).
-        let (warning_card, warning_body) = build_callout_card(
+        let (warning_card, _, warning_body) = build_callout_card(
             "inspector-warning-card",
             "battery-caution-symbolic",
             "error",
@@ -328,8 +366,8 @@ impl PackageInspector {
         );
         body.append(&warning_card);
 
-        // Session re-login notice for GNOME Shell extension updates.
-        let (note_card, note_body) = build_callout_card(
+        // Session re-login notice for GNOME Shell extension updates or container execution note.
+        let (note_card, note_title, note_body) = build_callout_card(
             "inspector-note-card",
             "dialog-information-symbolic",
             "accent",
@@ -465,6 +503,7 @@ impl PackageInspector {
             warning_card,
             warning_body,
             note_card,
+            note_title,
             note_body,
             source_field,
             repo_field,
@@ -529,6 +568,7 @@ impl PackageInspector {
         }
 
         if let Some(note) = vm.session_note.as_deref() {
+            self.note_title.set_label(vm.note_title);
             self.note_body.set_label(note);
             self.note_card.set_visible(true);
         } else {
@@ -537,11 +577,13 @@ impl PackageInspector {
         }
 
         self.source_field.set_optional(Some(vm.source_title));
-        self.repo_field.set_optional(vm.repo.as_deref());
+        self.repo_field
+            .set_optional_with_label(vm.repo_label, vm.repo.as_deref());
         self.arch_field.set_optional(vm.arch.as_deref());
         self.old_version_field
             .set_optional(vm.old_version.as_deref());
-        self.version_field.set_optional(Some(&vm.version));
+        self.version_field
+            .set_optional_with_label(vm.version_label, Some(&vm.version));
         self.size_field.set_optional(vm.size_label.as_deref());
         self.disk_delta_field
             .set_optional(vm.install_size_delta.as_deref());
@@ -743,6 +785,31 @@ impl PackageInspector {
     }
 
     #[cfg(test)]
+    pub fn repo_label_text(&self) -> String {
+        self.repo_field.key.text().to_string()
+    }
+
+    #[cfg(test)]
+    pub fn version_label_text(&self) -> String {
+        self.version_field.key.text().to_string()
+    }
+
+    #[cfg(test)]
+    pub fn note_card_visible(&self) -> bool {
+        self.note_card.get_visible()
+    }
+
+    #[cfg(test)]
+    pub fn note_title_text(&self) -> String {
+        self.note_title.text().to_string()
+    }
+
+    #[cfg(test)]
+    pub fn note_body_text(&self) -> String {
+        self.note_body.text().to_string()
+    }
+
+    #[cfg(test)]
     pub fn advisory_summary_text(&self) -> String {
         let mut parts = Vec::new();
         collect_label_texts(self.advisories_list.upcast_ref(), &mut parts);
@@ -788,7 +855,7 @@ fn build_callout_card(
     icon_name: &str,
     icon_css_class: &str,
     title: &str,
-) -> (gtk::Box, gtk::Label) {
+) -> (gtk::Box, gtk::Label, gtk::Label) {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("card");
     card.add_css_class(css_class);
@@ -823,7 +890,7 @@ fn build_callout_card(
     inner.append(&head);
     inner.append(&body_lbl);
     card.append(&inner);
-    (card, body_lbl)
+    (card, title_lbl, body_lbl)
 }
 
 fn clear_box(container: &gtk::Box) {
@@ -971,9 +1038,52 @@ mod tests {
         assert_eq!(ostree_vm.source_title, "System (Atomic · rpm-ostree)");
         assert_eq!(ostree_vm.version_display, "25.0.2-1.fc44 → 25.0.4-1.fc44");
         assert!(ostree_vm.needs_reboot);
-        assert_eq!(
-            ostree_vm.reboot_reason.as_deref(),
+        assert_eq!(ostree_vm.reboot_reason.as_deref(),
             Some("Atomic system image updates stage a new deployment that activates on restart.")
         );
+
+        let dbox = Package::new_container(
+            UpdateSource::Distrobox,
+            "a1b2c3d4e5f6",
+            "arch-dev",
+            "Up 2 hours",
+            "docker.io/library/archlinux:latest",
+            None,
+        );
+        let dbox_vm = InspectorViewModel::from_package(&dbox);
+        assert_eq!(dbox_vm.badge, "DBOX");
+        assert_eq!(dbox_vm.badge_css, "src-container");
+        assert_eq!(dbox_vm.source_title, "Dev & Containers (Distrobox)");
+        assert_eq!(dbox_vm.repo_label, "Base Image");
+        assert_eq!(
+            dbox_vm.repo.as_deref(),
+            Some("docker.io/library/archlinux:latest")
+        );
+        assert_eq!(dbox_vm.version_label, "Container State");
+        assert_eq!(dbox_vm.version, "Up 2 hours");
+        assert_eq!(dbox_vm.note_title, "Container Note");
+        assert!(dbox_vm
+            .session_note
+            .as_deref()
+            .unwrap()
+            .contains("check and apply packages inside the container"));
+        assert!(!dbox_vm.needs_reboot);
+
+        let tbx = Package::new_container(
+            UpdateSource::Toolbx,
+            "0123456789ab",
+            "fedora-toolbox-44",
+            "exited",
+            "registry.fedoraproject.org/fedora-toolbox:44",
+            Some("2 weeks ago".into()),
+        );
+        let tbx_vm = InspectorViewModel::from_package(&tbx);
+        assert_eq!(tbx_vm.badge, "TBX");
+        assert_eq!(tbx_vm.badge_css, "src-container");
+        assert_eq!(tbx_vm.source_title, "Dev & Containers (Toolbx)");
+        assert_eq!(tbx_vm.repo_label, "Base Image");
+        assert_eq!(tbx_vm.version_label, "Container State");
+        assert_eq!(tbx_vm.version, "exited");
+        assert_eq!(tbx_vm.note_title, "Container Note");
     }
 }

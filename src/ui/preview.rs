@@ -42,6 +42,8 @@ pub fn initial_console() -> ConsoleBuffer {
             "Update available: Blur my Shell (v47 -> v48)",
         );
         console.push_committed_tagged("brew", "==> Upgrading ripgrep 14.1.0 -> 14.1.1");
+        console.push_committed_tagged("distrobox", "Updating fedora-dev container");
+        console.push_committed_tagged("toolbx", "Upgrading fedora-toolbox-43");
         console.push_committed_tagged("fwupd", "Loaded LVFS metadata for UEFI dbx");
     }
     console
@@ -324,6 +326,10 @@ pub fn config_for(phase: &str) -> PreviewConfig {
                 failure_reasons: vec![],
             }
         }
+        "ready-containers" => Phase::Ready {
+            packages: sample_container_packages(),
+            soft_errors: vec![],
+        },
         other => {
             eprintln!("unknown FEDORA_UPDATER_PREVIEW={other}, using idle");
             Phase::Idle(IdleScreen::Fresh)
@@ -394,11 +400,37 @@ fn pkg(
         UpdateSource::Homebrew => {
             Package::new_homebrew(name, Some(old.into()), version, "homebrew/core", false)
         }
+        UpdateSource::Distrobox | UpdateSource::Toolbx => {
+            Package::new_container(source, "c0ffee123456", name, old, version, None)
+        }
     };
-    p.old_version = Some(old.into());
+    if !matches!(source, UpdateSource::Distrobox | UpdateSource::Toolbx) {
+        p.old_version = Some(old.into());
+    }
     p.size_bytes = parse_size_bytes(size);
     p.status = status;
     p
+}
+
+fn sample_container_packages() -> Vec<Package> {
+    vec![
+        Package::new_container(
+            UpdateSource::Distrobox,
+            "a1b2c3d4e5f6",
+            "fedora-dev",
+            "Up 2 hours",
+            "registry.fedoraproject.org/fedora-toolbox:43",
+            Some("2 weeks ago".into()),
+        ),
+        Package::new_container(
+            UpdateSource::Toolbx,
+            "f6e5d4c3b2a1",
+            "fedora-toolbox-43",
+            "exited",
+            "registry.fedoraproject.org/fedora-toolbox:43",
+            Some("3 days ago".into()),
+        ),
+    ]
 }
 
 fn sample_ostree_packages(running: bool) -> Vec<Package> {
@@ -873,6 +905,15 @@ mod tests {
         assert!(matches!(
             &done_ostree.state.phase,
             Phase::Done { needs_reboot: true, failed: 0, .. }
+        ));
+        let ready_containers = super::config_for("ready-containers");
+        assert!(!ready_containers.ostree_booted);
+        assert!(matches!(
+            &ready_containers.state.phase,
+            Phase::Ready { packages, .. }
+                if packages.len() == 2
+                    && packages.iter().any(|p| p.source == UpdateSource::Distrobox)
+                    && packages.iter().any(|p| p.source == UpdateSource::Toolbx)
         ));
 
         if std::env::var_os("FEDORA_UPDATER_PREVIEW").is_none() {

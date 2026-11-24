@@ -110,6 +110,8 @@ pub enum UpdateSource {
     FlatpakSystem,
     GnomeExtensions,
     Homebrew,
+    Distrobox,
+    Toolbx,
     Firmware,
 }
 
@@ -121,6 +123,8 @@ impl UpdateSource {
         Self::FlatpakSystem,
         Self::GnomeExtensions,
         Self::Homebrew,
+        Self::Distrobox,
+        Self::Toolbx,
         Self::Firmware,
     ];
 
@@ -145,7 +149,7 @@ impl UpdateSource {
             Self::Dnf | Self::RpmOstree => SourceCategory::System,
             Self::FlatpakUser | Self::FlatpakSystem => SourceCategory::Apps,
             Self::GnomeExtensions => SourceCategory::Extensions,
-            Self::Homebrew => SourceCategory::DevAndContainers,
+            Self::Homebrew | Self::Distrobox | Self::Toolbx => SourceCategory::DevAndContainers,
             Self::Firmware => SourceCategory::Firmware,
         }
     }
@@ -157,6 +161,8 @@ impl UpdateSource {
             Self::FlatpakUser | Self::FlatpakSystem => "flatpak",
             Self::GnomeExtensions => "gnome-extensions",
             Self::Homebrew => "homebrew",
+            Self::Distrobox => "distrobox",
+            Self::Toolbx => "toolbx",
             Self::Firmware => "firmware",
         }
     }
@@ -168,6 +174,8 @@ impl UpdateSource {
             Self::FlatpakUser | Self::FlatpakSystem => "Flatpak Apps",
             Self::GnomeExtensions => "GNOME Shell Extensions",
             Self::Homebrew => "Homebrew (brew)",
+            Self::Distrobox => "Distrobox Containers",
+            Self::Toolbx => "Toolbx Containers",
             Self::Firmware => "Firmware (fwupd / LVFS)",
         }
     }
@@ -178,7 +186,9 @@ impl UpdateSource {
             Self::FlatpakUser
             | Self::FlatpakSystem
             | Self::GnomeExtensions
-            | Self::Homebrew => false,
+            | Self::Homebrew
+            | Self::Distrobox
+            | Self::Toolbx => false,
         }
     }
 
@@ -192,6 +202,8 @@ impl UpdateSource {
             | Self::FlatpakSystem
             | Self::GnomeExtensions
             | Self::Homebrew
+            | Self::Distrobox
+            | Self::Toolbx
             | Self::Firmware => true,
         }
     }
@@ -205,6 +217,8 @@ impl UpdateSource {
             | Self::FlatpakSystem
             | Self::GnomeExtensions
             | Self::Homebrew
+            | Self::Distrobox
+            | Self::Toolbx
             | Self::Firmware => true,
         }
     }
@@ -217,7 +231,23 @@ impl UpdateSource {
     /// True for core Fedora sources expected by default on the given host OS mode.
     pub fn installed_by_default_for_host(self, ostree_booted: bool) -> bool {
         self.is_applicable_for_host(ostree_booted)
-            && !matches!(self, Self::GnomeExtensions | Self::Homebrew)
+            && !matches!(
+                self,
+                Self::GnomeExtensions | Self::Homebrew | Self::Distrobox | Self::Toolbx
+            )
+    }
+
+    /// True when this source stays disabled until the user explicitly enables it in Preferences.
+    pub fn is_opt_in(self) -> bool {
+        matches!(self, Self::Distrobox | Self::Toolbx)
+    }
+
+    /// True when a normalized preference key corresponds to an opt-in source.
+    pub fn pref_key_is_opt_in(pref_key: &str) -> bool {
+        let normalized = pref_key.trim().to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .any(|src| src.pref_key() == normalized && src.is_opt_in())
     }
 
     /// Deduplicated preference-level sources for classic hosts preserving canonical order.
@@ -254,6 +284,8 @@ impl UpdateSource {
             Self::FlatpakSystem => "FP",
             Self::GnomeExtensions => "EXT",
             Self::Homebrew => "BREW",
+            Self::Distrobox => "DBOX",
+            Self::Toolbx => "TBX",
             Self::Firmware => "FW",
         }
     }
@@ -265,6 +297,7 @@ impl UpdateSource {
             Self::FlatpakUser | Self::FlatpakSystem => "src-flatpak",
             Self::GnomeExtensions => "src-ext",
             Self::Homebrew => "src-brew",
+            Self::Distrobox | Self::Toolbx => "src-container",
             Self::Firmware => "src-firmware",
         }
     }
@@ -277,11 +310,13 @@ impl UpdateSource {
             Self::FlatpakSystem => "flatpak-system",
             Self::GnomeExtensions => "gnome-ext",
             Self::Homebrew => "brew",
+            Self::Distrobox => "distrobox",
+            Self::Toolbx => "toolbx",
             Self::Firmware => "fwupd",
         }
     }
 
-    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Firmware.
+    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Distrobox → Toolbx → Firmware.
     pub fn apply_order(self) -> u8 {
         match self {
             Self::Dnf | Self::RpmOstree => 0,
@@ -289,7 +324,9 @@ impl UpdateSource {
             Self::FlatpakSystem => 2,
             Self::GnomeExtensions => 3,
             Self::Homebrew => 4,
-            Self::Firmware => 5,
+            Self::Distrobox => 5,
+            Self::Toolbx => 6,
+            Self::Firmware => 7,
         }
     }
 }
@@ -625,6 +662,63 @@ impl Package {
         }
     }
 
+    /// Construct a rootless Distrobox or Toolbx container update item.
+    pub fn new_container(
+        source: UpdateSource,
+        container_id: impl Into<String>,
+        name: impl Into<String>,
+        status: impl Into<String>,
+        image: impl Into<String>,
+        created: Option<String>,
+    ) -> Self {
+        let name = name.into().trim().to_string();
+        let raw_status = status.into();
+        let status_clean = raw_status.trim();
+        let container_state = if status_clean.is_empty() {
+            "unknown".to_string()
+        } else {
+            status_clean.to_string()
+        };
+        let raw_image = image.into();
+        let image_clean = raw_image.trim();
+        let base_image = if image_clean.is_empty() {
+            "unknown".to_string()
+        } else {
+            image_clean.to_string()
+        };
+        let raw_id = container_id.into();
+        let short_id: String = raw_id.trim().chars().take(12).collect();
+        let created_clean = created
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let summary = match (short_id.is_empty(), created_clean) {
+            (false, Some(created_at)) => {
+                Some(format!("Rootless container {short_id} · Created {created_at}"))
+            }
+            (false, None) => Some(format!("Rootless container {short_id}")),
+            (true, Some(created_at)) => Some(format!("Rootless container · Created {created_at}")),
+            (true, None) => None,
+        };
+        let id = format!("{}:{name}", source.console_tag());
+        Self {
+            id,
+            name,
+            arch: String::new(),
+            version: container_state,
+            repo: base_image.clone(),
+            size_bytes: None,
+            old_version: None,
+            status: PackageStatus::Pending,
+            source,
+            detail: format!("Container · {base_image} · check & update on apply"),
+            summary,
+            url: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
+            preflight_warning: None,
+        }
+    }
+
     /// Related extensions extracted from Flatpak `detail` (`... · installs a, b`).
     pub fn related_extensions(&self) -> Vec<String> {
         let Some((_, rest)) = self.detail.split_once("installs ") else {
@@ -743,6 +837,9 @@ impl Package {
             }
             let short_name = self.name.rsplit('/').next().unwrap_or(&self.name);
             return hint == short_name;
+        }
+        if matches!(self.source, UpdateSource::Distrobox | UpdateSource::Toolbx) {
+            return false;
         }
         // Flatpak/fwupd ids: `flatpak:user:app/org.foo/x86_64/stable`, `fwupd:<device>`.
         self.id.split([':', '/']).any(|part| part == hint)
@@ -1029,6 +1126,31 @@ mod tests {
         assert!(brew_tap.matches_progress_name("oven-sh/bun/bun"));
         assert!(brew_tap.matches_progress_name("bun"));
         assert!(!brew_tap.matches_progress_name("oven-sh"));
+
+        let dbox = Package::new_container(
+            UpdateSource::Distrobox,
+            "a1b2c3d4e5f6",
+            "arch-dev",
+            "Up 2 hours",
+            "docker.io/library/archlinux:latest",
+            None,
+        );
+        assert!(dbox.matches_progress_name("arch-dev"));
+        assert!(dbox.matches_progress_name("distrobox:arch-dev"));
+        assert!(!dbox.matches_progress_name("distrobox"));
+        assert!(!dbox.matches_progress_name("arch"));
+
+        let tbx = Package::new_container(
+            UpdateSource::Toolbx,
+            "0123456789ab",
+            "fedora-toolbox-44",
+            "exited",
+            "registry.fedoraproject.org/fedora-toolbox:44",
+            Some("2 weeks ago".into()),
+        );
+        assert!(tbx.matches_progress_name("fedora-toolbox-44"));
+        assert!(tbx.matches_progress_name("toolbx:fedora-toolbox-44"));
+        assert!(!tbx.matches_progress_name("toolbx"));
     }
 
     #[test]
@@ -1329,6 +1451,8 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.label(), "Apps");
         assert_eq!(UpdateSource::GnomeExtensions.label(), "Extensions");
         assert_eq!(UpdateSource::Homebrew.label(), "Dev & Containers");
+        assert_eq!(UpdateSource::Distrobox.label(), "Dev & Containers");
+        assert_eq!(UpdateSource::Toolbx.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Firmware.label(), "Firmware");
 
         assert_eq!(UpdateSource::Dnf.badge(), "DNF");
@@ -1336,6 +1460,8 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.badge(), "FP");
         assert_eq!(UpdateSource::GnomeExtensions.badge(), "EXT");
         assert_eq!(UpdateSource::Homebrew.badge(), "BREW");
+        assert_eq!(UpdateSource::Distrobox.badge(), "DBOX");
+        assert_eq!(UpdateSource::Toolbx.badge(), "TBX");
         assert_eq!(UpdateSource::Firmware.badge(), "FW");
 
         assert_eq!(UpdateSource::Dnf.css_class(), "src-dnf");
@@ -1343,6 +1469,8 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.css_class(), "src-flatpak");
         assert_eq!(UpdateSource::GnomeExtensions.css_class(), "src-ext");
         assert_eq!(UpdateSource::Homebrew.css_class(), "src-brew");
+        assert_eq!(UpdateSource::Distrobox.css_class(), "src-container");
+        assert_eq!(UpdateSource::Toolbx.css_class(), "src-container");
         assert_eq!(UpdateSource::Firmware.css_class(), "src-firmware");
 
         assert_eq!(UpdateSource::Dnf.console_tag(), "dnf");
@@ -1350,6 +1478,8 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.console_tag(), "flatpak-system");
         assert_eq!(UpdateSource::GnomeExtensions.console_tag(), "gnome-ext");
         assert_eq!(UpdateSource::Homebrew.console_tag(), "brew");
+        assert_eq!(UpdateSource::Distrobox.console_tag(), "distrobox");
+        assert_eq!(UpdateSource::Toolbx.console_tag(), "toolbx");
         assert_eq!(UpdateSource::Firmware.console_tag(), "fwupd");
 
         assert_eq!(UpdateSource::Dnf.to_string(), "System");
@@ -1492,6 +1622,8 @@ mod tests {
                 UpdateSource::FlatpakSystem,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Distrobox,
+                UpdateSource::Toolbx,
                 UpdateSource::Firmware,
             ]
         );
@@ -1507,6 +1639,14 @@ mod tests {
             UpdateSource::Homebrew.category(),
             SourceCategory::DevAndContainers
         );
+        assert_eq!(
+            UpdateSource::Distrobox.category(),
+            SourceCategory::DevAndContainers
+        );
+        assert_eq!(
+            UpdateSource::Toolbx.category(),
+            SourceCategory::DevAndContainers
+        );
         assert_eq!(UpdateSource::Firmware.category(), SourceCategory::Firmware);
 
         assert_eq!(UpdateSource::Dnf.pref_key(), "dnf");
@@ -1515,6 +1655,8 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.pref_key(), "flatpak");
         assert_eq!(UpdateSource::GnomeExtensions.pref_key(), "gnome-extensions");
         assert_eq!(UpdateSource::Homebrew.pref_key(), "homebrew");
+        assert_eq!(UpdateSource::Distrobox.pref_key(), "distrobox");
+        assert_eq!(UpdateSource::Toolbx.pref_key(), "toolbx");
         assert_eq!(UpdateSource::Firmware.pref_key(), "firmware");
 
         assert!(UpdateSource::Dnf.requires_root());
@@ -1523,6 +1665,8 @@ mod tests {
         assert!(!UpdateSource::FlatpakSystem.requires_root());
         assert!(!UpdateSource::GnomeExtensions.requires_root());
         assert!(!UpdateSource::Homebrew.requires_root());
+        assert!(!UpdateSource::Distrobox.requires_root());
+        assert!(!UpdateSource::Toolbx.requires_root());
         assert!(UpdateSource::Firmware.requires_root());
 
         assert!(UpdateSource::Dnf.installed_by_default());
@@ -1533,6 +1677,14 @@ mod tests {
         assert!(UpdateSource::FlatpakSystem.installed_by_default());
         assert!(!UpdateSource::GnomeExtensions.installed_by_default());
         assert!(!UpdateSource::Homebrew.installed_by_default());
+        assert!(!UpdateSource::Distrobox.installed_by_default());
+        assert!(!UpdateSource::Toolbx.installed_by_default());
+        assert!(UpdateSource::Distrobox.is_opt_in());
+        assert!(UpdateSource::Toolbx.is_opt_in());
+        assert!(!UpdateSource::Homebrew.is_opt_in());
+        assert!(UpdateSource::pref_key_is_opt_in(" Distrobox "));
+        assert!(UpdateSource::pref_key_is_opt_in("toolbx"));
+        assert!(!UpdateSource::pref_key_is_opt_in("homebrew"));
         assert!(UpdateSource::Firmware.installed_by_default());
 
         assert_eq!(
@@ -1565,6 +1717,8 @@ mod tests {
                 UpdateSource::FlatpakUser,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Distrobox,
+                UpdateSource::Toolbx,
                 UpdateSource::Firmware,
             ]
         );
@@ -1575,6 +1729,8 @@ mod tests {
                 UpdateSource::FlatpakUser,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Distrobox,
+                UpdateSource::Toolbx,
                 UpdateSource::Firmware,
             ]
         );
@@ -1619,17 +1775,50 @@ mod tests {
         assert_eq!(brew_cask.repo, "homebrew/cask");
         assert_eq!(brew_cask.detail, "3.3.0 · homebrew/cask · cask");
 
+        let dbox = Package::new_container(
+            UpdateSource::Distrobox,
+            "a1b2c3d4e5f6ffff",
+            "arch-dev",
+            "Up 2 hours",
+            "docker.io/library/archlinux:latest",
+            None,
+        );
+        assert_eq!(dbox.id, "distrobox:arch-dev");
+        assert_eq!(dbox.repo, "docker.io/library/archlinux:latest");
+        assert_eq!(dbox.version, "Up 2 hours");
+        assert_eq!(
+            dbox.detail,
+            "Container · docker.io/library/archlinux:latest · check & update on apply"
+        );
+        assert_eq!(dbox.summary.as_deref(), Some("Rootless container a1b2c3d4e5f6"));
+
+        let tbx = Package::new_container(
+            UpdateSource::Toolbx,
+            "0123456789ab",
+            "fedora-toolbox-44",
+            "exited",
+            "registry.fedoraproject.org/fedora-toolbox:44",
+            Some("2 weeks ago".into()),
+        );
+        assert_eq!(tbx.id, "toolbx:fedora-toolbox-44");
+        assert_eq!(
+            tbx.summary.as_deref(),
+            Some("Rootless container 0123456789ab · Created 2 weeks ago")
+        );
+
         let pkgs = vec![
             Package::new_dnf("bash", "x86_64", "1", "updates"),
             fp_user,
             fp_sys,
             brew_pkg,
+            dbox,
+            tbx,
             firmware_pkg("UEFI"),
         ];
         let by_cat = count_by_category(&pkgs);
         assert_eq!(by_cat.get(&SourceCategory::System), Some(&1));
         assert_eq!(by_cat.get(&SourceCategory::Apps), Some(&2));
-        assert_eq!(by_cat.get(&SourceCategory::DevAndContainers), Some(&1));
+        assert_eq!(by_cat.get(&SourceCategory::DevAndContainers), Some(&3));
         assert_eq!(by_cat.get(&SourceCategory::Firmware), Some(&1));
         assert_eq!(by_cat.get(&SourceCategory::Extensions), None);
         assert_eq!(count_for_category(&pkgs, SourceCategory::Apps), 2);

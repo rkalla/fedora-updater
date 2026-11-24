@@ -6,6 +6,10 @@ use common::fixtures::{read_fixture, read_fixture_value, read_flatpak_fixture};
 use fedora_updater::backend::brew::{
     parse_outdated_json, parse_progress_line as parse_brew_progress, upgrade_names_from_packages,
 };
+use fedora_updater::backend::containers::{
+    container_names_from_packages, filter_toolbox_duplicates, list_exit_is_empty,
+    parse_distrobox_list, parse_progress_line as parse_container_progress, parse_toolbox_list,
+};
 use fedora_updater::backend::dnf::{
     apply_download_sizes, check_exit_is_hard_error, check_exit_is_ok, detect_reboot_needed,
     parse_check_update, parse_progress_line as parse_dnf_progress, parse_repoquery_sizes,
@@ -597,4 +601,90 @@ fn rpm_ostree_fixtures_cover_status_diff_oci_progress_and_errors() {
     let err_raw = read_fixture("rpm_ostree/upgrade_error.txt");
     assert!(rpm_ostree_exit_is_hard_error(1, &err_raw, &[]));
     assert!(!rpm_ostree_detect_reboot(&err_raw, &diff_pkgs));
+}
+
+#[test]
+fn containers_fixtures_cover_list_dedup_empty_and_upgrade_logs() {
+    let dbox_raw = read_fixture("containers/distrobox_list.txt");
+    let dbox = parse_distrobox_list(&dbox_raw);
+    assert_eq!(dbox.len(), 3);
+    assert_eq!(dbox[0].name, "arch-dev");
+    assert_eq!(dbox[0].status, "Up 3 hours");
+    assert_eq!(
+        dbox[0].image,
+        "quay.io/toolbx-images/archlinux-toolbox:latest"
+    );
+    assert_eq!(dbox[1].name, "fedora-dev");
+    assert_eq!(dbox[1].status, "Exited (0) 2 days ago");
+    assert_eq!(dbox[2].name, "ubuntu-lts");
+
+    let tbx_raw = read_fixture("containers/toolbox_list.txt");
+    let tbx = parse_toolbox_list(&tbx_raw);
+    assert_eq!(tbx.len(), 2);
+    assert_eq!(tbx[0].name, "fedora-toolbox-43");
+    assert_eq!(tbx[0].status, "running");
+    assert_eq!(tbx[0].created.as_deref(), Some("3 days ago"));
+    assert_eq!(tbx[1].name, "f44-rawhide");
+    assert_eq!(tbx[1].status, "exited");
+
+    let tbx_dup_raw = read_fixture("containers/toolbox_list_with_duplicates.txt");
+    let tbx_dup = parse_toolbox_list(&tbx_dup_raw);
+    assert_eq!(tbx_dup.len(), 3);
+    let deduped = filter_toolbox_duplicates(tbx_dup, &dbox);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].name, "fedora-toolbox-43");
+
+    let empty_raw = read_fixture("containers/empty.txt");
+    assert!(parse_distrobox_list(&empty_raw).is_empty());
+    assert!(parse_toolbox_list(&empty_raw).is_empty());
+    assert!(list_exit_is_empty(0, &empty_raw));
+
+    let pkgs: Vec<Package> = dbox
+        .iter()
+        .cloned()
+        .map(|info| info.into_package(UpdateSource::Distrobox))
+        .chain(
+            deduped
+                .iter()
+                .cloned()
+                .map(|info| info.into_package(UpdateSource::Toolbx)),
+        )
+        .collect();
+    assert_eq!(pkgs.len(), 4);
+    assert!(pkgs.iter().all(|p| p.old_version.is_none()));
+    assert_eq!(
+        pkgs[0].detail,
+        "Container · quay.io/toolbx-images/archlinux-toolbox:latest · check & update on apply"
+    );
+    assert_eq!(
+        container_names_from_packages(&pkgs, UpdateSource::Distrobox),
+        vec![
+            ("distrobox:arch-dev".into(), "arch-dev".into()),
+            ("distrobox:fedora-dev".into(), "fedora-dev".into()),
+            ("distrobox:ubuntu-lts".into(), "ubuntu-lts".into()),
+        ]
+    );
+    assert_eq!(
+        container_names_from_packages(&pkgs, UpdateSource::Toolbx),
+        vec![("toolbx:fedora-toolbox-43".into(), "fedora-toolbox-43".into())]
+    );
+
+    let dbox_log = read_fixture("containers/distrobox_upgrade_log.txt");
+    let dbox_hints: Vec<_> = dbox_log.lines().map(parse_container_progress).collect();
+    assert!(dbox_hints
+        .iter()
+        .any(|h| h.status == Some(PackageStatus::Installing)));
+    assert!(dbox_hints
+        .iter()
+        .any(|h| h.phase_label.as_deref() == Some("Complete")));
+    assert!(!detect_reboot(UpdateSource::Distrobox, &dbox_log, &pkgs));
+
+    let tbx_log = read_fixture("containers/toolbox_upgrade_log.txt");
+    let tbx_sync = parse_progress(UpdateSource::Toolbx, "[1/1] Upgrading curl-0:8.11.1-2.fc43.x86_64");
+    assert_eq!(tbx_sync.status, Some(PackageStatus::Installing));
+    assert!(!detect_reboot(UpdateSource::Toolbx, &tbx_log, &pkgs));
+
+    let err_log = read_fixture("containers/upgrade_error.txt");
+    assert!(!detect_reboot(UpdateSource::Distrobox, &err_log, &pkgs));
+    assert!(!detect_reboot(UpdateSource::Toolbx, &err_log, &pkgs));
 }

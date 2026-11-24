@@ -2,6 +2,7 @@
 //! Flatpak discovery and transaction apply call libflatpak natively, with flatpak CLI fallback.
 
 pub mod brew;
+pub mod containers;
 pub mod dnf;
 pub mod dnf_dbus;
 pub mod flatpak;
@@ -44,6 +45,7 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
         }
         UpdateSource::GnomeExtensions => ProgressHint::default(),
         UpdateSource::Homebrew => brew::parse_progress_line(line),
+        UpdateSource::Distrobox | UpdateSource::Toolbx => containers::parse_progress_line(line),
         UpdateSource::Firmware => fwupd::parse_progress_line(line),
     }
 }
@@ -55,7 +57,9 @@ pub fn detect_reboot(source: UpdateSource, log: &str, packages: &[Package]) -> b
         UpdateSource::FlatpakUser
         | UpdateSource::FlatpakSystem
         | UpdateSource::GnomeExtensions
-        | UpdateSource::Homebrew => false,
+        | UpdateSource::Homebrew
+        | UpdateSource::Distrobox
+        | UpdateSource::Toolbx => false,
         UpdateSource::Firmware => fwupd::detect_reboot_needed(log),
     }
 }
@@ -111,12 +115,17 @@ mod tests {
         assert_eq!(ostree_hint.stage_current, Some(2));
         assert_eq!(ostree_hint.stage_total, Some(5));
 
-        let brew_hint = parse_progress(
-            UpdateSource::Homebrew,
-            "==> Pouring ripgrep--14.1.1.x86_64_linux.bottle.tar.gz",
-        );
+        let brew_hint = parse_progress(UpdateSource::Homebrew, "==> Pouring ripgrep--14.1.1.x86_64_linux.bottle.tar.gz");
         assert_eq!(brew_hint.package_name.as_deref(), Some("ripgrep"));
         assert_eq!(brew_hint.status, Some(PackageStatus::Installing));
+
+        let dbox_hint = parse_progress(UpdateSource::Distrobox, "Upgrading arch-dev...");
+        assert_eq!(dbox_hint.package_name.as_deref(), Some("arch-dev"));
+        assert_eq!(dbox_hint.status, Some(PackageStatus::Installing));
+
+        let tbx_hint = parse_progress(UpdateSource::Toolbx, "[1/2] Downloading git-core 50%");
+        assert_eq!(tbx_hint.status, Some(PackageStatus::Downloading));
+        assert_eq!(tbx_hint.progress, Some(0.5));
 
         assert_eq!(
             parse_progress(
@@ -133,7 +142,7 @@ mod tests {
         assert!(detect_reboot(UpdateSource::Dnf, "", &kernel));
         assert!(!detect_reboot(UpdateSource::Dnf, "Complete!", &[]));
 
-        // Flatpak, GNOME Extensions, and Homebrew never request a system reboot regardless of log text or package list.
+        // Flatpak, GNOME Extensions, Homebrew, and container backends never request a system reboot regardless of log text or package list.
         assert!(!detect_reboot(
             UpdateSource::FlatpakUser,
             "An update requires a reboot to complete.",
@@ -151,6 +160,16 @@ mod tests {
         ));
         assert!(!detect_reboot(
             UpdateSource::Homebrew,
+            "An update requires a reboot to complete.",
+            &kernel
+        ));
+        assert!(!detect_reboot(
+            UpdateSource::Distrobox,
+            "An update requires a reboot to complete.",
+            &kernel
+        ));
+        assert!(!detect_reboot(
+            UpdateSource::Toolbx,
             "An update requires a reboot to complete.",
             &kernel
         ));

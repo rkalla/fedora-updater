@@ -30,7 +30,14 @@ use fedora_updater::backend::fwupd_dbus::{
 use fedora_updater::backend::gnome_extensions::parse_extensions_json;
 use fedora_updater::backend::logind::{RebootPreflight, ShutdownInhibitor};
 use fedora_updater::backend::rpm_ostree::{parse_status_json, RPM_OSTREE_DEFAULT_PATH};
-use fedora_updater::backend::{brew::LINUXBREW_SYSTEM_PATH, dnf, NativeOutcome};
+use fedora_updater::backend::{
+    brew::LINUXBREW_SYSTEM_PATH,
+    containers::{
+        DISTROBOX_DEFAULT_PATH, NONINTERACTIVE_ENV as CONTAINER_NONINTERACTIVE_ENV,
+        TOOLBOX_DEFAULT_PATH,
+    },
+    dnf, NativeOutcome,
+};
 use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
 use fedora_updater::model::{
@@ -3864,4 +3871,550 @@ fn atomic_ostree_host_check_apply_cancel_modes_and_classic_isolation() {
         }
         other => panic!("expected Failed on active transaction conflict, got {other:?}"),
     }
+}
+
+fn containers_only_config(distrobox_enabled: bool, toolbx_enabled: bool) -> SourceConfig {
+    let mut opt_in = Vec::new();
+    if distrobox_enabled {
+        opt_in.push("distrobox".into());
+    }
+    if toolbx_enabled {
+        opt_in.push("toolbx".into());
+    }
+    SourceConfig::from_prefs(
+        [
+            "dnf".into(),
+            "flatpak".into(),
+            "gnome-extensions".into(),
+            "homebrew".into(),
+            "firmware".into(),
+        ],
+        opt_in,
+    )
+}
+
+#[test]
+fn containers_missing_clis_and_opt_in_default_skip_silently_with_zero_auth() {
+    // 1) Even when Distrobox & Toolbx CLIs exist on disk, default opt-in config skips both.
+    let rt_default = FakeRuntime::new();
+    rt_default.set_dnf_dbus_available(true);
+    rt_default.push_dnf_dbus_check(NativeOutcome::Handled(Ok(Vec::new())));
+    rt_default.push_flatpak_appstream_ok();
+    rt_default.push_flatpak_empty(true);
+    rt_default.push_flatpak_empty(false);
+    rt_default.set_fwupd_dbus_available(true);
+    rt_default.push_fwupd_dbus_check(NativeOutcome::Handled(Ok(Vec::new())));
+    rt_default.set_distrobox_available(true);
+    rt_default.set_toolbox_available(true);
+
+    let default_cfg = SourceConfig::default();
+    assert!(!default_cfg.is_enabled(UpdateSource::Distrobox));
+    assert!(!default_cfg.is_enabled(UpdateSource::Toolbx));
+
+    let mut h_default = FlowHarness::new();
+    h_default.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    execute_check_all_with_config(&tx, &rt_default, &WorkCancel::new(), &default_cfg);
+    drop(tx);
+    h_default.drain(&rx);
+
+    assert!(matches!(
+        h_default.state.phase,
+        Phase::Idle(IdleScreen::Current { .. })
+    ));
+    assert!(rt_default.helper_calls().is_empty());
+    assert_eq!(rt_default.ensure_session_calls(), 0);
+    assert!(
+        !rt_default
+            .local_calls()
+            .iter()
+            .any(|(prog, _)| prog == DISTROBOX_DEFAULT_PATH || prog == TOOLBOX_DEFAULT_PATH),
+        "opt-in container CLIs must not run under default SourceConfig"
+    );
+
+    // 2) When opted in but both binaries are missing, check stays silently clean with zero soft errors.
+    let rt_missing = FakeRuntime::new();
+    let cfg_enabled = containers_only_config(true, true);
+    let mut h_missing = FlowHarness::new();
+    h_missing.dispatch(Event::StartCheck { then_apply: false });
+    let (tx2, rx2) = async_channel::unbounded();
+    execute_check_all_with_config(&tx2, &rt_missing, &WorkCancel::new(), &cfg_enabled);
+    drop(tx2);
+    h_missing.drain(&rx2);
+
+    assert!(matches!(
+        h_missing.state.phase,
+        Phase::Idle(IdleScreen::Current { .. })
+    ));
+    assert!(rt_missing.local_calls().is_empty());
+    assert!(rt_missing.helper_calls().is_empty());
+}
+
+#[test]
+fn containers_opt_in_discovery_handles_empty_dedup_zero_auth_and_list_errors() {
+    let cfg = containers_only_config(true, true);
+    assert!(!check_requires_helper_auth(false, false, &cfg));
+    assert!(!check_requires_helper_auth(false, true, &cfg));
+    assert!(can_skip_check_auth_ui(true));
+
+    // 1) Empty listings cleanly resolve to Idle::Current.
+    let rt_empty = FakeRuntime::new();
+    rt_empty.set_distrobox_available(true);
+    rt_empty.set_toolbox_available(true);
+    rt_empty.push_local_fixture(
+        DISTROBOX_DEFAULT_PATH,
+        &["list", "--no-color"],
+        "containers/empty.txt",
+        0,
+    );
+    rt_empty.push_local_fixture(
+        TOOLBOX_DEFAULT_PATH,
+        &["list", "--containers"],
+        "containers/empty.txt",
+        0,
+    );
+
+    let mut h_empty = FlowHarness::new();
+    h_empty.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    execute_check_all_with_config(&tx, &rt_empty, &WorkCancel::new(), &cfg);
+    drop(tx);
+    h_empty.drain(&rx);
+
+    assert!(matches!(
+        h_empty.state.phase,
+        Phase::Idle(IdleScreen::Current { .. })
+    ));
+    assert!(rt_empty.helper_calls().is_empty());
+
+    // 2) Combined Distrobox + Toolbx discovery deduplicates Distrobox-managed containers.
+    let rt = FakeRuntime::new();
+    rt.set_distrobox_available(true);
+    rt.set_toolbox_available(true);
+    rt.push_local_fixture(
+        DISTROBOX_DEFAULT_PATH,
+        &["list", "--no-color"],
+        "containers/distrobox_list.txt",
+        0,
+    );
+    rt.push_local_fixture(
+        TOOLBOX_DEFAULT_PATH,
+        &["list", "--containers"],
+        "containers/toolbox_list_with_duplicates.txt",
+        0,
+    );
+
+    let mut h = FlowHarness::new();
+    h.console.clear();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx2, rx2) = async_channel::unbounded();
+    execute_check_all_with_config(&tx2, &rt, &WorkCancel::new(), &cfg);
+    drop(tx2);
+    h.drain(&rx2);
+
+    assert!(rt.helper_calls().is_empty());
+    assert_eq!(rt.ensure_session_calls(), 0);
+    let env_calls = rt.local_env_calls();
+    assert_eq!(env_calls.len(), 2);
+    for expected_env in CONTAINER_NONINTERACTIVE_ENV {
+        assert!(env_calls.iter().all(|(_, _, envs)| {
+            envs.iter()
+                .any(|(k, v)| k == expected_env.0 && v == expected_env.1)
+        }));
+    }
+
+    match &h.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert!(soft_errors.is_empty(), "{soft_errors:?}");
+            assert_eq!(packages.len(), 4);
+            let names: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["arch-dev", "fedora-dev", "ubuntu-lts", "fedora-toolbox-43"]
+            );
+            assert!(packages[..3]
+                .iter()
+                .all(|p| p.source == UpdateSource::Distrobox));
+            assert_eq!(packages[3].source, UpdateSource::Toolbx);
+            assert!(packages.iter().all(|p| p.old_version.is_none()));
+            assert!(packages[0]
+                .detail
+                .ends_with("check & update on apply"));
+        }
+        other => panic!("expected Phase::Ready with container rows, got {other:?}"),
+    }
+
+    // 3) Hard non-zero list error on one container tool is isolated as a soft error while the other succeeds.
+    let rt_err = FakeRuntime::new();
+    rt_err.set_distrobox_available(true);
+    rt_err.set_toolbox_available(true);
+    rt_err.push_local_fixture(
+        DISTROBOX_DEFAULT_PATH,
+        &["list", "--no-color"],
+        "containers/upgrade_error.txt",
+        1,
+    );
+    rt_err.push_local_fixture(
+        TOOLBOX_DEFAULT_PATH,
+        &["list", "--containers"],
+        "containers/toolbox_list.txt",
+        0,
+    );
+
+    let mut h_err = FlowHarness::new();
+    h_err.dispatch(Event::StartCheck { then_apply: false });
+    let (tx3, rx3) = async_channel::unbounded();
+    execute_check_all_with_config(&tx3, &rt_err, &WorkCancel::new(), &cfg);
+    drop(tx3);
+    h_err.drain(&rx3);
+
+    match &h_err.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert_eq!(soft_errors.len(), 1);
+            assert!(soft_errors[0].contains("distrobox"), "{}", soft_errors[0]);
+            assert_eq!(packages.len(), 2);
+            assert!(packages.iter().all(|p| p.source == UpdateSource::Toolbx));
+        }
+        other => panic!("expected Phase::Ready with isolated soft error, got {other:?}"),
+    }
+}
+
+#[test]
+fn containers_selective_unprivileged_apply_streams_logs_and_keeps_needs_reboot_false() {
+    let cfg = containers_only_config(true, true);
+    let rt = FakeRuntime::new();
+    rt.set_distrobox_available(true);
+    rt.set_toolbox_available(true);
+    rt.push_local_fixture(
+        DISTROBOX_DEFAULT_PATH,
+        &["list", "--no-color"],
+        "containers/distrobox_list.txt",
+        0,
+    );
+    rt.push_local_fixture(
+        TOOLBOX_DEFAULT_PATH,
+        &["list", "--containers"],
+        "containers/toolbox_list_with_duplicates.txt",
+        0,
+    );
+
+    let mut check_h = FlowHarness::new();
+    check_h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx_c, rx_c) = async_channel::unbounded();
+    execute_check_all_with_config(&tx_c, &rt, &WorkCancel::new(), &cfg);
+    drop(tx_c);
+    check_h.drain(&rx_c);
+
+    let discovered = match &check_h.state.phase {
+        Phase::Ready { packages, .. } => packages.clone(),
+        other => panic!("expected Ready, got {other:?}"),
+    };
+    let selected: Vec<Package> = discovered
+        .into_iter()
+        .filter(|p| p.name == "arch-dev" || p.name == "fedora-toolbox-43")
+        .collect();
+    assert_eq!(selected.len(), 2);
+    assert!(apply_skips_helper_auth_ui(&selected, ApplyMode::Live, false, false));
+
+    rt.push_local_fixture(
+        DISTROBOX_DEFAULT_PATH,
+        &["upgrade", "arch-dev"],
+        "containers/distrobox_upgrade_log.txt",
+        0,
+    );
+    rt.push_local_fixture(
+        TOOLBOX_DEFAULT_PATH,
+        &["run", "--container", "fedora-toolbox-43", "sudo", "dnf", "upgrade", "-y"],
+        "containers/toolbox_upgrade_log.txt",
+        0,
+    );
+
+    let mut apply_h = FlowHarness::ready(selected.clone());
+    apply_h.console.clear();
+    apply_h.dispatch(Event::StartApply);
+    apply_h.dispatch(session_started_event(
+        session_started_purpose(&apply_h.state.phase).unwrap(),
+    ));
+    let (tx_a, rx_a) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_a,
+        selected,
+        ApplyMode::Live,
+        &rt,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_a);
+    apply_h.drain(&rx_a);
+
+    assert!(rt.helper_calls().is_empty());
+    assert_eq!(rt.ensure_session_calls(), 0);
+    let calls = rt.local_calls();
+    assert!(calls.contains(&(
+        DISTROBOX_DEFAULT_PATH.to_string(),
+        vec!["upgrade".into(), "arch-dev".into()]
+    )));
+    assert!(calls.contains(&(
+        TOOLBOX_DEFAULT_PATH.to_string(),
+        vec![
+            "run".into(),
+            "--container".into(),
+            "fedora-toolbox-43".into(),
+            "sudo".into(),
+            "dnf".into(),
+            "upgrade".into(),
+            "-y".into(),
+        ]
+    )));
+    assert!(!calls
+        .iter()
+        .any(|(_, args)| args.iter().any(|a| a == "fedora-dev" || a == "ubuntu-lts")));
+
+    let env_calls = rt.local_env_calls();
+    for expected_env in CONTAINER_NONINTERACTIVE_ENV {
+        assert!(env_calls.iter().all(|(_, _, envs)| {
+            envs.iter()
+                .any(|(k, v)| k == expected_env.0 && v == expected_env.1)
+        }));
+    }
+
+    let rendered = apply_h.console.lines().collect::<Vec<_>>().join("\n");
+    assert!(rendered.contains("[distrobox] ── Upgrading arch-dev ──"));
+    assert!(rendered.contains("[distrobox] Container arch-dev upgraded successfully."));
+    assert!(rendered.contains("[toolbx] ── Upgrading fedora-toolbox-43 ──"));
+    assert!(rendered.contains("[toolbx] Complete!"));
+
+    match &apply_h.state.phase {
+        Phase::Done {
+            packages,
+            needs_reboot,
+            failed,
+            failure_reasons,
+            ..
+        } => {
+            assert!(!needs_reboot);
+            assert_eq!(*failed, 0);
+            assert!(failure_reasons.is_empty());
+            assert_eq!(packages.len(), 2);
+            assert!(packages.iter().all(|p| p.status == PackageStatus::Completed));
+        }
+        other => panic!("expected Phase::Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn containers_failure_isolation_mode_skips_and_work_cancel() {
+    let cfg = containers_only_config(true, true);
+    let arch_dev = Package::new_container(
+        UpdateSource::Distrobox,
+        "a1b2c3d4e5f6",
+        "arch-dev",
+        "Up 3 hours",
+        "quay.io/toolbx-images/archlinux-toolbox:latest",
+        None,
+    );
+    let ubuntu_lts = Package::new_container(
+        UpdateSource::Distrobox,
+        "d4e5f6a7b8c9",
+        "ubuntu-lts",
+        "Exited (0) 5 days ago",
+        "docker.io/library/ubuntu:24.04",
+        None,
+    );
+    let fedora_tbx = Package::new_container(
+        UpdateSource::Toolbx,
+        "c3d4e5f6a7b8",
+        "fedora-toolbox-43",
+        "running",
+        "registry.fedoraproject.org/fedora-toolbox:43",
+        None,
+    );
+
+    // 1) Partial failure isolation within Distrobox: arch-dev completes, ubuntu-lts fails.
+    let rt_partial = FakeRuntime::new();
+    rt_partial.set_distrobox_available(true);
+    rt_partial.push_local_fixture(
+        DISTROBOX_DEFAULT_PATH,
+        &["upgrade", "arch-dev"],
+        "containers/distrobox_upgrade_log.txt",
+        0,
+    );
+    rt_partial.push_local_fixture(
+        DISTROBOX_DEFAULT_PATH,
+        &["upgrade", "ubuntu-lts"],
+        "containers/upgrade_error.txt",
+        1,
+    );
+    let partial_pkgs = vec![arch_dev.clone(), ubuntu_lts.clone()];
+    let mut h_partial = FlowHarness::ready(partial_pkgs.clone());
+    h_partial.dispatch(Event::StartApply);
+    h_partial.dispatch(session_started_event(
+        session_started_purpose(&h_partial.state.phase).unwrap(),
+    ));
+    let (tx_p, rx_p) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_p,
+        partial_pkgs,
+        ApplyMode::Live,
+        &rt_partial,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_p);
+    h_partial.drain(&rx_p);
+
+    match &h_partial.state.phase {
+        Phase::Done {
+            packages,
+            needs_reboot,
+            failed,
+            failure_reasons,
+            ..
+        } => {
+            assert!(!needs_reboot);
+            assert_eq!(*failed, 1);
+            assert_eq!(packages[0].status, PackageStatus::Completed);
+            assert_eq!(packages[1].status, PackageStatus::Failed);
+            assert!(
+                failure_reasons
+                    .iter()
+                    .any(|r| r.contains("ubuntu-lts")),
+                "{failure_reasons:?}"
+            );
+        }
+        other => panic!("expected partial Done with failed=1, got {other:?}"),
+    }
+
+    // 2) All selected containers failing moves to Phase::Failed.
+    let rt_all_fail = FakeRuntime::new();
+    rt_all_fail.set_distrobox_available(true);
+    rt_all_fail.set_toolbox_available(true);
+    rt_all_fail.push_local_fixture(
+        DISTROBOX_DEFAULT_PATH,
+        &["upgrade", "ubuntu-lts"],
+        "containers/upgrade_error.txt",
+        1,
+    );
+    rt_all_fail.push_local_fixture(
+        TOOLBOX_DEFAULT_PATH,
+        &["run", "--container", "fedora-toolbox-43", "sudo", "dnf", "upgrade", "-y"],
+        "containers/upgrade_error.txt",
+        1,
+    );
+    let fail_pkgs = vec![ubuntu_lts, fedora_tbx.clone()];
+    let mut h_fail = FlowHarness::ready(fail_pkgs.clone());
+    h_fail.dispatch(Event::StartApply);
+    h_fail.dispatch(session_started_event(
+        session_started_purpose(&h_fail.state.phase).unwrap(),
+    ));
+    let (tx_f, rx_f) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_f,
+        fail_pkgs,
+        ApplyMode::Live,
+        &rt_all_fail,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_f);
+    h_fail.drain(&rx_f);
+
+    match &h_fail.state.phase {
+        Phase::Failed { detail, .. } => {
+            assert!(detail.contains("ubuntu-lts"), "{detail}");
+            assert!(detail.contains("fedora-toolbox-43"), "{detail}");
+        }
+        other => panic!("expected Phase::Failed, got {other:?}"),
+    }
+
+    // 3) DownloadOnly & OfflineOnReboot skip container commands cleanly without invoking tools or helper.
+    for mode in [ApplyMode::DownloadOnly, ApplyMode::OfflineOnReboot] {
+        let rt_skip = FakeRuntime::new();
+        rt_skip.set_distrobox_available(true);
+        rt_skip.set_toolbox_available(true);
+        let skip_pkgs = vec![arch_dev.clone(), fedora_tbx.clone()];
+        let mut h_skip = FlowHarness::ready(skip_pkgs.clone());
+        h_skip.console.clear();
+        h_skip.dispatch(Event::StartApply);
+        h_skip.dispatch(session_started_event(
+            session_started_purpose(&h_skip.state.phase).unwrap(),
+        ));
+        let (tx_s, rx_s) = async_channel::unbounded();
+        execute_apply_all_with_mode_and_config(
+            &tx_s,
+            skip_pkgs,
+            mode,
+            &rt_skip,
+            &WorkCancel::new(),
+            &cfg,
+        );
+        drop(tx_s);
+        h_skip.drain(&rx_s);
+
+        assert!(rt_skip.local_calls().is_empty());
+        assert!(rt_skip.helper_calls().is_empty());
+        let text = h_skip.console.lines().collect::<Vec<_>>().join("\n");
+        assert!(text.contains("[distrobox] Skipping Distrobox containers"));
+        assert!(text.contains("[toolbx] Skipping Toolbx containers"));
+        assert!(matches!(
+            h_skip.state.phase,
+            Phase::Done {
+                failed: 0,
+                needs_reboot: false,
+                ..
+            }
+        ));
+    }
+
+    // 4) WorkCancel mid-apply stops before running the next container and never touches helper.
+    let cancel = WorkCancel::new();
+    let cancel_hook = cancel.clone();
+    let rt_cancel = FakeRuntime::new();
+    rt_cancel.set_distrobox_available(true);
+    rt_cancel.set_toolbox_available(true);
+    rt_cancel.push_local_step(
+        DISTROBOX_DEFAULT_PATH,
+        &["upgrade", "arch-dev"],
+        LocalStep {
+            lines: vec![
+                "Updating arch-dev...".into(),
+                "(1/2) upgrading glibc".into(),
+                "(2/2) upgrading linux-api-headers".into(),
+            ],
+            result: Ok(0),
+            hook_after_line: Some((
+                0,
+                Box::new(move || {
+                    cancel_hook.cancel();
+                }),
+            )),
+        },
+    );
+    let cancel_pkgs = vec![arch_dev, fedora_tbx];
+    let mut h_cancel = FlowHarness::ready(cancel_pkgs.clone());
+    h_cancel.dispatch(Event::StartApply);
+    h_cancel.dispatch(session_started_event(
+        session_started_purpose(&h_cancel.state.phase).unwrap(),
+    ));
+    let (tx_k, rx_k) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_k,
+        cancel_pkgs,
+        ApplyMode::Live,
+        &rt_cancel,
+        &cancel,
+        &cfg,
+    );
+    drop(tx_k);
+    h_cancel.drain(&rx_k);
+
+    assert_eq!(rt_cancel.local_calls().len(), 1);
+    assert!(rt_cancel.helper_calls().is_empty());
+    assert!(matches!(h_cancel.state.phase, Phase::Running(_)));
 }

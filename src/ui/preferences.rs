@@ -1,7 +1,7 @@
 //! Native Libadwaita Preferences dialog (`Ctrl+,`) for enabling/disabling update sources.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use gtk::prelude::*;
@@ -55,8 +55,8 @@ pub fn build_preferences_dialog(
     );
     page.add(&all_disabled_group);
 
-    let disabled_state: Rc<RefCell<BTreeSet<String>>> =
-        Rc::new(RefCell::new(current_prefs.disabled_sources.clone()));
+    let config_state: Rc<RefCell<SourceConfig>> =
+        Rc::new(RefCell::new(current_prefs.source_config()));
     let on_toggle: ToggleSourceCb = Rc::new(on_toggle);
     let pref_sources = UpdateSource::pref_sources_for_host(ostree_booted);
     #[cfg(test)]
@@ -82,7 +82,13 @@ pub fn build_preferences_dialog(
             let subtitle = availability
                 .get(key)
                 .map(|info| info.subtitle.as_str())
-                .unwrap_or("Installed");
+                .unwrap_or_else(|| {
+                    if src.is_opt_in() {
+                        "Updates installed containers when enabled"
+                    } else {
+                        "Installed"
+                    }
+                });
             let escaped_pref_title = gtk::glib::markup_escape_text(src.pref_title());
             let escaped_subtitle = gtk::glib::markup_escape_text(subtitle);
             let row = libadwaita::SwitchRow::builder()
@@ -92,20 +98,19 @@ pub fn build_preferences_dialog(
                 .active(current_prefs.is_source_enabled(key))
                 .build();
 
-            let disabled_state = disabled_state.clone();
+            let config_state = config_state.clone();
             let all_disabled_group = all_disabled_group.clone();
             let on_toggle = on_toggle.clone();
             row.connect_active_notify(move |switch_row| {
                 let enabled = switch_row.is_active();
                 {
-                    let mut guard = disabled_state.borrow_mut();
+                    let mut guard = config_state.borrow_mut();
                     if enabled {
-                        guard.remove(key);
+                        guard.enable(key);
                     } else {
-                        guard.insert(key.to_string());
+                        guard.disable(key);
                     }
-                    let cfg = SourceConfig::from_disabled_keys(guard.iter().cloned());
-                    all_disabled_group.set_visible(cfg.all_disabled_for_host(ostree_booted));
+                    all_disabled_group.set_visible(guard.all_disabled_for_host(ostree_booted));
                 }
                 on_toggle(key, enabled);
             });
