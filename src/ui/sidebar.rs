@@ -353,6 +353,7 @@ impl Sidebar {
 
         let default_available: BTreeSet<SourceCategory> = UpdateSource::ALL
             .iter()
+            .filter(|src| src.installed_by_default())
             .map(|src| src.category())
             .collect();
         let mut category_rows = Vec::with_capacity(SourceCategory::ALL.len());

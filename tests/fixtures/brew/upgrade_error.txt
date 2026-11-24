@@ -1,0 +1,7 @@
+==> Upgrading ripgrep
+  14.1.0 -> 14.1.1
+==> Pouring ripgrep--14.1.1.x86_64_linux.bottle.tar.gz
+🍺  /home/linuxbrew/.linuxbrew/Cellar/ripgrep/14.1.1: 12 files, 5.2MB
+==> Downloading https://ghcr.io/v2/homebrew/core/fd/blobs/sha256:deadbeef
+Warning: Cannot verify integrity of 'fd--10.2.0.x86_64_linux.bottle.tar.gz'.
+Error: fd: SHA256 mismatch

@@ -1,0 +1,32 @@
+{
+  "formulae": [
+    {
+      "name": "node",
+      "installed_versions": [
+        "20.18.0"
+      ],
+      "current_version": "22.11.0",
+      "pinned": true,
+      "pinned_version": "20.18.0"
+    },
+    {
+      "name": "fd",
+      "installed_versions": [
+        "10.1.0"
+      ],
+      "current_version": "10.2.0",
+      "pinned": false,
+      "pinned_version": null
+    }
+  ],
+  "casks": [
+    {
+      "name": "firefox",
+      "installed_versions": [
+        "132.0"
+      ],
+      "current_version": "133.0",
+      "pinned": true
+    }
+  ]
+}

@@ -773,7 +773,6 @@ impl QueueList {
         }
     }
 
-    #[cfg(test)]
     pub fn is_selectable(&self) -> bool {
         self.selectable.get()
     }

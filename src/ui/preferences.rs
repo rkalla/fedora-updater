@@ -67,8 +67,9 @@ pub fn build_preferences_dialog(
             continue;
         }
 
+        let escaped_title = gtk::glib::markup_escape_text(category.label());
         let group = libadwaita::PreferencesGroup::builder()
-            .title(category.label())
+            .title(escaped_title.as_str())
             .build();
 
         for src in cat_sources {
@@ -77,10 +78,12 @@ pub fn build_preferences_dialog(
                 .get(key)
                 .map(|info| info.subtitle.as_str())
                 .unwrap_or("Installed");
+            let escaped_pref_title = gtk::glib::markup_escape_text(src.pref_title());
+            let escaped_subtitle = gtk::glib::markup_escape_text(subtitle);
             let row = libadwaita::SwitchRow::builder()
                 .name(format!("pref-source:{key}"))
-                .title(src.pref_title())
-                .subtitle(subtitle)
+                .title(escaped_pref_title.as_str())
+                .subtitle(escaped_subtitle.as_str())
                 .active(current_prefs.is_source_enabled(key))
                 .build();
 

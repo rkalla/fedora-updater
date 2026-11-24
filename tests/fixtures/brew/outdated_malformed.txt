@@ -1,0 +1,2 @@
+Error: Unexpected end of JSON input while reading tap metadata
+{"formulae":[{"name":"ripgrep"

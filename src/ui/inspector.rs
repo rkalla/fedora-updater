@@ -37,6 +37,7 @@ impl InspectorViewModel {
             UpdateSource::Dnf => "System (DNF)",
             UpdateSource::FlatpakUser => "Apps (Flatpak · User)",
             UpdateSource::FlatpakSystem => "Apps (Flatpak · System)",
+            UpdateSource::Homebrew => "Dev & Containers (Homebrew)",
             UpdateSource::Firmware => "Firmware (LVFS)",
         };
         let repo = (!package.repo.trim().is_empty()).then(|| package.repo.trim().to_string());
@@ -833,5 +834,20 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("AC power"));
+
+        let brew = Package::new_homebrew(
+            "ripgrep",
+            Some("14.1.0".into()),
+            "14.1.1",
+            "homebrew/core",
+            false,
+        );
+        let brew_vm = InspectorViewModel::from_package(&brew);
+        assert_eq!(brew_vm.badge, "BREW");
+        assert_eq!(brew_vm.badge_css, "src-brew");
+        assert_eq!(brew_vm.source_title, "Dev & Containers (Homebrew)");
+        assert_eq!(brew_vm.repo.as_deref(), Some("homebrew/core"));
+        assert_eq!(brew_vm.version_display, "14.1.0 → 14.1.1");
+        assert!(!brew_vm.needs_reboot);
     }
 }

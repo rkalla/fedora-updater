@@ -36,6 +36,7 @@ pub fn initial_console() -> ConsoleBuffer {
         console.push_committed_tagged("dnf", "Repositories loaded.");
         console.push_committed_tagged("dnf", "[3/5] Installing gnome-shell-48.2-1.fc44.x86_64");
         console.push_committed_tagged("flatpak-user", "Syncing flathub metadata");
+        console.push_committed_tagged("brew", "==> Upgrading ripgrep 14.1.0 -> 14.1.1");
         console.push_committed_tagged("fwupd", "Loaded LVFS metadata for UEFI dbx");
     }
     console
@@ -317,6 +318,9 @@ fn pkg(
                 format!("{version} · flathub · installs org.freedesktop.Platform.GL.nvidia-570-133-07");
             p
         }
+        UpdateSource::Homebrew => {
+            Package::new_homebrew(name, Some(old.into()), version, "homebrew/core", false)
+        }
     };
     p.old_version = Some(old.into());
     p.size_bytes = parse_size_bytes(size);
@@ -380,6 +384,14 @@ fn sample_packages(running: bool) -> Vec<Package> {
             "128.2.0",
             "128.0.1",
             "94 MB",
+            PackageStatus::Pending,
+        ),
+        pkg(
+            "ripgrep",
+            UpdateSource::Homebrew,
+            "14.1.1",
+            "14.1.0",
+            "2.8 MB",
             PackageStatus::Pending,
         ),
         pkg(
@@ -563,7 +575,8 @@ mod tests {
                 checked_sources,
                 soft_errors,
             } => {
-                assert_eq!(packages_so_far.len(), 6);
+                assert_eq!(packages_so_far.len(), 7);
+                assert!(packages_so_far.iter().any(|p| p.source == UpdateSource::Homebrew));
                 assert_eq!(checked_sources, vec![UpdateSource::Dnf]);
                 assert!(soft_errors.is_empty());
             }
@@ -575,7 +588,7 @@ mod tests {
         assert_eq!(ready_cfg.detail_view, DetailView::Updates);
         assert!(matches!(
             &ready_cfg.state.phase,
-            Phase::Ready { packages, soft_errors } if packages.len() == 6 && soft_errors.is_empty()
+            Phase::Ready { packages, soft_errors } if packages.len() == 7 && soft_errors.is_empty()
         ));
 
         let lumen_cfg = super::config_for("ready-lumen");
@@ -583,7 +596,7 @@ mod tests {
         assert_eq!(lumen_cfg.detail_view, DetailView::Updates);
         assert!(matches!(
             &lumen_cfg.state.phase,
-            Phase::Ready { packages, soft_errors } if packages.len() == 6 && soft_errors.is_empty()
+            Phase::Ready { packages, soft_errors } if packages.len() == 7 && soft_errors.is_empty()
         ));
 
         assert!(matches!(
@@ -594,7 +607,7 @@ mod tests {
         assert!(matches!(
             &super::state_for("ready-warn").phase,
             Phase::Ready { packages, soft_errors }
-                if packages.len() == 6 && soft_errors == &vec!["Firmware metadata refresh failed".to_string()]
+                if packages.len() == 7 && soft_errors == &vec!["Firmware metadata refresh failed".to_string()]
         ));
 
         match super::state_for("running").phase {
@@ -647,7 +660,7 @@ mod tests {
                 assert_eq!(failed, 0);
                 assert!(needs_reboot);
                 assert!(failure_reasons.is_empty());
-                assert_eq!(packages.len(), 6);
+                assert_eq!(packages.len(), 7);
                 assert!(packages.iter().all(|p| p.status == PackageStatus::Completed));
             }
             other => panic!("expected Done (reboot), got {other:?}"),

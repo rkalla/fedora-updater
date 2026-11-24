@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 39, "expected 39 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 45, "expected 45 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(
@@ -283,4 +283,39 @@ fn release_upgrade_and_systemctl_fixtures_contain_expected_signals() {
 
     let logind_inhibit = read_fixture_value("systemctl/logind_inhibitors.json");
     assert_eq!(logind_inhibit.as_array().map(Vec::len), Some(3));
+}
+
+#[test]
+fn brew_fixtures_contain_expected_signals() {
+    let outdated = read_fixture_value("brew/outdated_v2.json");
+    assert_eq!(outdated["formulae"].as_array().map(Vec::len), Some(3));
+    assert_eq!(outdated["casks"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        outdated["formulae"][1]["installed_versions"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let empty = read_fixture_value("brew/outdated_empty.json");
+    assert_eq!(empty["formulae"].as_array().map(Vec::len), Some(0));
+    assert_eq!(empty["casks"].as_array().map(Vec::len), Some(0));
+
+    let pinned = read_fixture_value("brew/outdated_pinned.json");
+    assert_eq!(pinned["formulae"][0]["pinned"], true);
+    assert_eq!(pinned["formulae"][1]["pinned"], false);
+    assert_eq!(pinned["casks"][0]["pinned"], true);
+
+    let malformed = read_fixture("brew/outdated_malformed.txt");
+    assert!(serde_json::from_str::<serde_json::Value>(&malformed).is_err());
+
+    let upgrade = read_fixture("brew/upgrade_log.txt");
+    assert!(upgrade.contains("==> Downloading "));
+    assert!(upgrade.contains("==> Upgrading ripgrep"));
+    assert!(upgrade.contains("==> Pouring "));
+    assert!(upgrade.contains("🍺"));
+
+    let upgrade_err = read_fixture("brew/upgrade_error.txt");
+    assert!(upgrade_err.contains("🍺"));
+    assert!(upgrade_err.contains("Error: fd: SHA256 mismatch"));
 }

@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+use fedora_updater::backend::brew::LINUXBREW_SYSTEM_PATH;
 
 use fedora_updater::backend::dnf_dbus::{
     upgrade_specs_from_packages, DnfApplyOutcome, DnfHistoryTransaction, ThroughputSample,
@@ -113,11 +116,15 @@ impl LocalMatcher {
     }
 }
 
+pub type LocalEnvCall = (String, Vec<String>, Vec<(String, String)>);
+
 struct FakeState {
     now: SystemTime,
     ensure_session_calls: usize,
     helper_calls: Vec<HelperCommand>,
     local_calls: Vec<(String, Vec<String>)>,
+    local_env_calls: Vec<LocalEnvCall>,
+    brew_binary: Option<PathBuf>,
     flatpak_queries: Vec<bool>,
     flatpak_native_apply_calls: Vec<(bool, Vec<String>)>,
     dnf_dbus_available: bool,
@@ -166,6 +173,8 @@ impl FakeRuntime {
                 ensure_session_calls: 0,
                 helper_calls: Vec::new(),
                 local_calls: Vec::new(),
+                local_env_calls: Vec::new(),
+                brew_binary: None,
                 flatpak_queries: Vec::new(),
                 flatpak_native_apply_calls: Vec::new(),
                 dnf_dbus_available: false,
@@ -347,6 +356,70 @@ impl FakeRuntime {
         self.inner.lock().unwrap().local_calls.clone()
     }
 
+    pub fn local_env_calls(&self) -> Vec<LocalEnvCall> {
+        self.inner.lock().unwrap().local_env_calls.clone()
+    }
+
+    pub fn set_brew_available(&self, available: bool) {
+        self.set_brew_binary(available.then(|| PathBuf::from(LINUXBREW_SYSTEM_PATH)));
+    }
+
+    pub fn set_brew_binary(&self, path: Option<PathBuf>) {
+        self.inner.lock().unwrap().brew_binary = path;
+    }
+
+    fn execute_local_step(
+        &self,
+        program: &str,
+        args: &[&str],
+        envs: Option<&[(&str, &str)]>,
+        cancel: Option<&WorkCancel>,
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String> {
+        if cancel.is_some_and(WorkCancel::is_cancelled) {
+            return Ok(-1);
+        }
+        let step = {
+            let mut s = self.inner.lock().unwrap();
+            let owned_args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            s.local_calls.push((program.into(), owned_args.clone()));
+            if let Some(env_pairs) = envs {
+                s.local_env_calls.push((
+                    program.into(),
+                    owned_args,
+                    env_pairs
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect(),
+                ));
+            }
+            let pos = s
+                .local_steps
+                .iter()
+                .position(|m| m.matches(program, args));
+            pos.and_then(|idx| s.local_steps.remove(idx)).map(|m| m.step)
+        };
+        let Some(mut step) = step else {
+            panic!("FakeRuntime: unscripted local command `{program}` args={args:?}");
+        };
+        let mut hook = step.hook_after_line.take();
+        for (idx, line) in step.lines.into_iter().enumerate() {
+            if cancel.is_some_and(WorkCancel::is_cancelled) {
+                return Ok(-1);
+            }
+            on_line(line);
+            if let Some((target_idx, ref mut f)) = hook {
+                if idx == target_idx {
+                    f();
+                }
+            }
+        }
+        if cancel.is_some_and(WorkCancel::is_cancelled) {
+            return Ok(-1);
+        }
+        step.result
+    }
+
     pub fn flatpak_queries(&self) -> Vec<bool> {
         self.inner.lock().unwrap().flatpak_queries.clone()
     }
@@ -519,33 +592,22 @@ impl OrchestratorRuntime for FakeRuntime {
         args: &[&str],
         on_line: &mut dyn FnMut(String),
     ) -> Result<i32, String> {
-        let step = {
-            let mut s = self.inner.lock().unwrap();
-            s.local_calls.push((
-                program.into(),
-                args.iter().map(|a| (*a).to_string()).collect(),
-            ));
-            let pos = s
-                .local_steps
-                .iter()
-                .position(|m| m.matches(program, args));
-            pos.and_then(|idx| s.local_steps.remove(idx)).map(|m| m.step)
-        };
-        let Some(mut step) = step else {
-            panic!(
-                "FakeRuntime: unscripted local command `{program}` args={args:?}"
-            );
-        };
-        let mut hook = step.hook_after_line.take();
-        for (idx, line) in step.lines.into_iter().enumerate() {
-            on_line(line);
-            if let Some((target_idx, ref mut f)) = hook {
-                if idx == target_idx {
-                    f();
-                }
-            }
-        }
-        step.result
+        self.execute_local_step(program, args, None, None, on_line)
+    }
+
+    fn run_cancellable_local_env(
+        &self,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        cancel: Option<&WorkCancel>,
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String> {
+        self.execute_local_step(program, args, Some(envs), cancel, on_line)
+    }
+
+    fn brew_binary(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().brew_binary.clone()
     }
 
     fn query_flatpak(&self, user: bool) -> Result<FlatpakCheck, String> {

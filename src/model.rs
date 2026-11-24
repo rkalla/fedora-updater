@@ -97,6 +97,7 @@ pub enum UpdateSource {
     Dnf,
     FlatpakUser,
     FlatpakSystem,
+    Homebrew,
     Firmware,
 }
 
@@ -105,6 +106,7 @@ impl UpdateSource {
         Self::Dnf,
         Self::FlatpakUser,
         Self::FlatpakSystem,
+        Self::Homebrew,
         Self::Firmware,
     ];
 
@@ -128,6 +130,7 @@ impl UpdateSource {
         match self {
             Self::Dnf => SourceCategory::System,
             Self::FlatpakUser | Self::FlatpakSystem => SourceCategory::Apps,
+            Self::Homebrew => SourceCategory::DevAndContainers,
             Self::Firmware => SourceCategory::Firmware,
         }
     }
@@ -136,6 +139,7 @@ impl UpdateSource {
         match self {
             Self::Dnf => "dnf",
             Self::FlatpakUser | Self::FlatpakSystem => "flatpak",
+            Self::Homebrew => "homebrew",
             Self::Firmware => "firmware",
         }
     }
@@ -144,6 +148,7 @@ impl UpdateSource {
         match self {
             Self::Dnf => "System Packages (DNF)",
             Self::FlatpakUser | Self::FlatpakSystem => "Flatpak Apps",
+            Self::Homebrew => "Homebrew (brew)",
             Self::Firmware => "Firmware (fwupd / LVFS)",
         }
     }
@@ -151,7 +156,7 @@ impl UpdateSource {
     pub fn requires_root(self) -> bool {
         match self {
             Self::Dnf | Self::Firmware => true,
-            Self::FlatpakUser | Self::FlatpakSystem => false,
+            Self::FlatpakUser | Self::FlatpakSystem | Self::Homebrew => false,
         }
     }
 
@@ -159,8 +164,18 @@ impl UpdateSource {
     /// Future atomic/toolchain sources may override to `false`.
     pub fn supports_selective_apply(self) -> bool {
         match self {
-            Self::Dnf | Self::FlatpakUser | Self::FlatpakSystem | Self::Firmware => true,
+            Self::Dnf
+            | Self::FlatpakUser
+            | Self::FlatpakSystem
+            | Self::Homebrew
+            | Self::Firmware => true,
         }
+    }
+
+    /// True for core Fedora sources expected on standard installations by default.
+    /// Optional user-space tools like Homebrew remain hidden until detected or populated.
+    pub fn installed_by_default(self) -> bool {
+        !matches!(self, Self::Homebrew)
     }
 
     /// Deduplicated preference-level sources preserving canonical order.
@@ -183,6 +198,7 @@ impl UpdateSource {
             Self::Dnf => "DNF",
             Self::FlatpakUser => "FP",
             Self::FlatpakSystem => "FP",
+            Self::Homebrew => "BREW",
             Self::Firmware => "FW",
         }
     }
@@ -191,6 +207,7 @@ impl UpdateSource {
         match self {
             Self::Dnf => "src-dnf",
             Self::FlatpakUser | Self::FlatpakSystem => "src-flatpak",
+            Self::Homebrew => "src-brew",
             Self::Firmware => "src-firmware",
         }
     }
@@ -200,17 +217,19 @@ impl UpdateSource {
             Self::Dnf => "dnf",
             Self::FlatpakUser => "flatpak-user",
             Self::FlatpakSystem => "flatpak-system",
+            Self::Homebrew => "brew",
             Self::Firmware => "fwupd",
         }
     }
 
-    /// Apply order: DNF → Flatpak user → Flatpak system → Firmware.
+    /// Apply order: DNF → Flatpak user → Flatpak system → Homebrew → Firmware.
     pub fn apply_order(self) -> u8 {
         match self {
             Self::Dnf => 0,
             Self::FlatpakUser => 1,
             Self::FlatpakSystem => 2,
-            Self::Firmware => 3,
+            Self::Homebrew => 3,
+            Self::Firmware => 4,
         }
     }
 }
@@ -393,6 +412,50 @@ impl Package {
         }
     }
 
+    /// Construct a Homebrew formula or cask update item with deterministic `brew:<full_name>:<version>` id.
+    pub fn new_homebrew(
+        name: impl Into<String>,
+        old_version: Option<String>,
+        version: impl Into<String>,
+        tap: impl Into<String>,
+        is_cask: bool,
+    ) -> Self {
+        let full_name = name.into().trim().to_string();
+        let version = version.into().trim().to_string();
+        let raw_tap = tap.into();
+        let trimmed_tap = raw_tap.trim();
+        let tap = if trimmed_tap.is_empty() {
+            if is_cask {
+                "homebrew/cask".to_string()
+            } else {
+                "homebrew/core".to_string()
+            }
+        } else {
+            trimmed_tap.to_string()
+        };
+        let old_version = old_version
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let kind = if is_cask { "cask" } else { "formula" };
+        let id = format!("brew:{full_name}:{version}");
+        Self {
+            id,
+            name: full_name,
+            arch: String::new(),
+            version: version.clone(),
+            repo: tap.clone(),
+            size_bytes: None,
+            old_version,
+            status: PackageStatus::Pending,
+            source: UpdateSource::Homebrew,
+            detail: format!("{version} · {tap} · {kind}"),
+            summary: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
+            preflight_warning: None,
+        }
+    }
+
     /// Related extensions extracted from Flatpak `detail` (`... · installs a, b`).
     pub fn related_extensions(&self) -> Vec<String> {
         let Some((_, rest)) = self.detail.split_once("installs ") else {
@@ -495,6 +558,15 @@ impl Package {
         }
         if !self.arch.is_empty() && format!("{}.{}", self.name, self.arch) == hint {
             return true;
+        }
+        if self.source == UpdateSource::Homebrew {
+            if let Some(rest) = self.id.strip_prefix("brew:") {
+                let full_name = rest.rsplit_once(':').map(|(n, _)| n).unwrap_or(rest);
+                let short_name = full_name.rsplit('/').next().unwrap_or(full_name);
+                return hint == full_name || hint == short_name;
+            }
+            let short_name = self.name.rsplit('/').next().unwrap_or(&self.name);
+            return hint == short_name;
         }
         // Flatpak/fwupd ids: `flatpak:user:app/org.foo/x86_64/stable`, `fwupd:<device>`.
         self.id.split([':', '/']).any(|part| part == hint)
@@ -758,6 +830,17 @@ mod tests {
         assert!(fp.matches_progress_name("Thunderbird"));
         assert!(fp.matches_progress_name("org.mozilla.Thunderbird"));
         assert!(!fp.matches_progress_name("Thunder"));
+
+        let brew_tap = Package::new_homebrew(
+            "oven-sh/bun/bun",
+            Some("1.1.30".into()),
+            "1.1.38",
+            "oven-sh/bun",
+            false,
+        );
+        assert!(brew_tap.matches_progress_name("oven-sh/bun/bun"));
+        assert!(brew_tap.matches_progress_name("bun"));
+        assert!(!brew_tap.matches_progress_name("oven-sh"));
     }
 
     #[test]
@@ -1055,21 +1138,25 @@ mod tests {
         assert_eq!(UpdateSource::Dnf.label(), "System");
         assert_eq!(UpdateSource::FlatpakUser.label(), "Apps");
         assert_eq!(UpdateSource::FlatpakSystem.label(), "Apps");
+        assert_eq!(UpdateSource::Homebrew.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Firmware.label(), "Firmware");
 
         assert_eq!(UpdateSource::Dnf.badge(), "DNF");
         assert_eq!(UpdateSource::FlatpakUser.badge(), "FP");
         assert_eq!(UpdateSource::FlatpakSystem.badge(), "FP");
+        assert_eq!(UpdateSource::Homebrew.badge(), "BREW");
         assert_eq!(UpdateSource::Firmware.badge(), "FW");
 
         assert_eq!(UpdateSource::Dnf.css_class(), "src-dnf");
         assert_eq!(UpdateSource::FlatpakUser.css_class(), "src-flatpak");
         assert_eq!(UpdateSource::FlatpakSystem.css_class(), "src-flatpak");
+        assert_eq!(UpdateSource::Homebrew.css_class(), "src-brew");
         assert_eq!(UpdateSource::Firmware.css_class(), "src-firmware");
 
         assert_eq!(UpdateSource::Dnf.console_tag(), "dnf");
         assert_eq!(UpdateSource::FlatpakUser.console_tag(), "flatpak-user");
         assert_eq!(UpdateSource::FlatpakSystem.console_tag(), "flatpak-system");
+        assert_eq!(UpdateSource::Homebrew.console_tag(), "brew");
         assert_eq!(UpdateSource::Firmware.console_tag(), "fwupd");
 
         assert_eq!(UpdateSource::Dnf.to_string(), "System");
@@ -1209,23 +1296,36 @@ mod tests {
                 UpdateSource::Dnf,
                 UpdateSource::FlatpakUser,
                 UpdateSource::FlatpakSystem,
+                UpdateSource::Homebrew,
                 UpdateSource::Firmware,
             ]
         );
         assert_eq!(UpdateSource::Dnf.category(), SourceCategory::System);
         assert_eq!(UpdateSource::FlatpakUser.category(), SourceCategory::Apps);
         assert_eq!(UpdateSource::FlatpakSystem.category(), SourceCategory::Apps);
+        assert_eq!(
+            UpdateSource::Homebrew.category(),
+            SourceCategory::DevAndContainers
+        );
         assert_eq!(UpdateSource::Firmware.category(), SourceCategory::Firmware);
 
         assert_eq!(UpdateSource::Dnf.pref_key(), "dnf");
         assert_eq!(UpdateSource::FlatpakUser.pref_key(), "flatpak");
         assert_eq!(UpdateSource::FlatpakSystem.pref_key(), "flatpak");
+        assert_eq!(UpdateSource::Homebrew.pref_key(), "homebrew");
         assert_eq!(UpdateSource::Firmware.pref_key(), "firmware");
 
         assert!(UpdateSource::Dnf.requires_root());
         assert!(!UpdateSource::FlatpakUser.requires_root());
         assert!(!UpdateSource::FlatpakSystem.requires_root());
+        assert!(!UpdateSource::Homebrew.requires_root());
         assert!(UpdateSource::Firmware.requires_root());
+
+        assert!(UpdateSource::Dnf.installed_by_default());
+        assert!(UpdateSource::FlatpakUser.installed_by_default());
+        assert!(UpdateSource::FlatpakSystem.installed_by_default());
+        assert!(!UpdateSource::Homebrew.installed_by_default());
+        assert!(UpdateSource::Firmware.installed_by_default());
 
         for &src in UpdateSource::all_sources() {
             assert!(src.supports_selective_apply());
@@ -1237,6 +1337,7 @@ mod tests {
             vec![
                 UpdateSource::Dnf,
                 UpdateSource::FlatpakUser,
+                UpdateSource::Homebrew,
                 UpdateSource::Firmware,
             ]
         );
@@ -1245,15 +1346,29 @@ mod tests {
         fp_sys.source = UpdateSource::FlatpakSystem;
         let mut fp_user = Package::new_dnf("Signal", "", "1", "flathub");
         fp_user.source = UpdateSource::FlatpakUser;
+        let brew_pkg = Package::new_homebrew("ripgrep", Some("14.1.0".into()), "14.1.1", "", false);
+        assert_eq!(brew_pkg.id, "brew:ripgrep:14.1.1");
+        assert_eq!(brew_pkg.repo, "homebrew/core");
+        assert_eq!(brew_pkg.old_version.as_deref(), Some("14.1.0"));
+        assert_eq!(brew_pkg.detail, "14.1.1 · homebrew/core · formula");
+        assert_eq!(brew_pkg.version_line(), "14.1.0 → 14.1.1");
+
+        let brew_cask = Package::new_homebrew("font-jetbrains-mono", None, "3.3.0", "", true);
+        assert_eq!(brew_cask.id, "brew:font-jetbrains-mono:3.3.0");
+        assert_eq!(brew_cask.repo, "homebrew/cask");
+        assert_eq!(brew_cask.detail, "3.3.0 · homebrew/cask · cask");
+
         let pkgs = vec![
             Package::new_dnf("bash", "x86_64", "1", "updates"),
             fp_user,
             fp_sys,
+            brew_pkg,
             firmware_pkg("UEFI"),
         ];
         let by_cat = count_by_category(&pkgs);
         assert_eq!(by_cat.get(&SourceCategory::System), Some(&1));
         assert_eq!(by_cat.get(&SourceCategory::Apps), Some(&2));
+        assert_eq!(by_cat.get(&SourceCategory::DevAndContainers), Some(&1));
         assert_eq!(by_cat.get(&SourceCategory::Firmware), Some(&1));
         assert_eq!(by_cat.get(&SourceCategory::Extensions), None);
         assert_eq!(count_for_category(&pkgs, SourceCategory::Apps), 2);
@@ -1262,6 +1377,7 @@ mod tests {
             vec![
                 SourceCategory::System,
                 SourceCategory::Apps,
+                SourceCategory::DevAndContainers,
                 SourceCategory::Firmware,
             ]
         );

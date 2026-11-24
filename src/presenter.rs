@@ -74,15 +74,30 @@ fn up_to_date_chrome(checked_at: &str, detail: Option<String>) -> IdleChrome {
 /// Ready-view caption: `38 system · 0 apps · 0 firmware · 1.2 GB`.
 pub fn source_summary_line(packages: &[Package]) -> String {
     let (dnf, fp, fw) = count_by_source(packages);
-    match total_download_bytes(packages) {
-        Some(bytes) if bytes > 0 => {
-            format!(
-                "{dnf} system · {fp} apps · {fw} firmware · {}",
-                format_bytes(bytes)
-            )
-        }
-        _ => format!("{dnf} system · {fp} apps · {fw} firmware"),
+    let counts = crate::model::count_by_category(packages);
+    let dev = counts
+        .get(&crate::model::SourceCategory::DevAndContainers)
+        .copied()
+        .unwrap_or(0);
+    let extensions = counts
+        .get(&crate::model::SourceCategory::Extensions)
+        .copied()
+        .unwrap_or(0);
+    let mut parts = vec![
+        format!("{dnf} system"),
+        format!("{fp} apps"),
+        format!("{fw} firmware"),
+    ];
+    if dev > 0 {
+        parts.push(format!("{dev} dev"));
     }
+    if extensions > 0 {
+        parts.push(format!("{extensions} extensions"));
+    }
+    if let Some(bytes) = total_download_bytes(packages).filter(|b| *b > 0) {
+        parts.push(format_bytes(bytes));
+    }
+    parts.join(" · ")
 }
 
 /// Check progress from finished backends. Three user-facing groups:
@@ -530,6 +545,45 @@ pub fn done_header_subtitle(
     } else {
         format!("{upgraded} upgraded · {dnf} system / {flatpak} apps / {firmware} firmware · {duration}")
     }
+}
+
+pub fn done_header_subtitle_for_packages(
+    failed: usize,
+    upgraded: usize,
+    packages: &[Package],
+    duration: &str,
+) -> String {
+    if failed > 0 {
+        return format!("{upgraded} applied · {failed} failed · {duration}");
+    }
+    let (dnf, flatpak, firmware) = count_by_source(packages);
+    let counts = crate::model::count_by_category(packages);
+    let dev = counts
+        .get(&crate::model::SourceCategory::DevAndContainers)
+        .copied()
+        .unwrap_or(0);
+    let extensions = counts
+        .get(&crate::model::SourceCategory::Extensions)
+        .copied()
+        .unwrap_or(0);
+    if dev == 0 && extensions == 0 {
+        return done_header_subtitle(failed, upgraded, dnf, flatpak, firmware, duration);
+    }
+    let mut breakdown = vec![
+        format!("{dnf} system"),
+        format!("{flatpak} apps"),
+        format!("{firmware} firmware"),
+    ];
+    if dev > 0 {
+        breakdown.push(format!("{dev} dev"));
+    }
+    if extensions > 0 {
+        breakdown.push(format!("{extensions} extensions"));
+    }
+    format!(
+        "{upgraded} upgraded · {} · {duration}",
+        breakdown.join(" / ")
+    )
 }
 
 pub fn soft_error_banner_title(count: usize) -> String {
@@ -1794,7 +1848,12 @@ mod tests {
 
     #[test]
     fn check_progress_for_sources_matches_legacy_and_handles_subsets() {
-        let all = UpdateSource::all_sources();
+        let core_sources = &[
+            UpdateSource::Dnf,
+            UpdateSource::FlatpakUser,
+            UpdateSource::FlatpakSystem,
+            UpdateSource::Firmware,
+        ];
         for checked in [
             vec![],
             vec![UpdateSource::Dnf],
@@ -1812,7 +1871,8 @@ mod tests {
             ],
         ] {
             let (l_frac, l_done, l_status) = check_progress(&checked);
-            let (g_frac, g_done, g_total, g_status) = check_progress_for_sources(&checked, all);
+            let (g_frac, g_done, g_total, g_status) =
+                check_progress_for_sources(&checked, core_sources);
             assert!((l_frac - g_frac).abs() < 1e-9);
             assert_eq!(l_done, g_done);
             assert_eq!(g_total, 3);
@@ -1840,6 +1900,45 @@ mod tests {
         assert_eq!(
             checking_footnote_of(1, 2, Some("About 1 minute left")),
             "About 1 minute left · 1 of 2 sources"
+        );
+    }
+
+    #[test]
+    fn source_summary_and_done_subtitle_include_homebrew_dev_counts_when_present() {
+        let dnf = Package::new_dnf("kernel", "x86_64", "6.14.11", "updates");
+        let mut brew = Package::new_homebrew(
+            "ripgrep",
+            Some("14.1.0".into()),
+            "14.1.1",
+            "homebrew/core",
+            false,
+        );
+        brew.status = PackageStatus::Completed;
+
+        assert_eq!(
+            source_summary_line(&[dnf.clone(), brew.clone()]),
+            "1 system · 0 apps · 0 firmware · 1 dev"
+        );
+        assert_eq!(
+            done_header_subtitle_for_packages(0, 2, &[dnf, brew], "45 seconds"),
+            "2 upgraded · 1 system / 0 apps / 0 firmware / 1 dev · 45 seconds"
+        );
+
+        let with_brew = [
+            UpdateSource::Dnf,
+            UpdateSource::FlatpakUser,
+            UpdateSource::FlatpakSystem,
+            UpdateSource::Homebrew,
+            UpdateSource::Firmware,
+        ];
+        let (frac, done, total, status) =
+            check_progress_for_sources(&[UpdateSource::Dnf], &with_brew);
+        assert!((frac - 0.2).abs() < 1e-9);
+        assert_eq!(done, 1);
+        assert_eq!(total, 4);
+        assert_eq!(
+            status,
+            "System done · Apps in progress · Dev & Containers queued · Firmware queued"
         );
     }
 }

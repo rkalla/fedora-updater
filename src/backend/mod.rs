@@ -1,6 +1,7 @@
 //! Parsers and progress hints for each update backend.
 //! Flatpak discovery and transaction apply call libflatpak natively, with flatpak CLI fallback.
 
+pub mod brew;
 pub mod dnf;
 pub mod dnf_dbus;
 pub mod flatpak;
@@ -38,6 +39,7 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
         UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
             flatpak::parse_progress_line(line)
         }
+        UpdateSource::Homebrew => brew::parse_progress_line(line),
         UpdateSource::Firmware => fwupd::parse_progress_line(line),
     }
 }
@@ -45,7 +47,7 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
 pub fn detect_reboot(source: UpdateSource, log: &str, packages: &[Package]) -> bool {
     match source {
         UpdateSource::Dnf => dnf::detect_reboot_needed(log, packages),
-        UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => false,
+        UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem | UpdateSource::Homebrew => false,
         UpdateSource::Firmware => fwupd::detect_reboot_needed(log),
     }
 }
@@ -91,6 +93,13 @@ mod tests {
         let fw_hint = parse_progress(UpdateSource::Firmware, "Writing… Percentage=60");
         assert_eq!(fw_hint.phase_label.as_deref(), Some("Installing firmware"));
         assert_eq!(fw_hint.progress, Some(0.6));
+
+        let brew_hint = parse_progress(
+            UpdateSource::Homebrew,
+            "==> Pouring ripgrep--14.1.1.x86_64_linux.bottle.tar.gz",
+        );
+        assert_eq!(brew_hint.package_name.as_deref(), Some("ripgrep"));
+        assert_eq!(brew_hint.status, Some(PackageStatus::Installing));
     }
 
     #[test]
@@ -99,7 +108,7 @@ mod tests {
         assert!(detect_reboot(UpdateSource::Dnf, "", &kernel));
         assert!(!detect_reboot(UpdateSource::Dnf, "Complete!", &[]));
 
-        // Flatpak never requests a system reboot regardless of log text or package list.
+        // Flatpak and Homebrew never request a system reboot regardless of log text or package list.
         assert!(!detect_reboot(
             UpdateSource::FlatpakUser,
             "An update requires a reboot to complete.",
@@ -108,6 +117,11 @@ mod tests {
         assert!(!detect_reboot(
             UpdateSource::FlatpakSystem,
             "System restart required",
+            &kernel
+        ));
+        assert!(!detect_reboot(
+            UpdateSource::Homebrew,
+            "An update requires a reboot to complete.",
             &kernel
         ));
 

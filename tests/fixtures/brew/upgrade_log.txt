@@ -1,0 +1,16 @@
+==> Fetching downloads for: ripgrep and oven-sh/bun/bun
+==> Downloading https://ghcr.io/v2/homebrew/core/ripgrep/blobs/sha256:abcd1234
+==> Upgrading 2 outdated packages:
+ripgrep 14.1.0 -> 14.1.1
+oven-sh/bun/bun 1.1.30 -> 1.1.34
+==> Upgrading ripgrep
+  14.1.0 -> 14.1.1
+==> Pouring ripgrep--14.1.1.x86_64_linux.bottle.tar.gz
+🍺  /home/linuxbrew/.linuxbrew/Cellar/ripgrep/14.1.1: 12 files, 5.2MB
+==> Fetching oven-sh/bun/bun
+==> Downloading https://ghcr.io/v2/oven-sh/bun/bun/blobs/sha256:ef567890
+==> Upgrading oven-sh/bun/bun
+  1.1.30 -> 1.1.34
+==> Pouring bun--1.1.34.x86_64_linux.bottle.tar.gz
+🍺  /home/linuxbrew/.linuxbrew/Cellar/bun/1.1.34: 3 files, 91.4MB
+==> Running `brew cleanup`...

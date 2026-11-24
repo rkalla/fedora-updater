@@ -3,6 +3,9 @@
 mod common;
 
 use common::fixtures::{read_fixture, read_flatpak_fixture};
+use fedora_updater::backend::brew::{
+    parse_outdated_json, parse_progress_line as parse_brew_progress, upgrade_names_from_packages,
+};
 use fedora_updater::backend::dnf::{
     apply_download_sizes, check_exit_is_hard_error, check_exit_is_ok, detect_reboot_needed,
     parse_check_update, parse_progress_line as parse_dnf_progress, parse_repoquery_sizes,
@@ -356,4 +359,87 @@ fn release_upgrade_fixtures_cover_collections_and_os_release() {
     let html_err = read_fixture("release_upgrade/collections_malformed.txt");
     assert_eq!(newest_active_newer_than(&html_err, current), None);
     assert_eq!(offer_from_collections(&html_err, current, "2026-11-20"), None);
+}
+
+#[test]
+fn brew_fixtures_cover_outdated_pinned_malformed_and_upgrade_logs() {
+    // 1. Outdated v2 formulae + multi-installed version + custom tap + cask
+    let outdated = parse_outdated_json(&read_fixture("brew/outdated_v2.json"))
+        .expect("outdated_v2.json parses");
+    assert_eq!(outdated.len(), 4);
+    assert!(outdated.iter().all(|p| p.source == UpdateSource::Homebrew));
+
+    assert_eq!(outdated[0].name, "ripgrep");
+    assert_eq!(outdated[0].old_version.as_deref(), Some("14.1.0"));
+    assert_eq!(outdated[0].version, "14.1.1");
+    assert_eq!(outdated[0].repo, "homebrew/core");
+
+    assert_eq!(outdated[1].name, "cmake");
+    assert_eq!(outdated[1].old_version.as_deref(), Some("3.30.2"));
+    assert_eq!(outdated[1].version, "3.30.3");
+
+    assert_eq!(outdated[2].name, "oven-sh/bun/bun");
+    assert_eq!(outdated[2].repo, "oven-sh/bun");
+
+    assert_eq!(outdated[3].name, "visual-studio-code");
+    assert_eq!(outdated[3].repo, "homebrew/cask");
+
+    assert_eq!(
+        upgrade_names_from_packages(&outdated[..3]),
+        vec![
+            "ripgrep".to_string(),
+            "cmake".to_string(),
+            "oven-sh/bun/bun".to_string(),
+        ]
+    );
+
+    // 2. Empty updates JSON
+    let empty = parse_outdated_json(&read_fixture("brew/outdated_empty.json"))
+        .expect("outdated_empty.json parses");
+    assert!(empty.is_empty());
+
+    // 3. Pinned items are skipped while unpinned entries remain
+    let pinned = parse_outdated_json(&read_fixture("brew/outdated_pinned.json"))
+        .expect("outdated_pinned.json parses");
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].name, "fd");
+    assert_eq!(pinned[0].version, "10.2.0");
+
+    // 4. Malformed JSON surfaces an error cleanly
+    assert!(parse_outdated_json(&read_fixture("brew/outdated_malformed.txt")).is_err());
+
+    // 5. Happy upgrade progress hints & reboot false invariant
+    let upgrade_log = read_fixture("brew/upgrade_log.txt");
+    let hints: Vec<ProgressHint> = upgrade_log
+        .lines()
+        .map(|line| parse_progress(UpdateSource::Homebrew, line))
+        .collect();
+    assert!(hints
+        .iter()
+        .any(|h| h.package_name.as_deref() == Some("ripgrep") && h.status == Some(PackageStatus::Downloading)));
+    assert!(hints
+        .iter()
+        .any(|h| h.package_name.as_deref() == Some("ripgrep") && h.status == Some(PackageStatus::Installing)));
+    assert!(hints.iter().any(|h| {
+        h.package_name.as_deref() == Some("ripgrep") && h.status == Some(PackageStatus::Completed)
+    }));
+    assert!(hints.iter().any(|h| {
+        h.package_name.as_deref() == Some("bun") && h.status == Some(PackageStatus::Completed)
+    }));
+    assert!(hints.iter().any(|h| {
+        parse_brew_progress("==> Running `brew cleanup`...")
+            .phase_label
+            .as_deref()
+            == h.phase_label.as_deref()
+            && h.phase_label.as_deref() == Some("Cleanup")
+    }));
+    assert!(!detect_reboot(UpdateSource::Homebrew, &upgrade_log, &outdated));
+
+    // 6. Partial error log marks completed item without fabricating progress for Error line
+    let err_log = read_fixture("brew/upgrade_error.txt");
+    let err_hints: Vec<ProgressHint> = err_log.lines().map(parse_brew_progress).collect();
+    assert!(err_hints.iter().any(|h| {
+        h.package_name.as_deref() == Some("ripgrep") && h.status == Some(PackageStatus::Completed)
+    }));
+    assert_eq!(err_hints.last(), Some(&ProgressHint::default()));
 }

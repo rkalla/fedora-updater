@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use fedora_updater::backend::flatpak::FlatpakCheck;
 use fedora_updater::helper_protocol::{HelperCommand, HELLO_LINE};
-use fedora_updater::orchestrator::OrchestratorRuntime;
+use fedora_updater::orchestrator::{OrchestratorRuntime, WorkCancel};
 use fedora_updater::privilege::{PrivilegedSession, SessionError, SessionEvent};
 use tempfile::TempDir;
 
@@ -458,6 +458,23 @@ impl OrchestratorRuntime for PipeHelperRuntime {
         on_line: &mut dyn FnMut(String),
     ) -> Result<i32, String> {
         self.inner.local.run_cancellable_local(program, args, on_line)
+    }
+
+    fn run_cancellable_local_env(
+        &self,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        cancel: Option<&WorkCancel>,
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String> {
+        self.inner
+            .local
+            .run_cancellable_local_env(program, args, envs, cancel, on_line)
+    }
+
+    fn brew_binary(&self) -> Option<PathBuf> {
+        self.inner.local.brew_binary()
     }
 
     fn query_flatpak(&self, user: bool) -> Result<FlatpakCheck, String> {

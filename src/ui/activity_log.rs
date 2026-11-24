@@ -17,6 +17,7 @@ pub enum LogSourceFilter {
     All,
     Dnf,
     Flatpak,
+    Brew,
     Fwupd,
 }
 
@@ -27,6 +28,7 @@ impl LogSourceFilter {
             Self::All => "all",
             Self::Dnf => "dnf",
             Self::Flatpak => "flatpak",
+            Self::Brew => "brew",
             Self::Fwupd => "fwupd",
         }
     }
@@ -35,6 +37,7 @@ impl LogSourceFilter {
         match name {
             Some("dnf") => Self::Dnf,
             Some("flatpak") => Self::Flatpak,
+            Some("brew") => Self::Brew,
             Some("fwupd") => Self::Fwupd,
             _ => Self::All,
         }
@@ -68,6 +71,7 @@ pub fn line_matches_source(line: &str, filter: LogSourceFilter) -> bool {
                 Some("flatpak" | "flatpak-user" | "flatpak-system")
             )
         }
+        LogSourceFilter::Brew => matches!(parse_log_tag(line), Some("brew")),
         LogSourceFilter::Fwupd => matches!(parse_log_tag(line), Some("fwupd")),
     }
 }
@@ -180,6 +184,7 @@ impl ActivityLogView {
             ("all", "All"),
             ("dnf", "DNF"),
             ("flatpak", "Flatpak"),
+            ("brew", "Brew"),
             ("fwupd", "fwupd"),
         ] {
             let toggle = libadwaita::Toggle::builder().name(name).label(label).build();
@@ -471,35 +476,42 @@ mod tests {
         console.push_committed_tagged("dnf", "Complete!");
         console.push_committed_tagged("flatpak-user", "Syncing flathub");
         console.push_committed_tagged("flatpak-system", "Thunderbird ready");
+        console.push_committed_tagged("brew", "==> Upgrading ripgrep 14.1.0 -> 14.1.1");
         console.push_committed_tagged("fwupd", "UEFI dbx 20241101");
         assert_eq!(LogSourceFilter::All.name(), "all");
         assert_eq!(LogSourceFilter::from_name(Some("flatpak")), LogSourceFilter::Flatpak);
+        assert_eq!(LogSourceFilter::from_name(Some("brew")), LogSourceFilter::Brew);
 
         let (all_text, all_m, all_t) = filter_console_lines(&console, LogSourceFilter::All, "");
-        assert_eq!(all_m, 6);
-        assert_eq!(all_t, 6);
+        assert_eq!(all_m, 7);
+        assert_eq!(all_t, 7);
         assert!(!all_text.contains("40%"));
         assert!(all_text.contains("[1/2] openssl 100%"));
 
         let (dnf_text, dnf_m, dnf_t) =
             filter_console_lines(&console, LogSourceFilter::Dnf, "openssl");
-        assert_eq!((dnf_m, dnf_t), (1, 6));
+        assert_eq!((dnf_m, dnf_t), (1, 7));
         assert_eq!(dnf_text, "[dnf] [1/2] openssl 100%");
 
         let (fp_text, fp_m, fp_t) =
             filter_console_lines(&console, LogSourceFilter::Flatpak, "");
-        assert_eq!((fp_m, fp_t), (2, 6));
+        assert_eq!((fp_m, fp_t), (2, 7));
         assert!(fp_text.contains("[flatpak-user]"));
         assert!(fp_text.contains("[flatpak-system]"));
 
+        let (brew_text, brew_m, brew_t) =
+            filter_console_lines(&console, LogSourceFilter::Brew, "ripgrep");
+        assert_eq!((brew_m, brew_t), (1, 7));
+        assert_eq!(brew_text, "[brew] ==> Upgrading ripgrep 14.1.0 -> 14.1.1");
+
         let (fw_text, fw_m, fw_t) =
             filter_console_lines(&console, LogSourceFilter::Fwupd, "dbx");
-        assert_eq!((fw_m, fw_t), (1, 6));
+        assert_eq!((fw_m, fw_t), (1, 7));
         assert_eq!(fw_text, "[fwupd] UEFI dbx 20241101");
 
         let (none_text, none_m, none_t) =
             filter_console_lines(&console, LogSourceFilter::Fwupd, "thunderbird");
-        assert_eq!((none_m, none_t), (0, 6));
+        assert_eq!((none_m, none_t), (0, 7));
         assert_eq!(none_text, "");
     }
 }

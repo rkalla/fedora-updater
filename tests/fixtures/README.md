@@ -2,7 +2,7 @@
 
 Checked-in, deterministic, offline test inputs for unit, functional, and end-to-end suites ([rkalla/fedora-updater#20](https://github.com/rkalla/fedora-updater/issues/20)).
 
-All 39 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
+All 45 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
 
 ## Usage in Tests
 
@@ -62,6 +62,17 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `fwupd/check_reboot_needed_false.json` | `fwupdmgr check-reboot-needed --json` (exit 2) | Empty `"Devices"` array under non-zero exit code |
 | `fwupd/dbus_devices_and_upgrades.json` | `org.freedesktop.fwupd` (`GetDevices`/`GetUpgrades`) | Devices with `REQUIRE_AC` flag, host & peripheral `BatteryLevel`/`BatteryThreshold`, HTML `<p>` release notes, and `NEEDS_REBOOT` device |
 | `fwupd/dbus_history.json` | `org.freedesktop.fwupd` (`GetHistory`) | Realistic `Success` and `Failed` firmware history entries with target versions and error reasons |
+
+### `brew/` (6 fixtures)
+
+| File | Simulated Command & Exit | Scenario & Edge-Case Signals |
+|---|---|---|
+| `brew/outdated_v2.json` | `brew outdated --json=v2` (exit 0) | Multiple outdated formulae (`ripgrep`, multi-installed-versions `cmake`, tapped `oven-sh/bun/bun`) plus an outdated cask (`visual-studio-code`) |
+| `brew/outdated_empty.json` | `brew outdated --json=v2` (exit 0) | Clean `{ "formulae": [], "casks": [] }` JSON response yielding zero updates |
+| `brew/outdated_pinned.json` | `brew outdated --json=v2` (exit 0) | Mix of pinned (`node` with `pinned: true` / `pinned_version`, pinned cask `firefox`) and unpinned (`fd`) entries |
+| `brew/outdated_malformed.txt` | `brew outdated --json=v2` | Error prefix + truncated JSON testing soft-error resilience |
+| `brew/upgrade_log.txt` | `brew upgrade ...` (exit 0) | Realistic Homebrew upgrade stream (`==> Fetching`, `==> Downloading`, `==> Upgrading N outdated packages:` summary ignore, `==> Pouring`, `🍺 .../Cellar/...`, `==> Running \`brew cleanup\``) |
+| `brew/upgrade_error.txt` | `brew upgrade ...` (exit 1) | Partial failure where `ripgrep` completes cleanly (`🍺`) before `Warning:` / `Error: fd: SHA256 mismatch` aborts |
 
 ### `release_upgrade/` (7 fixtures)
 

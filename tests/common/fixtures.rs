@@ -42,6 +42,13 @@ pub const ALL_FIXTURES: &[&str] = &[
     "fwupd/check_reboot_needed_false.json",
     "fwupd/dbus_devices_and_upgrades.json",
     "fwupd/dbus_history.json",
+    // brew/
+    "brew/outdated_v2.json",
+    "brew/outdated_empty.json",
+    "brew/outdated_pinned.json",
+    "brew/outdated_malformed.txt",
+    "brew/upgrade_log.txt",
+    "brew/upgrade_error.txt",
     // release_upgrade/
     "release_upgrade/collections_f45_active.json",
     "release_upgrade/collections_already_current.json",

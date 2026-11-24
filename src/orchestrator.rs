@@ -1,7 +1,7 @@
 //! Sequential multi-backend check/apply using one privileged helper session.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,14 +10,15 @@ use std::time::SystemTime;
 use async_channel::Sender;
 
 use crate::backend::{
-    self, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, logind, ProgressHint,
+    self, brew, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, logind, ProgressHint,
 };
 pub use crate::backend::NativeOutcome;
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
 use crate::model::{ApplyMode, AuthPurpose, Package, RetryAction, UpdateSource};
 use crate::privilege::{
-    close_session, kill_recorded_local_command, run_cancellable_local_command, run_local_command,
-    session_is_alive, with_session, SessionError, SessionEvent,
+    close_session, kill_recorded_local_command, run_cancellable_local_command,
+    run_cancellable_local_command_env, run_local_command, session_is_alive, with_session,
+    SessionError, SessionEvent,
 };
 use crate::state::Event as StateEvent;
 
@@ -101,6 +102,16 @@ pub fn probe_source_availability(
     native_dnf: bool,
     native_fwupd: bool,
 ) -> BTreeMap<String, SourceAvailability> {
+    let brew_bin = brew::find_brew_binary();
+    probe_source_availability_with(native_dnf, native_fwupd, brew_bin.as_deref())
+}
+
+/// Injectable variant of [`probe_source_availability`] for deterministic offline tests.
+pub fn probe_source_availability_with(
+    native_dnf: bool,
+    native_fwupd: bool,
+    brew_bin: Option<&Path>,
+) -> BTreeMap<String, SourceAvailability> {
     let mut map = BTreeMap::new();
     let dnf_cli = command_exists("dnf");
     let dnf_installed = native_dnf || dnf_cli;
@@ -135,6 +146,20 @@ pub fn probe_source_availability(
         },
     );
 
+    let brew_installed = brew_bin.is_some();
+    let brew_sub = match brew_bin {
+        Some(path) => format!("Installed ({})", path.display()),
+        None => "Not installed".into(),
+    };
+    map.insert(
+        "homebrew".into(),
+        SourceAvailability {
+            pref_key: "homebrew",
+            installed: brew_installed,
+            subtitle: brew_sub,
+        },
+    );
+
     let fw_cli = command_exists("fwupdmgr");
     let fw_installed = native_fwupd || fw_cli;
     let fw_sub = if native_fwupd {
@@ -161,12 +186,17 @@ pub fn default_source_availability() -> BTreeMap<String, SourceAvailability> {
     let mut map = BTreeMap::new();
     for src in UpdateSource::pref_sources() {
         let key = src.pref_key();
+        let installed = src.installed_by_default();
         map.insert(
             key.into(),
             SourceAvailability {
                 pref_key: key,
-                installed: true,
-                subtitle: "Installed".into(),
+                installed,
+                subtitle: if installed {
+                    "Installed".into()
+                } else {
+                    "Not installed".into()
+                },
             },
         );
     }
@@ -342,6 +372,22 @@ pub trait OrchestratorRuntime: Send + 'static {
     ) -> Result<i32, String> {
         self.run_local(program, args, on_line)
     }
+    fn run_cancellable_local_env(
+        &self,
+        program: &str,
+        args: &[&str],
+        _envs: &[(&str, &str)],
+        _cancel: Option<&WorkCancel>,
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String> {
+        self.run_cancellable_local(program, args, on_line)
+    }
+    fn brew_binary(&self) -> Option<PathBuf> {
+        None
+    }
+    fn brew_available(&self) -> bool {
+        self.brew_binary().is_some()
+    }
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String>;
     fn apply_flatpak_native(
         &self,
@@ -446,6 +492,22 @@ impl OrchestratorRuntime for SystemRuntime {
         on_line: &mut dyn FnMut(String),
     ) -> Result<i32, String> {
         run_cancellable_local_command(program, args, on_line).map_err(|e| e.to_string())
+    }
+
+    fn run_cancellable_local_env(
+        &self,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        cancel: Option<&WorkCancel>,
+        on_line: &mut dyn FnMut(String),
+    ) -> Result<i32, String> {
+        run_cancellable_local_command_env(program, args, envs, cancel, on_line)
+            .map_err(|e| e.to_string())
+    }
+
+    fn brew_binary(&self) -> Option<PathBuf> {
+        brew::find_brew_binary()
     }
 
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String> {
@@ -805,6 +867,26 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
         );
     }
 
+    // 4) Homebrew — unprivileged user-space check when detected and enabled.
+    if config.is_enabled(UpdateSource::Homebrew) {
+        if let Some(brew_bin) = brew_program(runtime) {
+            if !ch.is_current() {
+                return;
+            }
+            let brew_res = run_brew_check(&ch, runtime, &brew_bin, &mut soft_errors);
+            if !ch.is_current() {
+                return;
+            }
+            emit_backend_check(
+                &ch,
+                UpdateSource::Homebrew,
+                brew_res,
+                &mut all,
+                &mut soft_errors,
+            );
+        }
+    }
+
     // 5) fwupd — prefer native org.freedesktop.fwupd D-Bus, falling back cleanly
     // to the Phase 1 privileged fwupdmgr CLI helper when unavailable.
     if config.is_enabled(UpdateSource::Firmware) {
@@ -991,6 +1073,106 @@ fn run_flatpak_check<R: OrchestratorRuntime>(
     Ok(check.packages)
 }
 
+fn brew_program<R: OrchestratorRuntime>(runtime: &R) -> Option<String> {
+    runtime
+        .brew_binary()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn run_brew_check<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    brew_bin: &str,
+    soft_errors: &mut Vec<String>,
+) -> Result<Vec<Package>, String> {
+    let work_cancel = ch.cancel.work_cancel();
+    let mut refresh_log = String::new();
+    let refresh_warning = match runtime.run_cancellable_local_env(
+        brew_bin,
+        &["update", "--quiet"],
+        brew::CHECK_REFRESH_ENV,
+        Some(&work_cancel),
+        &mut |l| {
+            if !l.trim().is_empty() {
+                ch.line("brew", l.clone());
+            }
+            refresh_log.push_str(&l);
+            refresh_log.push('\n');
+        },
+    ) {
+        Ok(0) => None,
+        Ok(code) => {
+            let detail = summarize_apply_failure(UpdateSource::Homebrew, &refresh_log, code);
+            ch.line("brew", format!("Tap refresh warning: {detail}"));
+            Some(format!("Homebrew tap refresh failed (exit {code})"))
+        }
+        Err(err) => {
+            if !ch.is_current() {
+                return Err("cancelled".into());
+            }
+            ch.line("brew", format!("Tap refresh warning: {err}"));
+            Some(format!("Homebrew tap refresh failed: {err}"))
+        }
+    };
+
+    if !ch.is_current() {
+        return Err("cancelled".into());
+    }
+
+    let mut json_log = String::new();
+    let code = runtime
+        .run_cancellable_local_env(
+            brew_bin,
+            &["outdated", "--json=v2"],
+            brew::NONINTERACTIVE_NO_AUTO_UPDATE_ENV,
+            Some(&work_cancel),
+            &mut |l| {
+                json_log.push_str(&l);
+                json_log.push('\n');
+            },
+        )
+        .map_err(|e| format!("homebrew: {e}"))?;
+
+    if !ch.is_current() {
+        return Err("cancelled".into());
+    }
+
+    if code != 0 {
+        for line in json_log.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            ch.line("brew", line.to_string());
+        }
+        return Err(format!("homebrew: brew outdated exited with {code}"));
+    }
+
+    match brew::parse_outdated_json(&json_log) {
+        Ok(pkgs) => {
+            ch.line("brew", format!("{} update(s) (brew)", pkgs.len()));
+            for pkg in &pkgs {
+                let ver = match pkg.old_version.as_deref() {
+                    Some(old) => format!("{old} → {}", pkg.version),
+                    None => pkg.version.clone(),
+                };
+                ch.line("brew", format!("  {} ({ver})", pkg.name));
+            }
+            if let Some(warn) = refresh_warning {
+                soft_errors.push(warn);
+            }
+            Ok(pkgs)
+        }
+        Err(err) => {
+            for line in json_log
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .take(8)
+            {
+                ch.line("brew", line.to_string());
+            }
+            Err(format!("homebrew: {err}"))
+        }
+    }
+}
+
 /// Apply all pending sources sequentially (`ApplyMode::Live`). Reuses the
 /// shared helper session when still open (no second password).
 pub fn run_apply_all(tx: Sender<WorkerMsg>, packages: Vec<Package>) {
@@ -1163,7 +1345,9 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
             package_hint: None,
             status_hint: None,
             progress: None,
-            phase_label: if mode == ApplyMode::DownloadOnly && source == UpdateSource::Dnf {
+            phase_label: if mode == ApplyMode::DownloadOnly
+                && matches!(source, UpdateSource::Dnf | UpdateSource::Homebrew)
+            {
                 "Downloading packages".into()
             } else {
                 format!("Updating {}", source.label())
@@ -1290,6 +1474,51 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                                 let (c, l) =
                                     run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source);
+                                (c, l, false)
+                            }
+                        }
+                    }
+                }
+            }
+            UpdateSource::Homebrew => {
+                if mode == ApplyMode::OfflineOnReboot {
+                    ch.line(
+                        tag,
+                        "Skipping Homebrew during offline reboot transaction (apply live instead)."
+                            .into(),
+                    );
+                    (0, String::new(), false)
+                } else {
+                    match brew_program(runtime) {
+                        None => {
+                            let msg = "Homebrew (brew) executable not found";
+                            ch.line(tag, format!("error: {msg}"));
+                            (-1, msg.to_string(), false)
+                        }
+                        Some(brew_bin) => {
+                            let names = brew::upgrade_names_from_packages(&packages);
+                            if names.is_empty() {
+                                (0, String::new(), false)
+                            } else {
+                                let subcmd = if mode == ApplyMode::DownloadOnly {
+                                    "fetch"
+                                } else {
+                                    "upgrade"
+                                };
+                                let mut args = Vec::with_capacity(1 + names.len());
+                                args.push(subcmd);
+                                args.extend(names.iter().map(String::as_str));
+                                let work_cancel = ch.cancel.work_cancel();
+                                let (c, l) = run_local_apply_with_env(
+                                    &ch,
+                                    runtime,
+                                    &brew_bin,
+                                    &args,
+                                    brew::NONINTERACTIVE_NO_AUTO_UPDATE_ENV,
+                                    Some(&work_cancel),
+                                    tag,
+                                    source,
+                                );
                                 (c, l, false)
                             }
                         }
@@ -1478,13 +1707,33 @@ fn run_local_apply<R: OrchestratorRuntime>(
     tag: &str,
     source: UpdateSource,
 ) -> (i32, String) {
+    run_local_apply_with_env(ch, runtime, program, args, &[], None, tag, source)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_local_apply_with_env<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    cancel: Option<&WorkCancel>,
+    tag: &str,
+    source: UpdateSource,
+) -> (i32, String) {
     let mut log = String::new();
-    match runtime.run_cancellable_local(program, args, &mut |l| {
+    let mut handle_line = |l: String| {
         log.push_str(&l);
         log.push('\n');
         ch.line(tag, l.clone());
         emit_progress_from_line(ch, source, &l);
-    }) {
+    };
+    let result = if envs.is_empty() && cancel.is_none() {
+        runtime.run_cancellable_local(program, args, &mut handle_line)
+    } else {
+        runtime.run_cancellable_local_env(program, args, envs, cancel, &mut handle_line)
+    };
+    match result {
         Ok(code) => {
             // "Nothing to update" is success (exit 0) — treat as ok even if unexpected.
             (code, log)
@@ -2065,13 +2314,19 @@ mod tests {
         assert!(!cfg.is_enabled(UpdateSource::FlatpakUser));
         assert!(!cfg.is_enabled(UpdateSource::FlatpakSystem));
         assert!(cfg.is_enabled(UpdateSource::Dnf));
+        assert!(cfg.is_enabled(UpdateSource::Homebrew));
         assert!(cfg.is_enabled(UpdateSource::Firmware));
         assert_eq!(
             cfg.enabled_sources(),
-            vec![UpdateSource::Dnf, UpdateSource::Firmware]
+            vec![
+                UpdateSource::Dnf,
+                UpdateSource::Homebrew,
+                UpdateSource::Firmware,
+            ]
         );
 
         cfg.disable("dnf");
+        cfg.disable("homebrew");
         cfg.disable("firmware");
         assert!(cfg.all_disabled());
         assert!(cfg.enabled_sources().is_empty());
@@ -2086,6 +2341,7 @@ mod tests {
         let from_keys = SourceConfig::from_disabled_keys([" ".into(), "Firmware".into()]);
         assert!(!from_keys.is_enabled(UpdateSource::Firmware));
         assert!(from_keys.is_enabled(UpdateSource::Dnf));
+        assert!(from_keys.is_enabled(UpdateSource::Homebrew));
     }
 
     #[test]
@@ -2093,17 +2349,34 @@ mod tests {
         let defaults = default_source_availability();
         for src in UpdateSource::pref_sources() {
             let entry = defaults.get(src.pref_key()).expect("default availability");
-            assert!(entry.installed);
-            assert_eq!(entry.subtitle, "Installed");
+            assert_eq!(entry.installed, src.installed_by_default());
+            if src.installed_by_default() {
+                assert_eq!(entry.subtitle, "Installed");
+            } else {
+                assert_eq!(entry.subtitle, "Not installed");
+            }
         }
 
-        let probed = probe_source_availability(true, false);
+        let probed_no_brew = probe_source_availability_with(true, false, None);
         assert_eq!(
-            probed.get("dnf").map(|s| s.subtitle.as_str()),
+            probed_no_brew.get("dnf").map(|s| s.subtitle.as_str()),
             Some("Installed (dnf5daemon D-Bus)")
         );
-        assert!(probed.get("dnf").unwrap().installed);
-        assert!(probed.contains_key("flatpak"));
-        assert!(probed.contains_key("firmware"));
+        assert!(probed_no_brew.get("dnf").unwrap().installed);
+        assert!(probed_no_brew.contains_key("flatpak"));
+        assert!(!probed_no_brew.get("homebrew").unwrap().installed);
+        assert_eq!(probed_no_brew.get("homebrew").unwrap().subtitle, "Not installed");
+        assert!(probed_no_brew.contains_key("firmware"));
+
+        let probed_with_brew = probe_source_availability_with(
+            true,
+            false,
+            Some(std::path::Path::new(brew::LINUXBREW_SYSTEM_PATH)),
+        );
+        assert!(probed_with_brew.get("homebrew").unwrap().installed);
+        assert_eq!(
+            probed_with_brew.get("homebrew").unwrap().subtitle,
+            "Installed (/home/linuxbrew/.linuxbrew/bin/brew)"
+        );
     }
 }

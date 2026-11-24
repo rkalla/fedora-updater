@@ -20,8 +20,8 @@ use libadwaita::{
 use fedora_updater::backend::{dnf, dnf_dbus, fwupd_dbus};
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
-    count_by_source, ApplyMode, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus,
-    RetryAction, RunPass, SourceCategory, UpdateSource,
+    ApplyMode, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
+    SourceCategory, UpdateSource,
 };
 use fedora_updater::orchestrator::{
     can_skip_apply_auth_ui, can_skip_check_auth_ui, cancel_background_work,
@@ -31,12 +31,12 @@ use fedora_updater::orchestrator::{
 };
 use fedora_updater::presenter::{
     about_time_left, activity_log_subtitle, apply_cta_label, cache_activity_note,
-    check_progress_for_sources, checking_footnote_of, done_clean_summary, done_header_subtitle,
-    fail_retry_label, history_subtitle, idle_chrome, now_playing_subtitle, now_playing_title,
-    phase_completion_notification, pipeline_stage, quiet_ui, ready_banner_title,
-    reboot_trigger_summary, run_heading, running_progress_captions, selection_summary_text,
-    source_summary_line, window_header, DesktopNotification, HeaderView, PipelineStage, QuietInput,
-    AUTH_DESCRIPTION, COMPLETION_NOTIFICATION_ID,
+    check_progress_for_sources, checking_footnote_of, done_clean_summary,
+    done_header_subtitle_for_packages, fail_retry_label, history_subtitle, idle_chrome,
+    now_playing_subtitle, now_playing_title, phase_completion_notification, pipeline_stage,
+    quiet_ui, ready_banner_title, reboot_trigger_summary, run_heading, running_progress_captions,
+    selection_summary_text, source_summary_line, window_header, DesktopNotification, HeaderView,
+    PipelineStage, QuietInput, AUTH_DESCRIPTION, COMPLETION_NOTIFICATION_ID,
 };
 use fedora_updater::privilege::{
     dnf_daemon_is_running, kill_recorded_helper, kill_recorded_local_command,
@@ -496,6 +496,17 @@ fn flush_prefs_on_close(w: &Widgets) {
     let _ = prefs::save(&latest);
 }
 
+fn can_selective_apply(packages: &[Package], native_dnf: bool, native_fwupd: bool) -> bool {
+    !packages.is_empty()
+        && packages.iter().all(|pkg| match pkg.source {
+            UpdateSource::Dnf => native_dnf,
+            UpdateSource::Firmware => native_fwupd,
+            UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem | UpdateSource::Homebrew => {
+                pkg.source.supports_selective_apply()
+            }
+        })
+}
+
 fn sync_sidebar_categories(w: &Widgets, state: &AppState) {
     let cfg = w.prefs.borrow().source_config();
     let availability = w.source_availability.borrow();
@@ -506,7 +517,8 @@ fn sync_sidebar_categories(w: &Widgets, state: &AppState) {
             let installed = availability
                 .get(src.pref_key())
                 .is_none_or(|info| info.installed);
-            installed && cfg.is_enabled(*src)
+            let has_packages = state.packages().iter().any(|p| p.source == *src);
+            (installed || has_packages) && cfg.is_enabled(*src)
         })
         .map(UpdateSource::category)
         .collect();
@@ -1047,7 +1059,7 @@ fn update_ready_filter_chrome(w: &Widgets, total_packages: usize) {
 }
 
 fn update_ready_selection_chrome(w: &Widgets) {
-    if !w.native_dnf_available.get() {
+    if !w.ready_queue.is_selectable() {
         w.ready_selection_bar.set_visible(false);
         w.ready_split_update.set_visible(false);
         w.ready_update.set_visible(true);
@@ -1564,7 +1576,15 @@ fn trigger_apply_from_ready(
         });
         return;
     }
-    if widgets.native_dnf_available.get() {
+    let selective = {
+        let st = state.borrow();
+        can_selective_apply(
+            st.packages(),
+            widgets.native_dnf_available.get(),
+            widgets.native_fwupd_available.get(),
+        )
+    };
+    if selective {
         let selected_ids = widgets.ready_queue.selected_ids();
         if selected_ids.is_empty() {
             return;
@@ -1601,7 +1621,9 @@ fn begin_apply(
     prepare_for_operation(console, widgets);
     let packages = state.borrow().packages().to_vec();
     dispatch(state, console, widgets, Event::StartApply, true);
-    if can_skip_apply_auth_ui(widgets.native_dnf_available.get()) {
+    if !packages.iter().any(|p| p.source.requires_root())
+        || can_skip_apply_auth_ui(widgets.native_dnf_available.get())
+    {
         dispatch(
             state,
             console,
@@ -1634,7 +1656,9 @@ fn begin_apply_selected(
         true,
     );
     let packages = state.borrow().packages().to_vec();
-    if can_skip_apply_auth_ui(widgets.native_dnf_available.get()) {
+    if !packages.iter().any(|p| p.source.requires_root())
+        || can_skip_apply_auth_ui(widgets.native_dnf_available.get())
+    {
         dispatch(
             state,
             console,
@@ -2537,7 +2561,22 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             w.stack.set_visible_child_name("checking");
             w.console_line
                 .set_text(console_preview_line(console.last_line()));
-            let enabled_sources = w.prefs.borrow().source_config().enabled_sources();
+            let availability = w.source_availability.borrow();
+            let enabled_sources: Vec<UpdateSource> = w
+                .prefs
+                .borrow()
+                .source_config()
+                .enabled_sources()
+                .into_iter()
+                .filter(|src| {
+                    src.installed_by_default()
+                        || availability
+                            .get(src.pref_key())
+                            .is_some_and(|info| info.installed)
+                        || checked_sources.contains(src)
+                })
+                .collect();
+            drop(availability);
             let (frac, groups_done, groups_total, status) =
                 check_progress_for_sources(checked_sources, &enabled_sources);
             let eta = about_time_left(elapsed, frac);
@@ -2575,7 +2614,12 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 w.ready_banner.set_revealed(false);
             }
             w.ready_update.set_sensitive(!packages.is_empty());
-            w.ready_queue.set_selectable(w.native_dnf_available.get());
+            let selective = can_selective_apply(
+                packages,
+                w.native_dnf_available.get(),
+                w.native_fwupd_available.get(),
+            );
+            w.ready_queue.set_selectable(selective);
             w.ready_queue.sync(packages, None, None);
             update_ready_filter_chrome(w, packages.len());
             update_ready_selection_chrome(w);
@@ -2599,8 +2643,7 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 .iter()
                 .filter(|p| p.status == PackageStatus::Completed)
                 .count();
-            let (dnf, fp, fw) = count_by_source(packages);
-            let subtitle = done_header_subtitle(*failed, upgraded, dnf, fp, fw, duration);
+            let subtitle = done_header_subtitle_for_packages(*failed, upgraded, packages, duration);
             paint_header(
                 w,
                 HeaderView::Done {
@@ -2954,6 +2997,7 @@ mod tests {
             (UpdateSource::Dnf, "DNF", "src-dnf"),
             (UpdateSource::FlatpakUser, "FP", "src-flatpak"),
             (UpdateSource::FlatpakSystem, "FP", "src-flatpak"),
+            (UpdateSource::Homebrew, "BREW", "src-brew"),
             (UpdateSource::Firmware, "FW", "src-firmware"),
         ] {
             let lbl = rows::source_badge(source);
@@ -4587,14 +4631,22 @@ mod tests {
             let mut console = ConsoleBuffer::new(100);
             console.push_committed_tagged("dnf", "Repositories loaded.");
             console.push_committed_tagged("flatpak-user", "Syncing flathub");
+            console.push_committed_tagged("brew", "==> Upgrading ripgrep 14.1.0 -> 14.1.1");
             console.push_committed_tagged("fwupd", "UEFI dbx");
 
             let cfg = super::super::preview::config_for(preset);
             super::apply_preview_config(&cfg, &widgets);
+            super::sync_sidebar_categories(&widgets, &cfg.state);
             super::sync_shell_layout(&widgets);
             super::render(&cfg.state, &console, &widgets);
 
             match preset {
+                "ready" => {
+                    assert!(widgets
+                        .sidebar
+                        .category_row(fedora_updater::model::SourceCategory::DevAndContainers)
+                        .get_visible());
+                }
                 "ready-native" => {
                     assert!(widgets.native_dnf_available.get());
                     assert!(widgets.ready_split_update.get_visible());
@@ -4994,7 +5046,7 @@ mod tests {
 
         use fedora_updater::model::SourceCategory;
         use fedora_updater::orchestrator::SourceAvailability;
-        use fedora_updater::state::AppState;
+        use fedora_updater::state::{AppState, Phase};
         use gtk::prelude::*;
         use libadwaita::prelude::*;
 
@@ -5044,6 +5096,14 @@ mod tests {
             },
         );
         availability.insert(
+            "homebrew".into(),
+            SourceAvailability {
+                pref_key: "homebrew",
+                installed: false,
+                subtitle: "Not installed".into(),
+            },
+        );
+        availability.insert(
             "firmware".into(),
             SourceAvailability {
                 pref_key: "firmware",
@@ -5071,10 +5131,14 @@ mod tests {
             )
         };
 
-        assert_eq!(handle.switches.len(), 3);
+        assert_eq!(handle.switches.len(), 4);
         assert_eq!(
             handle.switches["dnf"].subtitle().as_deref(),
             Some("Installed (dnf5daemon D-Bus)")
+        );
+        assert_eq!(
+            handle.switches["homebrew"].subtitle().as_deref(),
+            Some("Not installed")
         );
         assert_eq!(
             handle.switches["firmware"].subtitle().as_deref(),
@@ -5098,6 +5162,7 @@ mod tests {
 
         // Disabling remaining sources reveals inline warning hint; re-enabling one clears it.
         handle.switches["dnf"].set_active(false);
+        handle.switches["homebrew"].set_active(false);
         handle.switches["firmware"].set_active(false);
         assert!(widgets.prefs.borrow().source_config().all_disabled());
         assert!(handle.all_disabled_group.get_visible());
@@ -5109,6 +5174,47 @@ mod tests {
             widgets.sidebar.visible_categories(),
             vec![SourceCategory::System]
         );
+
+        // Detecting Homebrew reveals Dev & Containers and enables selective apply without dnf5daemon.
+        handle.switches["homebrew"].set_active(true);
+        widgets.source_availability.borrow_mut().insert(
+            "homebrew".into(),
+            SourceAvailability {
+                pref_key: "homebrew",
+                installed: true,
+                subtitle: "Installed (/home/linuxbrew/.linuxbrew/bin/brew)".into(),
+            },
+        );
+        super::sync_sidebar_categories(&widgets, &state.borrow());
+        assert!(widgets
+            .sidebar
+            .category_row(SourceCategory::DevAndContainers)
+            .get_visible());
+
+        let brew_pkg = fedora_updater::model::Package::new_homebrew(
+            "ripgrep",
+            Some("14.1.0".into()),
+            "14.1.1",
+            "homebrew/core",
+            false,
+        );
+        assert!(super::can_selective_apply(
+            std::slice::from_ref(&brew_pkg),
+            false,
+            false
+        ));
+        *state.borrow_mut() = AppState {
+            phase: Phase::Ready {
+                packages: vec![brew_pkg],
+                soft_errors: vec![],
+            },
+            ..Default::default()
+        };
+        widgets.native_dnf_available.set(false);
+        super::render(&state.borrow(), &console.borrow(), &widgets);
+        assert!(widgets.ready_queue.is_selectable());
+        assert!(widgets.ready_selection_bar.get_visible());
+        assert!(widgets.ready_split_update.get_visible());
 
         gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }

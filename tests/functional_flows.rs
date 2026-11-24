@@ -11,7 +11,7 @@ use async_channel::Receiver;
 use common::fixtures::{read_fixture, read_fixture_value};
 use common::runtime::{
     fixture_to_helper_lines, flatpak_check_from_fixture, DnfDbusApplyStep, FakeRuntime,
-    FlatpakNativeApplyStep, FwupdDbusApplyStep, HelperStep,
+    FlatpakNativeApplyStep, FwupdDbusApplyStep, HelperStep, LocalStep,
 };
 use fedora_updater::backend::dnf_dbus::{
     merge_history, packages_from_dnf_dbus, parse_list_fd_ndjson, DnfAdvisoryRecord,
@@ -28,7 +28,7 @@ use fedora_updater::backend::fwupd_dbus::{
     FwupdUpdateState,
 };
 use fedora_updater::backend::logind::{RebootPreflight, ShutdownInhibitor};
-use fedora_updater::backend::{dnf, NativeOutcome};
+use fedora_updater::backend::{brew::LINUXBREW_SYSTEM_PATH, dnf, NativeOutcome};
 use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
 use fedora_updater::model::{
@@ -2711,4 +2711,463 @@ fn apply_honors_disabled_source_config() {
     assert_eq!(rt.fwupd_dbus_apply_calls(), 0);
     assert_eq!(rt.dnf_dbus_apply_calls().len(), 1);
     assert!(matches!(h.state.phase, Phase::Done { failed: 0, .. }));
+}
+
+#[test]
+fn homebrew_absent_is_silently_skipped_during_check() {
+    let rt = FakeRuntime::new();
+    rt.set_dnf_dbus_available(true);
+    rt.push_dnf_dbus_check(NativeOutcome::Handled(Ok(Vec::new())));
+    rt.push_flatpak_appstream_ok();
+    rt.push_flatpak_empty(true);
+    rt.push_flatpak_empty(false);
+    rt.set_fwupd_dbus_available(true);
+    rt.push_fwupd_dbus_check(NativeOutcome::Handled(Ok(Vec::new())));
+    // Default brew_binary is None: Homebrew must stay silent with zero local calls.
+
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_check_all(&tx, &rt, &cancel);
+    drop(tx);
+    h.drain(&rx);
+
+    assert!(rt.local_env_calls().is_empty());
+    assert!(matches!(
+        h.state.phase,
+        Phase::Idle(IdleScreen::Current { .. })
+    ));
+}
+
+#[test]
+fn homebrew_zero_auth_check_and_selective_apply_stream_progress_and_envs() {
+    let rt = FakeRuntime::new();
+    rt.set_brew_available(true);
+    rt.push_local_lines(
+        LINUXBREW_SYSTEM_PATH,
+        &["update", "--quiet"],
+        vec!["Updated 1 tap (homebrew/core).".into()],
+        Ok(0),
+    );
+    rt.push_local_fixture(
+        LINUXBREW_SYSTEM_PATH,
+        &["outdated", "--json=v2"],
+        "brew/outdated_v2.json",
+        0,
+    );
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("dnf");
+    cfg.disable("flatpak");
+    cfg.disable("firmware");
+
+    // 1) Check executes zero helper calls / zero auth and discovers formulae + cask.
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_check_all_with_config(&tx, &rt, &cancel, &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+
+    let discovered = match &h.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert!(soft_errors.is_empty());
+            assert_eq!(packages.len(), 4);
+            packages.clone()
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    };
+
+    // Select only `ripgrep` and `oven-sh/bun/bun`, omitting `cmake` and `visual-studio-code`.
+    let selected_ids: Vec<String> = discovered
+        .iter()
+        .filter(|p| matches!(p.name.as_str(), "ripgrep" | "oven-sh/bun/bun"))
+        .map(|p| p.id.clone())
+        .collect();
+    assert_eq!(selected_ids.len(), 2);
+
+    h.dispatch(Event::StartSelectiveApply {
+        selected_ids,
+        mode: ApplyMode::Live,
+    });
+    h.dispatch(session_started_event(
+        session_started_purpose(&h.state.phase).unwrap(),
+    ));
+    let selected_packages = h.state.packages().to_vec();
+    assert_eq!(selected_packages.len(), 2);
+
+    rt.push_local_fixture(
+        LINUXBREW_SYSTEM_PATH,
+        &["upgrade", "ripgrep", "oven-sh/bun/bun"],
+        "brew/upgrade_log.txt",
+        0,
+    );
+
+    let (tx2, rx2) = async_channel::unbounded();
+    let cancel2 = WorkCancel::new();
+    execute_apply_all_with_mode_and_config(
+        &tx2,
+        selected_packages,
+        ApplyMode::Live,
+        &rt,
+        &cancel2,
+        &cfg,
+    );
+    drop(tx2);
+    h.drain(&rx2);
+
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+
+    let env_calls = rt.local_env_calls();
+    assert_eq!(env_calls.len(), 3);
+    assert_eq!(env_calls[2].0, LINUXBREW_SYSTEM_PATH);
+    assert_eq!(
+        env_calls[2].1,
+        vec![
+            "upgrade".to_string(),
+            "oven-sh/bun/bun".to_string(),
+            "ripgrep".to_string(),
+        ]
+    );
+    assert!(env_calls[2]
+        .2
+        .iter()
+        .any(|(k, v)| k == "HOMEBREW_NO_AUTO_UPDATE" && v == "1"));
+    assert!(env_calls[2]
+        .2
+        .iter()
+        .any(|(k, v)| k == "HOMEBREW_NO_ENV_HINTS" && v == "1"));
+
+    assert!(h.console.full_text().contains("[brew] ==> Upgrading ripgrep"));
+
+    match &h.state.phase {
+        Phase::Done {
+            packages,
+            needs_reboot,
+            failed,
+            ..
+        } => {
+            assert_eq!(*failed, 0);
+            assert!(!needs_reboot);
+            assert_eq!(packages.len(), 2);
+            assert!(packages.iter().all(|p| p.status == PackageStatus::Completed));
+        }
+        other => panic!("expected Phase::Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn homebrew_download_only_fetches_and_offline_on_reboot_skips_cleanly() {
+    let pkg = Package::new_homebrew(
+        "ripgrep",
+        Some("14.1.0".into()),
+        "14.1.1",
+        "homebrew/core",
+        false,
+    );
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("dnf");
+    cfg.disable("flatpak");
+    cfg.disable("firmware");
+
+    // DownloadOnly runs `brew fetch <selected...>` with HOMEBREW_NO_AUTO_UPDATE=1.
+    let rt_dl = FakeRuntime::new();
+    rt_dl.set_brew_available(true);
+    rt_dl.push_local_lines(
+        LINUXBREW_SYSTEM_PATH,
+        &["fetch", "ripgrep"],
+        vec![
+            "==> Downloading https://ghcr.io/v2/homebrew/core/ripgrep/blobs/sha256:abcd1234"
+                .into(),
+        ],
+        Ok(0),
+    );
+    let mut h_dl = FlowHarness::ready(vec![pkg.clone()]);
+    h_dl.dispatch(Event::StartSelectiveApply {
+        selected_ids: vec![pkg.id.clone()],
+        mode: ApplyMode::DownloadOnly,
+    });
+    h_dl.dispatch(session_started_event(
+        session_started_purpose(&h_dl.state.phase).unwrap(),
+    ));
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_apply_all_with_mode_and_config(
+        &tx,
+        vec![pkg.clone()],
+        ApplyMode::DownloadOnly,
+        &rt_dl,
+        &cancel,
+        &cfg,
+    );
+    drop(tx);
+    h_dl.drain(&rx);
+    let dl_calls = rt_dl.local_env_calls();
+    assert_eq!(dl_calls.len(), 1);
+    assert_eq!(dl_calls[0].1, vec!["fetch", "ripgrep"]);
+    assert!(dl_calls[0]
+        .2
+        .iter()
+        .any(|(k, v)| k == "HOMEBREW_NO_AUTO_UPDATE" && v == "1"));
+    assert!(matches!(
+        h_dl.state.phase,
+        Phase::Done {
+            failed: 0,
+            needs_reboot: false,
+            ..
+        }
+    ));
+
+    // OfflineOnReboot skips Homebrew cleanly without calling brew.
+    let rt_off = FakeRuntime::new();
+    rt_off.set_brew_available(true);
+    let mut h_off = FlowHarness::ready(vec![pkg.clone()]);
+    h_off.dispatch(Event::StartApply);
+    h_off.dispatch(session_started_event(
+        session_started_purpose(&h_off.state.phase).unwrap(),
+    ));
+    let (tx2, rx2) = async_channel::unbounded();
+    let cancel2 = WorkCancel::new();
+    execute_apply_all_with_mode_and_config(
+        &tx2,
+        vec![pkg],
+        ApplyMode::OfflineOnReboot,
+        &rt_off,
+        &cancel2,
+        &cfg,
+    );
+    drop(tx2);
+    h_off.drain(&rx2);
+    assert!(rt_off.local_env_calls().is_empty());
+    assert!(h_off
+        .console
+        .full_text()
+        .contains("Skipping Homebrew during offline reboot transaction"));
+    assert!(matches!(
+        h_off.state.phase,
+        Phase::Done {
+            failed: 0,
+            needs_reboot: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn homebrew_apply_honors_work_cancel() {
+    let rt = FakeRuntime::new();
+    rt.set_brew_available(true);
+    let cancel = WorkCancel::new();
+    let cancel_hook = cancel.clone();
+    rt.push_local_step(
+        LINUXBREW_SYSTEM_PATH,
+        &["upgrade", "ripgrep"],
+        LocalStep {
+            lines: vec![
+                "==> Downloading https://ghcr.io/v2/homebrew/core/ripgrep/blobs/sha256:abcd1234"
+                    .into(),
+                "==> Pouring ripgrep--14.1.1.x86_64_linux.bottle.tar.gz".into(),
+            ],
+            result: Ok(0),
+            hook_after_line: Some((
+                0,
+                Box::new(move || {
+                    cancel_hook.cancel();
+                }),
+            )),
+        },
+    );
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("dnf");
+    cfg.disable("flatpak");
+    cfg.disable("firmware");
+
+    let pkg = Package::new_homebrew(
+        "ripgrep",
+        Some("14.1.0".into()),
+        "14.1.1",
+        "homebrew/core",
+        false,
+    );
+    let mut h = FlowHarness::ready(vec![pkg.clone()]);
+    h.dispatch(Event::StartApply);
+    h.dispatch(session_started_event(
+        session_started_purpose(&h.state.phase).unwrap(),
+    ));
+    let (tx, rx) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx,
+        vec![pkg],
+        ApplyMode::Live,
+        &rt,
+        &cancel,
+        &cfg,
+    );
+    drop(tx);
+    h.drain(&rx);
+
+    assert!(cancel.is_cancelled());
+    assert!(!matches!(h.state.phase, Phase::Done { .. }));
+    assert!(!h
+        .console
+        .full_text()
+        .contains("==> Pouring ripgrep--14.1.1"));
+}
+
+#[test]
+fn homebrew_soft_errors_and_partial_failure_isolate_cleanly() {
+    // 1) Tap refresh failure surfaces soft warning while still parsing outdated + keeping DNF healthy.
+    let rt = FakeRuntime::new();
+    rt.set_dnf_dbus_available(true);
+    rt.set_brew_available(true);
+    rt.push_dnf_dbus_check(NativeOutcome::Handled(Ok(vec![Package::new_dnf(
+        "bash",
+        "x86_64",
+        "5.2.37-1.fc44",
+        "updates",
+    )])));
+    rt.push_local_lines(
+        LINUXBREW_SYSTEM_PATH,
+        &["update", "--quiet"],
+        vec!["Error: Failed to fetch homebrew/core".into()],
+        Ok(1),
+    );
+    rt.push_local_fixture(
+        LINUXBREW_SYSTEM_PATH,
+        &["outdated", "--json=v2"],
+        "brew/outdated_v2.json",
+        0,
+    );
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("flatpak");
+    cfg.disable("firmware");
+
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_check_all_with_config(&tx, &rt, &cancel, &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    match &h.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert_eq!(soft_errors.len(), 1);
+            assert!(soft_errors[0].contains("tap refresh"));
+            assert_eq!(packages.len(), 5);
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    }
+
+    // 2) Malformed JSON surfaces soft error while DNF packages still complete check.
+    let rt_bad = FakeRuntime::new();
+    rt_bad.set_dnf_dbus_available(true);
+    rt_bad.set_brew_available(true);
+    rt_bad.push_dnf_dbus_check(NativeOutcome::Handled(Ok(vec![Package::new_dnf(
+        "bash",
+        "x86_64",
+        "5.2.37-1.fc44",
+        "updates",
+    )])));
+    rt_bad.push_local_lines(LINUXBREW_SYSTEM_PATH, &["update", "--quiet"], vec![], Ok(0));
+    rt_bad.push_local_fixture(
+        LINUXBREW_SYSTEM_PATH,
+        &["outdated", "--json=v2"],
+        "brew/outdated_malformed.txt",
+        0,
+    );
+
+    let mut h_bad = FlowHarness::new();
+    h_bad.dispatch(Event::StartCheck { then_apply: false });
+    let (tx2, rx2) = async_channel::unbounded();
+    let cancel2 = WorkCancel::new();
+    execute_check_all_with_config(&tx2, &rt_bad, &cancel2, &cfg);
+    drop(tx2);
+    h_bad.drain(&rx2);
+
+    match &h_bad.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert_eq!(soft_errors.len(), 1);
+            assert!(soft_errors[0].contains("homebrew:"));
+            assert_eq!(packages.len(), 1);
+            assert_eq!(packages[0].source, UpdateSource::Dnf);
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    }
+
+    // 3) Partial upgrade failure marks finished item Completed and failed item Failed.
+    let rg = Package::new_homebrew(
+        "ripgrep",
+        Some("14.1.0".into()),
+        "14.1.1",
+        "homebrew/core",
+        false,
+    );
+    let fd = Package::new_homebrew("fd", Some("10.1.0".into()), "10.2.0", "homebrew/core", false);
+    let rt_fail = FakeRuntime::new();
+    rt_fail.set_brew_available(true);
+    rt_fail.push_local_fixture(
+        LINUXBREW_SYSTEM_PATH,
+        &["upgrade", "ripgrep", "fd"],
+        "brew/upgrade_error.txt",
+        1,
+    );
+
+    cfg.disable("dnf");
+    let mut h_fail = FlowHarness::ready(vec![rg.clone(), fd.clone()]);
+    h_fail.dispatch(Event::StartApply);
+    h_fail.dispatch(session_started_event(
+        session_started_purpose(&h_fail.state.phase).unwrap(),
+    ));
+    let (tx3, rx3) = async_channel::unbounded();
+    let cancel3 = WorkCancel::new();
+    execute_apply_all_with_mode_and_config(
+        &tx3,
+        vec![rg, fd],
+        ApplyMode::Live,
+        &rt_fail,
+        &cancel3,
+        &cfg,
+    );
+    drop(tx3);
+    h_fail.drain(&rx3);
+
+    match &h_fail.state.phase {
+        Phase::Done {
+            packages,
+            needs_reboot,
+            failed,
+            failure_reasons,
+            ..
+        } => {
+            assert!(!needs_reboot);
+            assert_eq!(*failed, 1);
+            let ripgrep_status = packages
+                .iter()
+                .find(|p| p.name == "ripgrep")
+                .map(|p| p.status);
+            let fd_status = packages.iter().find(|p| p.name == "fd").map(|p| p.status);
+            assert_eq!(ripgrep_status, Some(PackageStatus::Completed));
+            assert_eq!(fd_status, Some(PackageStatus::Failed));
+            assert!(failure_reasons[0].contains("SHA256 mismatch"));
+        }
+        other => panic!("expected Phase::Done, got {other:?}"),
+    }
 }

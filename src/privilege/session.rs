@@ -9,9 +9,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use crate::helper_protocol::{parse_end_line, HelperCommand, HELLO_LINE};
+use crate::orchestrator::WorkCancel;
 
 /// Helper (or pkexec) pid so window close can SIGKILL without the session lock.
 static HELPER_PID: AtomicU32 = AtomicU32::new(0);
@@ -279,11 +280,17 @@ pub fn kill_recorded_local_command() {
     }
 }
 
-struct LocalPidGuard(Option<u32>);
+struct LocalPidGuard {
+    global_pid: Option<u32>,
+    scoped_pid: Option<Arc<AtomicU32>>,
+}
 
 impl Drop for LocalPidGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
+        if let Some(ref scoped) = self.scoped_pid {
+            scoped.store(0, Ordering::SeqCst);
+        }
+        if let Some(pid) = self.global_pid {
             LOCAL_CMD_PID
                 .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst)
                 .ok();
@@ -319,7 +326,7 @@ pub fn run_local_command(
     args: &[&str],
     on_line: impl FnMut(String),
 ) -> Result<i32, SessionError> {
-    run_local_command_inner(program, args, false, on_line)
+    run_local_command_inner(program, args, &[], false, None, on_line)
 }
 
 /// Run an unprivileged host command whose process group is recorded so `Stop` or
@@ -329,30 +336,75 @@ pub fn run_cancellable_local_command(
     args: &[&str],
     on_line: impl FnMut(String),
 ) -> Result<i32, SessionError> {
-    run_local_command_inner(program, args, true, on_line)
+    run_local_command_inner(program, args, &[], true, None, on_line)
+}
+
+/// Run an unprivileged host command with explicit environment overrides and
+/// optional [`WorkCancel`] termination hook.
+pub fn run_cancellable_local_command_env(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    cancel: Option<&WorkCancel>,
+    on_line: impl FnMut(String),
+) -> Result<i32, SessionError> {
+    run_local_command_inner(program, args, envs, true, cancel, on_line)
 }
 
 fn run_local_command_inner(
     program: &str,
     args: &[&str],
+    envs: &[(&str, &str)],
     track_for_cancel: bool,
+    cancel: Option<&WorkCancel>,
     mut on_line: impl FnMut(String),
 ) -> Result<i32, SessionError> {
+    if cancel.is_some_and(WorkCancel::is_cancelled) {
+        return Ok(-1);
+    }
+
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if track_for_cancel {
+    for &(k, v) in envs {
+        cmd.env(k, v);
+    }
+    if track_for_cancel || cancel.is_some() {
         cmd.process_group(0);
     }
     let mut child = cmd
         .spawn()
         .map_err(|e| SessionError::Spawn(format!("{program}: {e}")))?;
 
-    let _pid_guard = if track_for_cancel {
-        let pid = child.id();
-        LOCAL_CMD_PID.store(pid, Ordering::SeqCst);
-        Some(LocalPidGuard(Some(pid)))
+    let scoped_pid = cancel.map(|token| {
+        let pgid = Arc::new(AtomicU32::new(child.id()));
+        let hook_pgid = pgid.clone();
+        token.on_cancel(move || {
+            let p = hook_pgid.swap(0, Ordering::SeqCst);
+            if p != 0 {
+                let p = p as i32;
+                unsafe {
+                    libc::kill(-p, libc::SIGKILL);
+                    libc::kill(p, libc::SIGKILL);
+                }
+            }
+        });
+        pgid
+    });
+
+    let pid_guard = if track_for_cancel || scoped_pid.is_some() {
+        let global_pid = if track_for_cancel {
+            let pid = child.id();
+            LOCAL_CMD_PID.store(pid, Ordering::SeqCst);
+            Some(pid)
+        } else {
+            None
+        };
+        Some(LocalPidGuard {
+            global_pid,
+            scoped_pid,
+        })
     } else {
         None
     };
@@ -381,6 +433,7 @@ fn run_local_command_inner(
     let _ = t_err.join();
 
     let status = child.wait().map_err(|e| SessionError::Io(e.to_string()))?;
+    drop(pid_guard);
     Ok(status.code().unwrap_or(-1))
 }
 
@@ -737,5 +790,61 @@ exit 1\n"
         assert_ne!(res.unwrap(), 0);
         worker.join().expect("worker join");
         assert_eq!(LOCAL_CMD_PID.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn run_cancellable_local_command_env_forwards_env_and_honors_work_cancel() {
+        let mut lines = Vec::new();
+        let code = run_cancellable_local_command_env(
+            "/bin/sh",
+            &[
+                "-c",
+                "printf 'auto=%s hints=%s\\n' \"$HOMEBREW_NO_AUTO_UPDATE\" \"$HOMEBREW_NO_ENV_HINTS\"",
+            ],
+            &[
+                ("HOMEBREW_NO_AUTO_UPDATE", "1"),
+                ("HOMEBREW_NO_ENV_HINTS", "1"),
+            ],
+            None,
+            |l| lines.push(l),
+        )
+        .expect("env forward command");
+        assert_eq!(code, 0);
+        assert_eq!(lines, vec!["auto=1 hints=1".to_string()]);
+
+        let _lock = PRIVILEGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cancel = WorkCancel::new();
+        let cancel_worker = cancel.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            let res = run_cancellable_local_command_env(
+                "/bin/sh",
+                &["-c", "printf 'started\\n'; sleep 60"],
+                &[],
+                Some(&cancel_worker),
+                |line| {
+                    if line == "started" {
+                        let _ = started_tx.send(());
+                    }
+                },
+            );
+            let _ = done_tx.send(res);
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("child process did not emit started");
+        cancel.cancel();
+
+        let res = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("WorkCancel did not terminate child process promptly");
+        assert!(res.is_ok(), "unexpected error: {res:?}");
+        assert_ne!(res.unwrap(), 0);
+        worker.join().expect("worker join");
     }
 }
