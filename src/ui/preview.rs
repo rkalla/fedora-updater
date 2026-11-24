@@ -20,6 +20,7 @@ pub struct PreviewConfig {
     pub detail_view: DetailView,
     pub expand_completed: bool,
     pub enable_native_capabilities: bool,
+    pub ostree_booted: bool,
     pub sample_history: Vec<HistoryEntry>,
     pub sample_throughput: Vec<(f64, u64, u64)>,
 }
@@ -90,6 +91,7 @@ pub fn config_for(phase: &str) -> PreviewConfig {
     let mut detail_view = DetailView::Updates;
     let mut expand_completed = false;
     let mut enable_native_capabilities = false;
+    let mut ostree_booted = false;
     let mut sample_history = Vec::new();
     let mut sample_throughput = Vec::new();
 
@@ -278,6 +280,50 @@ pub fn config_for(phase: &str) -> PreviewConfig {
                 soft_errors: vec![],
             }
         }
+        "ready-ostree" => {
+            ostree_booted = true;
+            Phase::Ready {
+                packages: sample_ostree_packages(false),
+                soft_errors: vec![],
+            }
+        }
+        "ready-ostree-mixed" => {
+            ostree_booted = true;
+            enable_native_capabilities = true;
+            Phase::Ready {
+                packages: sample_ostree_mixed_packages(),
+                soft_errors: vec![],
+            }
+        }
+        "running-ostree" => {
+            ostree_booted = true;
+            let mut running = RunningState::new(sample_ostree_packages(true));
+            running.current_source = Some(UpdateSource::RpmOstree);
+            running.phase_label = "Downloading OSTree objects".into();
+            running.pass = RunPass::Download;
+            running.overall_progress = 0.45;
+            running.stage = Some(fedora_updater::model::StageCount {
+                current: 2,
+                total: 5,
+            });
+            Phase::Running(running)
+        }
+        "done-ostree" => {
+            ostree_booted = true;
+            Phase::Done {
+                packages: sample_ostree_packages(false)
+                    .into_iter()
+                    .map(|mut p| {
+                        p.status = PackageStatus::Completed;
+                        p
+                    })
+                    .collect(),
+                duration: "1m 52s".into(),
+                needs_reboot: true,
+                failed: 0,
+                failure_reasons: vec![],
+            }
+        }
         other => {
             eprintln!("unknown FEDORA_UPDATER_PREVIEW={other}, using idle");
             Phase::Idle(IdleScreen::Fresh)
@@ -290,6 +336,7 @@ pub fn config_for(phase: &str) -> PreviewConfig {
         detail_view,
         expand_completed,
         enable_native_capabilities,
+        ostree_booted,
         sample_history,
         sample_throughput,
     }
@@ -310,6 +357,16 @@ fn pkg(
 ) -> Package {
     let mut p = match source {
         UpdateSource::Dnf => Package::new_dnf(name, "x86_64", version, "updates"),
+        UpdateSource::RpmOstree => Package::new_rpm_ostree(
+            "upgraded",
+            name,
+            "x86_64",
+            Some(old.into()),
+            version,
+            "fedora:fedora/44/x86_64/silverblue",
+            "Upgraded",
+            Some("Target deployment: 44.20261124.0".into()),
+        ),
         UpdateSource::Firmware => {
             let mut p = Package::new_dnf(name, "", version, "fwupd");
             p.source = UpdateSource::Firmware;
@@ -342,6 +399,56 @@ fn pkg(
     p.size_bytes = parse_size_bytes(size);
     p.status = status;
     p
+}
+
+fn sample_ostree_packages(running: bool) -> Vec<Package> {
+    vec![
+        pkg(
+            "kernel",
+            UpdateSource::RpmOstree,
+            "6.14.11-300.fc44",
+            "6.14.10-300.fc44",
+            "68 MB",
+            if running {
+                PackageStatus::Installing
+            } else {
+                PackageStatus::Pending
+            },
+        ),
+        pkg(
+            "mesa-dri-drivers",
+            UpdateSource::RpmOstree,
+            "25.0.4-1.fc44",
+            "25.0.2-1.fc44",
+            "24 MB",
+            if running {
+                PackageStatus::Completed
+            } else {
+                PackageStatus::Pending
+            },
+        ),
+    ]
+}
+
+fn sample_ostree_mixed_packages() -> Vec<Package> {
+    let mut pkgs = sample_ostree_packages(false);
+    pkgs.push(pkg(
+        "Thunderbird",
+        UpdateSource::FlatpakUser,
+        "128.4.0",
+        "128.3.0",
+        "84 MB",
+        PackageStatus::Pending,
+    ));
+    pkgs.push(pkg(
+        "ripgrep",
+        UpdateSource::Homebrew,
+        "14.1.1",
+        "14.1.0",
+        "3.2 MB",
+        PackageStatus::Pending,
+    ));
+    pkgs
 }
 
 fn sample_packages(running: bool) -> Vec<Package> {
@@ -741,6 +848,32 @@ mod tests {
         assert!(hist_cfg.enable_native_capabilities);
         assert_eq!(hist_cfg.detail_view, DetailView::History);
         assert_eq!(hist_cfg.sample_history.len(), 2);
+
+        let ready_ostree = super::config_for("ready-ostree");
+        assert!(ready_ostree.ostree_booted);
+        assert!(matches!(
+            &ready_ostree.state.phase,
+            Phase::Ready { packages, .. }
+                if packages.len() == 2 && packages.iter().all(|p| p.source == UpdateSource::RpmOstree)
+        ));
+        let ready_ostree_mixed = super::config_for("ready-ostree-mixed");
+        assert!(ready_ostree_mixed.ostree_booted);
+        assert!(matches!(
+            &ready_ostree_mixed.state.phase,
+            Phase::Ready { packages, .. } if packages.len() == 4
+        ));
+        let running_ostree = super::config_for("running-ostree");
+        assert!(running_ostree.ostree_booted);
+        assert!(matches!(
+            &running_ostree.state.phase,
+            Phase::Running(r) if r.current_source == Some(UpdateSource::RpmOstree)
+        ));
+        let done_ostree = super::config_for("done-ostree");
+        assert!(done_ostree.ostree_booted);
+        assert!(matches!(
+            &done_ostree.state.phase,
+            Phase::Done { needs_reboot: true, failed: 0, .. }
+        ));
 
         if std::env::var_os("FEDORA_UPDATER_PREVIEW").is_none() {
             assert!(super::initial_config().is_none());

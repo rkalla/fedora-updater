@@ -159,7 +159,7 @@ fn split_name_arch(name_arch: &str) -> Option<(String, String)> {
     Some((name.to_string(), arch.to_string()))
 }
 
-fn is_plausible_arch(arch: &str) -> bool {
+pub(crate) fn is_plausible_arch(arch: &str) -> bool {
     matches!(
         arch,
         "x86_64"

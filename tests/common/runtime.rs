@@ -18,6 +18,7 @@ use fedora_updater::backend::gnome_extensions::{
     apply_extensions_with, GnomeExtensionsApplyOutcome,
 };
 use fedora_updater::backend::logind::RebootPreflight;
+use fedora_updater::backend::rpm_ostree::OstreeStatus;
 use fedora_updater::backend::{NativeOutcome, ProgressHint};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
 use fedora_updater::model::{ApplyMode, Package};
@@ -138,6 +139,10 @@ struct FakeState {
     helper_calls: Vec<HelperCommand>,
     local_calls: Vec<(String, Vec<String>)>,
     local_env_calls: Vec<LocalEnvCall>,
+    ostree_booted: bool,
+    rpm_ostree_binary: Option<PathBuf>,
+    rpm_ostree_status_steps: VecDeque<NativeOutcome<OstreeStatus>>,
+    cancel_rpm_ostree_calls: usize,
     brew_binary: Option<PathBuf>,
     flatpak_queries: Vec<bool>,
     flatpak_native_apply_calls: Vec<(bool, Vec<String>)>,
@@ -193,6 +198,10 @@ impl FakeRuntime {
                 helper_calls: Vec::new(),
                 local_calls: Vec::new(),
                 local_env_calls: Vec::new(),
+                ostree_booted: false,
+                rpm_ostree_binary: None,
+                rpm_ostree_status_steps: VecDeque::new(),
+                cancel_rpm_ostree_calls: 0,
                 brew_binary: None,
                 flatpak_queries: Vec::new(),
                 flatpak_native_apply_calls: Vec::new(),
@@ -595,6 +604,26 @@ impl FakeRuntime {
             .gnome_extensions_apply_calls
             .clone()
     }
+
+    pub fn set_ostree_booted(&self, ostree: bool) {
+        self.inner.lock().unwrap().ostree_booted = ostree;
+    }
+
+    pub fn set_rpm_ostree_binary(&self, path: Option<PathBuf>) {
+        self.inner.lock().unwrap().rpm_ostree_binary = path;
+    }
+
+    pub fn push_rpm_ostree_status(&self, outcome: NativeOutcome<OstreeStatus>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .rpm_ostree_status_steps
+            .push_back(outcome);
+    }
+
+    pub fn cancel_rpm_ostree_calls(&self) -> usize {
+        self.inner.lock().unwrap().cancel_rpm_ostree_calls
+    }
 }
 
 impl OrchestratorRuntime for FakeRuntime {
@@ -660,6 +689,29 @@ impl OrchestratorRuntime for FakeRuntime {
         on_line: &mut dyn FnMut(String),
     ) -> Result<i32, String> {
         self.execute_local_step(program, args, Some(envs), cancel, on_line)
+    }
+
+    fn is_ostree_booted(&self) -> bool {
+        self.inner.lock().unwrap().ostree_booted
+    }
+
+    fn rpm_ostree_binary(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().rpm_ostree_binary.clone()
+    }
+
+    fn query_rpm_ostree_status(&self) -> NativeOutcome<OstreeStatus> {
+        self.inner
+            .lock()
+            .unwrap()
+            .rpm_ostree_status_steps
+            .pop_front()
+            .unwrap_or_else(|| NativeOutcome::Unavailable("rpm-ostree status not scripted".into()))
+    }
+
+    fn cancel_rpm_ostree(&self) -> bool {
+        let mut s = self.inner.lock().unwrap();
+        s.cancel_rpm_ostree_calls += 1;
+        true
     }
 
     fn brew_binary(&self) -> Option<PathBuf> {

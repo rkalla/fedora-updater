@@ -103,7 +103,7 @@ pub fn source_summary_line(packages: &[Package]) -> String {
 /// Check progress from finished backends. Three user-facing groups:
 /// System (DNF), Apps (both Flatpak scopes), Firmware.
 pub fn check_progress(checked: &[UpdateSource]) -> (f64, u32, &'static str) {
-    let sys = checked.contains(&UpdateSource::Dnf);
+    let sys = checked.contains(&UpdateSource::Dnf) || checked.contains(&UpdateSource::RpmOstree);
     let fp_user = checked.contains(&UpdateSource::FlatpakUser);
     let fp_sys = checked.contains(&UpdateSource::FlatpakSystem);
     let fw = checked.contains(&UpdateSource::Firmware);
@@ -288,6 +288,7 @@ pub struct QuietInput<'a> {
     pub at_full_item: bool,
     pub cache_note: Option<&'a str>,
     pub watching_dnf: bool,
+    pub watching_ostree: bool,
     pub daemon_running: bool,
 }
 
@@ -321,7 +322,9 @@ pub fn quiet_ui(input: QuietInput<'_>) -> QuietUi {
     let footnote = if let Some(note) = cache {
         Some(note.to_string())
     } else if stalled {
-        Some(if input.watching_dnf {
+        Some(if input.watching_ostree {
+            "Waiting on rpm-ostree".into()
+        } else if input.watching_dnf {
             "Waiting on dnf".into()
         } else {
             "Waiting for output".into()
@@ -694,11 +697,15 @@ pub fn pipeline_stage(phase_label: &str, pass: RunPass) -> PipelineStage {
         || label.contains("complete")
         || label.contains("installed")
         || label.contains("restarting")
+        || label.contains("staged")
     {
         PipelineStage::Verify
     } else if label.contains("prepar")
         || label.contains("decompress")
         || label.contains("running transaction")
+        || label.contains("checking out")
+        || label.contains("writing ostree")
+        || label.contains("overlaying")
         || label.contains("waiting")
     {
         PipelineStage::Prepare
@@ -707,6 +714,7 @@ pub fn pipeline_stage(phase_label: &str, pass: RunPass) -> PipelineStage {
         || label.contains("upgrad")
         || label.contains("eras")
         || label.contains("remov")
+        || label.contains("staging")
         || label.contains("updating flatpak")
     {
         PipelineStage::Install
@@ -755,7 +763,16 @@ pub fn reboot_trigger_names(packages: &[Package]) -> Vec<String> {
 pub fn reboot_trigger_summary(packages: &[Package]) -> String {
     let names = reboot_trigger_names(packages);
     match names.as_slice() {
-        [] => "Restart to finish applying system updates.".to_string(),
+        [] => {
+            if packages
+                .iter()
+                .any(|p| p.status != PackageStatus::Failed && p.source == UpdateSource::RpmOstree)
+            {
+                "Restart to boot into the staged atomic system deployment.".to_string()
+            } else {
+                "Restart to finish applying system updates.".to_string()
+            }
+        }
         [a] => format!("{a} requires a restart to take effect."),
         [a, b] => format!("{a} and {b} require a restart to take effect."),
         [a, b, c] => format!("{a}, {b}, and {c} require a restart to take effect."),
@@ -1165,6 +1182,7 @@ mod tests {
             at_full_item: true,
             cache_note: Some("Downloading grok-bot — 85 MB and rising"),
             watching_dnf: true,
+            watching_ostree: false,
             daemon_running: false,
         });
         assert_eq!(growing.mode, QuietMode::CacheGrowing);
@@ -1189,6 +1207,18 @@ mod tests {
         let stalled_banner = stalled.banner.expect("stalled banner");
         assert_eq!(stalled_banner, "No output for 3 minutes.");
         assert!(!stalled_banner.contains("Last line:"));
+
+        let ostree_stalled = quiet_ui(QuietInput {
+            quiet_secs: 180,
+            at_full_item: false,
+            watching_ostree: true,
+            ..Default::default()
+        });
+        assert_eq!(ostree_stalled.mode, QuietMode::Stalled);
+        assert_eq!(
+            ostree_stalled.footnote.as_deref(),
+            Some("Waiting on rpm-ostree")
+        );
 
         let flatpak_stalled = quiet_ui(QuietInput {
             quiet_secs: 180,
@@ -1735,6 +1765,27 @@ mod tests {
         failed_fw.status = PackageStatus::Failed;
         assert_eq!(
             reboot_trigger_summary(&[failed_kernel, failed_fw, mesa]),
+            "Restart to finish applying system updates."
+        );
+
+        let mut ostree_pkg = Package::new_rpm_ostree(
+            "upgraded",
+            "mesa-dri-drivers",
+            "x86_64",
+            Some("25.0".into()),
+            "25.1",
+            "fedora-ostree",
+            "Upgraded",
+            None,
+        );
+        ostree_pkg.status = PackageStatus::Completed;
+        assert_eq!(
+            reboot_trigger_summary(std::slice::from_ref(&ostree_pkg)),
+            "Restart to boot into the staged atomic system deployment."
+        );
+        ostree_pkg.status = PackageStatus::Failed;
+        assert_eq!(
+            reboot_trigger_summary(&[ostree_pkg]),
             "Restart to finish applying system updates."
         );
     }

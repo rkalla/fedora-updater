@@ -24,7 +24,8 @@ pub enum QueueRowMode {
 
 /// True when updating `package` triggers a restart recommendation badge/callout.
 pub fn package_needs_reboot(package: &Package) -> bool {
-    package.source == UpdateSource::Dnf && package_implies_reboot(&package.name)
+    package.source == UpdateSource::RpmOstree
+        || (package.source == UpdateSource::Dnf && package_implies_reboot(&package.name))
 }
 
 /// Compact display name for a Flatpak related extension (e.g. `GL32.nvidia-570-133-07`).
@@ -445,9 +446,14 @@ impl QueueRowWidgets {
         is_selected: bool,
         selectable: bool,
     ) {
+        let is_atomic = !pkg.source.supports_selective_apply();
         let show_check = selectable && mode == QueueRowMode::Review;
         self.ignore_check.set(true);
-        self.check_btn.set_active(is_selected);
+        self.check_btn.set_active(if is_atomic { true } else { is_selected });
+        self.check_btn.set_sensitive(!is_atomic);
+        self.check_btn.set_tooltip_text(
+            is_atomic.then_some("Atomic system updates apply together"),
+        );
         self.check_btn.set_visible(show_check);
         self.ignore_check.set(false);
         for cls in UpdateSource::ALL_CSS_CLASSES {
@@ -792,8 +798,16 @@ impl QueueList {
     pub fn set_all_selected(&self, selected: bool) {
         for pos in 0..self.store.n_items() {
             if let Some(obj) = self.store.item(pos).and_downcast::<PackageObject>() {
-                if obj.selected() != selected {
-                    obj.set_selected(selected);
+                let target = if obj
+                    .package()
+                    .is_some_and(|p| !p.source.supports_selective_apply())
+                {
+                    true
+                } else {
+                    selected
+                };
+                if obj.selected() != target {
+                    obj.set_selected(target);
                     obj.bump_revision();
                 }
             }
@@ -808,6 +822,13 @@ impl QueueList {
                 continue;
             };
             if obj.id() == id {
+                if !selected
+                    && obj
+                        .package()
+                        .is_some_and(|p| !p.source.supports_selective_apply())
+                {
+                    return false;
+                }
                 if obj.selected() != selected {
                     obj.set_selected(selected);
                     obj.bump_revision();
@@ -1098,6 +1119,19 @@ mod tests {
         let kernel_tools =
             Package::new_dnf("kernel-tools", "x86_64", "6.14.11-300.fc44", "updates");
         assert!(!package_needs_reboot(&kernel_tools));
+
+        let ostree = Package::new_rpm_ostree(
+            "upgraded",
+            "mesa-dri-drivers",
+            "x86_64",
+            Some("25.0.2-1.fc44".into()),
+            "25.0.4-1.fc44",
+            "fedora-ostree",
+            "Upgraded",
+            Some("Atomic system deployment".into()),
+        );
+        assert!(package_needs_reboot(&ostree));
+        assert!(!ostree.source.supports_selective_apply());
     }
 
     #[test]

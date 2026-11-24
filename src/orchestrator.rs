@@ -10,7 +10,8 @@ use std::time::SystemTime;
 use async_channel::Sender;
 
 use crate::backend::{
-    self, brew, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, gnome_extensions, logind, ProgressHint,
+    self, brew, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, gnome_extensions, logind, rpm_ostree,
+    ProgressHint,
 };
 pub use crate::backend::NativeOutcome;
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
@@ -54,15 +55,25 @@ impl SourceConfig {
     }
 
     pub fn enabled_sources(&self) -> Vec<UpdateSource> {
+        self.enabled_sources_for_host(false)
+    }
+
+    pub fn enabled_sources_for_host(&self, ostree_booted: bool) -> Vec<UpdateSource> {
         UpdateSource::ALL
             .iter()
             .copied()
-            .filter(|s| self.is_enabled(*s))
+            .filter(|s| s.is_applicable_for_host(ostree_booted) && self.is_enabled(*s))
             .collect()
     }
 
     pub fn all_disabled(&self) -> bool {
-        UpdateSource::ALL.iter().all(|s| !self.is_enabled(*s))
+        self.all_disabled_for_host(false)
+    }
+
+    pub fn all_disabled_for_host(&self, ostree_booted: bool) -> bool {
+        !UpdateSource::ALL
+            .iter()
+            .any(|s| s.is_applicable_for_host(ostree_booted) && self.is_enabled(*s))
     }
 
     pub fn disable(&mut self, pref_key: &str) {
@@ -103,11 +114,28 @@ pub fn probe_source_availability(
     native_fwupd: bool,
     gnome_ext_available: bool,
 ) -> BTreeMap<String, SourceAvailability> {
+    probe_source_availability_for_host(false, native_dnf, native_fwupd, gnome_ext_available)
+}
+
+/// Probe host availability of update sources for the given host mode without spawning processes.
+pub fn probe_source_availability_for_host(
+    ostree_booted: bool,
+    native_dnf: bool,
+    native_fwupd: bool,
+    gnome_ext_available: bool,
+) -> BTreeMap<String, SourceAvailability> {
     let brew_bin = brew::find_brew_binary();
-    probe_source_availability_with(
+    let rpm_ostree_bin = if ostree_booted {
+        rpm_ostree::find_rpm_ostree_binary()
+    } else {
+        None
+    };
+    probe_source_availability_for_host_with(
+        ostree_booted,
         native_dnf,
         native_fwupd,
         brew_bin.as_deref(),
+        rpm_ostree_bin.as_deref(),
         gnome_ext_available,
     )
 }
@@ -119,24 +147,59 @@ pub fn probe_source_availability_with(
     brew_bin: Option<&Path>,
     gnome_ext_available: bool,
 ) -> BTreeMap<String, SourceAvailability> {
+    probe_source_availability_for_host_with(
+        false,
+        native_dnf,
+        native_fwupd,
+        brew_bin,
+        None,
+        gnome_ext_available,
+    )
+}
+
+/// Host-mode-aware injectable variant of [`probe_source_availability`] for offline tests.
+pub fn probe_source_availability_for_host_with(
+    ostree_booted: bool,
+    native_dnf: bool,
+    native_fwupd: bool,
+    brew_bin: Option<&Path>,
+    rpm_ostree_bin: Option<&Path>,
+    gnome_ext_available: bool,
+) -> BTreeMap<String, SourceAvailability> {
     let mut map = BTreeMap::new();
-    let dnf_cli = command_exists("dnf");
-    let dnf_installed = native_dnf || dnf_cli;
-    let dnf_sub = if native_dnf {
-        "Installed (dnf5daemon D-Bus)"
-    } else if dnf_cli {
-        "Installed (CLI)"
+    if ostree_booted {
+        let ostree_installed = rpm_ostree_bin.is_some();
+        let ostree_sub = match rpm_ostree_bin {
+            Some(path) => format!("Installed ({})", path.display()),
+            None => "Not installed".into(),
+        };
+        map.insert(
+            "rpm-ostree".into(),
+            SourceAvailability {
+                pref_key: "rpm-ostree",
+                installed: ostree_installed,
+                subtitle: ostree_sub,
+            },
+        );
     } else {
-        "Not installed"
-    };
-    map.insert(
-        "dnf".into(),
-        SourceAvailability {
-            pref_key: "dnf",
-            installed: dnf_installed,
-            subtitle: dnf_sub.into(),
-        },
-    );
+        let dnf_cli = command_exists("dnf");
+        let dnf_installed = native_dnf || dnf_cli;
+        let dnf_sub = if native_dnf {
+            "Installed (dnf5daemon D-Bus)"
+        } else if dnf_cli {
+            "Installed (CLI)"
+        } else {
+            "Not installed"
+        };
+        map.insert(
+            "dnf".into(),
+            SourceAvailability {
+                pref_key: "dnf",
+                installed: dnf_installed,
+                subtitle: dnf_sub.into(),
+            },
+        );
+    }
 
     let fp_installed = command_exists("flatpak");
     map.insert(
@@ -203,10 +266,17 @@ pub fn probe_source_availability_with(
 
 /// Optimistic default availability used before live host probing or in offline tests.
 pub fn default_source_availability() -> BTreeMap<String, SourceAvailability> {
+    default_source_availability_for_host(false)
+}
+
+/// Host-mode-aware optimistic default availability before live host probing.
+pub fn default_source_availability_for_host(
+    ostree_booted: bool,
+) -> BTreeMap<String, SourceAvailability> {
     let mut map = BTreeMap::new();
-    for src in UpdateSource::pref_sources() {
+    for src in UpdateSource::pref_sources_for_host(ostree_booted) {
         let key = src.pref_key();
-        let installed = src.installed_by_default();
+        let installed = src.installed_by_default_for_host(ostree_booted);
         map.insert(
             key.into(),
             SourceAvailability {
@@ -274,6 +344,7 @@ pub fn cancel_background_work() {
     }
     flatpak::cancel_active_transaction();
     dnf_dbus::cancel_active_transaction();
+    rpm_ostree::cancel_active_transaction();
 }
 
 fn send(tx: &Sender<WorkerMsg>, msg: WorkerMsg) {
@@ -401,6 +472,18 @@ pub trait OrchestratorRuntime: Send + 'static {
         on_line: &mut dyn FnMut(String),
     ) -> Result<i32, String> {
         self.run_cancellable_local(program, args, on_line)
+    }
+    fn is_ostree_booted(&self) -> bool {
+        false
+    }
+    fn rpm_ostree_binary(&self) -> Option<PathBuf> {
+        None
+    }
+    fn query_rpm_ostree_status(&self) -> NativeOutcome<rpm_ostree::OstreeStatus> {
+        NativeOutcome::Unavailable("rpm-ostree status unavailable in test runtime".into())
+    }
+    fn cancel_rpm_ostree(&self) -> bool {
+        false
     }
     fn brew_binary(&self) -> Option<PathBuf> {
         None
@@ -545,6 +628,18 @@ impl OrchestratorRuntime for SystemRuntime {
             .map_err(|e| e.to_string())
     }
 
+    fn is_ostree_booted(&self) -> bool {
+        rpm_ostree::is_ostree_booted()
+    }
+    fn rpm_ostree_binary(&self) -> Option<PathBuf> {
+        rpm_ostree::find_rpm_ostree_binary()
+    }
+    fn query_rpm_ostree_status(&self) -> NativeOutcome<rpm_ostree::OstreeStatus> {
+        rpm_ostree::query_status()
+    }
+    fn cancel_rpm_ostree(&self) -> bool {
+        rpm_ostree::cancel_active_transaction()
+    }
     fn brew_binary(&self) -> Option<PathBuf> {
         brew::find_brew_binary()
     }
@@ -785,7 +880,8 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
     config: &SourceConfig,
 ) {
     let ch = WorkChannel { tx, cancel };
-    if config.all_disabled() {
+    let ostree_booted = runtime.is_ostree_booted();
+    if config.all_disabled_for_host(ostree_booted) {
         ch.event(StateEvent::Fail {
             title: "All update sources are disabled".into(),
             detail: "Enable at least one update source in Preferences (Ctrl+,) to check for updates.".into(),
@@ -794,7 +890,8 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
         return;
     }
 
-    let dnf_enabled = config.is_enabled(UpdateSource::Dnf);
+    let dnf_enabled = !ostree_booted && config.is_enabled(UpdateSource::Dnf);
+    let ostree_enabled = ostree_booted && config.is_enabled(UpdateSource::RpmOstree);
     // Use zero-password dnf5daemon SessionManager.open_session({}) when available;
     // only elevate the helper session up front when falling back to CLI DNF.
     let use_native_dnf = dnf_enabled && runtime.dnf_dbus_available();
@@ -819,8 +916,20 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
         return;
     }
 
-    // 1) DNF — prefer native org.rpm.dnf.v0 (zero-password), falling back to CLI helper.
-    if dnf_enabled {
+    // 1) System engine: rpm-ostree (zero-password) on Atomic hosts, DNF on classic hosts.
+    if ostree_enabled {
+        let ostree_res = run_rpm_ostree_check(&ch, runtime);
+        if !ch.is_current() {
+            return;
+        }
+        emit_backend_check(
+            &ch,
+            UpdateSource::RpmOstree,
+            ostree_res,
+            &mut all,
+            &mut soft_errors,
+        );
+    } else if dnf_enabled {
         let dnf_res = if use_native_dnf {
             match runtime.check_dnf_dbus(&mut |l| ch.line("dnf", l)) {
                 NativeOutcome::Handled(res) => res,
@@ -1149,6 +1258,99 @@ fn run_flatpak_check<R: OrchestratorRuntime>(
         }
     }
     Ok(check.packages)
+}
+
+fn rpm_ostree_program<R: OrchestratorRuntime>(runtime: &R) -> Option<String> {
+    runtime
+        .rpm_ostree_binary()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn run_rpm_ostree_check<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+) -> Result<Vec<Package>, String> {
+    let bin = rpm_ostree_program(runtime)
+        .ok_or_else(|| "rpm-ostree: executable not found".to_string())?;
+
+    let status = match runtime.query_rpm_ostree_status() {
+        NativeOutcome::Handled(Ok(st)) => {
+            if let Some(booted) = st.booted_deployment() {
+                let ver = booted
+                    .version
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("unknown");
+                ch.line(
+                    "rpm-ostree",
+                    format!("Booted deployment: {} ({ver})", booted.repo_label()),
+                );
+            }
+            Some(st)
+        }
+        NativeOutcome::Handled(Err(e)) => {
+            ch.line("rpm-ostree", format!("Status query skipped: {e}"));
+            None
+        }
+        NativeOutcome::Unavailable(_) => None,
+    };
+
+    if !ch.is_current() {
+        return Err("cancelled".into());
+    }
+
+    let work_cancel = ch.cancel.work_cancel();
+    let mut check_log = String::new();
+    let code = runtime
+        .run_cancellable_local_env(
+            &bin,
+            &["upgrade", "--check"],
+            rpm_ostree::NONINTERACTIVE_ENV,
+            Some(&work_cancel),
+            &mut |l| {
+                if !l.trim().is_empty() {
+                    ch.line("rpm-ostree", l.clone());
+                }
+                check_log.push_str(&l);
+                check_log.push('\n');
+            },
+        )
+        .map_err(|e| format!("rpm-ostree: {e}"))?;
+
+    if !ch.is_current() {
+        return Err("cancelled".into());
+    }
+
+    if rpm_ostree::check_exit_is_no_updates(code, &check_log) {
+        ch.line("rpm-ostree", "No upgrade available.".into());
+        return Ok(Vec::new());
+    }
+
+    let pkgs = match rpm_ostree::parse_upgrade_check(&check_log, status.as_ref()) {
+        Ok(pkgs) => pkgs,
+        Err(err) => {
+            return Err(if code != 0 {
+                summarize_apply_failure(UpdateSource::RpmOstree, &check_log, code)
+            } else {
+                format!("rpm-ostree: {err}")
+            });
+        }
+    };
+
+    if rpm_ostree::check_exit_is_hard_error(code, &check_log, &pkgs) {
+        return Err(summarize_apply_failure(
+            UpdateSource::RpmOstree,
+            &check_log,
+            code,
+        ));
+    }
+
+    ch.line(
+        "rpm-ostree",
+        format!("{} update(s) in pending deployment", pkgs.len()),
+    );
+    Ok(pkgs)
 }
 
 fn brew_program<R: OrchestratorRuntime>(runtime: &R) -> Option<String> {
@@ -1495,6 +1697,54 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                                 ch.line(tag, format!("error: {e}"));
                                 (-1, e.to_string(), false)
                             }
+                        }
+                    }
+                }
+            }
+            UpdateSource::RpmOstree => {
+                if mode == ApplyMode::DownloadOnly {
+                    ch.line(
+                        tag,
+                        "Skipping Atomic OS deployment during Download Only mode.".into(),
+                    );
+                    (0, String::new(), false)
+                } else {
+                    if mode == ApplyMode::OfflineOnReboot {
+                        ch.line(
+                            tag,
+                            "Staging Atomic OS deployment for next boot (rpm-ostree upgrade)…"
+                                .into(),
+                        );
+                    }
+                    match rpm_ostree_program(runtime) {
+                        None => {
+                            let msg = "rpm-ostree executable not found";
+                            ch.line(tag, format!("error: {msg}"));
+                            (-1, msg.to_string(), false)
+                        }
+                        Some(ostree_bin) => {
+                            let _active_guard = rpm_ostree::ApplyActiveGuard::enter();
+                            let work_cancel = ch.cancel.work_cancel();
+                            work_cancel.on_cancel(|| {
+                                let _ = rpm_ostree::cancel_active_transaction();
+                            });
+                            let (c, l) = run_local_apply_with_env(
+                                &ch,
+                                runtime,
+                                &ostree_bin,
+                                &["upgrade"],
+                                rpm_ostree::NONINTERACTIVE_ENV,
+                                Some(&work_cancel),
+                                tag,
+                                source,
+                            );
+                            if !ch.is_current() || work_cancel.is_cancelled() {
+                                let _ = runtime.cancel_rpm_ostree();
+                                return;
+                            }
+                            let staged =
+                                c == 0 && rpm_ostree::detect_reboot_needed(&l, &packages);
+                            (c, l, staged)
                         }
                     }
                 }
@@ -1990,6 +2240,35 @@ pub fn summarize_apply_failure(source: UpdateSource, log: &str, exit_code: i32) 
         }
     }
 
+    if source == UpdateSource::RpmOstree {
+        if lower_full.contains("transaction in progress")
+            || lower_full.contains("active transaction")
+            || lower_full.contains("already in progress")
+        {
+            return "System (Atomic): Another rpm-ostree transaction is already in progress. Wait a moment or cancel it and try again."
+                .into();
+        }
+        if lower_full.contains("polkit")
+            || lower_full.contains("not authorized")
+            || lower_full.contains("permission denied")
+            || lower_full.contains("authentication")
+        {
+            return "System (Atomic): Authorization cancelled or denied by rpm-ostreed.".into();
+        }
+        if let Some(conflict) = log.lines().map(str::trim).find(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("could not depsolve")
+                || l.contains("cannot install")
+                || l.starts_with("problem ")
+                || (l.contains("conflict") && !l.starts_with("error:"))
+        }) {
+            return format!(
+                "System (Atomic): layered package conflict — {}",
+                truncate_summary(conflict, 140)
+            );
+        }
+    }
+
     if source == UpdateSource::Firmware {
         if let Some(batt) = log.lines().map(str::trim).find(|line| {
             let l = line.to_ascii_lowercase();
@@ -2114,6 +2393,7 @@ pub fn session_started_event(purpose: AuthPurpose) -> StateEvent {
 /// so the user is not re-prompted mid-session.
 pub fn release_privileges() {
     dnf_dbus::cancel_active_transaction();
+    rpm_ostree::cancel_active_transaction();
     flatpak::cancel_active_transaction();
     kill_recorded_local_command();
     close_session();
@@ -2129,9 +2409,34 @@ pub fn can_skip_check_auth_ui(native_dnf: bool) -> bool {
     native_dnf || session_is_alive()
 }
 
+/// Whether Check requires opening our `--helper` polkit session up front.
+/// Atomic OSTree hosts check zero-password via `rpm-ostree` and never use `--helper`.
+pub fn check_requires_helper_auth(ostree_booted: bool, native_dnf: bool, config: &SourceConfig) -> bool {
+    !ostree_booted && config.is_enabled(UpdateSource::Dnf) && !can_skip_check_auth_ui(native_dnf)
+}
+
 /// Whether Apply can bypass the helper wait screen (`dnf5daemon` prompts directly via polkit).
 pub fn can_skip_apply_auth_ui(native_dnf: bool) -> bool {
     native_dnf || session_is_alive()
+}
+
+/// Whether Apply can skip our `--helper` auth prompt screen for this batch.
+/// Only CLI `dnf` (`!native_dnf`) or non-download CLI `fwupdmgr` (`!native_fwupd`) need `--helper`;
+/// `rpm-ostree` talks to `rpm-ostreed` Polkit directly without `--helper`.
+pub fn apply_skips_helper_auth_ui(
+    packages: &[Package],
+    mode: ApplyMode,
+    native_dnf: bool,
+    native_fwupd: bool,
+) -> bool {
+    if session_is_alive() {
+        return true;
+    }
+    let needs_dnf_helper = !native_dnf && packages.iter().any(|p| p.source == UpdateSource::Dnf);
+    let needs_fw_helper = mode != ApplyMode::DownloadOnly
+        && !native_fwupd
+        && packages.iter().any(|p| p.source == UpdateSource::Firmware);
+    !(needs_dnf_helper || needs_fw_helper)
 }
 
 /// Load merged chronological update history across `org.rpm.dnf.v0.History` and `fwupd`.
@@ -2462,12 +2767,34 @@ mod tests {
     fn source_config_filters_and_detects_all_disabled() {
         let mut cfg = SourceConfig::all_enabled();
         assert!(!cfg.all_disabled());
-        assert_eq!(cfg.enabled_sources(), UpdateSource::ALL);
+        assert!(!cfg.all_disabled_for_host(true));
+        let expected_classic = vec![
+            UpdateSource::Dnf,
+            UpdateSource::FlatpakUser,
+            UpdateSource::FlatpakSystem,
+            UpdateSource::GnomeExtensions,
+            UpdateSource::Homebrew,
+            UpdateSource::Firmware,
+        ];
+        assert_eq!(cfg.enabled_sources(), expected_classic);
+        assert_eq!(cfg.enabled_sources_for_host(false), expected_classic);
+        assert_eq!(
+            cfg.enabled_sources_for_host(true),
+            vec![
+                UpdateSource::RpmOstree,
+                UpdateSource::FlatpakUser,
+                UpdateSource::FlatpakSystem,
+                UpdateSource::GnomeExtensions,
+                UpdateSource::Homebrew,
+                UpdateSource::Firmware,
+            ]
+        );
 
         cfg.disable("  FLATPAK  ");
         assert!(!cfg.is_enabled(UpdateSource::FlatpakUser));
         assert!(!cfg.is_enabled(UpdateSource::FlatpakSystem));
         assert!(cfg.is_enabled(UpdateSource::Dnf));
+        assert!(cfg.is_enabled(UpdateSource::RpmOstree));
         assert!(cfg.is_enabled(UpdateSource::GnomeExtensions));
         assert!(cfg.is_enabled(UpdateSource::Homebrew));
         assert!(cfg.is_enabled(UpdateSource::Firmware));
@@ -2487,9 +2814,13 @@ mod tests {
         cfg.disable("firmware");
         assert!(cfg.all_disabled());
         assert!(cfg.enabled_sources().is_empty());
+        assert!(!cfg.all_disabled_for_host(true));
+        cfg.disable("rpm-ostree");
+        assert!(cfg.all_disabled_for_host(true));
 
         cfg.enable("flatpak");
         assert!(!cfg.all_disabled());
+        assert!(!cfg.all_disabled_for_host(true));
         assert_eq!(
             cfg.enabled_sources(),
             vec![UpdateSource::FlatpakUser, UpdateSource::FlatpakSystem]
@@ -2514,6 +2845,11 @@ mod tests {
                 assert_eq!(entry.subtitle, "Not installed");
             }
         }
+
+        let ostree_defaults = default_source_availability_for_host(true);
+        assert!(ostree_defaults.contains_key("rpm-ostree"));
+        assert!(!ostree_defaults.contains_key("dnf"));
+        assert!(ostree_defaults["rpm-ostree"].installed);
 
         let probed_no_brew = probe_source_availability_with(true, false, None, false);
         assert_eq!(
@@ -2550,5 +2886,80 @@ mod tests {
             probed_with_brew_and_ext.get("homebrew").unwrap().subtitle,
             "Installed (/home/linuxbrew/.linuxbrew/bin/brew)"
         );
+
+        let probed_ostree = probe_source_availability_for_host_with(
+            true,
+            false,
+            true,
+            None,
+            Some(std::path::Path::new(rpm_ostree::RPM_OSTREE_DEFAULT_PATH)),
+            false,
+        );
+        assert!(!probed_ostree.contains_key("dnf"));
+        assert!(probed_ostree["rpm-ostree"].installed);
+        assert_eq!(
+            probed_ostree["rpm-ostree"].subtitle,
+            "Installed (/usr/bin/rpm-ostree)"
+        );
+        assert_eq!(
+            probed_ostree["firmware"].subtitle,
+            "Installed (fwupd D-Bus)"
+        );
+    }
+
+    #[test]
+    fn ostree_auth_ui_gates_skip_helper_except_cli_fwupd() {
+        let cfg = SourceConfig::all_enabled();
+        assert!(!check_requires_helper_auth(true, false, &cfg));
+        assert!(check_requires_helper_auth(false, false, &cfg) || can_skip_check_auth_ui(false));
+        assert!(!check_requires_helper_auth(false, true, &cfg));
+
+        let ostree_pkg = Package::new_rpm_ostree(
+            "upgraded",
+            "mesa",
+            "x86_64",
+            Some("25.0".into()),
+            "25.1",
+            "fedora",
+            "",
+            None,
+        );
+        let fw_pkg = {
+            let mut p = Package::new_dnf("UEFI dbx", "", "20241101", "fwupd");
+            p.source = UpdateSource::Firmware;
+            p
+        };
+        let dnf_pkg = Package::new_dnf("openssl", "x86_64", "3.2", "updates");
+
+        assert!(apply_skips_helper_auth_ui(
+            std::slice::from_ref(&ostree_pkg),
+            ApplyMode::Live,
+            false,
+            false
+        ));
+        assert!(apply_skips_helper_auth_ui(
+            &[ostree_pkg.clone(), fw_pkg.clone()],
+            ApplyMode::Live,
+            false,
+            true
+        ));
+        assert!(!apply_skips_helper_auth_ui(
+            &[ostree_pkg.clone(), fw_pkg.clone()],
+            ApplyMode::Live,
+            false,
+            false
+        ) || crate::privilege::session_is_alive());
+        assert!(apply_skips_helper_auth_ui(
+            &[ostree_pkg, fw_pkg],
+            ApplyMode::DownloadOnly,
+            false,
+            false
+        ));
+        assert!(apply_skips_helper_auth_ui(
+            &[dnf_pkg],
+            ApplyMode::Live,
+            true,
+            false
+        ));
     }
 }

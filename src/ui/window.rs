@@ -17,17 +17,18 @@ use libadwaita::{
     ToolbarStyle, ToolbarView, WindowTitle,
 };
 
-use fedora_updater::backend::{dnf, dnf_dbus, fwupd_dbus, gnome_extensions};
+use fedora_updater::backend::{dnf, dnf_dbus, fwupd_dbus, gnome_extensions, rpm_ostree};
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
     ApplyMode, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
     SourceCategory, UpdateSource,
 };
 use fedora_updater::orchestrator::{
-    can_skip_apply_auth_ui, can_skip_check_auth_ui, cancel_background_work,
-    default_source_availability, load_history_system, probe_source_availability,
-    release_privileges, run_apply_all_with_mode_and_config, run_check_with_config,
-    run_systemctl_reboot, session_started_event, SourceAvailability, WorkerMsg,
+    apply_skips_helper_auth_ui, cancel_background_work, check_requires_helper_auth,
+    default_source_availability, default_source_availability_for_host, load_history_system,
+    probe_source_availability_for_host, release_privileges, run_apply_all_with_mode_and_config,
+    run_check_with_config, run_systemctl_reboot, session_started_event, SourceAvailability,
+    WorkerMsg,
 };
 use fedora_updater::presenter::{
     about_time_left, activity_log_subtitle, apply_cta_label, cache_activity_note,
@@ -51,6 +52,43 @@ use super::{
 
 const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMenuKind {
+    Standard,
+    MixedWithOstree,
+    OstreeOnly,
+}
+
+fn append_apply_mode_item(section: &gio::Menu, label: &str, target: &str) {
+    let item = gio::MenuItem::new(Some(label), None);
+    item.set_action_and_target_value(Some("win.apply-mode"), Some(&target.to_variant()));
+    section.append_item(&item);
+}
+
+fn build_apply_mode_menu(kind: ApplyMenuKind) -> gio::Menu {
+    let section = gio::Menu::new();
+    match kind {
+        ApplyMenuKind::Standard => {
+            append_apply_mode_item(&section, "Update All", "live");
+            append_apply_mode_item(&section, "Update & Restart", "live-reboot");
+            append_apply_mode_item(&section, "Prepare Offline Update", "offline");
+            append_apply_mode_item(&section, "Download Only", "download-only");
+        }
+        ApplyMenuKind::MixedWithOstree => {
+            append_apply_mode_item(&section, "Update All", "live");
+            append_apply_mode_item(&section, "Update & Restart", "live-reboot");
+            append_apply_mode_item(&section, "Download Only", "download-only");
+        }
+        ApplyMenuKind::OstreeOnly => {
+            append_apply_mode_item(&section, "Stage System Update", "live");
+            append_apply_mode_item(&section, "Update & Restart", "live-reboot");
+        }
+    }
+    let menu = gio::Menu::new();
+    menu.append_section(None, &section);
+    menu
+}
+
 struct Widgets {
     window: ApplicationWindow,
     split_view: NavigationSplitView,
@@ -64,9 +102,14 @@ struct Widgets {
     activity_log: activity_log::ActivityLogView,
     history_view: history::HistoryView,
     history_loaded: Cell<bool>,
+    ostree_booted: Cell<bool>,
     native_dnf_available: Cell<bool>,
     native_fwupd_available: Cell<bool>,
     apply_mode: Cell<ApplyMode>,
+    apply_menu_kind: Cell<ApplyMenuKind>,
+    ready_has_ostree: Cell<bool>,
+    ready_has_dnf: Cell<bool>,
+    ready_ostree_only: Cell<bool>,
     ignore_select_all: Cell<bool>,
     source_filter: Cell<sidebar::SourceFilter>,
     #[cfg_attr(not(test), allow(dead_code))] // Verified by headless widget E2E tests.
@@ -264,9 +307,14 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         activity_log,
         history_view,
         history_loaded: Cell::new(false),
+        ostree_booted: Cell::new(false),
         native_dnf_available: Cell::new(false),
         native_fwupd_available: Cell::new(false),
         apply_mode: Cell::new(ApplyMode::Live),
+        apply_menu_kind: Cell::new(ApplyMenuKind::Standard),
+        ready_has_ostree: Cell::new(false),
+        ready_has_dnf: Cell::new(false),
+        ready_ostree_only: Cell::new(false),
         ignore_select_all: Cell::new(false),
         source_filter: Cell::new(sidebar::SourceFilter::All),
         ready_toolbar: obj(builder, "ready_toolbar"),
@@ -498,9 +546,13 @@ fn flush_prefs_on_close(w: &Widgets) {
 }
 
 fn can_selective_apply(packages: &[Package], native_dnf: bool, native_fwupd: bool) -> bool {
-    !packages.is_empty()
+    let has_selective = packages
+        .iter()
+        .any(|pkg| pkg.source.supports_selective_apply());
+    has_selective
         && packages.iter().all(|pkg| match pkg.source {
             UpdateSource::Dnf => native_dnf,
+            UpdateSource::RpmOstree => true,
             UpdateSource::Firmware => native_fwupd,
             UpdateSource::FlatpakUser
             | UpdateSource::FlatpakSystem
@@ -510,12 +562,18 @@ fn can_selective_apply(packages: &[Package], native_dnf: bool, native_fwupd: boo
 }
 
 fn sync_sidebar_categories(w: &Widgets, state: &AppState) {
+    let ostree = w.ostree_booted.get();
+    w.sidebar.set_ostree_mode(ostree);
+    w.activity_log.set_ostree_mode(ostree);
     let cfg = w.prefs.borrow().source_config();
     let availability = w.source_availability.borrow();
     let categories: BTreeSet<SourceCategory> = UpdateSource::ALL
         .iter()
         .copied()
         .filter(|src| {
+            if !src.is_applicable_for_host(ostree) {
+                return false;
+            }
             let installed = availability
                 .get(src.pref_key())
                 .is_none_or(|info| info.installed);
@@ -576,11 +634,16 @@ impl Widgets {
 }
 
 fn apply_preview_config(cfg: &preview::PreviewConfig, w: &Widgets) {
+    w.ostree_booted.set(cfg.ostree_booted);
+    *w.source_availability.borrow_mut() =
+        default_source_availability_for_host(cfg.ostree_booted);
+    w.sidebar.set_ostree_mode(cfg.ostree_booted);
+    w.activity_log.set_ostree_mode(cfg.ostree_booted);
     w.sidebar_open.set(cfg.sidebar_open);
     w.detail_view.set(cfg.detail_view);
     w.sidebar.select_view(cfg.detail_view);
     if cfg.enable_native_capabilities {
-        w.native_dnf_available.set(true);
+        w.native_dnf_available.set(!cfg.ostree_booted);
         w.native_fwupd_available.set(true);
         w.sidebar.set_history_available(true);
     }
@@ -632,6 +695,10 @@ pub fn build(app: &Application) {
     widgets.persist_prefs.set(!prefs::is_persistence_disabled());
     if let Some(cfg) = preview_cfg.as_ref() {
         apply_preview_config(cfg, &widgets);
+    } else {
+        let ostree = rpm_ostree::is_ostree_booted();
+        widgets.ostree_booted.set(ostree);
+        *widgets.source_availability.borrow_mut() = default_source_availability_for_host(ostree);
     }
     sync_sidebar_categories(&widgets, &state.borrow());
 
@@ -1060,7 +1127,62 @@ fn update_ready_filter_chrome(w: &Widgets, total_packages: usize) {
     });
 }
 
+fn sync_apply_mode_action_state(w: &Widgets, mode: ApplyMode, canonical: &str) {
+    w.apply_mode.set(mode);
+    if let Some(action) = w
+        .window
+        .lookup_action("apply-mode")
+        .and_downcast::<gio::SimpleAction>()
+    {
+        action.set_state(&canonical.to_variant());
+    }
+}
+
 fn update_ready_selection_chrome(w: &Widgets) {
+    let target_kind = if w.ready_ostree_only.get() {
+        ApplyMenuKind::OstreeOnly
+    } else if w.ready_has_ostree.get() && !w.ready_has_dnf.get() {
+        ApplyMenuKind::MixedWithOstree
+    } else {
+        ApplyMenuKind::Standard
+    };
+    if w.apply_menu_kind.get() != target_kind {
+        w.apply_menu_kind.set(target_kind);
+        w.ready_split_update
+            .set_menu_model(Some(&build_apply_mode_menu(target_kind)));
+    }
+
+    match target_kind {
+        ApplyMenuKind::OstreeOnly => {
+            if matches!(
+                w.apply_mode.get(),
+                ApplyMode::OfflineOnReboot | ApplyMode::DownloadOnly
+            ) {
+                sync_apply_mode_action_state(w, ApplyMode::Live, "live");
+            }
+        }
+        ApplyMenuKind::MixedWithOstree => {
+            if w.apply_mode.get() == ApplyMode::OfflineOnReboot {
+                sync_apply_mode_action_state(w, ApplyMode::Live, "live");
+            }
+        }
+        ApplyMenuKind::Standard => {}
+    }
+
+    if w.ready_ostree_only.get() {
+        w.ready_selection_bar.set_visible(false);
+        w.ready_update.set_visible(false);
+        w.ready_split_update.set_visible(true);
+        w.ready_split_update.set_sensitive(true);
+        let label = if w.apply_mode.get() == ApplyMode::LiveAndReboot {
+            "Update & Restart"
+        } else {
+            "Stage System Update"
+        };
+        w.ready_split_update.set_label(label);
+        return;
+    }
+
     if !w.ready_queue.is_selectable() {
         w.ready_selection_bar.set_visible(false);
         w.ready_split_update.set_visible(false);
@@ -1136,12 +1258,13 @@ fn spawn_native_capability_probe(
     console: &Rc<RefCell<ConsoleBuffer>>,
     widgets: &Rc<Widgets>,
 ) {
+    let ostree = widgets.ostree_booted.get();
     let (tx, rx) = async_channel::bounded::<(bool, bool, BTreeMap<String, SourceAvailability>)>(1);
     std::thread::spawn(move || {
-        let dnf = dnf_dbus::is_available();
+        let dnf = !ostree && dnf_dbus::is_available();
         let fwupd = fwupd_dbus::is_available();
         let gnome_ext = gnome_extensions::is_available();
-        let availability = probe_source_availability(dnf, fwupd, gnome_ext);
+        let availability = probe_source_availability_for_host(ostree, dnf, fwupd, gnome_ext);
         let _ = tx.send_blocking((dnf, fwupd, availability));
     });
     let state = state.clone();
@@ -1531,7 +1654,8 @@ fn start_check(
     then_apply: bool,
 ) {
     let config = widgets.prefs.borrow().source_config();
-    if config.all_disabled() {
+    let ostree = widgets.ostree_booted.get();
+    if config.all_disabled_for_host(ostree) {
         widgets.toast.add_toast(Toast::new(
             "All update sources are disabled. Enable a source in Preferences.",
         ));
@@ -1551,8 +1675,7 @@ fn start_check(
 
     prepare_for_operation(console, widgets);
     dispatch(state, console, widgets, Event::StartCheck { then_apply }, true);
-    let dnf_enabled = config.is_enabled(UpdateSource::Dnf);
-    if !dnf_enabled || can_skip_check_auth_ui(widgets.native_dnf_available.get()) {
+    if !check_requires_helper_auth(ostree, widgets.native_dnf_available.get(), &config) {
         dispatch(
             state,
             console,
@@ -1624,9 +1747,12 @@ fn begin_apply(
     prepare_for_operation(console, widgets);
     let packages = state.borrow().packages().to_vec();
     dispatch(state, console, widgets, Event::StartApply, true);
-    if !packages.iter().any(|p| p.source.requires_root())
-        || can_skip_apply_auth_ui(widgets.native_dnf_available.get())
-    {
+    if apply_skips_helper_auth_ui(
+        &packages,
+        ApplyMode::Live,
+        widgets.native_dnf_available.get(),
+        widgets.native_fwupd_available.get(),
+    ) {
         dispatch(
             state,
             console,
@@ -1659,9 +1785,12 @@ fn begin_apply_selected(
         true,
     );
     let packages = state.borrow().packages().to_vec();
-    if !packages.iter().any(|p| p.source.requires_root())
-        || can_skip_apply_auth_ui(widgets.native_dnf_available.get())
-    {
+    if apply_skips_helper_auth_ui(
+        &packages,
+        mode,
+        widgets.native_dnf_available.get(),
+        widgets.native_fwupd_available.get(),
+    ) {
         dispatch(
             state,
             console,
@@ -2212,11 +2341,13 @@ fn paint_quiet_chrome_with(
 ) {
     let at_full = running.work_progress.is_some_and(|frac| frac >= 0.999);
     let watching_dnf = running.current_source == Some(UpdateSource::Dnf);
+    let watching_ostree = running.current_source == Some(UpdateSource::RpmOstree);
     let quiet = quiet_ui(QuietInput {
         quiet_secs: secs,
         at_full_item: at_full,
         cache_note,
         watching_dnf,
+        watching_ostree,
         daemon_running,
     });
 
@@ -2565,14 +2696,15 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             w.console_line
                 .set_text(console_preview_line(console.last_line()));
             let availability = w.source_availability.borrow();
+            let ostree = w.ostree_booted.get();
             let enabled_sources: Vec<UpdateSource> = w
                 .prefs
                 .borrow()
                 .source_config()
-                .enabled_sources()
+                .enabled_sources_for_host(ostree)
                 .into_iter()
                 .filter(|src| {
-                    src.installed_by_default()
+                    src.installed_by_default_for_host(ostree)
                         || availability
                             .get(src.pref_key())
                             .is_some_and(|info| info.installed)
@@ -2616,6 +2748,14 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             } else {
                 w.ready_banner.set_revealed(false);
             }
+            w.ready_has_ostree
+                .set(packages.iter().any(|p| p.source == UpdateSource::RpmOstree));
+            w.ready_has_dnf
+                .set(packages.iter().any(|p| p.source == UpdateSource::Dnf));
+            w.ready_ostree_only.set(
+                !packages.is_empty()
+                    && packages.iter().all(|p| p.source == UpdateSource::RpmOstree),
+            );
             w.ready_update.set_sensitive(!packages.is_empty());
             let selective = can_selective_apply(
                 packages,
@@ -3002,6 +3142,7 @@ mod tests {
 
         for (source, badge, cls) in [
             (UpdateSource::Dnf, "DNF", "src-dnf"),
+            (UpdateSource::RpmOstree, "OSTREE", "src-ostree"),
             (UpdateSource::FlatpakUser, "FP", "src-flatpak"),
             (UpdateSource::FlatpakSystem, "FP", "src-flatpak"),
             (UpdateSource::GnomeExtensions, "EXT", "src-ext"),
@@ -4631,6 +4772,10 @@ mod tests {
             "failed",
             "log",
             "history",
+            "ready-ostree",
+            "ready-ostree-mixed",
+            "running-ostree",
+            "done-ostree",
         ];
 
         for preset in presets {
@@ -4714,6 +4859,38 @@ mod tests {
                         Some("history")
                     );
                     assert!(widgets.history_view.counts().1 > 0);
+                }
+                "ready-ostree" => {
+                    assert!(widgets.ostree_booted.get());
+                    assert!(!widgets.ready_queue.is_selectable());
+                    assert!(!widgets.ready_selection_bar.get_visible());
+                    assert!(!widgets.ready_update.get_visible());
+                    assert!(widgets.ready_split_update.get_visible());
+                    assert_eq!(
+                        widgets.ready_split_update.label().as_deref(),
+                        Some("Stage System Update")
+                    );
+                }
+                "ready-ostree-mixed" => {
+                    assert!(widgets.ostree_booted.get());
+                    assert!(widgets.ready_queue.is_selectable());
+                    assert!(widgets.ready_selection_bar.get_visible());
+                    assert!(widgets.ready_split_update.get_visible());
+                }
+                "running-ostree" => {
+                    assert!(widgets.ostree_booted.get());
+                    assert_eq!(
+                        widgets.stack.visible_child_name().as_deref(),
+                        Some("running")
+                    );
+                }
+                "done-ostree" => {
+                    assert!(widgets.ostree_booted.get());
+                    assert!(widgets.done_reboot_clamp.get_visible());
+                    assert!(widgets
+                        .done_reboot_detail
+                        .label()
+                        .contains("staged atomic system deployment"));
                 }
                 _ => {}
             }
@@ -5273,6 +5450,159 @@ mod tests {
         gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
 
+    fn verify_ostree_ui_adaptation() {
+        use super::super::queue_list::QueueList;
+        use fedora_updater::model::{Package, UpdateSource};
+        use fedora_updater::orchestrator::default_source_availability_for_host;
+        use fedora_updater::state::{AppState, Phase};
+        use gtk::prelude::*;
+
+        fn split_menu_items(split: &libadwaita::SplitButton) -> Vec<(String, String)> {
+            let menu_model = split
+                .menu_model()
+                .expect("ready_split_update menu-model should be set");
+            let section = menu_model
+                .item_link(0, gtk::gio::MENU_LINK_SECTION)
+                .expect("ready_split_update menu-model should contain a section");
+            (0..section.n_items())
+                .map(|idx| {
+                    let label = section
+                        .item_attribute_value(idx, gtk::gio::MENU_ATTRIBUTE_LABEL, None)
+                        .and_then(|v| v.str().map(str::to_string))
+                        .unwrap_or_default();
+                    let target = section
+                        .item_attribute_value(idx, gtk::gio::MENU_ATTRIBUTE_TARGET, None)
+                        .and_then(|v| v.str().map(str::to_string))
+                        .unwrap_or_default();
+                    (label, target)
+                })
+                .collect()
+        }
+
+        // 1) Host-mode sidebar + ActivityLog system toggle labeling.
+        let widgets = super::Widgets::for_test();
+        assert_eq!(
+            widgets.activity_log.system_toggle_label().as_deref(),
+            Some("DNF")
+        );
+        widgets.ostree_booted.set(true);
+        super::sync_sidebar_categories(&widgets, &AppState::default());
+        assert_eq!(
+            widgets.activity_log.system_toggle_label().as_deref(),
+            Some("OSTree")
+        );
+        widgets.ostree_booted.set(false);
+        super::sync_sidebar_categories(&widgets, &AppState::default());
+        assert_eq!(
+            widgets.activity_log.system_toggle_label().as_deref(),
+            Some("DNF")
+        );
+
+        // 2) Preferences render rpm-ostree (never DNF) on Atomic hosts and gate all-disabled banner.
+        let ostree_avail = default_source_availability_for_host(true);
+        let prefs = super::prefs::UiPrefs::default();
+        let pref_handle =
+            super::preferences::build_preferences_dialog(&prefs, &ostree_avail, |_, _| {});
+        assert_eq!(pref_handle.switches.len(), 5);
+        assert!(pref_handle.switches.contains_key("rpm-ostree"));
+        assert!(!pref_handle.switches.contains_key("dnf"));
+        assert!(!pref_handle.all_disabled_group.get_visible());
+        for key in [
+            "rpm-ostree",
+            "flatpak",
+            "gnome-extensions",
+            "homebrew",
+            "firmware",
+        ] {
+            pref_handle.switches[key].set_active(false);
+        }
+        assert!(pref_handle.all_disabled_group.get_visible());
+
+        // 3) Individual OSTree row checkbox stays active, insensitive, and carries atomic tooltip.
+        let ostree_pkg = Package::new_rpm_ostree(
+            "upgraded",
+            "kernel",
+            "x86_64",
+            Some("6.14.10-300.fc44".into()),
+            "6.14.11-300.fc44",
+            "fedora:fedora/44/x86_64/silverblue",
+            "Upgraded",
+            Some("Target deployment: 44.20261124.0".into()),
+        );
+        let locked_row = QueueList::build_selectable_row_for_test(&ostree_pkg, false);
+        assert!(locked_row.check_btn().get_visible());
+        assert!(locked_row.check_btn().is_active());
+        assert!(!locked_row.check_btn().is_sensitive());
+        assert_eq!(
+            locked_row.check_btn().tooltip_text().as_deref(),
+            Some("Atomic system updates apply together")
+        );
+
+        // 4) Pure OSTree Ready menu vs mixed OSTree + selective menu & selection locking.
+        let ostree_only_cfg = super::super::preview::config_for("ready-ostree");
+        super::apply_preview_config(&ostree_only_cfg, &widgets);
+        super::sync_sidebar_categories(&widgets, &ostree_only_cfg.state);
+        super::render(
+            &ostree_only_cfg.state,
+            &fedora_updater::console::ConsoleBuffer::new(16),
+            &widgets,
+        );
+        assert!(!widgets.ready_queue.is_selectable());
+        assert_eq!(
+            split_menu_items(&widgets.ready_split_update),
+            vec![
+                ("Stage System Update".into(), "live".into()),
+                ("Update & Restart".into(), "live-reboot".into()),
+            ]
+        );
+
+        let mixed_cfg = super::super::preview::config_for("ready-ostree-mixed");
+        super::apply_preview_config(&mixed_cfg, &widgets);
+        super::sync_sidebar_categories(&widgets, &mixed_cfg.state);
+        super::render(
+            &mixed_cfg.state,
+            &fedora_updater::console::ConsoleBuffer::new(16),
+            &widgets,
+        );
+        assert!(widgets.ready_queue.is_selectable());
+        assert_eq!(
+            split_menu_items(&widgets.ready_split_update),
+            vec![
+                ("Update All".into(), "live".into()),
+                ("Update & Restart".into(), "live-reboot".into()),
+                ("Download Only".into(), "download-only".into()),
+            ]
+        );
+        widgets.ready_queue.set_all_selected(false);
+        assert_eq!(widgets.ready_queue.selected_ids().len(), 2);
+        let ostree_id = match &mixed_cfg.state.phase {
+            Phase::Ready { packages, .. } => packages
+                .iter()
+                .find(|p| p.source == UpdateSource::RpmOstree)
+                .unwrap()
+                .id
+                .clone(),
+            _ => unreachable!(),
+        };
+        let flatpak_id = match &mixed_cfg.state.phase {
+            Phase::Ready { packages, .. } => packages
+                .iter()
+                .find(|p| p.source == UpdateSource::FlatpakUser)
+                .unwrap()
+                .id
+                .clone(),
+            _ => unreachable!(),
+        };
+        assert!(!widgets.ready_queue.set_selected_by_id(&ostree_id, false));
+        assert_eq!(widgets.ready_queue.selected_ids().len(), 2);
+        widgets.ready_queue.set_all_selected(true);
+        assert_eq!(widgets.ready_queue.selected_ids().len(), 4);
+        assert!(widgets.ready_queue.set_selected_by_id(&flatpak_id, false));
+        assert_eq!(widgets.ready_queue.selected_ids().len(), 3);
+
+        gtk::prelude::GtkWindowExt::destroy(&widgets.window);
+    }
+
     /// Serialized on a single thread because GTK4/Libadwaita asserts main-thread ownership.
     #[test]
     fn gtk_widget_window_rows_and_dialogs_e2e() {
@@ -5298,5 +5628,6 @@ mod tests {
         verify_preview_presets_render_cleanly();
         verify_phase2_native_controls_and_history();
         verify_preferences_dialog_and_dynamic_sidebar();
+        verify_ostree_ui_adaptation();
     }
 }

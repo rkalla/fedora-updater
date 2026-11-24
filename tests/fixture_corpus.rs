@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 48, "expected 48 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 54, "expected 54 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(
@@ -343,4 +343,34 @@ fn gnome_extensions_fixtures_contain_expected_signals() {
 
     let replies = read_fixture_value("gnome_extensions/install_replies.json");
     assert_eq!(replies["replies"].as_array().map(Vec::len), Some(4));
+}
+
+#[test]
+fn rpm_ostree_fixtures_contain_expected_signals() {
+    let diff = read_fixture("rpm_ostree/upgrade_check_diff.txt");
+    assert!(diff.contains("AvailableUpdate:"));
+    assert!(diff.contains("SecAdvisories:"));
+    assert!(diff.contains("Upgraded:"));
+    assert!(diff.contains("Added:"));
+    assert!(diff.contains("Removed:"));
+
+    let none = read_fixture("rpm_ostree/upgrade_check_none.txt");
+    assert!(none.contains("No upgrade available."));
+
+    let oci = read_fixture("rpm_ostree/upgrade_check_oci.txt");
+    assert!(oci.contains("Digest: sha256:"));
+
+    let status = read_fixture_value("rpm_ostree/status.json");
+    assert_eq!(status["deployments"][0]["booted"], true);
+    assert!(status["deployments"][0]["requested-packages"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|v| v == "htop")));
+
+    let apply = read_fixture("rpm_ostree/upgrade_apply_log.txt");
+    assert!(apply.contains("Receiving objects: 42%"));
+    assert!(apply.contains("Staging deployment... done"));
+    assert!(apply.contains("systemctl reboot"));
+
+    let err = read_fixture("rpm_ostree/upgrade_error.txt");
+    assert!(err.contains("Transaction in progress"));
 }

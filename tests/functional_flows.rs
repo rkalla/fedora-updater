@@ -29,6 +29,7 @@ use fedora_updater::backend::fwupd_dbus::{
 };
 use fedora_updater::backend::gnome_extensions::parse_extensions_json;
 use fedora_updater::backend::logind::{RebootPreflight, ShutdownInhibitor};
+use fedora_updater::backend::rpm_ostree::{parse_status_json, RPM_OSTREE_DEFAULT_PATH};
 use fedora_updater::backend::{brew::LINUXBREW_SYSTEM_PATH, dnf, NativeOutcome};
 use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
@@ -37,7 +38,8 @@ use fedora_updater::model::{
     Package, PackageStatus, RetryAction, RunPass, UpdateSource,
 };
 use fedora_updater::orchestrator::{
-    can_skip_apply_auth_ui, can_skip_check_auth_ui, execute_apply_all, execute_apply_all_with_mode,
+    apply_skips_helper_auth_ui, can_skip_apply_auth_ui, can_skip_check_auth_ui,
+    check_requires_helper_auth, execute_apply_all, execute_apply_all_with_mode,
     execute_apply_all_with_mode_and_config, execute_check_all, execute_check_all_with_config,
     execute_load_history, execute_systemctl_reboot, run_apply_all_with, run_check_all_with,
     run_systemctl_reboot_with, session_started_event, SourceConfig, WorkCancel, WorkerMsg,
@@ -3556,4 +3558,310 @@ fn gnome_extensions_soft_error_mode_skips_disabled_pref_and_work_cancel() {
     assert!(cancel_apply.is_cancelled());
     assert_eq!(*seen_uuids.lock().unwrap(), vec!["blur-my-shell@aunetx"]);
     assert!(!matches!(h_cancel.state.phase, Phase::Done { .. }));
+}
+
+#[test]
+fn atomic_ostree_host_check_apply_cancel_modes_and_classic_isolation() {
+    use common::runtime::fixture_to_local_lines;
+
+    // 1) OSTree host checks zero-password via rpm-ostree (skipping DNF + helper session).
+    let rt = FakeRuntime::new();
+    rt.set_ostree_booted(true);
+    rt.set_rpm_ostree_binary(Some(RPM_OSTREE_DEFAULT_PATH.into()));
+    let status = parse_status_json(&read_fixture("rpm_ostree/status.json")).expect("status.json");
+    rt.push_rpm_ostree_status(NativeOutcome::Handled(Ok(status)));
+    rt.push_local_fixture(
+        RPM_OSTREE_DEFAULT_PATH,
+        &["upgrade", "--check"],
+        "rpm_ostree/upgrade_check_diff.txt",
+        0,
+    );
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("flatpak");
+    cfg.disable("gnome-extensions");
+    cfg.disable("homebrew");
+    cfg.disable("firmware");
+
+    assert!(!check_requires_helper_auth(true, false, &SourceConfig::all_enabled()));
+
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    assert_eq!(session_started_purpose(&h.state.phase), Some(fedora_updater::model::AuthPurpose::Check));
+    let (tx, rx) = async_channel::unbounded();
+    execute_check_all_with_config(&tx, &rt, &WorkCancel::new(), &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+    assert_eq!(rt.dnf_dbus_check_calls(), 0);
+    assert!(rt
+        .local_env_calls()
+        .iter()
+        .any(|(prog, args, envs)| prog == RPM_OSTREE_DEFAULT_PATH
+            && args == &["upgrade", "--check"]
+            && envs.iter().any(|(k, v)| k == "NO_COLOR" && v == "1")));
+
+    let packages = match &h.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert!(soft_errors.is_empty(), "{soft_errors:?}");
+            assert_eq!(packages.len(), 7);
+            assert!(packages
+                .iter()
+                .all(|p| p.source == UpdateSource::RpmOstree));
+            assert!(packages
+                .iter()
+                .any(|p| p.name == "htop" && p.detail.to_ascii_lowercase().contains("layered")));
+            assert!(packages
+                .iter()
+                .any(|p| p.name == "kernel" && p.has_security_advisory()));
+            packages.clone()
+        }
+        other => panic!("expected Ready with OSTree diff, got {other:?}"),
+    };
+
+    // 2) Exit code 77 ("No upgrade available") resolves cleanly to Up-to-Date with 0 errors.
+    let rt_none = FakeRuntime::new();
+    rt_none.set_ostree_booted(true);
+    rt_none.set_rpm_ostree_binary(Some(RPM_OSTREE_DEFAULT_PATH.into()));
+    rt_none.push_local_fixture(
+        RPM_OSTREE_DEFAULT_PATH,
+        &["upgrade", "--check"],
+        "rpm_ostree/upgrade_check_none.txt",
+        77,
+    );
+    let mut h_none = FlowHarness::new();
+    h_none.dispatch(Event::StartCheck { then_apply: false });
+    let (tx_n, rx_n) = async_channel::unbounded();
+    execute_check_all_with_config(&tx_n, &rt_none, &WorkCancel::new(), &cfg);
+    drop(tx_n);
+    h_none.drain(&rx_n);
+    assert_eq!(rt_none.ensure_session_calls(), 0);
+    assert!(matches!(
+        h_none.state.phase,
+        Phase::Idle(IdleScreen::Current { detail: None, .. })
+    ));
+
+    // 3) Classic host (`ostree_booted = false`) runs DNF and never touches rpm-ostree.
+    let rt_classic = FakeRuntime::new();
+    rt_classic.set_ostree_booted(false);
+    rt_classic.set_rpm_ostree_binary(Some(RPM_OSTREE_DEFAULT_PATH.into()));
+    rt_classic.set_dnf_dbus_available(true);
+    rt_classic.push_dnf_dbus_check(NativeOutcome::Handled(Ok(vec![Package::new_dnf(
+        "openssl",
+        "x86_64",
+        "3.2.2-3.fc44",
+        "updates",
+    )])));
+    let mut cfg_classic = SourceConfig::all_enabled();
+    cfg_classic.disable("flatpak");
+    cfg_classic.disable("gnome-extensions");
+    cfg_classic.disable("homebrew");
+    cfg_classic.disable("firmware");
+    let mut h_classic = FlowHarness::new();
+    h_classic.dispatch(Event::StartCheck { then_apply: false });
+    let (tx_cl, rx_cl) = async_channel::unbounded();
+    execute_check_all_with_config(&tx_cl, &rt_classic, &WorkCancel::new(), &cfg_classic);
+    drop(tx_cl);
+    h_classic.drain(&rx_cl);
+    assert_eq!(rt_classic.dnf_dbus_check_calls(), 1);
+    assert!(rt_classic.local_calls().is_empty());
+    assert!(matches!(
+        &h_classic.state.phase,
+        Phase::Ready { packages, .. } if packages.len() == 1 && packages[0].source == UpdateSource::Dnf
+    ));
+
+    // 4) Staged rpm-ostree upgrade streams progress hints, skips --helper, and sets needs_reboot = true.
+    assert!(apply_skips_helper_auth_ui(&packages, ApplyMode::Live, false, false));
+    let rt_apply = FakeRuntime::new();
+    rt_apply.set_ostree_booted(true);
+    rt_apply.set_rpm_ostree_binary(Some(RPM_OSTREE_DEFAULT_PATH.into()));
+    rt_apply.push_local_fixture(
+        RPM_OSTREE_DEFAULT_PATH,
+        &["upgrade"],
+        "rpm_ostree/upgrade_apply_log.txt",
+        0,
+    );
+    let mut h_apply = FlowHarness::ready(packages.clone());
+    h_apply.dispatch(Event::StartApply);
+    h_apply.dispatch(session_started_event(
+        session_started_purpose(&h_apply.state.phase).unwrap(),
+    ));
+    let (tx_a, rx_a) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_a,
+        packages.clone(),
+        ApplyMode::Live,
+        &rt_apply,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_a);
+    h_apply.drain(&rx_a);
+    assert_eq!(rt_apply.ensure_session_calls(), 0);
+    assert!(h_apply.saw_download_pass);
+    assert!(h_apply.saw_apply_pass);
+    assert!(matches!(
+        h_apply.state.phase,
+        Phase::Done {
+            failed: 0,
+            needs_reboot: true,
+            ..
+        }
+    ));
+
+    // 5) OfflineOnReboot maps to staged upgrade (needs_reboot = true); DownloadOnly skips upgrade.
+    let rt_offline = FakeRuntime::new();
+    rt_offline.set_ostree_booted(true);
+    rt_offline.set_rpm_ostree_binary(Some(RPM_OSTREE_DEFAULT_PATH.into()));
+    rt_offline.push_local_fixture(
+        RPM_OSTREE_DEFAULT_PATH,
+        &["upgrade"],
+        "rpm_ostree/upgrade_apply_log.txt",
+        0,
+    );
+    let mut h_offline = FlowHarness::ready(packages.clone());
+    h_offline.dispatch(Event::StartSelectiveApply {
+        selected_ids: packages.iter().map(|p| p.id.clone()).collect(),
+        mode: ApplyMode::OfflineOnReboot,
+    });
+    h_offline.dispatch(session_started_event(
+        session_started_purpose(&h_offline.state.phase).unwrap(),
+    ));
+    let (tx_o, rx_o) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_o,
+        packages.clone(),
+        ApplyMode::OfflineOnReboot,
+        &rt_offline,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_o);
+    h_offline.drain(&rx_o);
+    assert_eq!(rt_offline.local_calls().len(), 1);
+    assert!(h_offline
+        .console
+        .full_text()
+        .contains("Staging Atomic OS deployment for next boot"));
+    assert!(matches!(
+        h_offline.state.phase,
+        Phase::Done {
+            failed: 0,
+            needs_reboot: true,
+            ..
+        }
+    ));
+
+    let rt_dl = FakeRuntime::new();
+    rt_dl.set_ostree_booted(true);
+    rt_dl.set_rpm_ostree_binary(Some(RPM_OSTREE_DEFAULT_PATH.into()));
+    let mut h_dl = FlowHarness::ready(packages.clone());
+    h_dl.dispatch(Event::StartSelectiveApply {
+        selected_ids: packages.iter().map(|p| p.id.clone()).collect(),
+        mode: ApplyMode::DownloadOnly,
+    });
+    h_dl.dispatch(session_started_event(
+        session_started_purpose(&h_dl.state.phase).unwrap(),
+    ));
+    let (tx_d, rx_d) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_d,
+        packages.clone(),
+        ApplyMode::DownloadOnly,
+        &rt_dl,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_d);
+    h_dl.drain(&rx_d);
+    assert!(rt_dl.local_calls().is_empty());
+    assert!(matches!(
+        h_dl.state.phase,
+        Phase::Done {
+            failed: 0,
+            needs_reboot: false,
+            ..
+        }
+    ));
+
+    // 6) WorkCancel mid-apply invokes runtime.cancel_rpm_ostree() and stops cleanly.
+    let rt_cancel = FakeRuntime::new();
+    rt_cancel.set_ostree_booted(true);
+    rt_cancel.set_rpm_ostree_binary(Some(RPM_OSTREE_DEFAULT_PATH.into()));
+    let cancel = WorkCancel::new();
+    let cancel_hook = cancel.clone();
+    let lines = fixture_to_local_lines(&read_fixture("rpm_ostree/upgrade_apply_log.txt"));
+    rt_cancel.push_local_step(
+        RPM_OSTREE_DEFAULT_PATH,
+        &["upgrade"],
+        LocalStep {
+            lines,
+            result: Ok(0),
+            hook_after_line: Some((
+                5,
+                Box::new(move || {
+                    cancel_hook.cancel();
+                }),
+            )),
+        },
+    );
+    let mut h_cancel = FlowHarness::ready(packages.clone());
+    h_cancel.dispatch(Event::StartApply);
+    h_cancel.dispatch(session_started_event(
+        session_started_purpose(&h_cancel.state.phase).unwrap(),
+    ));
+    let (tx_c, rx_c) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_c,
+        packages.clone(),
+        ApplyMode::Live,
+        &rt_cancel,
+        &cancel,
+        &cfg,
+    );
+    drop(tx_c);
+    h_cancel.drain(&rx_c);
+    assert_eq!(rt_cancel.cancel_rpm_ostree_calls(), 1);
+    assert!(!matches!(h_cancel.state.phase, Phase::Done { .. }));
+
+    // 7) Active daemon transaction error summarizes cleanly into Phase::Failed.
+    let rt_err = FakeRuntime::new();
+    rt_err.set_ostree_booted(true);
+    rt_err.set_rpm_ostree_binary(Some(RPM_OSTREE_DEFAULT_PATH.into()));
+    rt_err.push_local_fixture(
+        RPM_OSTREE_DEFAULT_PATH,
+        &["upgrade"],
+        "rpm_ostree/upgrade_error.txt",
+        1,
+    );
+    let mut h_err = FlowHarness::ready(packages.clone());
+    h_err.dispatch(Event::StartApply);
+    h_err.dispatch(session_started_event(
+        session_started_purpose(&h_err.state.phase).unwrap(),
+    ));
+    let (tx_e, rx_e) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_e,
+        packages,
+        ApplyMode::Live,
+        &rt_err,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_e);
+    h_err.drain(&rx_e);
+    match &h_err.state.phase {
+        Phase::Failed { detail, .. } => {
+            assert!(
+                detail.contains("Another rpm-ostree transaction is already in progress"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected Failed on active transaction conflict, got {other:?}"),
+    }
 }

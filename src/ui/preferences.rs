@@ -47,13 +47,18 @@ pub fn build_preferences_dialog(
     warn_icon.set_valign(gtk::Align::Center);
     warning_row.add_prefix(&warn_icon);
     all_disabled_group.add(&warning_row);
-    all_disabled_group.set_visible(current_prefs.source_config().all_disabled());
+    let ostree_booted = availability.contains_key("rpm-ostree") && !availability.contains_key("dnf");
+    all_disabled_group.set_visible(
+        current_prefs
+            .source_config()
+            .all_disabled_for_host(ostree_booted),
+    );
     page.add(&all_disabled_group);
 
     let disabled_state: Rc<RefCell<BTreeSet<String>>> =
         Rc::new(RefCell::new(current_prefs.disabled_sources.clone()));
     let on_toggle: ToggleSourceCb = Rc::new(on_toggle);
-    let pref_sources = UpdateSource::pref_sources();
+    let pref_sources = UpdateSource::pref_sources_for_host(ostree_booted);
     #[cfg(test)]
     let mut switches = BTreeMap::new();
 
@@ -100,7 +105,7 @@ pub fn build_preferences_dialog(
                         guard.insert(key.to_string());
                     }
                     let cfg = SourceConfig::from_disabled_keys(guard.iter().cloned());
-                    all_disabled_group.set_visible(cfg.all_disabled());
+                    all_disabled_group.set_visible(cfg.all_disabled_for_host(ostree_booted));
                 }
                 on_toggle(key, enabled);
             });

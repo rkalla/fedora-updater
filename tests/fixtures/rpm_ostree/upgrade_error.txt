@@ -1,0 +1,2 @@
+Checking out tree a1b2c3d... done
+error: Loading sysroot: Transaction in progress; please wait or run rpm-ostree cancel

@@ -1,0 +1,41 @@
+{
+  "deployments": [
+    {
+      "id": "fedora-00a1b2c3d4e5f6.0",
+      "osname": "fedora",
+      "checksum": "00a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcd",
+      "version": "44.20261120.0",
+      "timestamp": 1763611200,
+      "booted": true,
+      "staged": false,
+      "pinned": false,
+      "origin": "fedora:fedora/44/x86_64/silverblue",
+      "requested-packages": [
+        "htop",
+        "distrobox"
+      ],
+      "packages": [
+        "htop",
+        "distrobox"
+      ]
+    }
+  ],
+  "cached-update": {
+    "origin": "fedora:fedora/44/x86_64/silverblue",
+    "checksum": "a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef",
+    "version": "44.20261124.0",
+    "timestamp": 1763957520,
+    "rpm-diff": {
+      "upgraded": [
+        ["kernel", "6.14.10-300.fc44.x86_64", "6.14.11-300.fc44.x86_64"],
+        ["mesa-dri-drivers", "25.0.2-1.fc44.x86_64", "25.0.4-1.fc44.x86_64"]
+      ],
+      "added": [
+        ["fastfetch", "2.36.0-1.fc44.x86_64"]
+      ],
+      "removed": [
+        ["neofetch", "7.1.0-11.fc44.noarch"]
+      ]
+    }
+  }
+}

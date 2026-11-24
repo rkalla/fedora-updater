@@ -49,7 +49,11 @@ pub struct SourcePipelineItem {
     pub badge: String,
 }
 
-fn build_pipeline_item(running: &RunningState, category: SourceCategory) -> SourcePipelineItem {
+fn build_pipeline_item_for_host(
+    running: &RunningState,
+    category: SourceCategory,
+    ostree_booted: bool,
+) -> SourcePipelineItem {
     let mut total = 0usize;
     let mut done = 0usize;
     let mut failed = 0usize;
@@ -83,26 +87,43 @@ fn build_pipeline_item(running: &RunningState, category: SourceCategory) -> Sour
     };
     SourcePipelineItem {
         category,
-        label: category.sidebar_label(),
-        dot_class: category.dot_css_class(),
+        label: category.sidebar_label_for_host(ostree_booted),
+        dot_class: category.dot_css_class_for_host(ostree_booted),
         status,
         badge,
     }
 }
 
+#[cfg(test)]
 pub fn running_source_checklist_for_categories(
     running: &RunningState,
     categories: &[SourceCategory],
+) -> Vec<SourcePipelineItem> {
+    running_source_checklist_for_categories_for_host(running, categories, false)
+}
+
+pub fn running_source_checklist_for_categories_for_host(
+    running: &RunningState,
+    categories: &[SourceCategory],
+    ostree_booted: bool,
 ) -> Vec<SourcePipelineItem> {
     SourceCategory::ALL
         .iter()
         .copied()
         .filter(|cat| categories.contains(cat))
-        .map(|cat| build_pipeline_item(running, cat))
+        .map(|cat| build_pipeline_item_for_host(running, cat, ostree_booted))
         .collect()
 }
 
+#[cfg(test)]
 pub fn running_source_checklist(running: &RunningState) -> Vec<SourcePipelineItem> {
+    running_source_checklist_for_host(running, false)
+}
+
+pub fn running_source_checklist_for_host(
+    running: &RunningState,
+    ostree_booted: bool,
+) -> Vec<SourcePipelineItem> {
     let active_categories: Vec<SourceCategory> = SourceCategory::ALL
         .iter()
         .copied()
@@ -113,7 +134,7 @@ pub fn running_source_checklist(running: &RunningState) -> Vec<SourcePipelineIte
                     .is_some_and(|s| s.category() == cat)
         })
         .collect();
-    running_source_checklist_for_categories(running, &active_categories)
+    running_source_checklist_for_categories_for_host(running, &active_categories, ostree_booted)
 }
 
 pub fn release_upgrade_allowed_in_sidebar(phase: &Phase) -> bool {
@@ -290,6 +311,8 @@ impl UpgradeCard {
 struct CategoryRow {
     category: SourceCategory,
     row: gtk::ListBoxRow,
+    title: gtk::Label,
+    dot: Option<gtk::Box>,
     count: gtk::Label,
 }
 
@@ -302,6 +325,7 @@ pub struct Sidebar {
     row_security: gtk::ListBoxRow,
     category_rows: Vec<CategoryRow>,
     available_categories: RefCell<BTreeSet<SourceCategory>>,
+    ostree_booted: Cell<bool>,
     count_all: gtk::Label,
     count_security: gtk::Label,
     nav_context_stack: gtk::Stack,
@@ -342,9 +366,9 @@ impl Sidebar {
             .css_classes(["navigation-sidebar"])
             .build();
 
-        let (row_all, count_all) =
+        let (row_all, _, _, count_all) =
             source_row("source:all", "All Updates", None, Some("view-list-symbolic"));
-        let (row_security, count_security) =
+        let (row_security, _, _, count_security) =
             source_row("source:security", "Security Fixes", Some("src-sec"), None);
         row_security.set_visible(false);
 
@@ -358,7 +382,7 @@ impl Sidebar {
             .collect();
         let mut category_rows = Vec::with_capacity(SourceCategory::ALL.len());
         for &cat in SourceCategory::ALL {
-            let (row, count) = source_row(
+            let (row, title, dot, count) = source_row(
                 cat.filter_key(),
                 cat.sidebar_label(),
                 Some(cat.dot_css_class()),
@@ -369,6 +393,8 @@ impl Sidebar {
             category_rows.push(CategoryRow {
                 category: cat,
                 row,
+                title,
+                dot,
                 count,
             });
         }
@@ -507,6 +533,7 @@ impl Sidebar {
             row_security,
             category_rows,
             available_categories: RefCell::new(default_available),
+            ostree_booted: Cell::new(false),
             count_all,
             count_security,
             nav_context_stack,
@@ -594,6 +621,26 @@ impl Sidebar {
 
     pub fn set_available_categories(&self, categories: BTreeSet<SourceCategory>) {
         *self.available_categories.borrow_mut() = categories;
+    }
+
+    pub fn set_ostree_mode(&self, ostree: bool) {
+        if self.ostree_booted.replace(ostree) == ostree {
+            return;
+        }
+        for entry in &self.category_rows {
+            if entry.category == SourceCategory::System {
+                entry.title.set_text(entry.category.sidebar_label_for_host(ostree));
+                if let Some(dot) = &entry.dot {
+                    dot.remove_css_class("src-dnf");
+                    dot.remove_css_class("src-ostree");
+                    dot.add_css_class(entry.category.dot_css_class_for_host(ostree));
+                }
+            }
+        }
+        while let Some(child) = self.pipeline_list.first_child() {
+            self.pipeline_list.remove(&child);
+        }
+        self.pipeline_rows.borrow_mut().clear();
     }
 
     pub fn set_history_available(&self, available: bool) {
@@ -692,7 +739,7 @@ impl Sidebar {
 
         if let Phase::Running(running) = &state.phase {
             self.nav_context_stack.set_visible_child_name("pipeline");
-            let items = running_source_checklist(running);
+            let items = running_source_checklist_for_host(running, self.ostree_booted.get());
             self.sync_pipeline_rows(&items);
         } else {
             self.nav_context_stack.set_visible_child_name("sources");
@@ -902,13 +949,14 @@ fn source_row(
     label: &str,
     dot_class: Option<&str>,
     icon_name: Option<&str>,
-) -> (gtk::ListBoxRow, gtk::Label) {
+) -> (gtk::ListBoxRow, gtk::Label, Option<gtk::Box>, gtk::Label) {
     let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     row_box.set_margin_top(6);
     row_box.set_margin_bottom(6);
     row_box.set_margin_start(8);
     row_box.set_margin_end(8);
 
+    let mut dot_widget = None;
     if let Some(icon) = icon_name {
         let img = gtk::Image::from_icon_name(icon);
         img.set_valign(gtk::Align::Center);
@@ -923,6 +971,7 @@ fn source_row(
         dot.add_css_class("source-dot");
         dot.add_css_class(dot_cls);
         row_box.append(&dot);
+        dot_widget = Some(dot);
     }
 
     let title = gtk::Label::builder()
@@ -946,7 +995,7 @@ fn source_row(
         .name(widget_name)
         .child(&row_box)
         .build();
-    (row, count)
+    (row, title, dot_widget, count)
 }
 
 fn view_row(widget_name: &str, label: &str, icon_name: &str) -> gtk::ListBoxRow {

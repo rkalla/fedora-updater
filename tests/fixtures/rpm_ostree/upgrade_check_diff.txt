@@ -1,0 +1,19 @@
+AvailableUpdate:
+  Version: 44.20261124.0 (2026-11-24T04:12:00Z)
+  Timestamp: 2026-11-24T04:12:00Z
+  Commit: a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef
+  Diff: 4 upgraded, 1 downgraded, 1 added, 1 removed
+SecAdvisories:
+  FEDORA-2026-11a2bc  Important  kernel-6.14.11-300.fc44.x86_64
+  FEDORA-2026-99d8ef  Moderate   openssl-1:3.2.2-3.fc44.x86_64
+Upgraded:
+  htop 3.3.0-2.fc44 -> 3.4.0-1.fc44.x86_64
+  kernel 6.14.10-300.fc44 -> 6.14.11-300.fc44.x86_64
+  mesa-dri-drivers 25.0.2-1.fc44 -> 25.0.4-1.fc44.x86_64
+  openssl 1:3.2.2-1.fc44 -> 1:3.2.2-3.fc44.x86_64
+Downgraded:
+  curl 8.11.1-2.fc44 -> 8.11.0-1.fc44.x86_64
+Added:
+  fastfetch-2.36.0-1.fc44.x86_64
+Removed:
+  neofetch-7.1.0-11.fc44.noarch

@@ -38,6 +38,7 @@ impl InspectorViewModel {
     pub fn from_package(package: &Package) -> Self {
         let source_title = match package.source {
             UpdateSource::Dnf => "System (DNF)",
+            UpdateSource::RpmOstree => "System (Atomic · rpm-ostree)",
             UpdateSource::FlatpakUser => "Apps (Flatpak · User)",
             UpdateSource::FlatpakSystem => "Apps (Flatpak · System)",
             UpdateSource::GnomeExtensions => "Extensions (GNOME Shell)",
@@ -69,10 +70,15 @@ impl InspectorViewModel {
         };
         let needs_reboot = package_needs_reboot(package);
         let reboot_reason = needs_reboot.then(|| {
-            format!(
-                "Updating {} modifies core system components and requires a restart to take effect.",
-                package.name
-            )
+            if package.source == UpdateSource::RpmOstree {
+                "Atomic system image updates stage a new deployment that activates on restart."
+                    .to_string()
+            } else {
+                format!(
+                    "Updating {} modifies core system components and requires a restart to take effect.",
+                    package.name
+                )
+            }
         });
         let preflight_warning = package
             .preflight_warning
@@ -948,5 +954,26 @@ mod tests {
         let done_vm = InspectorViewModel::from_package(&ext);
         assert_eq!(done_vm.status_label, Some("Installed"));
         assert_eq!(done_vm.session_note.as_deref(), Some(GNOME_EXT_RELOGIN_NOTE));
+
+        let ostree = Package::new_rpm_ostree(
+            "upgraded",
+            "mesa-dri-drivers",
+            "x86_64",
+            Some("25.0.2-1.fc44".into()),
+            "25.0.4-1.fc44",
+            "fedora:fedora/44/x86_64/silverblue",
+            "Upgraded",
+            Some("Atomic system deployment".into()),
+        );
+        let ostree_vm = InspectorViewModel::from_package(&ostree);
+        assert_eq!(ostree_vm.badge, "OSTREE");
+        assert_eq!(ostree_vm.badge_css, "src-ostree");
+        assert_eq!(ostree_vm.source_title, "System (Atomic · rpm-ostree)");
+        assert_eq!(ostree_vm.version_display, "25.0.2-1.fc44 → 25.0.4-1.fc44");
+        assert!(ostree_vm.needs_reboot);
+        assert_eq!(
+            ostree_vm.reboot_reason.as_deref(),
+            Some("Atomic system image updates stage a new deployment that activates on restart.")
+        );
     }
 }

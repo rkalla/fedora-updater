@@ -34,7 +34,12 @@ impl SourceCategory {
     }
 
     pub fn sidebar_label(self) -> &'static str {
+        self.sidebar_label_for_host(false)
+    }
+
+    pub fn sidebar_label_for_host(self, ostree_booted: bool) -> &'static str {
         match self {
+            Self::System if ostree_booted => "System · Atomic",
             Self::System => "System · DNF",
             Self::Apps => "Apps · Flatpak",
             Self::Extensions => "Extensions",
@@ -65,7 +70,12 @@ impl SourceCategory {
     }
 
     pub fn dot_css_class(self) -> &'static str {
+        self.dot_css_class_for_host(false)
+    }
+
+    pub fn dot_css_class_for_host(self, ostree_booted: bool) -> &'static str {
         match self {
+            Self::System if ostree_booted => "src-ostree",
             Self::System => "src-dnf",
             Self::Apps => "src-flatpak",
             Self::Extensions => "src-ext",
@@ -95,6 +105,7 @@ impl fmt::Display for SourceCategory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UpdateSource {
     Dnf,
+    RpmOstree,
     FlatpakUser,
     FlatpakSystem,
     GnomeExtensions,
@@ -105,6 +116,7 @@ pub enum UpdateSource {
 impl UpdateSource {
     pub const ALL: &'static [UpdateSource] = &[
         Self::Dnf,
+        Self::RpmOstree,
         Self::FlatpakUser,
         Self::FlatpakSystem,
         Self::GnomeExtensions,
@@ -130,7 +142,7 @@ impl UpdateSource {
 
     pub fn category(self) -> SourceCategory {
         match self {
-            Self::Dnf => SourceCategory::System,
+            Self::Dnf | Self::RpmOstree => SourceCategory::System,
             Self::FlatpakUser | Self::FlatpakSystem => SourceCategory::Apps,
             Self::GnomeExtensions => SourceCategory::Extensions,
             Self::Homebrew => SourceCategory::DevAndContainers,
@@ -141,6 +153,7 @@ impl UpdateSource {
     pub fn pref_key(self) -> &'static str {
         match self {
             Self::Dnf => "dnf",
+            Self::RpmOstree => "rpm-ostree",
             Self::FlatpakUser | Self::FlatpakSystem => "flatpak",
             Self::GnomeExtensions => "gnome-extensions",
             Self::Homebrew => "homebrew",
@@ -151,6 +164,7 @@ impl UpdateSource {
     pub fn pref_title(self) -> &'static str {
         match self {
             Self::Dnf => "System Packages (DNF)",
+            Self::RpmOstree => "System Image (rpm-ostree)",
             Self::FlatpakUser | Self::FlatpakSystem => "Flatpak Apps",
             Self::GnomeExtensions => "GNOME Shell Extensions",
             Self::Homebrew => "Homebrew (brew)",
@@ -160,7 +174,7 @@ impl UpdateSource {
 
     pub fn requires_root(self) -> bool {
         match self {
-            Self::Dnf | Self::Firmware => true,
+            Self::Dnf | Self::RpmOstree | Self::Firmware => true,
             Self::FlatpakUser
             | Self::FlatpakSystem
             | Self::GnomeExtensions
@@ -169,9 +183,10 @@ impl UpdateSource {
     }
 
     /// True when individual items from this source can be selectively applied.
-    /// Future atomic/toolchain sources may override to `false`.
+    /// Atomic `rpm-ostree` deployments apply together as a single unit.
     pub fn supports_selective_apply(self) -> bool {
         match self {
+            Self::RpmOstree => false,
             Self::Dnf
             | Self::FlatpakUser
             | Self::FlatpakSystem
@@ -181,17 +196,46 @@ impl UpdateSource {
         }
     }
 
-    /// True for core Fedora sources expected on standard installations by default.
-    /// Optional or desktop-specific sources remain hidden until detected or populated.
-    pub fn installed_by_default(self) -> bool {
-        !matches!(self, Self::GnomeExtensions | Self::Homebrew)
+    /// True when this source applies to the current host OS mode (classic vs OSTree).
+    pub fn is_applicable_for_host(self, ostree_booted: bool) -> bool {
+        match self {
+            Self::Dnf => !ostree_booted,
+            Self::RpmOstree => ostree_booted,
+            Self::FlatpakUser
+            | Self::FlatpakSystem
+            | Self::GnomeExtensions
+            | Self::Homebrew
+            | Self::Firmware => true,
+        }
     }
 
-    /// Deduplicated preference-level sources preserving canonical order.
+    /// True for core Fedora sources expected on classic installations by default.
+    pub fn installed_by_default(self) -> bool {
+        self.installed_by_default_for_host(false)
+    }
+
+    /// True for core Fedora sources expected by default on the given host OS mode.
+    pub fn installed_by_default_for_host(self, ostree_booted: bool) -> bool {
+        self.is_applicable_for_host(ostree_booted)
+            && !matches!(self, Self::GnomeExtensions | Self::Homebrew)
+    }
+
+    /// Deduplicated preference-level sources for classic hosts preserving canonical order.
     pub fn pref_sources() -> Vec<UpdateSource> {
+        Self::pref_sources_for_host(false)
+    }
+
+    /// Deduplicated preference-level sources for the given host OS mode.
+    pub fn pref_sources_for_host(ostree_booted: bool) -> Vec<UpdateSource> {
         let mut out = Vec::new();
         for &src in Self::ALL {
-            if !out.iter().any(|existing: &UpdateSource| existing.pref_key() == src.pref_key()) {
+            if !src.is_applicable_for_host(ostree_booted) {
+                continue;
+            }
+            if !out
+                .iter()
+                .any(|existing: &UpdateSource| existing.pref_key() == src.pref_key())
+            {
                 out.push(src);
             }
         }
@@ -205,6 +249,7 @@ impl UpdateSource {
     pub fn badge(self) -> &'static str {
         match self {
             Self::Dnf => "DNF",
+            Self::RpmOstree => "OSTREE",
             Self::FlatpakUser => "FP",
             Self::FlatpakSystem => "FP",
             Self::GnomeExtensions => "EXT",
@@ -216,6 +261,7 @@ impl UpdateSource {
     pub fn css_class(self) -> &'static str {
         match self {
             Self::Dnf => "src-dnf",
+            Self::RpmOstree => "src-ostree",
             Self::FlatpakUser | Self::FlatpakSystem => "src-flatpak",
             Self::GnomeExtensions => "src-ext",
             Self::Homebrew => "src-brew",
@@ -226,6 +272,7 @@ impl UpdateSource {
     pub fn console_tag(self) -> &'static str {
         match self {
             Self::Dnf => "dnf",
+            Self::RpmOstree => "rpm-ostree",
             Self::FlatpakUser => "flatpak-user",
             Self::FlatpakSystem => "flatpak-system",
             Self::GnomeExtensions => "gnome-ext",
@@ -234,10 +281,10 @@ impl UpdateSource {
         }
     }
 
-    /// Apply order: DNF → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Firmware.
+    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Firmware.
     pub fn apply_order(self) -> u8 {
         match self {
-            Self::Dnf => 0,
+            Self::Dnf | Self::RpmOstree => 0,
             Self::FlatpakUser => 1,
             Self::FlatpakSystem => 2,
             Self::GnomeExtensions => 3,
@@ -515,6 +562,62 @@ impl Package {
             source: UpdateSource::Homebrew,
             detail: format!("{version} · {tap} · {kind}"),
             summary: None,
+            url: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
+            preflight_warning: None,
+        }
+    }
+
+    /// Construct an Atomic Fedora (`rpm-ostree`) deployment package or image update item.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_rpm_ostree(
+        kind: &str,
+        name: impl Into<String>,
+        arch: impl Into<String>,
+        old_version: Option<String>,
+        version: impl Into<String>,
+        repo: impl Into<String>,
+        detail: impl Into<String>,
+        summary: Option<String>,
+    ) -> Self {
+        let name = name.into().trim().to_string();
+        let arch = arch.into().trim().to_string();
+        let version = version.into().trim().to_string();
+        let raw_repo = repo.into();
+        let repo = if raw_repo.trim().is_empty() {
+            "fedora-ostree".to_string()
+        } else {
+            raw_repo.trim().to_string()
+        };
+        let old_version = old_version
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let kind_clean = kind.trim().to_ascii_lowercase();
+        let id_ver = if version == "removed" {
+            old_version.as_deref().unwrap_or("removed")
+        } else {
+            version.as_str()
+        };
+        let id = if arch.is_empty() {
+            format!("rpm-ostree:{kind_clean}:{name}:{id_ver}")
+        } else {
+            format!("rpm-ostree:{kind_clean}:{name}.{arch}:{id_ver}")
+        };
+        Self {
+            id,
+            name,
+            arch,
+            version,
+            repo,
+            size_bytes: None,
+            old_version,
+            status: PackageStatus::Pending,
+            source: UpdateSource::RpmOstree,
+            detail: detail.into().trim().to_string(),
+            summary: summary
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             url: None,
             install_size_delta: None,
             advisories: Vec::new(),
@@ -1384,6 +1487,7 @@ mod tests {
             UpdateSource::all_sources(),
             &[
                 UpdateSource::Dnf,
+                UpdateSource::RpmOstree,
                 UpdateSource::FlatpakUser,
                 UpdateSource::FlatpakSystem,
                 UpdateSource::GnomeExtensions,
@@ -1392,6 +1496,7 @@ mod tests {
             ]
         );
         assert_eq!(UpdateSource::Dnf.category(), SourceCategory::System);
+        assert_eq!(UpdateSource::RpmOstree.category(), SourceCategory::System);
         assert_eq!(UpdateSource::FlatpakUser.category(), SourceCategory::Apps);
         assert_eq!(UpdateSource::FlatpakSystem.category(), SourceCategory::Apps);
         assert_eq!(
@@ -1405,6 +1510,7 @@ mod tests {
         assert_eq!(UpdateSource::Firmware.category(), SourceCategory::Firmware);
 
         assert_eq!(UpdateSource::Dnf.pref_key(), "dnf");
+        assert_eq!(UpdateSource::RpmOstree.pref_key(), "rpm-ostree");
         assert_eq!(UpdateSource::FlatpakUser.pref_key(), "flatpak");
         assert_eq!(UpdateSource::FlatpakSystem.pref_key(), "flatpak");
         assert_eq!(UpdateSource::GnomeExtensions.pref_key(), "gnome-extensions");
@@ -1412,6 +1518,7 @@ mod tests {
         assert_eq!(UpdateSource::Firmware.pref_key(), "firmware");
 
         assert!(UpdateSource::Dnf.requires_root());
+        assert!(UpdateSource::RpmOstree.requires_root());
         assert!(!UpdateSource::FlatpakUser.requires_root());
         assert!(!UpdateSource::FlatpakSystem.requires_root());
         assert!(!UpdateSource::GnomeExtensions.requires_root());
@@ -1419,14 +1526,35 @@ mod tests {
         assert!(UpdateSource::Firmware.requires_root());
 
         assert!(UpdateSource::Dnf.installed_by_default());
+        assert!(!UpdateSource::RpmOstree.installed_by_default());
+        assert!(!UpdateSource::Dnf.installed_by_default_for_host(true));
+        assert!(UpdateSource::RpmOstree.installed_by_default_for_host(true));
         assert!(UpdateSource::FlatpakUser.installed_by_default());
         assert!(UpdateSource::FlatpakSystem.installed_by_default());
         assert!(!UpdateSource::GnomeExtensions.installed_by_default());
         assert!(!UpdateSource::Homebrew.installed_by_default());
         assert!(UpdateSource::Firmware.installed_by_default());
 
+        assert_eq!(
+            SourceCategory::System.sidebar_label_for_host(false),
+            "System · DNF"
+        );
+        assert_eq!(
+            SourceCategory::System.sidebar_label_for_host(true),
+            "System · Atomic"
+        );
+        assert_eq!(SourceCategory::System.dot_css_class_for_host(false), "src-dnf");
+        assert_eq!(
+            SourceCategory::System.dot_css_class_for_host(true),
+            "src-ostree"
+        );
+        assert_eq!(UpdateSource::RpmOstree.badge(), "OSTREE");
+        assert_eq!(UpdateSource::RpmOstree.css_class(), "src-ostree");
+        assert_eq!(UpdateSource::RpmOstree.console_tag(), "rpm-ostree");
+        assert_eq!(UpdateSource::RpmOstree.apply_order(), 0);
+
         for &src in UpdateSource::all_sources() {
-            assert!(src.supports_selective_apply());
+            assert_eq!(src.supports_selective_apply(), src != UpdateSource::RpmOstree);
             assert!(!src.pref_title().is_empty());
         }
 
@@ -1434,6 +1562,16 @@ mod tests {
             UpdateSource::pref_sources(),
             vec![
                 UpdateSource::Dnf,
+                UpdateSource::FlatpakUser,
+                UpdateSource::GnomeExtensions,
+                UpdateSource::Homebrew,
+                UpdateSource::Firmware,
+            ]
+        );
+        assert_eq!(
+            UpdateSource::pref_sources_for_host(true),
+            vec![
+                UpdateSource::RpmOstree,
                 UpdateSource::FlatpakUser,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,

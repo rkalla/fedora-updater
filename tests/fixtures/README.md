@@ -101,3 +101,14 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `gnome_extensions/list_extensions_mixed.json` | `org.gnome.Shell.Extensions.ListExtensions` | Mixed system RPM (`type: 1` with/without `hasUpdate: true`, both skipped), up-to-date user (`type: 2`, `hasUpdate: false`), full-metadata updateable user extension, float `version: 54.0` + distinct `version-name`, and minimal extension omitting optional fields |
 | `gnome_extensions/list_extensions_empty.json` | `org.gnome.Shell.Extensions.ListExtensions` | System extension + up-to-date user extension yielding zero extension updates |
 | `gnome_extensions/install_replies.json` | `org.gnome.Shell.Extensions.InstallRemoteExtension` | Canonical reply cases: `"successful"`, `"cancelled"`, `"error"`, and session D-Bus timeout error |
+
+### `rpm_ostree/` (6 fixtures)
+
+| File | Simulated Command & Exit | Scenario & Edge-Case Signals |
+|---|---|---|
+| `rpm_ostree/upgrade_check_diff.txt` | `rpm-ostree upgrade --check` (exit 0) | Pending Silverblue deployment with `Version:`, `Commit:`, `SecAdvisories:`, `Diff:`, `Upgraded:`, `Downgraded:`, `Added:`, and `Removed:` entries |
+| `rpm_ostree/upgrade_check_none.txt` | `rpm-ostree upgrade --check` (exit 77) | Clean `No upgrade available.` response handled as zero pending updates |
+| `rpm_ostree/upgrade_check_oci.txt` | `rpm-ostree upgrade --check` (exit 0) | Image-mode OCI digest deployment (`Digest: sha256:...`, `Version:`) without per-RPM diff sections |
+| `rpm_ostree/status.json` | `rpm-ostree status --json` (exit 0) | Silverblue deployment metadata (`booted: true`, layered `htop`/`distrobox`, `origin`, and `cached-update`) |
+| `rpm_ostree/upgrade_apply_log.txt` | `rpm-ostree upgrade` (exit 0) | Full staged apply stream (`Receiving metadata objects`, `Receiving objects: N%`, `Checking out tree`, `Overlaying`, `Writing OSTree commit`, `Staging deployment... done`, `systemctl reboot`) |
+| `rpm_ostree/upgrade_error.txt` | `rpm-ostree upgrade` (exit 1) | Active daemon transaction lock (`Transaction in progress; please wait or run rpm-ostree cancel`) |

@@ -805,6 +805,8 @@ fn should_enter_apply(label: &str, status: Option<PackageStatus>, package: Optio
         || label_l.contains("scriptlet")
         || label_l.contains("cleanup")
         || label_l.contains("verif")
+        || label_l.contains("staging")
+        || label_l.contains("writing ostree")
     {
         return true;
     }
@@ -891,6 +893,8 @@ mod tests {
         assert!(should_enter_apply("Cleanup", None, None));
         assert!(should_enter_apply("Verifying", None, None));
         assert!(should_enter_apply("Installing firmware", None, None));
+        assert!(should_enter_apply("Staging deployment", None, None));
+        assert!(should_enter_apply("Writing OSTree commit", None, None));
 
         // Named packages enter apply on install/upgrade labels or apply statuses.
         assert!(should_enter_apply(

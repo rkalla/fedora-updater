@@ -21,6 +21,12 @@ use fedora_updater::backend::fwupd::{
 use fedora_updater::backend::gnome_extensions::{
     extension_uuids_from_packages, interpret_install_reply, parse_extensions_json,
 };
+use fedora_updater::backend::rpm_ostree::{
+    check_exit_is_hard_error as rpm_ostree_exit_is_hard_error,
+    check_exit_is_no_updates as rpm_ostree_exit_is_no_updates,
+    detect_reboot_needed as rpm_ostree_detect_reboot, parse_progress_line as parse_rpm_ostree_progress,
+    parse_status_json, parse_upgrade_check,
+};
 use fedora_updater::backend::{detect_reboot, parse_progress, ProgressHint};
 use fedora_updater::model::{total_download_bytes, Package, PackageStatus, UpdateSource};
 use fedora_updater::release_upgrade::{
@@ -526,4 +532,69 @@ fn gnome_extensions_fixtures_cover_filtering_metadata_and_install_replies() {
             );
         }
     }
+}
+
+#[test]
+fn rpm_ostree_fixtures_cover_status_diff_oci_progress_and_errors() {
+    let status = parse_status_json(&read_fixture("rpm_ostree/status.json"))
+        .expect("status.json parses");
+    let booted = status.booted_deployment().expect("booted deployment");
+    assert_eq!(booted.version.as_deref(), Some("44.20261120.0"));
+    assert!(booted.is_layered_package("htop"));
+    assert!(!booted.is_layered_package("kernel"));
+
+    let diff_raw = read_fixture("rpm_ostree/upgrade_check_diff.txt");
+    let diff_pkgs =
+        parse_upgrade_check(&diff_raw, Some(&status)).expect("upgrade_check_diff.txt parses");
+    assert_eq!(diff_pkgs.len(), 7);
+    assert!(diff_pkgs
+        .iter()
+        .all(|p| p.source == UpdateSource::RpmOstree && !p.source.supports_selective_apply()));
+
+    let kernel = diff_pkgs.iter().find(|p| p.name == "kernel").expect("kernel");
+    assert_eq!(kernel.old_version.as_deref(), Some("6.14.10-300.fc44"));
+    assert_eq!(kernel.version, "6.14.11-300.fc44");
+    assert_eq!(kernel.arch, "x86_64");
+    assert_eq!(kernel.advisories.len(), 1);
+    assert_eq!(kernel.advisories[0].id, "FEDORA-2026-11a2bc");
+
+    let htop = diff_pkgs.iter().find(|p| p.name == "htop").expect("htop");
+    assert!(htop.detail.to_ascii_lowercase().contains("layered"), "{}", htop.detail);
+
+    assert!(diff_pkgs.iter().any(|p| p.name == "fastfetch" && p.detail.contains("Added")));
+    assert!(diff_pkgs.iter().any(|p| p.name == "neofetch" && p.detail.contains("Removed")));
+    assert!(diff_pkgs.iter().any(|p| p.name == "curl" && p.detail.contains("Downgraded")));
+
+    let none_raw = read_fixture("rpm_ostree/upgrade_check_none.txt");
+    assert!(rpm_ostree_exit_is_no_updates(77, &none_raw));
+    assert!(parse_upgrade_check(&none_raw, Some(&status))
+        .expect("no-updates check parses cleanly")
+        .is_empty());
+
+    let oci_raw = read_fixture("rpm_ostree/upgrade_check_oci.txt");
+    let oci_pkgs = parse_upgrade_check(&oci_raw, None).expect("upgrade_check_oci.txt parses");
+    assert_eq!(oci_pkgs.len(), 1);
+    assert_eq!(oci_pkgs[0].version, "44.20261124.0");
+    assert!(oci_pkgs[0]
+        .summary
+        .as_deref()
+        .unwrap_or("")
+        .contains("sha256:9f86d081884c"));
+
+    let apply_raw = read_fixture("rpm_ostree/upgrade_apply_log.txt");
+    let recv_hint = parse_rpm_ostree_progress("Receiving objects: 42% (84/200) 8.5 MB/s");
+    assert_eq!(recv_hint.status, Some(PackageStatus::Downloading));
+    assert_eq!(recv_hint.progress, Some(0.42));
+    let commit_hint = parse_progress(UpdateSource::RpmOstree, "Writing OSTree commit... done");
+    assert_eq!(commit_hint.phase_label.as_deref(), Some("Writing OSTree commit"));
+    let staged_hint = parse_rpm_ostree_progress("Staging deployment... done");
+    assert_eq!(staged_hint.phase_label.as_deref(), Some("Deployment staged"));
+    assert_eq!(staged_hint.progress, Some(1.0));
+    assert!(rpm_ostree_detect_reboot(&apply_raw, &diff_pkgs));
+    assert!(detect_reboot(UpdateSource::RpmOstree, &apply_raw, &diff_pkgs));
+    assert!(!rpm_ostree_detect_reboot(&none_raw, &[]));
+
+    let err_raw = read_fixture("rpm_ostree/upgrade_error.txt");
+    assert!(rpm_ostree_exit_is_hard_error(1, &err_raw, &[]));
+    assert!(!rpm_ostree_detect_reboot(&err_raw, &diff_pkgs));
 }

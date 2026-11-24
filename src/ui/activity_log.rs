@@ -68,7 +68,7 @@ pub fn parse_log_tag(line: &str) -> Option<&str> {
 pub fn line_matches_source(line: &str, filter: LogSourceFilter) -> bool {
     match filter {
         LogSourceFilter::All => true,
-        LogSourceFilter::Dnf => matches!(parse_log_tag(line), Some("dnf")),
+        LogSourceFilter::Dnf => matches!(parse_log_tag(line), Some("dnf" | "rpm-ostree")),
         LogSourceFilter::Flatpak => {
             matches!(
                 parse_log_tag(line),
@@ -159,6 +159,7 @@ pub(super) fn apply_text_buffer_delta(buffer: &gtk::TextBuffer, delta: ConsoleDe
 pub struct ActivityLogView {
     root: gtk::Box,
     source_toggles: libadwaita::ToggleGroup,
+    system_toggle: libadwaita::Toggle,
     search_entry: gtk::SearchEntry,
     copy_btn: gtk::Button,
     content_stack: gtk::Stack,
@@ -185,6 +186,7 @@ impl ActivityLogView {
         bar.set_margin_end(14);
 
         let source_toggles = libadwaita::ToggleGroup::new();
+        let mut system_toggle = None;
         for (name, label) in [
             ("all", "All"),
             ("dnf", "DNF"),
@@ -194,8 +196,12 @@ impl ActivityLogView {
             ("fwupd", "fwupd"),
         ] {
             let toggle = libadwaita::Toggle::builder().name(name).label(label).build();
+            if name == "dnf" {
+                system_toggle = Some(toggle.clone());
+            }
             source_toggles.add(toggle);
         }
+        let system_toggle = system_toggle.expect("dnf/system toggle present");
         source_toggles.set_active_name(Some("all"));
 
         let search_entry = gtk::SearchEntry::builder()
@@ -274,6 +280,7 @@ impl ActivityLogView {
         Self {
             root,
             source_toggles,
+            system_toggle,
             search_entry,
             copy_btn,
             content_stack,
@@ -285,6 +292,16 @@ impl ActivityLogView {
             matched_count: Rc::new(Cell::new(0)),
             total_count: Rc::new(Cell::new(0)),
         }
+    }
+
+    pub fn set_ostree_mode(&self, ostree: bool) {
+        self.system_toggle
+            .set_label(Some(if ostree { "OSTree" } else { "DNF" }));
+    }
+
+    #[cfg(test)]
+    pub fn system_toggle_label(&self) -> Option<String> {
+        self.system_toggle.label().map(|s| s.to_string())
     }
 
     pub fn root(&self) -> &gtk::Box {
@@ -509,6 +526,15 @@ mod tests {
             filter_console_lines(&console, LogSourceFilter::Dnf, "openssl");
         assert_eq!((dnf_m, dnf_t), (1, 8));
         assert_eq!(dnf_text, "[dnf] [1/2] openssl 100%");
+
+        assert!(line_matches_source(
+            "[rpm-ostree] Booted deployment: fedora-ostree",
+            LogSourceFilter::Dnf
+        ));
+        assert_eq!(
+            parse_log_tag("[rpm-ostree] Staging deployment... done"),
+            Some("rpm-ostree")
+        );
 
         let (fp_text, fp_m, fp_t) =
             filter_console_lines(&console, LogSourceFilter::Flatpak, "");

@@ -65,6 +65,13 @@ pub const ALL_FIXTURES: &[&str] = &[
     "gnome_extensions/list_extensions_mixed.json",
     "gnome_extensions/list_extensions_empty.json",
     "gnome_extensions/install_replies.json",
+    // rpm_ostree/
+    "rpm_ostree/upgrade_check_diff.txt",
+    "rpm_ostree/upgrade_check_none.txt",
+    "rpm_ostree/upgrade_check_oci.txt",
+    "rpm_ostree/status.json",
+    "rpm_ostree/upgrade_apply_log.txt",
+    "rpm_ostree/upgrade_error.txt",
 ];
 
 #[derive(Debug, Clone)]

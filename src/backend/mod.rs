@@ -9,6 +9,7 @@ pub mod fwupd;
 pub mod fwupd_dbus;
 pub mod gnome_extensions;
 pub mod logind;
+pub mod rpm_ostree;
 
 use crate::model::{Package, PackageStatus, UpdateSource};
 
@@ -37,6 +38,7 @@ pub struct ProgressHint {
 pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
     match source {
         UpdateSource::Dnf => dnf::parse_progress_line(line),
+        UpdateSource::RpmOstree => rpm_ostree::parse_progress_line(line),
         UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
             flatpak::parse_progress_line(line)
         }
@@ -49,6 +51,7 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
 pub fn detect_reboot(source: UpdateSource, log: &str, packages: &[Package]) -> bool {
     match source {
         UpdateSource::Dnf => dnf::detect_reboot_needed(log, packages),
+        UpdateSource::RpmOstree => rpm_ostree::detect_reboot_needed(log, packages),
         UpdateSource::FlatpakUser
         | UpdateSource::FlatpakSystem
         | UpdateSource::GnomeExtensions
@@ -98,6 +101,15 @@ mod tests {
         let fw_hint = parse_progress(UpdateSource::Firmware, "Writing… Percentage=60");
         assert_eq!(fw_hint.phase_label.as_deref(), Some("Installing firmware"));
         assert_eq!(fw_hint.progress, Some(0.6));
+
+        let ostree_hint = parse_progress(
+            UpdateSource::RpmOstree,
+            "Receiving objects: 65% (130/200) 10.2 MB/s",
+        );
+        assert_eq!(ostree_hint.status, Some(PackageStatus::Downloading));
+        assert_eq!(ostree_hint.progress, Some(0.65));
+        assert_eq!(ostree_hint.stage_current, Some(2));
+        assert_eq!(ostree_hint.stage_total, Some(5));
 
         let brew_hint = parse_progress(
             UpdateSource::Homebrew,
@@ -151,6 +163,17 @@ mod tests {
         assert!(!detect_reboot(
             UpdateSource::Firmware,
             "Successfully installed firmware",
+            &[]
+        ));
+
+        assert!(detect_reboot(
+            UpdateSource::RpmOstree,
+            "Staging deployment... done\nRun \"systemctl reboot\" to start a reboot",
+            &[]
+        ));
+        assert!(!detect_reboot(
+            UpdateSource::RpmOstree,
+            "No upgrade available.",
             &[]
         ));
     }

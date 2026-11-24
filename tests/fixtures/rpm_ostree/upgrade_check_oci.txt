@@ -1,0 +1,4 @@
+AvailableUpdate:
+  Version: 44.20261124.0 (2026-11-24T05:00:00Z)
+  Timestamp: 2026-11-24T05:00:00Z
+  Digest: sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
