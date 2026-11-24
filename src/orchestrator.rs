@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use async_channel::Sender;
 
 use crate::backend::{
-    self, brew, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, logind, ProgressHint,
+    self, brew, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, gnome_extensions, logind, ProgressHint,
 };
 pub use crate::backend::NativeOutcome;
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
@@ -101,9 +101,15 @@ fn command_exists(program: &str) -> bool {
 pub fn probe_source_availability(
     native_dnf: bool,
     native_fwupd: bool,
+    gnome_ext_available: bool,
 ) -> BTreeMap<String, SourceAvailability> {
     let brew_bin = brew::find_brew_binary();
-    probe_source_availability_with(native_dnf, native_fwupd, brew_bin.as_deref())
+    probe_source_availability_with(
+        native_dnf,
+        native_fwupd,
+        brew_bin.as_deref(),
+        gnome_ext_available,
+    )
 }
 
 /// Injectable variant of [`probe_source_availability`] for deterministic offline tests.
@@ -111,6 +117,7 @@ pub fn probe_source_availability_with(
     native_dnf: bool,
     native_fwupd: bool,
     brew_bin: Option<&Path>,
+    gnome_ext_available: bool,
 ) -> BTreeMap<String, SourceAvailability> {
     let mut map = BTreeMap::new();
     let dnf_cli = command_exists("dnf");
@@ -151,6 +158,19 @@ pub fn probe_source_availability_with(
         Some(path) => format!("Installed ({})", path.display()),
         None => "Not installed".into(),
     };
+    map.insert(
+        "gnome-extensions".into(),
+        SourceAvailability {
+            pref_key: "gnome-extensions",
+            installed: gnome_ext_available,
+            subtitle: if gnome_ext_available {
+                "Available (session D-Bus)".into()
+            } else {
+                "Not available (requires GNOME Shell)".into()
+            },
+        },
+    );
+
     map.insert(
         "homebrew".into(),
         SourceAvailability {
@@ -388,6 +408,25 @@ pub trait OrchestratorRuntime: Send + 'static {
     fn brew_available(&self) -> bool {
         self.brew_binary().is_some()
     }
+    fn gnome_extensions_available(&self) -> bool {
+        false
+    }
+    fn check_gnome_extensions(&self, _on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        NativeOutcome::Unavailable(
+            "GNOME Shell Extensions D-Bus unavailable in test runtime".into(),
+        )
+    }
+    fn apply_gnome_extensions(
+        &self,
+        _uuids: &[String],
+        _cancel: &WorkCancel,
+        _on_line: &mut dyn FnMut(String),
+        _on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<gnome_extensions::GnomeExtensionsApplyOutcome> {
+        NativeOutcome::Unavailable(
+            "GNOME Shell Extensions D-Bus unavailable in test runtime".into(),
+        )
+    }
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String>;
     fn apply_flatpak_native(
         &self,
@@ -508,6 +547,24 @@ impl OrchestratorRuntime for SystemRuntime {
 
     fn brew_binary(&self) -> Option<PathBuf> {
         brew::find_brew_binary()
+    }
+
+    fn gnome_extensions_available(&self) -> bool {
+        gnome_extensions::is_available()
+    }
+
+    fn check_gnome_extensions(&self, on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        gnome_extensions::check_updates(on_line)
+    }
+
+    fn apply_gnome_extensions(
+        &self,
+        uuids: &[String],
+        cancel: &WorkCancel,
+        on_line: &mut dyn FnMut(String),
+        on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<gnome_extensions::GnomeExtensionsApplyOutcome> {
+        gnome_extensions::apply_gnome_extensions(uuids, cancel, on_line, on_progress)
     }
 
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String> {
@@ -867,7 +924,28 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
         );
     }
 
-    // 4) Homebrew — unprivileged user-space check when detected and enabled.
+    // 4) GNOME Shell Extensions — unprivileged session D-Bus check when active and enabled.
+    if config.is_enabled(UpdateSource::GnomeExtensions) && runtime.gnome_extensions_available() {
+        if !ch.is_current() {
+            return;
+        }
+        if let NativeOutcome::Handled(ext_res) =
+            runtime.check_gnome_extensions(&mut |l| ch.line("gnome-ext", l))
+        {
+            if !ch.is_current() {
+                return;
+            }
+            emit_backend_check(
+                &ch,
+                UpdateSource::GnomeExtensions,
+                ext_res,
+                &mut all,
+                &mut soft_errors,
+            );
+        }
+    }
+
+    // 5) Homebrew — unprivileged user-space check when detected and enabled.
     if config.is_enabled(UpdateSource::Homebrew) {
         if let Some(brew_bin) = brew_program(runtime) {
             if !ch.is_current() {
@@ -1475,6 +1553,82 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                                 let (c, l) =
                                     run_local_apply(&ch, runtime, "flatpak", &arg_refs, tag, source);
                                 (c, l, false)
+                            }
+                        }
+                    }
+                }
+            }
+            UpdateSource::GnomeExtensions => {
+                if mode == ApplyMode::DownloadOnly {
+                    ch.line(
+                        tag,
+                        "Skipping GNOME Shell extension install during Download Only mode.".into(),
+                    );
+                    (0, String::new(), false)
+                } else if mode == ApplyMode::OfflineOnReboot {
+                    ch.line(
+                        tag,
+                        "Skipping GNOME Shell extensions during offline reboot transaction (apply live instead)."
+                            .into(),
+                    );
+                    (0, String::new(), false)
+                } else {
+                    let uuids = gnome_extensions::extension_uuids_from_packages(&packages);
+                    if uuids.is_empty() {
+                        (0, String::new(), false)
+                    } else {
+                        let work_cancel = ch.cancel.work_cancel();
+                        let mut native_log = String::new();
+                        let outcome = runtime.apply_gnome_extensions(
+                            &uuids,
+                            &work_cancel,
+                            &mut |l| {
+                                native_log.push_str(&l);
+                                native_log.push('\n');
+                                ch.line(tag, l);
+                            },
+                            &mut |hint| emit_progress_hint(&ch, source, hint),
+                        );
+                        match outcome {
+                            NativeOutcome::Handled(Ok(res)) => {
+                                if res.cancelled || !ch.is_current() {
+                                    return;
+                                }
+                                if res.completed > 0 {
+                                    let note = crate::presenter::GNOME_EXT_RELOGIN_NOTE;
+                                    native_log.push_str(note);
+                                    native_log.push('\n');
+                                    ch.line(tag, note.to_string());
+                                }
+                                if res.failed > 0 {
+                                    if res.errors.is_empty() {
+                                        let msg = format!(
+                                            "{} GNOME Shell extension update(s) failed",
+                                            res.failed
+                                        );
+                                        log_native_apply_error(&ch, tag, &mut native_log, &msg);
+                                    } else {
+                                        for err in &res.errors {
+                                            log_native_apply_error(&ch, tag, &mut native_log, err);
+                                        }
+                                    }
+                                    (1, native_log, false)
+                                } else {
+                                    (0, native_log, false)
+                                }
+                            }
+                            NativeOutcome::Handled(Err(reason)) => {
+                                log_native_apply_error(&ch, tag, &mut native_log, &reason);
+                                (1, native_log, false)
+                            }
+                            NativeOutcome::Unavailable(reason) => {
+                                let msg = if reason.trim().is_empty() {
+                                    "GNOME Shell Extensions D-Bus service is unavailable".to_string()
+                                } else {
+                                    reason
+                                };
+                                log_native_apply_error(&ch, tag, &mut native_log, &msg);
+                                (-1, native_log, false)
                             }
                         }
                     }
@@ -2314,18 +2468,21 @@ mod tests {
         assert!(!cfg.is_enabled(UpdateSource::FlatpakUser));
         assert!(!cfg.is_enabled(UpdateSource::FlatpakSystem));
         assert!(cfg.is_enabled(UpdateSource::Dnf));
+        assert!(cfg.is_enabled(UpdateSource::GnomeExtensions));
         assert!(cfg.is_enabled(UpdateSource::Homebrew));
         assert!(cfg.is_enabled(UpdateSource::Firmware));
         assert_eq!(
             cfg.enabled_sources(),
             vec![
                 UpdateSource::Dnf,
+                UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
                 UpdateSource::Firmware,
             ]
         );
 
         cfg.disable("dnf");
+        cfg.disable("gnome-extensions");
         cfg.disable("homebrew");
         cfg.disable("firmware");
         assert!(cfg.all_disabled());
@@ -2341,6 +2498,7 @@ mod tests {
         let from_keys = SourceConfig::from_disabled_keys([" ".into(), "Firmware".into()]);
         assert!(!from_keys.is_enabled(UpdateSource::Firmware));
         assert!(from_keys.is_enabled(UpdateSource::Dnf));
+        assert!(from_keys.is_enabled(UpdateSource::GnomeExtensions));
         assert!(from_keys.is_enabled(UpdateSource::Homebrew));
     }
 
@@ -2357,25 +2515,39 @@ mod tests {
             }
         }
 
-        let probed_no_brew = probe_source_availability_with(true, false, None);
+        let probed_no_brew = probe_source_availability_with(true, false, None, false);
         assert_eq!(
             probed_no_brew.get("dnf").map(|s| s.subtitle.as_str()),
             Some("Installed (dnf5daemon D-Bus)")
         );
         assert!(probed_no_brew.get("dnf").unwrap().installed);
         assert!(probed_no_brew.contains_key("flatpak"));
+        assert!(!probed_no_brew.get("gnome-extensions").unwrap().installed);
+        assert_eq!(
+            probed_no_brew.get("gnome-extensions").unwrap().subtitle,
+            "Not available (requires GNOME Shell)"
+        );
         assert!(!probed_no_brew.get("homebrew").unwrap().installed);
         assert_eq!(probed_no_brew.get("homebrew").unwrap().subtitle, "Not installed");
         assert!(probed_no_brew.contains_key("firmware"));
 
-        let probed_with_brew = probe_source_availability_with(
+        let probed_with_brew_and_ext = probe_source_availability_with(
             true,
             false,
             Some(std::path::Path::new(brew::LINUXBREW_SYSTEM_PATH)),
+            true,
         );
-        assert!(probed_with_brew.get("homebrew").unwrap().installed);
+        assert!(probed_with_brew_and_ext.get("gnome-extensions").unwrap().installed);
         assert_eq!(
-            probed_with_brew.get("homebrew").unwrap().subtitle,
+            probed_with_brew_and_ext
+                .get("gnome-extensions")
+                .unwrap()
+                .subtitle,
+            "Available (session D-Bus)"
+        );
+        assert!(probed_with_brew_and_ext.get("homebrew").unwrap().installed);
+        assert_eq!(
+            probed_with_brew_and_ext.get("homebrew").unwrap().subtitle,
             "Installed (/home/linuxbrew/.linuxbrew/bin/brew)"
         );
     }

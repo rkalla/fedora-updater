@@ -1,0 +1,16 @@
+{
+  "apps-menu@gnome-shell-extensions.gcampax.github.com": {
+    "uuid": "apps-menu@gnome-shell-extensions.gcampax.github.com",
+    "name": "Applications Menu",
+    "type": 1,
+    "version": 60,
+    "hasUpdate": true
+  },
+  "dash-to-dock@micxgx.gmail.com": {
+    "uuid": "dash-to-dock@micxgx.gmail.com",
+    "name": "Dash to Dock",
+    "type": 2,
+    "version": 99,
+    "hasUpdate": false
+  }
+}

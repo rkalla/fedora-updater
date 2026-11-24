@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 45, "expected 45 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 48, "expected 48 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(
@@ -318,4 +318,29 @@ fn brew_fixtures_contain_expected_signals() {
     let upgrade_err = read_fixture("brew/upgrade_error.txt");
     assert!(upgrade_err.contains("🍺"));
     assert!(upgrade_err.contains("Error: fd: SHA256 mismatch"));
+}
+
+#[test]
+fn gnome_extensions_fixtures_contain_expected_signals() {
+    let mixed = read_fixture_value("gnome_extensions/list_extensions_mixed.json");
+    assert_eq!(mixed["system-rpm-ext@redhat.com"]["type"], 1);
+    assert_eq!(mixed["system-rpm-ext@redhat.com"]["hasUpdate"], true);
+    assert_eq!(mixed["gsconnect@andyholmes.github.io"]["type"], 2);
+    assert_eq!(mixed["gsconnect@andyholmes.github.io"]["hasUpdate"], false);
+    assert_eq!(mixed["blur-my-shell@aunetx"]["type"], 2);
+    assert_eq!(mixed["blur-my-shell@aunetx"]["hasUpdate"], true);
+    assert!(mixed["minimal@example.org"].get("name").is_none());
+
+    let empty = read_fixture_value("gnome_extensions/list_extensions_empty.json");
+    assert_eq!(
+        empty["apps-menu@gnome-shell-extensions.gcampax.github.com"]["type"],
+        1
+    );
+    assert_eq!(
+        empty["dash-to-dock@micxgx.gmail.com"]["hasUpdate"],
+        false
+    );
+
+    let replies = read_fixture_value("gnome_extensions/install_replies.json");
+    assert_eq!(replies["replies"].as_array().map(Vec::len), Some(4));
 }

@@ -533,6 +533,7 @@ pub fn package_from_device_and_release(
         source: UpdateSource::Firmware,
         detail,
         summary,
+        url: None,
         install_size_delta: None,
         advisories: Vec::new(),
         preflight_warning,

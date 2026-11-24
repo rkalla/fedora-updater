@@ -61,6 +61,10 @@ pub const ALL_FIXTURES: &[&str] = &[
     "systemctl/logind_inhibitors.json",
     "systemctl/reboot_block_inhibitor.txt",
     "systemctl/reboot_logind_error.txt",
+    // gnome_extensions/
+    "gnome_extensions/list_extensions_mixed.json",
+    "gnome_extensions/list_extensions_empty.json",
+    "gnome_extensions/install_replies.json",
 ];
 
 #[derive(Debug, Clone)]

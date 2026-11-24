@@ -17,7 +17,7 @@ use libadwaita::{
     ToolbarStyle, ToolbarView, WindowTitle,
 };
 
-use fedora_updater::backend::{dnf, dnf_dbus, fwupd_dbus};
+use fedora_updater::backend::{dnf, dnf_dbus, fwupd_dbus, gnome_extensions};
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
     ApplyMode, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
@@ -31,12 +31,13 @@ use fedora_updater::orchestrator::{
 };
 use fedora_updater::presenter::{
     about_time_left, activity_log_subtitle, apply_cta_label, cache_activity_note,
-    check_progress_for_sources, checking_footnote_of, done_clean_summary,
-    done_header_subtitle_for_packages, fail_retry_label, history_subtitle, idle_chrome,
-    now_playing_subtitle, now_playing_title, phase_completion_notification, pipeline_stage,
-    quiet_ui, ready_banner_title, reboot_trigger_summary, run_heading, running_progress_captions,
-    selection_summary_text, source_summary_line, window_header, DesktopNotification, HeaderView,
-    PipelineStage, QuietInput, AUTH_DESCRIPTION, COMPLETION_NOTIFICATION_ID,
+    check_progress_for_sources, checking_footnote_of, done_clean_summary_for_packages,
+    done_header_subtitle_for_packages, fail_retry_label, has_completed_gnome_extensions,
+    history_subtitle, idle_chrome, now_playing_subtitle, now_playing_title,
+    phase_completion_notification, pipeline_stage, quiet_ui, ready_banner_title,
+    reboot_trigger_summary, run_heading, running_progress_captions, selection_summary_text,
+    source_summary_line, window_header, DesktopNotification, HeaderView, PipelineStage, QuietInput,
+    AUTH_DESCRIPTION, COMPLETION_NOTIFICATION_ID, GNOME_EXT_RELOGIN_NOTE,
 };
 use fedora_updater::privilege::{
     dnf_daemon_is_running, kill_recorded_helper, kill_recorded_local_command,
@@ -501,9 +502,10 @@ fn can_selective_apply(packages: &[Package], native_dnf: bool, native_fwupd: boo
         && packages.iter().all(|pkg| match pkg.source {
             UpdateSource::Dnf => native_dnf,
             UpdateSource::Firmware => native_fwupd,
-            UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem | UpdateSource::Homebrew => {
-                pkg.source.supports_selective_apply()
-            }
+            UpdateSource::FlatpakUser
+            | UpdateSource::FlatpakSystem
+            | UpdateSource::GnomeExtensions
+            | UpdateSource::Homebrew => pkg.source.supports_selective_apply(),
         })
 }
 
@@ -1138,7 +1140,8 @@ fn spawn_native_capability_probe(
     std::thread::spawn(move || {
         let dnf = dnf_dbus::is_available();
         let fwupd = fwupd_dbus::is_available();
-        let availability = probe_source_availability(dnf, fwupd);
+        let gnome_ext = gnome_extensions::is_available();
+        let availability = probe_source_availability(dnf, fwupd, gnome_ext);
         let _ = tx.send_blocking((dnf, fwupd, availability));
     });
     let state = state.clone();
@@ -2652,22 +2655,26 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 },
             );
             if *failed > 0 {
-                let msg = if failure_reasons.is_empty() {
+                let mut parts = if failure_reasons.is_empty() {
                     if *failed == 1 {
-                        "1 update failed".to_string()
+                        vec!["1 update failed".to_string()]
                     } else {
-                        format!("{failed} updates failed")
+                        vec![format!("{failed} updates failed")]
                     }
                 } else {
-                    failure_reasons.join(" · ")
+                    failure_reasons.clone()
                 };
+                if !*needs_reboot && has_completed_gnome_extensions(packages) {
+                    parts.push(GNOME_EXT_RELOGIN_NOTE.to_string());
+                }
+                let msg = parts.join(" · ");
                 w.done_problem_banner.set_title(&msg);
                 w.done_problem_banner.set_revealed(true);
             } else {
                 w.done_problem_banner.set_revealed(false);
             }
             w.done_summary_detail
-                .set_text(&done_clean_summary(upgraded, duration));
+                .set_text(&done_clean_summary_for_packages(upgraded, packages, duration));
             w.done_summary_clamp.set_visible(!*needs_reboot && *failed == 0);
             let base_reboot = reboot_trigger_summary(packages);
             let blocker = w.reboot_blocker_detail.borrow().clone();
@@ -2997,6 +3004,7 @@ mod tests {
             (UpdateSource::Dnf, "DNF", "src-dnf"),
             (UpdateSource::FlatpakUser, "FP", "src-flatpak"),
             (UpdateSource::FlatpakSystem, "FP", "src-flatpak"),
+            (UpdateSource::GnomeExtensions, "EXT", "src-ext"),
             (UpdateSource::Homebrew, "BREW", "src-brew"),
             (UpdateSource::Firmware, "FW", "src-firmware"),
         ] {
@@ -4631,6 +4639,7 @@ mod tests {
             let mut console = ConsoleBuffer::new(100);
             console.push_committed_tagged("dnf", "Repositories loaded.");
             console.push_committed_tagged("flatpak-user", "Syncing flathub");
+            console.push_committed_tagged("gnome-ext", "Update available: Blur my Shell");
             console.push_committed_tagged("brew", "==> Upgrading ripgrep 14.1.0 -> 14.1.1");
             console.push_committed_tagged("fwupd", "UEFI dbx");
 
@@ -4642,6 +4651,10 @@ mod tests {
 
             match preset {
                 "ready" => {
+                    assert!(widgets
+                        .sidebar
+                        .category_row(fedora_updater::model::SourceCategory::Extensions)
+                        .get_visible());
                     assert!(widgets
                         .sidebar
                         .category_row(fedora_updater::model::SourceCategory::DevAndContainers)
@@ -4671,6 +4684,10 @@ mod tests {
                 "done" => {
                     assert!(widgets.done_summary_clamp.get_visible());
                     assert!(!widgets.done_reboot_clamp.get_visible());
+                    assert!(widgets
+                        .done_summary_detail
+                        .label()
+                        .contains("Log out and back in"));
                     assert!(widgets.done_btn.has_css_class("suggested-action"));
                 }
                 "done-reboot" => {
@@ -5096,6 +5113,14 @@ mod tests {
             },
         );
         availability.insert(
+            "gnome-extensions".into(),
+            SourceAvailability {
+                pref_key: "gnome-extensions",
+                installed: false,
+                subtitle: "GNOME Shell session D-Bus unavailable".into(),
+            },
+        );
+        availability.insert(
             "homebrew".into(),
             SourceAvailability {
                 pref_key: "homebrew",
@@ -5131,10 +5156,14 @@ mod tests {
             )
         };
 
-        assert_eq!(handle.switches.len(), 4);
+        assert_eq!(handle.switches.len(), 5);
         assert_eq!(
             handle.switches["dnf"].subtitle().as_deref(),
             Some("Installed (dnf5daemon D-Bus)")
+        );
+        assert_eq!(
+            handle.switches["gnome-extensions"].subtitle().as_deref(),
+            Some("GNOME Shell session D-Bus unavailable")
         );
         assert_eq!(
             handle.switches["homebrew"].subtitle().as_deref(),
@@ -5145,6 +5174,10 @@ mod tests {
             Some("Not installed")
         );
         assert!(!handle.all_disabled_group.get_visible());
+        assert!(!widgets
+            .sidebar
+            .category_row(SourceCategory::Extensions)
+            .get_visible());
 
         // Toggling Flatpak off updates UiPrefs, persists to temp ui.json, and hides Apps row.
         handle.switches["flatpak"].set_active(false);
@@ -5162,6 +5195,7 @@ mod tests {
 
         // Disabling remaining sources reveals inline warning hint; re-enabling one clears it.
         handle.switches["dnf"].set_active(false);
+        handle.switches["gnome-extensions"].set_active(false);
         handle.switches["homebrew"].set_active(false);
         handle.switches["firmware"].set_active(false);
         assert!(widgets.prefs.borrow().source_config().all_disabled());
@@ -5175,8 +5209,17 @@ mod tests {
             vec![SourceCategory::System]
         );
 
-        // Detecting Homebrew reveals Dev & Containers and enables selective apply without dnf5daemon.
+        // Detecting Homebrew + GNOME Shell Extensions reveals both categories and enables selective apply without dnf5daemon.
+        handle.switches["gnome-extensions"].set_active(true);
         handle.switches["homebrew"].set_active(true);
+        widgets.source_availability.borrow_mut().insert(
+            "gnome-extensions".into(),
+            SourceAvailability {
+                pref_key: "gnome-extensions",
+                installed: true,
+                subtitle: "Available (GNOME Shell session D-Bus)".into(),
+            },
+        );
         widgets.source_availability.borrow_mut().insert(
             "homebrew".into(),
             SourceAvailability {
@@ -5188,9 +5231,20 @@ mod tests {
         super::sync_sidebar_categories(&widgets, &state.borrow());
         assert!(widgets
             .sidebar
+            .category_row(SourceCategory::Extensions)
+            .get_visible());
+        assert!(widgets
+            .sidebar
             .category_row(SourceCategory::DevAndContainers)
             .get_visible());
 
+        let ext_pkg = fedora_updater::model::Package::new_gnome_extension(
+            "blur-my-shell@aunetx",
+            "Blur my Shell",
+            Some("v47".into()),
+            None,
+            None,
+        );
         let brew_pkg = fedora_updater::model::Package::new_homebrew(
             "ripgrep",
             Some("14.1.0".into()),
@@ -5199,13 +5253,13 @@ mod tests {
             false,
         );
         assert!(super::can_selective_apply(
-            std::slice::from_ref(&brew_pkg),
+            &[ext_pkg.clone(), brew_pkg.clone()],
             false,
             false
         ));
         *state.borrow_mut() = AppState {
             phase: Phase::Ready {
-                packages: vec![brew_pkg],
+                packages: vec![ext_pkg, brew_pkg],
                 soft_errors: vec![],
             },
             ..Default::default()

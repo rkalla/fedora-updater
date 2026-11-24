@@ -121,6 +121,8 @@ pub fn matches_package_query(package: &Package, query: &str) -> bool {
         package.old_version.as_deref().unwrap_or(""),
         package.detail.as_str(),
         package.summary.as_deref().unwrap_or(""),
+        package.url.as_deref().unwrap_or(""),
+        package.id.strip_prefix("gnome-ext:").unwrap_or(""),
         package.source.badge(),
     ];
     trimmed.split_whitespace().all(|raw_token| {

@@ -1,0 +1,58 @@
+{
+  "background-logo@fedorahosted.org": {
+    "uuid": "background-logo@fedorahosted.org",
+    "name": "Background Logo",
+    "description": "Overlay a tasteful watermark on the background",
+    "url": "https://pagure.io/background-logo-extension",
+    "type": 1,
+    "state": 1,
+    "version": 1,
+    "hasUpdate": false
+  },
+  "system-rpm-ext@redhat.com": {
+    "uuid": "system-rpm-ext@redhat.com",
+    "name": "System RPM Managed Extension",
+    "description": "Packaged via DNF — must never be modified via user session D-Bus",
+    "type": 1,
+    "state": 1,
+    "version": 12,
+    "hasUpdate": true
+  },
+  "gsconnect@andyholmes.github.io": {
+    "uuid": "gsconnect@andyholmes.github.io",
+    "name": "GSConnect",
+    "description": "KDE Connect implementation for GNOME",
+    "url": "https://github.com/GSConnect/gnome-shell-extension-gsconnect",
+    "type": 2,
+    "state": 1,
+    "version": 58,
+    "hasUpdate": false
+  },
+  "blur-my-shell@aunetx": {
+    "uuid": "blur-my-shell@aunetx",
+    "name": "Blur my Shell",
+    "description": "Adds a blur look to different parts of the GNOME Shell",
+    "url": "https://github.com/aunetx/blur-my-shell",
+    "type": 2,
+    "state": 1,
+    "version": 47,
+    "version-name": "v47",
+    "hasUpdate": true
+  },
+  "caffeine@patapon.info": {
+    "uuid": "caffeine@patapon.info",
+    "name": "Caffeine",
+    "description": "Disable the screensaver and auto suspend",
+    "url": "https://extensions.gnome.org/extension/517/caffeine/",
+    "type": 2,
+    "state": 1,
+    "version": 54.0,
+    "version-name": "5.4.1",
+    "hasUpdate": true
+  },
+  "minimal@example.org": {
+    "uuid": "minimal@example.org",
+    "type": 2,
+    "hasUpdate": true
+  }
+}

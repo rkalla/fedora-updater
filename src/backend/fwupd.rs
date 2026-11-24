@@ -102,6 +102,7 @@ fn parse_json_updates(json: &str) -> Result<Vec<Package>, serde_json::Error> {
             source: UpdateSource::Firmware,
             detail,
             summary: None,
+            url: None,
             install_size_delta: None,
             advisories: Vec::new(),
             preflight_warning: None,
@@ -145,6 +146,7 @@ fn parse_text_updates(output: &str) -> Vec<Package> {
                     version
                 },
                 summary: None,
+                url: None,
                 install_size_delta: None,
                 advisories: Vec::new(),
                 preflight_warning: None,

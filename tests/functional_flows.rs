@@ -11,7 +11,7 @@ use async_channel::Receiver;
 use common::fixtures::{read_fixture, read_fixture_value};
 use common::runtime::{
     fixture_to_helper_lines, flatpak_check_from_fixture, DnfDbusApplyStep, FakeRuntime,
-    FlatpakNativeApplyStep, FwupdDbusApplyStep, HelperStep, LocalStep,
+    FlatpakNativeApplyStep, FwupdDbusApplyStep, GnomeExtApplyStep, HelperStep, LocalStep,
 };
 use fedora_updater::backend::dnf_dbus::{
     merge_history, packages_from_dnf_dbus, parse_list_fd_ndjson, DnfAdvisoryRecord,
@@ -27,6 +27,7 @@ use fedora_updater::backend::fwupd_dbus::{
     FwupdApplyOutcome, FwupdDevice, FwupdHistoryEntry, FwupdHostPower, FwupdStatus,
     FwupdUpdateState,
 };
+use fedora_updater::backend::gnome_extensions::parse_extensions_json;
 use fedora_updater::backend::logind::{RebootPreflight, ShutdownInhibitor};
 use fedora_updater::backend::{brew::LINUXBREW_SYSTEM_PATH, dnf, NativeOutcome};
 use fedora_updater::console::{ConsoleBuffer, ConsoleDelta};
@@ -43,10 +44,11 @@ use fedora_updater::orchestrator::{
     REBOOT_FAILED_TITLE, REBOOT_SPAWN_FAILED_TITLE,
 };
 use fedora_updater::presenter::{
-    about_time_left, check_progress, checking_footnote, done_header_subtitle, fail_retry_label,
-    idle_chrome, now_playing_subtitle, now_playing_title, quiet_ui, run_heading,
-    running_progress_captions, soft_error_banner_title, source_summary_line, stale_update_dialog,
-    stop_update_dialog, window_header, HeaderView, QuietInput, QuietMode,
+    about_time_left, check_progress, checking_footnote, done_clean_summary_for_packages,
+    done_header_subtitle, fail_retry_label, idle_chrome, now_playing_subtitle, now_playing_title,
+    quiet_ui, run_heading, running_progress_captions, soft_error_banner_title,
+    source_summary_line, stale_update_dialog, stop_update_dialog, window_header, HeaderView,
+    QuietInput, QuietMode, GNOME_EXT_RELOGIN_NOTE,
 };
 use fedora_updater::privilege::SessionError;
 use fedora_updater::state::{
@@ -2244,6 +2246,7 @@ fn native_dnf5daemon_offline_on_reboot_and_download_only_modes() {
         size_bytes: Some(1_048_576),
         install_size_delta: None,
         summary: None,
+        url: None,
         advisories: Vec::new(),
         preflight_warning: None,
         detail: "Firmware update".into(),
@@ -2422,6 +2425,7 @@ fn native_apply_errors_are_logged_to_activity_console_without_duplication() {
         size_bytes: Some(1_048_576),
         install_size_delta: None,
         summary: None,
+        url: None,
         advisories: Vec::new(),
         preflight_warning: None,
         detail: "0.1.31 → 0.1.32".into(),
@@ -3170,4 +3174,386 @@ fn homebrew_soft_errors_and_partial_failure_isolate_cleanly() {
         }
         other => panic!("expected Phase::Done, got {other:?}"),
     }
+}
+
+#[test]
+fn gnome_extensions_silently_skipped_when_session_dbus_absent() {
+    let rt = FakeRuntime::new();
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("dnf");
+    cfg.disable("flatpak");
+    cfg.disable("homebrew");
+    cfg.disable("firmware");
+
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_check_all_with_config(&tx, &rt, &cancel, &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    assert_eq!(rt.gnome_extensions_check_calls(), 0);
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+    assert!(matches!(
+        h.state.phase,
+        Phase::Idle(IdleScreen::Current { .. })
+    ));
+}
+
+#[test]
+fn gnome_extensions_zero_auth_check_and_selective_apply_surface_relogin_without_reboot() {
+    let rt = FakeRuntime::new();
+    rt.set_gnome_extensions_available(true);
+    let fixture_pkgs = parse_extensions_json(&read_fixture(
+        "gnome_extensions/list_extensions_mixed.json",
+    ))
+    .expect("mixed extensions fixture parses");
+    rt.push_gnome_extensions_check(NativeOutcome::Handled(Ok(fixture_pkgs)));
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("dnf");
+    cfg.disable("flatpak");
+    cfg.disable("homebrew");
+    cfg.disable("firmware");
+
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_check_all_with_config(&tx, &rt, &cancel, &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    assert_eq!(rt.gnome_extensions_check_calls(), 1);
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+
+    let discovered = match &h.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert!(soft_errors.is_empty());
+            assert_eq!(packages.len(), 3);
+            assert!(packages
+                .iter()
+                .all(|p| p.source == UpdateSource::GnomeExtensions));
+            packages.clone()
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    };
+
+    // Apply only 1 of the 3 discovered extensions ("Blur my Shell").
+    let blur = discovered
+        .iter()
+        .find(|p| p.name == "Blur my Shell")
+        .expect("Blur my Shell discovered")
+        .clone();
+    h.dispatch(Event::StartSelectiveApply {
+        selected_ids: vec![blur.id.clone()],
+        mode: ApplyMode::Live,
+    });
+    h.dispatch(session_started_event(
+        session_started_purpose(&h.state.phase).unwrap(),
+    ));
+    let selected = h.state.packages().to_vec();
+    assert_eq!(selected.len(), 1);
+
+    rt.push_gnome_extensions_apply(GnomeExtApplyStep {
+        lines: vec![],
+        hints: vec![],
+        on_start: None,
+        install_handler: Some(Box::new(|uuid, _cancel| {
+            assert_eq!(uuid, "blur-my-shell@aunetx");
+            Ok("successful".into())
+        })),
+        outcome: NativeOutcome::Unavailable("unused when install_handler is set".into()),
+    });
+
+    let (tx2, rx2) = async_channel::unbounded();
+    let cancel2 = WorkCancel::new();
+    execute_apply_all_with_mode_and_config(
+        &tx2,
+        selected,
+        ApplyMode::Live,
+        &rt,
+        &cancel2,
+        &cfg,
+    );
+    drop(tx2);
+    h.drain(&rx2);
+
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+    assert_eq!(
+        rt.gnome_extensions_apply_calls(),
+        vec![vec!["blur-my-shell@aunetx".to_string()]]
+    );
+
+    match &h.state.phase {
+        Phase::Done {
+            packages,
+            needs_reboot,
+            failed,
+            failure_reasons,
+            ..
+        } => {
+            assert!(!needs_reboot);
+            assert_eq!(*failed, 0);
+            assert!(failure_reasons.is_empty());
+            assert_eq!(packages.len(), 1);
+            assert_eq!(packages[0].status, PackageStatus::Completed);
+            let summary = done_clean_summary_for_packages(1, packages, "5s");
+            assert!(summary.contains(GNOME_EXT_RELOGIN_NOTE));
+        }
+        other => panic!("expected Phase::Done, got {other:?}"),
+    }
+    assert!(h.console.full_text().contains(GNOME_EXT_RELOGIN_NOTE));
+}
+
+#[test]
+fn gnome_extensions_partial_failure_isolates_successful_and_cancelled_items() {
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("dnf");
+    cfg.disable("flatpak");
+    cfg.disable("homebrew");
+    cfg.disable("firmware");
+
+    let blur = Package::new_gnome_extension(
+        "blur-my-shell@aunetx",
+        "Blur my Shell",
+        Some("v47".into()),
+        None,
+        None,
+    );
+    let caffeine = Package::new_gnome_extension(
+        "caffeine@patapon.info",
+        "Caffeine",
+        Some("v54".into()),
+        None,
+        None,
+    );
+
+    let rt = FakeRuntime::new();
+    rt.set_gnome_extensions_available(true);
+    rt.push_gnome_extensions_apply(GnomeExtApplyStep {
+        lines: vec![],
+        hints: vec![],
+        on_start: None,
+        install_handler: Some(Box::new(|uuid, _cancel| match uuid {
+            "blur-my-shell@aunetx" => Ok("successful".into()),
+            "caffeine@patapon.info" => Ok("cancelled".into()),
+            other => Err(format!("unexpected uuid {other}")),
+        })),
+        outcome: NativeOutcome::Unavailable("unused when install_handler is set".into()),
+    });
+
+    let mut h = FlowHarness::ready(vec![blur.clone(), caffeine.clone()]);
+    h.dispatch(Event::StartApply);
+    h.dispatch(session_started_event(
+        session_started_purpose(&h.state.phase).unwrap(),
+    ));
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_apply_all_with_mode_and_config(
+        &tx,
+        vec![blur, caffeine],
+        ApplyMode::Live,
+        &rt,
+        &cancel,
+        &cfg,
+    );
+    drop(tx);
+    h.drain(&rx);
+
+    match &h.state.phase {
+        Phase::Done {
+            packages,
+            needs_reboot,
+            failed,
+            failure_reasons,
+            ..
+        } => {
+            assert!(!needs_reboot);
+            assert_eq!(*failed, 1);
+            assert_eq!(
+                packages
+                    .iter()
+                    .find(|p| p.id == "gnome-ext:blur-my-shell@aunetx")
+                    .map(|p| p.status),
+                Some(PackageStatus::Completed)
+            );
+            assert_eq!(
+                packages
+                    .iter()
+                    .find(|p| p.id == "gnome-ext:caffeine@patapon.info")
+                    .map(|p| p.status),
+                Some(PackageStatus::Failed)
+            );
+            assert!(
+                failure_reasons
+                    .iter()
+                    .any(|r| r.contains("caffeine@patapon.info") && r.contains("cancelled")),
+                "expected cancelled reason in {failure_reasons:?}"
+            );
+        }
+        other => panic!("expected Phase::Done, got {other:?}"),
+    }
+    assert!(h.console.full_text().contains(GNOME_EXT_RELOGIN_NOTE));
+}
+
+#[test]
+fn gnome_extensions_soft_error_mode_skips_disabled_pref_and_work_cancel() {
+    // 1) Soft check error isolates cleanly while DNF still discovers its update.
+    let rt = FakeRuntime::new();
+    rt.set_dnf_dbus_available(true);
+    rt.set_gnome_extensions_available(true);
+    rt.push_dnf_dbus_check(NativeOutcome::Handled(Ok(vec![Package::new_dnf(
+        "bash",
+        "x86_64",
+        "5.2.37-1.fc44",
+        "updates",
+    )])));
+    rt.push_gnome_extensions_check(NativeOutcome::Handled(Err(
+        "GNOME Shell ListExtensions failed: org.freedesktop.DBus.Error.NoReply".into(),
+    )));
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("flatpak");
+    cfg.disable("homebrew");
+    cfg.disable("firmware");
+
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_check_all_with_config(&tx, &rt, &cancel, &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    match &h.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert_eq!(packages.len(), 1);
+            assert_eq!(packages[0].source, UpdateSource::Dnf);
+            assert_eq!(soft_errors.len(), 1);
+            assert!(soft_errors[0].contains("gnome-ext") || soft_errors[0].contains("ListExtensions"));
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    }
+
+    // 2) Disabled "gnome-extensions" preference skips session D-Bus probe during check.
+    let rt_disabled = FakeRuntime::new();
+    rt_disabled.set_dnf_dbus_available(true);
+    rt_disabled.push_dnf_dbus_check(NativeOutcome::Handled(Ok(Vec::new())));
+    rt_disabled.set_gnome_extensions_available(true);
+    cfg.disable("gnome-extensions");
+    let mut h_disabled = FlowHarness::new();
+    h_disabled.dispatch(Event::StartCheck { then_apply: false });
+    let (tx_dis, rx_dis) = async_channel::unbounded();
+    let cancel_dis = WorkCancel::new();
+    execute_check_all_with_config(&tx_dis, &rt_disabled, &cancel_dis, &cfg);
+    drop(tx_dis);
+    h_disabled.drain(&rx_dis);
+    assert_eq!(rt_disabled.gnome_extensions_check_calls(), 0);
+    assert!(matches!(
+        h_disabled.state.phase,
+        Phase::Idle(IdleScreen::Current { .. })
+    ));
+
+    // 3) DownloadOnly and OfflineOnReboot skip GNOME Shell extension installation cleanly.
+    cfg.disable("dnf");
+    cfg.enable("gnome-extensions");
+    let ext = Package::new_gnome_extension(
+        "blur-my-shell@aunetx",
+        "Blur my Shell",
+        Some("v47".into()),
+        None,
+        None,
+    );
+    for mode in [ApplyMode::DownloadOnly, ApplyMode::OfflineOnReboot] {
+        let rt_mode = FakeRuntime::new();
+        rt_mode.set_gnome_extensions_available(true);
+        let mut h_mode = FlowHarness::ready(vec![ext.clone()]);
+        h_mode.dispatch(Event::StartSelectiveApply {
+            selected_ids: vec![ext.id.clone()],
+            mode,
+        });
+        h_mode.dispatch(session_started_event(
+            session_started_purpose(&h_mode.state.phase).unwrap(),
+        ));
+        let (tx_m, rx_m) = async_channel::unbounded();
+        let cancel_m = WorkCancel::new();
+        execute_apply_all_with_mode_and_config(
+            &tx_m,
+            vec![ext.clone()],
+            mode,
+            &rt_mode,
+            &cancel_m,
+            &cfg,
+        );
+        drop(tx_m);
+        h_mode.drain(&rx_m);
+        assert!(rt_mode.gnome_extensions_apply_calls().is_empty());
+        assert!(matches!(
+            h_mode.state.phase,
+            Phase::Done {
+                failed: 0,
+                needs_reboot: false,
+                ..
+            }
+        ));
+    }
+
+    // 4) WorkCancel mid-apply stops before installing the second selected extension.
+    let ext2 = Package::new_gnome_extension(
+        "caffeine@patapon.info",
+        "Caffeine",
+        Some("v54".into()),
+        None,
+        None,
+    );
+    let rt_cancel = FakeRuntime::new();
+    rt_cancel.set_gnome_extensions_available(true);
+    let cancel_apply = WorkCancel::new();
+    let cancel_hook = cancel_apply.clone();
+    let seen_uuids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen_clone = std::sync::Arc::clone(&seen_uuids);
+    rt_cancel.push_gnome_extensions_apply(GnomeExtApplyStep {
+        lines: vec![],
+        hints: vec![],
+        on_start: None,
+        install_handler: Some(Box::new(move |uuid, inner_cancel| {
+            seen_clone.lock().unwrap().push(uuid.to_string());
+            inner_cancel.cancel();
+            cancel_hook.cancel();
+            Ok("successful".into())
+        })),
+        outcome: NativeOutcome::Unavailable("unused when install_handler is set".into()),
+    });
+
+    let mut h_cancel = FlowHarness::ready(vec![ext.clone(), ext2.clone()]);
+    h_cancel.dispatch(Event::StartApply);
+    h_cancel.dispatch(session_started_event(
+        session_started_purpose(&h_cancel.state.phase).unwrap(),
+    ));
+    let (tx_c, rx_c) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_c,
+        vec![ext, ext2],
+        ApplyMode::Live,
+        &rt_cancel,
+        &cancel_apply,
+        &cfg,
+    );
+    drop(tx_c);
+    h_cancel.drain(&rx_c);
+
+    assert!(cancel_apply.is_cancelled());
+    assert_eq!(*seen_uuids.lock().unwrap(), vec!["blur-my-shell@aunetx"]);
+    assert!(!matches!(h_cancel.state.phase, Phase::Done { .. }));
 }

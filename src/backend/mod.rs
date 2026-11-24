@@ -7,6 +7,7 @@ pub mod dnf_dbus;
 pub mod flatpak;
 pub mod fwupd;
 pub mod fwupd_dbus;
+pub mod gnome_extensions;
 pub mod logind;
 
 use crate::model::{Package, PackageStatus, UpdateSource};
@@ -39,6 +40,7 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
         UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => {
             flatpak::parse_progress_line(line)
         }
+        UpdateSource::GnomeExtensions => ProgressHint::default(),
         UpdateSource::Homebrew => brew::parse_progress_line(line),
         UpdateSource::Firmware => fwupd::parse_progress_line(line),
     }
@@ -47,7 +49,10 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
 pub fn detect_reboot(source: UpdateSource, log: &str, packages: &[Package]) -> bool {
     match source {
         UpdateSource::Dnf => dnf::detect_reboot_needed(log, packages),
-        UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem | UpdateSource::Homebrew => false,
+        UpdateSource::FlatpakUser
+        | UpdateSource::FlatpakSystem
+        | UpdateSource::GnomeExtensions
+        | UpdateSource::Homebrew => false,
         UpdateSource::Firmware => fwupd::detect_reboot_needed(log),
     }
 }
@@ -100,6 +105,14 @@ mod tests {
         );
         assert_eq!(brew_hint.package_name.as_deref(), Some("ripgrep"));
         assert_eq!(brew_hint.status, Some(PackageStatus::Installing));
+
+        assert_eq!(
+            parse_progress(
+                UpdateSource::GnomeExtensions,
+                "Updated GNOME Shell extension blur-my-shell@aunetx"
+            ),
+            ProgressHint::default()
+        );
     }
 
     #[test]
@@ -108,7 +121,7 @@ mod tests {
         assert!(detect_reboot(UpdateSource::Dnf, "", &kernel));
         assert!(!detect_reboot(UpdateSource::Dnf, "Complete!", &[]));
 
-        // Flatpak and Homebrew never request a system reboot regardless of log text or package list.
+        // Flatpak, GNOME Extensions, and Homebrew never request a system reboot regardless of log text or package list.
         assert!(!detect_reboot(
             UpdateSource::FlatpakUser,
             "An update requires a reboot to complete.",
@@ -117,6 +130,11 @@ mod tests {
         assert!(!detect_reboot(
             UpdateSource::FlatpakSystem,
             "System restart required",
+            &kernel
+        ));
+        assert!(!detect_reboot(
+            UpdateSource::GnomeExtensions,
+            "An update requires a reboot to complete.",
             &kernel
         ));
         assert!(!detect_reboot(

@@ -3,7 +3,7 @@
 use gtk::prelude::*;
 
 use fedora_updater::model::{AdvisoryKind, Package, PackageAdvisory, PackageStatus, UpdateSource};
-use fedora_updater::presenter::format_size_delta;
+use fedora_updater::presenter::{format_size_delta, GNOME_EXT_RELOGIN_NOTE};
 
 use super::queue_list::package_needs_reboot;
 
@@ -26,6 +26,9 @@ pub struct InspectorViewModel {
     pub needs_reboot: bool,
     pub reboot_reason: Option<String>,
     pub preflight_warning: Option<String>,
+    pub session_note: Option<String>,
+    pub uuid: Option<String>,
+    pub url: Option<String>,
     pub related_extensions: Vec<String>,
     pub summary: Option<String>,
     pub advisories: Vec<PackageAdvisory>,
@@ -37,6 +40,7 @@ impl InspectorViewModel {
             UpdateSource::Dnf => "System (DNF)",
             UpdateSource::FlatpakUser => "Apps (Flatpak · User)",
             UpdateSource::FlatpakSystem => "Apps (Flatpak · System)",
+            UpdateSource::GnomeExtensions => "Extensions (GNOME Shell)",
             UpdateSource::Homebrew => "Dev & Containers (Homebrew)",
             UpdateSource::Firmware => "Firmware (LVFS)",
         };
@@ -76,6 +80,29 @@ impl InspectorViewModel {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToString::to_string);
+        let session_note = (package.source == UpdateSource::GnomeExtensions).then(|| {
+            match package.status {
+                PackageStatus::Completed => GNOME_EXT_RELOGIN_NOTE.to_string(),
+                _ => "Log out and back in after updating to activate GNOME Shell extensions."
+                    .to_string(),
+            }
+        });
+        let uuid = (package.source == UpdateSource::GnomeExtensions)
+            .then(|| {
+                package
+                    .id
+                    .strip_prefix("gnome-ext:")
+                    .unwrap_or(&package.id)
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty());
+        let url = package
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
         let summary = package
             .summary
             .as_deref()
@@ -104,6 +131,9 @@ impl InspectorViewModel {
             needs_reboot,
             reboot_reason,
             preflight_warning,
+            session_note,
+            uuid,
+            url,
             related_extensions: package.related_extensions(),
             summary,
             advisories: package.advisories.clone(),
@@ -168,6 +198,8 @@ pub struct PackageInspector {
     reboot_body: gtk::Label,
     warning_card: gtk::Box,
     warning_body: gtk::Label,
+    note_card: gtk::Box,
+    note_body: gtk::Label,
     source_field: MetadataField,
     repo_field: MetadataField,
     arch_field: MetadataField,
@@ -176,6 +208,8 @@ pub struct PackageInspector {
     size_field: MetadataField,
     disk_delta_field: MetadataField,
     status_field: MetadataField,
+    uuid_field: MetadataField,
+    url_field: MetadataField,
     extensions_card: gtk::Box,
     extensions_count: gtk::Label,
     extensions_list: gtk::Box,
@@ -288,6 +322,15 @@ impl PackageInspector {
         );
         body.append(&warning_card);
 
+        // Session re-login notice for GNOME Shell extension updates.
+        let (note_card, note_body) = build_callout_card(
+            "inspector-note-card",
+            "dialog-information-symbolic",
+            "accent",
+            "Session Note",
+        );
+        body.append(&note_card);
+
         // Metadata key-value card.
         let meta_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         meta_card.add_css_class("card");
@@ -305,6 +348,8 @@ impl PackageInspector {
         let size_field = MetadataField::new("Download Size");
         let disk_delta_field = MetadataField::new("Disk Change");
         let status_field = MetadataField::new("Status");
+        let uuid_field = MetadataField::new("Extension ID");
+        let url_field = MetadataField::new("Homepage");
 
         for field in [
             &source_field,
@@ -315,6 +360,8 @@ impl PackageInspector {
             &size_field,
             &disk_delta_field,
             &status_field,
+            &uuid_field,
+            &url_field,
         ] {
             meta_inner.append(&field.row);
         }
@@ -411,6 +458,8 @@ impl PackageInspector {
             reboot_body,
             warning_card,
             warning_body,
+            note_card,
+            note_body,
             source_field,
             repo_field,
             arch_field,
@@ -419,6 +468,8 @@ impl PackageInspector {
             size_field,
             disk_delta_field,
             status_field,
+            uuid_field,
+            url_field,
             extensions_card,
             extensions_count,
             extensions_list,
@@ -471,6 +522,14 @@ impl PackageInspector {
             self.warning_card.set_visible(false);
         }
 
+        if let Some(note) = vm.session_note.as_deref() {
+            self.note_body.set_label(note);
+            self.note_card.set_visible(true);
+        } else {
+            self.note_body.set_label("");
+            self.note_card.set_visible(false);
+        }
+
         self.source_field.set_optional(Some(vm.source_title));
         self.repo_field.set_optional(vm.repo.as_deref());
         self.arch_field.set_optional(vm.arch.as_deref());
@@ -481,6 +540,8 @@ impl PackageInspector {
         self.disk_delta_field
             .set_optional(vm.install_size_delta.as_deref());
         self.status_field.set_optional(vm.status_label);
+        self.uuid_field.set_optional(vm.uuid.as_deref());
+        self.url_field.set_optional(vm.url.as_deref());
 
         clear_box(&self.extensions_list);
         if vm.related_extensions.is_empty() {
@@ -849,5 +910,43 @@ mod tests {
         assert_eq!(brew_vm.repo.as_deref(), Some("homebrew/core"));
         assert_eq!(brew_vm.version_display, "14.1.0 → 14.1.1");
         assert!(!brew_vm.needs_reboot);
+        assert!(brew_vm.session_note.is_none());
+        assert!(brew_vm.uuid.is_none());
+        assert!(brew_vm.url.is_none());
+    }
+
+    #[test]
+    fn inspector_view_model_formats_gnome_extension_metadata_and_session_note() {
+        let mut ext = Package::new_gnome_extension(
+            "blur-my-shell@aunetx",
+            "Blur my Shell",
+            Some("v47".into()),
+            Some("Adds a blur look to different parts of the GNOME Shell".into()),
+            Some("https://github.com/aunetx/blur-my-shell".into()),
+        );
+        let vm = InspectorViewModel::from_package(&ext);
+        assert_eq!(vm.badge, "EXT");
+        assert_eq!(vm.badge_css, "src-ext");
+        assert_eq!(vm.source_title, "Extensions (GNOME Shell)");
+        assert_eq!(vm.uuid.as_deref(), Some("blur-my-shell@aunetx"));
+        assert_eq!(
+            vm.url.as_deref(),
+            Some("https://github.com/aunetx/blur-my-shell")
+        );
+        assert_eq!(
+            vm.summary.as_deref(),
+            Some("Adds a blur look to different parts of the GNOME Shell")
+        );
+        assert!(!vm.needs_reboot);
+        assert!(vm
+            .session_note
+            .as_deref()
+            .unwrap()
+            .contains("Log out and back in"));
+
+        ext.status = PackageStatus::Completed;
+        let done_vm = InspectorViewModel::from_package(&ext);
+        assert_eq!(done_vm.status_label, Some("Installed"));
+        assert_eq!(done_vm.session_note.as_deref(), Some(GNOME_EXT_RELOGIN_NOTE));
     }
 }

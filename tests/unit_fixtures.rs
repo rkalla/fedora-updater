@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::fixtures::{read_fixture, read_flatpak_fixture};
+use common::fixtures::{read_fixture, read_fixture_value, read_flatpak_fixture};
 use fedora_updater::backend::brew::{
     parse_outdated_json, parse_progress_line as parse_brew_progress, upgrade_names_from_packages,
 };
@@ -18,8 +18,11 @@ use fedora_updater::backend::fwupd::{
     detect_reboot_needed as fwupd_detect_reboot, parse_get_updates,
     parse_progress_line as parse_fwupd_progress, parse_reboot_needed_output,
 };
+use fedora_updater::backend::gnome_extensions::{
+    extension_uuids_from_packages, interpret_install_reply, parse_extensions_json,
+};
 use fedora_updater::backend::{detect_reboot, parse_progress, ProgressHint};
-use fedora_updater::model::{total_download_bytes, PackageStatus, UpdateSource};
+use fedora_updater::model::{total_download_bytes, Package, PackageStatus, UpdateSource};
 use fedora_updater::release_upgrade::{
     days_since_active, newest_active_newer_than, offer_from_collections, os_release_version,
     ReleaseOffer,
@@ -442,4 +445,85 @@ fn brew_fixtures_cover_outdated_pinned_malformed_and_upgrade_logs() {
         h.package_name.as_deref() == Some("ripgrep") && h.status == Some(PackageStatus::Completed)
     }));
     assert_eq!(err_hints.last(), Some(&ProgressHint::default()));
+}
+
+#[test]
+fn gnome_extensions_fixtures_cover_filtering_metadata_and_install_replies() {
+    // 1. Mixed extensions: skips system RPM extensions (even if hasUpdate=true) and up-to-date user items
+    let mixed = parse_extensions_json(&read_fixture("gnome_extensions/list_extensions_mixed.json"))
+        .expect("list_extensions_mixed.json parses");
+    assert_eq!(mixed.len(), 3);
+    assert_eq!(mixed[0].name, "Blur my Shell");
+    assert_eq!(mixed[0].id, "gnome-ext:blur-my-shell@aunetx");
+    assert_eq!(mixed[0].source, UpdateSource::GnomeExtensions);
+    assert_eq!(mixed[0].old_version.as_deref(), Some("v47"));
+    assert_eq!(mixed[0].version, "update available");
+    assert_eq!(
+        mixed[0].summary.as_deref(),
+        Some("Adds a blur look to different parts of the GNOME Shell")
+    );
+    assert_eq!(
+        mixed[0].url.as_deref(),
+        Some("https://github.com/aunetx/blur-my-shell")
+    );
+
+    // Float version + distinct version-name formatting
+    assert_eq!(mixed[1].name, "Caffeine");
+    assert_eq!(mixed[1].old_version.as_deref(), Some("5.4.1 (v54)"));
+
+    // Minimal entry omitting name, description, url, version
+    assert_eq!(mixed[2].name, "minimal@example.org");
+    assert!(mixed[2].old_version.is_none());
+    assert!(mixed[2].summary.is_none());
+    assert!(mixed[2].url.is_none());
+
+    // 2. Empty/system-only listing produces zero updates
+    let empty = parse_extensions_json(&read_fixture("gnome_extensions/list_extensions_empty.json"))
+        .expect("list_extensions_empty.json parses");
+    assert!(empty.is_empty());
+
+    // 3. UUID extraction skips non-extension packages & progress/reboot helpers behave accurately
+    let mut combined = vec![Package::new_dnf("kernel", "x86_64", "7.1.12", "updates")];
+    combined.extend(mixed.clone());
+    assert_eq!(
+        extension_uuids_from_packages(&combined),
+        vec![
+            "blur-my-shell@aunetx",
+            "caffeine@patapon.info",
+            "minimal@example.org",
+        ]
+    );
+    assert!(!detect_reboot(
+        UpdateSource::GnomeExtensions,
+        "Updated GNOME Shell extension blur-my-shell@aunetx",
+        &mixed
+    ));
+    assert_eq!(
+        parse_progress(
+            UpdateSource::GnomeExtensions,
+            "Updated GNOME Shell extension blur-my-shell@aunetx",
+        ),
+        ProgressHint::default()
+    );
+    assert!(mixed[0].matches_progress_name("blur-my-shell@aunetx"));
+
+    // 4. Canonical InstallRemoteExtension replies fixture
+    let replies = read_fixture_value("gnome_extensions/install_replies.json");
+    for case in replies["replies"].as_array().expect("replies array") {
+        let uuid = case["uuid"].as_str().expect("uuid");
+        let ok = case["ok"].as_bool().expect("ok");
+        let raw_reply = case["reply"].as_str().expect("reply").to_string();
+        let reply = if ok { Ok(raw_reply) } else { Err(raw_reply) };
+        let res = interpret_install_reply(uuid, reply);
+        if case["expected_ok"].as_bool().expect("expected_ok") {
+            assert!(res.is_ok(), "{uuid} should succeed");
+        } else {
+            let err = res.expect_err("reply should fail");
+            let expected_sub = case["expected_contains"].as_str().expect("expected_contains");
+            assert!(
+                err.contains(expected_sub),
+                "{uuid} error `{err}` should contain `{expected_sub}`"
+            );
+        }
+    }
 }

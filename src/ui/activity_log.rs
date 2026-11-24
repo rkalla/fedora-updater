@@ -17,6 +17,7 @@ pub enum LogSourceFilter {
     All,
     Dnf,
     Flatpak,
+    Extensions,
     Brew,
     Fwupd,
 }
@@ -28,6 +29,7 @@ impl LogSourceFilter {
             Self::All => "all",
             Self::Dnf => "dnf",
             Self::Flatpak => "flatpak",
+            Self::Extensions => "gnome-ext",
             Self::Brew => "brew",
             Self::Fwupd => "fwupd",
         }
@@ -37,6 +39,7 @@ impl LogSourceFilter {
         match name {
             Some("dnf") => Self::Dnf,
             Some("flatpak") => Self::Flatpak,
+            Some("gnome-ext") => Self::Extensions,
             Some("brew") => Self::Brew,
             Some("fwupd") => Self::Fwupd,
             _ => Self::All,
@@ -45,7 +48,8 @@ impl LogSourceFilter {
 }
 
 /// Extracts the leading source bracket `[tag]` when valid (`dnf`, `flatpak-user`,
-/// `flatpak-system`, `fwupd`), ignoring bracketed progress counters like `[1/4]`.
+/// `flatpak-system`, `gnome-ext`, `brew`, `fwupd`), ignoring bracketed progress
+/// counters like `[1/4]`.
 pub fn parse_log_tag(line: &str) -> Option<&str> {
     let rest = line.strip_prefix('[')?;
     let end = rest.find(']')?;
@@ -71,6 +75,7 @@ pub fn line_matches_source(line: &str, filter: LogSourceFilter) -> bool {
                 Some("flatpak" | "flatpak-user" | "flatpak-system")
             )
         }
+        LogSourceFilter::Extensions => matches!(parse_log_tag(line), Some("gnome-ext")),
         LogSourceFilter::Brew => matches!(parse_log_tag(line), Some("brew")),
         LogSourceFilter::Fwupd => matches!(parse_log_tag(line), Some("fwupd")),
     }
@@ -184,6 +189,7 @@ impl ActivityLogView {
             ("all", "All"),
             ("dnf", "DNF"),
             ("flatpak", "Flatpak"),
+            ("gnome-ext", "Ext"),
             ("brew", "Brew"),
             ("fwupd", "fwupd"),
         ] {
@@ -476,42 +482,61 @@ mod tests {
         console.push_committed_tagged("dnf", "Complete!");
         console.push_committed_tagged("flatpak-user", "Syncing flathub");
         console.push_committed_tagged("flatpak-system", "Thunderbird ready");
+        console.push_committed_tagged(
+            "gnome-ext",
+            "Updating Blur my Shell (blur-my-shell@aunetx)",
+        );
         console.push_committed_tagged("brew", "==> Upgrading ripgrep 14.1.0 -> 14.1.1");
         console.push_committed_tagged("fwupd", "UEFI dbx 20241101");
         assert_eq!(LogSourceFilter::All.name(), "all");
-        assert_eq!(LogSourceFilter::from_name(Some("flatpak")), LogSourceFilter::Flatpak);
+        assert_eq!(
+            LogSourceFilter::from_name(Some("flatpak")),
+            LogSourceFilter::Flatpak
+        );
+        assert_eq!(
+            LogSourceFilter::from_name(Some("gnome-ext")),
+            LogSourceFilter::Extensions
+        );
         assert_eq!(LogSourceFilter::from_name(Some("brew")), LogSourceFilter::Brew);
 
         let (all_text, all_m, all_t) = filter_console_lines(&console, LogSourceFilter::All, "");
-        assert_eq!(all_m, 7);
-        assert_eq!(all_t, 7);
+        assert_eq!(all_m, 8);
+        assert_eq!(all_t, 8);
         assert!(!all_text.contains("40%"));
         assert!(all_text.contains("[1/2] openssl 100%"));
 
         let (dnf_text, dnf_m, dnf_t) =
             filter_console_lines(&console, LogSourceFilter::Dnf, "openssl");
-        assert_eq!((dnf_m, dnf_t), (1, 7));
+        assert_eq!((dnf_m, dnf_t), (1, 8));
         assert_eq!(dnf_text, "[dnf] [1/2] openssl 100%");
 
         let (fp_text, fp_m, fp_t) =
             filter_console_lines(&console, LogSourceFilter::Flatpak, "");
-        assert_eq!((fp_m, fp_t), (2, 7));
+        assert_eq!((fp_m, fp_t), (2, 8));
         assert!(fp_text.contains("[flatpak-user]"));
         assert!(fp_text.contains("[flatpak-system]"));
 
+        let (ext_text, ext_m, ext_t) =
+            filter_console_lines(&console, LogSourceFilter::Extensions, "blur");
+        assert_eq!((ext_m, ext_t), (1, 8));
+        assert_eq!(
+            ext_text,
+            "[gnome-ext] Updating Blur my Shell (blur-my-shell@aunetx)"
+        );
+
         let (brew_text, brew_m, brew_t) =
             filter_console_lines(&console, LogSourceFilter::Brew, "ripgrep");
-        assert_eq!((brew_m, brew_t), (1, 7));
+        assert_eq!((brew_m, brew_t), (1, 8));
         assert_eq!(brew_text, "[brew] ==> Upgrading ripgrep 14.1.0 -> 14.1.1");
 
         let (fw_text, fw_m, fw_t) =
             filter_console_lines(&console, LogSourceFilter::Fwupd, "dbx");
-        assert_eq!((fw_m, fw_t), (1, 7));
+        assert_eq!((fw_m, fw_t), (1, 8));
         assert_eq!(fw_text, "[fwupd] UEFI dbx 20241101");
 
         let (none_text, none_m, none_t) =
             filter_console_lines(&console, LogSourceFilter::Fwupd, "thunderbird");
-        assert_eq!((none_m, none_t), (0, 7));
+        assert_eq!((none_m, none_t), (0, 8));
         assert_eq!(none_text, "");
     }
 }

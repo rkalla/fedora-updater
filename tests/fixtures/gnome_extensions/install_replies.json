@@ -1,0 +1,31 @@
+{
+  "replies": [
+    {
+      "uuid": "blur-my-shell@aunetx",
+      "ok": true,
+      "reply": "successful",
+      "expected_ok": true
+    },
+    {
+      "uuid": "caffeine@patapon.info",
+      "ok": true,
+      "reply": "cancelled",
+      "expected_ok": false,
+      "expected_contains": "cancelled"
+    },
+    {
+      "uuid": "minimal@example.org",
+      "ok": true,
+      "reply": "error",
+      "expected_ok": false,
+      "expected_contains": "Unexpected reply"
+    },
+    {
+      "uuid": "broken@example.org",
+      "ok": false,
+      "reply": "org.freedesktop.DBus.Error.TimedOut: did not receive a reply",
+      "expected_ok": false,
+      "expected_contains": "TimedOut"
+    }
+  ]
+}

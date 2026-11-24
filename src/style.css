@@ -374,6 +374,14 @@ window.is-dark .inspector-warning-card {
   background-color: alpha(@error_bg_color, 0.15);
 }
 
+.inspector-note-card {
+  background-color: alpha(@accent_bg_color, 0.08);
+}
+
+window.is-dark .inspector-note-card {
+  background-color: alpha(@accent_bg_color, 0.13);
+}
+
 /* Embedded Activity Log */
 .activity-log-view {
   background-color: @view_bg_color;

@@ -14,6 +14,9 @@ use fedora_updater::backend::flatpak::{
     packages_from_flatpak_updates, FlatpakApplyOutcome, FlatpakCheck,
 };
 use fedora_updater::backend::fwupd_dbus::{FwupdApplyOutcome, FwupdHistoryEntry};
+use fedora_updater::backend::gnome_extensions::{
+    apply_extensions_with, GnomeExtensionsApplyOutcome,
+};
 use fedora_updater::backend::logind::RebootPreflight;
 use fedora_updater::backend::{NativeOutcome, ProgressHint};
 use fedora_updater::helper_protocol::{HelperCommand, DRAW_PREFIX};
@@ -100,6 +103,17 @@ pub struct FlatpakNativeApplyStep {
     pub outcome: NativeOutcome<FlatpakApplyOutcome>,
 }
 
+pub type GnomeExtInstallHandler =
+    Box<dyn FnMut(&str, &WorkCancel) -> Result<String, String> + Send>;
+
+pub struct GnomeExtApplyStep {
+    pub lines: Vec<String>,
+    pub hints: Vec<ProgressHint>,
+    pub on_start: Option<DnfOnStartHook>,
+    pub install_handler: Option<GnomeExtInstallHandler>,
+    pub outcome: NativeOutcome<GnomeExtensionsApplyOutcome>,
+}
+
 struct LocalMatcher {
     program: String,
     required_args: Vec<String>,
@@ -134,6 +148,9 @@ struct FakeState {
     fwupd_dbus_check_calls: usize,
     fwupd_dbus_apply_calls: usize,
     fwupd_dbus_reboot_calls: usize,
+    gnome_extensions_available: bool,
+    gnome_extensions_check_calls: usize,
+    gnome_extensions_apply_calls: Vec<Vec<String>>,
     logind_preflight_calls: usize,
     logind_reboot_calls: usize,
     ensure_session_steps: VecDeque<EnsureSessionStep>,
@@ -149,6 +166,8 @@ struct FakeState {
     fwupd_dbus_apply_steps: VecDeque<FwupdDbusApplyStep>,
     fwupd_dbus_reboot_steps: VecDeque<NativeOutcome<bool>>,
     fwupd_history_steps: VecDeque<NativeOutcome<Vec<FwupdHistoryEntry>>>,
+    gnome_extensions_check_steps: VecDeque<NativeOutcome<Vec<Package>>>,
+    gnome_extensions_apply_steps: VecDeque<GnomeExtApplyStep>,
     logind_preflight_steps: VecDeque<NativeOutcome<RebootPreflight>>,
     logind_reboot_steps: VecDeque<(Vec<String>, NativeOutcome<()>)>,
 }
@@ -184,6 +203,9 @@ impl FakeRuntime {
                 fwupd_dbus_check_calls: 0,
                 fwupd_dbus_apply_calls: 0,
                 fwupd_dbus_reboot_calls: 0,
+                gnome_extensions_available: false,
+                gnome_extensions_check_calls: 0,
+                gnome_extensions_apply_calls: Vec::new(),
                 logind_preflight_calls: 0,
                 logind_reboot_calls: 0,
                 ensure_session_steps: VecDeque::new(),
@@ -199,6 +221,8 @@ impl FakeRuntime {
                 fwupd_dbus_apply_steps: VecDeque::new(),
                 fwupd_dbus_reboot_steps: VecDeque::new(),
                 fwupd_history_steps: VecDeque::new(),
+                gnome_extensions_check_steps: VecDeque::new(),
+                gnome_extensions_apply_steps: VecDeque::new(),
                 logind_preflight_steps: VecDeque::new(),
                 logind_reboot_steps: VecDeque::new(),
             })),
@@ -539,6 +563,38 @@ impl FakeRuntime {
     pub fn logind_reboot_calls(&self) -> usize {
         self.inner.lock().unwrap().logind_reboot_calls
     }
+
+    pub fn set_gnome_extensions_available(&self, available: bool) {
+        self.inner.lock().unwrap().gnome_extensions_available = available;
+    }
+
+    pub fn push_gnome_extensions_check(&self, outcome: NativeOutcome<Vec<Package>>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .gnome_extensions_check_steps
+            .push_back(outcome);
+    }
+
+    pub fn push_gnome_extensions_apply(&self, step: GnomeExtApplyStep) {
+        self.inner
+            .lock()
+            .unwrap()
+            .gnome_extensions_apply_steps
+            .push_back(step);
+    }
+
+    pub fn gnome_extensions_check_calls(&self) -> usize {
+        self.inner.lock().unwrap().gnome_extensions_check_calls
+    }
+
+    pub fn gnome_extensions_apply_calls(&self) -> Vec<Vec<String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .gnome_extensions_apply_calls
+            .clone()
+    }
 }
 
 impl OrchestratorRuntime for FakeRuntime {
@@ -765,6 +821,63 @@ impl OrchestratorRuntime for FakeRuntime {
         s.fwupd_dbus_reboot_steps
             .pop_front()
             .unwrap_or_else(|| NativeOutcome::Unavailable("fwupd D-Bus reboot check not scripted".into()))
+    }
+
+    fn gnome_extensions_available(&self) -> bool {
+        self.inner.lock().unwrap().gnome_extensions_available
+    }
+
+    fn check_gnome_extensions(&self, on_line: &mut dyn FnMut(String)) -> NativeOutcome<Vec<Package>> {
+        let step = {
+            let mut s = self.inner.lock().unwrap();
+            s.gnome_extensions_check_calls += 1;
+            s.gnome_extensions_check_steps.pop_front()
+        };
+        let Some(outcome) = step else {
+            return NativeOutcome::Unavailable(
+                "GNOME Shell Extensions D-Bus unavailable in test runtime".into(),
+            );
+        };
+        if matches!(outcome, NativeOutcome::Handled(_)) {
+            on_line("Checking GNOME Shell extensions for updates…".into());
+        }
+        outcome
+    }
+
+    fn apply_gnome_extensions(
+        &self,
+        uuids: &[String],
+        cancel: &WorkCancel,
+        on_line: &mut dyn FnMut(String),
+        on_progress: &mut dyn FnMut(ProgressHint),
+    ) -> NativeOutcome<GnomeExtensionsApplyOutcome> {
+        let step = {
+            let mut s = self.inner.lock().unwrap();
+            s.gnome_extensions_apply_calls.push(uuids.to_vec());
+            s.gnome_extensions_apply_steps.pop_front()
+        };
+        let Some(mut step) = step else {
+            return NativeOutcome::Unavailable(
+                "GNOME Shell Extensions D-Bus apply not scripted".into(),
+            );
+        };
+        if let Some(mut on_start) = step.on_start.take() {
+            on_start(cancel);
+        }
+        if let Some(mut handler) = step.install_handler.take() {
+            let outcome =
+                apply_extensions_with(uuids, cancel, on_line, on_progress, |uuid| {
+                    handler(uuid, cancel)
+                });
+            return NativeOutcome::Handled(Ok(outcome));
+        }
+        for l in step.lines {
+            on_line(l);
+        }
+        for h in step.hints {
+            on_progress(h);
+        }
+        step.outcome
     }
 
     fn reboot_preflight(&self) -> NativeOutcome<RebootPreflight> {

@@ -766,10 +766,36 @@ pub fn reboot_trigger_summary(packages: &[Package]) -> String {
     }
 }
 
+/// Non-blocking session restart note shown when GNOME Shell extensions are updated.
+pub const GNOME_EXT_RELOGIN_NOTE: &str =
+    "Log out and back in to activate updated GNOME Shell extensions.";
+
+/// True when at least one GNOME Shell extension update finished cleanly.
+pub fn has_completed_gnome_extensions(packages: &[Package]) -> bool {
+    packages
+        .iter()
+        .any(|p| p.source == UpdateSource::GnomeExtensions && p.status == PackageStatus::Completed)
+}
+
 /// Concise summary body for the clean `Done` closure card.
 pub fn done_clean_summary(upgraded: usize, duration: &str) -> String {
     let noun = if upgraded == 1 { "update" } else { "updates" };
     format!("{upgraded} {noun} installed in {duration}. No restart needed.")
+}
+
+/// Concise summary body for the clean `Done` closure card, noting re-login when
+/// GNOME Shell extensions were updated.
+pub fn done_clean_summary_for_packages(
+    upgraded: usize,
+    packages: &[Package],
+    duration: &str,
+) -> String {
+    if has_completed_gnome_extensions(packages) {
+        let noun = if upgraded == 1 { "update" } else { "updates" };
+        format!("{upgraded} {noun} installed in {duration}. {GNOME_EXT_RELOGIN_NOTE}")
+    } else {
+        done_clean_summary(upgraded, duration)
+    }
 }
 
 /// Fixed desktop notification ID replaced/withdrawn across check and apply cycles.
@@ -848,10 +874,15 @@ pub fn phase_completion_notification(
                     .filter(|p| p.status == PackageStatus::Completed)
                     .count();
                 let noun = if upgraded == 1 { "update" } else { "updates" };
+                let body = if has_completed_gnome_extensions(packages) {
+                    format!("{upgraded} {noun} applied cleanly. {GNOME_EXT_RELOGIN_NOTE}")
+                } else {
+                    format!("{upgraded} {noun} applied cleanly.")
+                };
                 Some(DesktopNotification {
                     id: COMPLETION_NOTIFICATION_ID,
                     title: "Updates Installed".into(),
-                    body: format!("{upgraded} {noun} applied cleanly."),
+                    body,
                 })
             }
         }
@@ -1939,6 +1970,56 @@ mod tests {
         assert_eq!(
             status,
             "System done · Apps in progress · Dev & Containers queued · Firmware queued"
+        );
+    }
+
+    #[test]
+    fn gnome_extensions_relogin_summary_counts_and_notification_work_without_reboot() {
+        let mut ext = Package::new_gnome_extension(
+            "blur-my-shell@aunetx",
+            "Blur my Shell",
+            Some("v66".into()),
+            Some("Adds blur to GNOME Shell".into()),
+            Some("https://github.com/aunetx/blur-my-shell".into()),
+        );
+        assert_eq!(source_summary_line(std::slice::from_ref(&ext)), "0 system · 0 apps · 0 firmware · 1 extensions");
+
+        ext.status = PackageStatus::Completed;
+        assert!(has_completed_gnome_extensions(std::slice::from_ref(&ext)));
+        assert_eq!(
+            done_header_subtitle_for_packages(0, 1, std::slice::from_ref(&ext), "6s"),
+            "1 upgraded · 0 system / 0 apps / 0 firmware / 1 extensions · 6s"
+        );
+        let summary = done_clean_summary_for_packages(1, std::slice::from_ref(&ext), "6s");
+        assert!(summary.contains("Log out and back in"), "{summary}");
+        assert!(!summary.contains("No restart needed"), "{summary}");
+
+        let done_ext = Phase::Done {
+            packages: vec![ext],
+            duration: "6s".into(),
+            needs_reboot: false,
+            failed: 0,
+            failure_reasons: vec![],
+        };
+        let notif = phase_completion_notification(&done_ext, false, true).expect("notif");
+        assert_eq!(notif.title, "Updates Installed");
+        assert!(notif.body.contains("Log out and back in"), "{}", notif.body);
+
+        let with_ext = [
+            UpdateSource::Dnf,
+            UpdateSource::FlatpakUser,
+            UpdateSource::FlatpakSystem,
+            UpdateSource::GnomeExtensions,
+            UpdateSource::Firmware,
+        ];
+        let (frac, done, total, status) =
+            check_progress_for_sources(&[UpdateSource::Dnf], &with_ext);
+        assert!((frac - 0.2).abs() < 1e-9);
+        assert_eq!(done, 1);
+        assert_eq!(total, 4);
+        assert_eq!(
+            status,
+            "System done · Apps in progress · Extensions queued · Firmware queued"
         );
     }
 }

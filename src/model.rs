@@ -97,6 +97,7 @@ pub enum UpdateSource {
     Dnf,
     FlatpakUser,
     FlatpakSystem,
+    GnomeExtensions,
     Homebrew,
     Firmware,
 }
@@ -106,6 +107,7 @@ impl UpdateSource {
         Self::Dnf,
         Self::FlatpakUser,
         Self::FlatpakSystem,
+        Self::GnomeExtensions,
         Self::Homebrew,
         Self::Firmware,
     ];
@@ -130,6 +132,7 @@ impl UpdateSource {
         match self {
             Self::Dnf => SourceCategory::System,
             Self::FlatpakUser | Self::FlatpakSystem => SourceCategory::Apps,
+            Self::GnomeExtensions => SourceCategory::Extensions,
             Self::Homebrew => SourceCategory::DevAndContainers,
             Self::Firmware => SourceCategory::Firmware,
         }
@@ -139,6 +142,7 @@ impl UpdateSource {
         match self {
             Self::Dnf => "dnf",
             Self::FlatpakUser | Self::FlatpakSystem => "flatpak",
+            Self::GnomeExtensions => "gnome-extensions",
             Self::Homebrew => "homebrew",
             Self::Firmware => "firmware",
         }
@@ -148,6 +152,7 @@ impl UpdateSource {
         match self {
             Self::Dnf => "System Packages (DNF)",
             Self::FlatpakUser | Self::FlatpakSystem => "Flatpak Apps",
+            Self::GnomeExtensions => "GNOME Shell Extensions",
             Self::Homebrew => "Homebrew (brew)",
             Self::Firmware => "Firmware (fwupd / LVFS)",
         }
@@ -156,7 +161,10 @@ impl UpdateSource {
     pub fn requires_root(self) -> bool {
         match self {
             Self::Dnf | Self::Firmware => true,
-            Self::FlatpakUser | Self::FlatpakSystem | Self::Homebrew => false,
+            Self::FlatpakUser
+            | Self::FlatpakSystem
+            | Self::GnomeExtensions
+            | Self::Homebrew => false,
         }
     }
 
@@ -167,15 +175,16 @@ impl UpdateSource {
             Self::Dnf
             | Self::FlatpakUser
             | Self::FlatpakSystem
+            | Self::GnomeExtensions
             | Self::Homebrew
             | Self::Firmware => true,
         }
     }
 
     /// True for core Fedora sources expected on standard installations by default.
-    /// Optional user-space tools like Homebrew remain hidden until detected or populated.
+    /// Optional or desktop-specific sources remain hidden until detected or populated.
     pub fn installed_by_default(self) -> bool {
-        !matches!(self, Self::Homebrew)
+        !matches!(self, Self::GnomeExtensions | Self::Homebrew)
     }
 
     /// Deduplicated preference-level sources preserving canonical order.
@@ -198,6 +207,7 @@ impl UpdateSource {
             Self::Dnf => "DNF",
             Self::FlatpakUser => "FP",
             Self::FlatpakSystem => "FP",
+            Self::GnomeExtensions => "EXT",
             Self::Homebrew => "BREW",
             Self::Firmware => "FW",
         }
@@ -207,6 +217,7 @@ impl UpdateSource {
         match self {
             Self::Dnf => "src-dnf",
             Self::FlatpakUser | Self::FlatpakSystem => "src-flatpak",
+            Self::GnomeExtensions => "src-ext",
             Self::Homebrew => "src-brew",
             Self::Firmware => "src-firmware",
         }
@@ -217,19 +228,21 @@ impl UpdateSource {
             Self::Dnf => "dnf",
             Self::FlatpakUser => "flatpak-user",
             Self::FlatpakSystem => "flatpak-system",
+            Self::GnomeExtensions => "gnome-ext",
             Self::Homebrew => "brew",
             Self::Firmware => "fwupd",
         }
     }
 
-    /// Apply order: DNF → Flatpak user → Flatpak system → Homebrew → Firmware.
+    /// Apply order: DNF → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Firmware.
     pub fn apply_order(self) -> u8 {
         match self {
             Self::Dnf => 0,
             Self::FlatpakUser => 1,
             Self::FlatpakSystem => 2,
-            Self::Homebrew => 3,
-            Self::Firmware => 4,
+            Self::GnomeExtensions => 3,
+            Self::Homebrew => 4,
+            Self::Firmware => 5,
         }
     }
 }
@@ -363,7 +376,7 @@ pub struct PackageAdvisory {
     pub description: Option<String>,
 }
 
-/// One updatable unit (RPM, Flatpak ref, or firmware device).
+/// One updatable unit (RPM, Flatpak ref, extension, Homebrew item, or firmware device).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Package {
     pub id: String,
@@ -377,6 +390,7 @@ pub struct Package {
     pub source: UpdateSource,
     pub detail: String,
     pub summary: Option<String>,
+    pub url: Option<String>,
     pub install_size_delta: Option<i64>,
     pub advisories: Vec<PackageAdvisory>,
     pub preflight_warning: Option<String>,
@@ -406,6 +420,57 @@ impl Package {
             source: UpdateSource::Dnf,
             detail: format!("{version} · {repo}"),
             summary: None,
+            url: None,
+            install_size_delta: None,
+            advisories: Vec::new(),
+            preflight_warning: None,
+        }
+    }
+
+    /// Construct a user-installed GNOME Shell extension update item with `gnome-ext:<uuid>` id.
+    pub fn new_gnome_extension(
+        uuid: impl Into<String>,
+        name: impl Into<String>,
+        current_version: Option<String>,
+        summary: Option<String>,
+        url: Option<String>,
+    ) -> Self {
+        let uuid = uuid.into().trim().to_string();
+        let raw_name = name.into();
+        let trimmed_name = raw_name.trim();
+        let display_name = if trimmed_name.is_empty() {
+            uuid.clone()
+        } else {
+            trimmed_name.to_string()
+        };
+        let old_version = current_version
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let summary = summary
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let url = url
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let version = "update available".to_string();
+        let id = format!("gnome-ext:{uuid}");
+        let detail = match &old_version {
+            Some(old) => format!("{old} → {version}"),
+            None => format!("{version} · {uuid}"),
+        };
+        Self {
+            id,
+            name: display_name,
+            arch: String::new(),
+            version,
+            repo: "extensions.gnome.org".into(),
+            size_bytes: None,
+            old_version,
+            status: PackageStatus::Pending,
+            source: UpdateSource::GnomeExtensions,
+            detail,
+            summary,
+            url,
             install_size_delta: None,
             advisories: Vec::new(),
             preflight_warning: None,
@@ -450,6 +515,7 @@ impl Package {
             source: UpdateSource::Homebrew,
             detail: format!("{version} · {tap} · {kind}"),
             summary: None,
+            url: None,
             install_size_delta: None,
             advisories: Vec::new(),
             preflight_warning: None,
@@ -558,6 +624,13 @@ impl Package {
         }
         if !self.arch.is_empty() && format!("{}.{}", self.name, self.arch) == hint {
             return true;
+        }
+        if self.source == UpdateSource::GnomeExtensions {
+            if let Some(uuid) = self.id.strip_prefix("gnome-ext:") {
+                if hint == uuid {
+                    return true;
+                }
+            }
         }
         if self.source == UpdateSource::Homebrew {
             if let Some(rest) = self.id.strip_prefix("brew:") {
@@ -823,6 +896,7 @@ mod tests {
             source: UpdateSource::FlatpakUser,
             detail: String::new(),
             summary: None,
+            url: None,
             install_size_delta: None,
             advisories: Vec::new(),
             preflight_warning: None,
@@ -830,6 +904,17 @@ mod tests {
         assert!(fp.matches_progress_name("Thunderbird"));
         assert!(fp.matches_progress_name("org.mozilla.Thunderbird"));
         assert!(!fp.matches_progress_name("Thunder"));
+
+        let ext = Package::new_gnome_extension(
+            "blur-my-shell@aunetx",
+            "Blur my Shell",
+            Some("v66".into()),
+            Some("Adds blur to GNOME Shell".into()),
+            Some("https://github.com/aunetx/blur-my-shell".into()),
+        );
+        assert!(ext.matches_progress_name("blur-my-shell@aunetx"));
+        assert!(ext.matches_progress_name("Blur my Shell"));
+        assert!(!ext.matches_progress_name("blur-my-shell"));
 
         let brew_tap = Package::new_homebrew(
             "oven-sh/bun/bun",
@@ -877,6 +962,7 @@ mod tests {
             source: UpdateSource::Firmware,
             detail: String::new(),
             summary: None,
+            url: None,
             install_size_delta: None,
             advisories: Vec::new(),
             preflight_warning: None,
@@ -1138,24 +1224,28 @@ mod tests {
         assert_eq!(UpdateSource::Dnf.label(), "System");
         assert_eq!(UpdateSource::FlatpakUser.label(), "Apps");
         assert_eq!(UpdateSource::FlatpakSystem.label(), "Apps");
+        assert_eq!(UpdateSource::GnomeExtensions.label(), "Extensions");
         assert_eq!(UpdateSource::Homebrew.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Firmware.label(), "Firmware");
 
         assert_eq!(UpdateSource::Dnf.badge(), "DNF");
         assert_eq!(UpdateSource::FlatpakUser.badge(), "FP");
         assert_eq!(UpdateSource::FlatpakSystem.badge(), "FP");
+        assert_eq!(UpdateSource::GnomeExtensions.badge(), "EXT");
         assert_eq!(UpdateSource::Homebrew.badge(), "BREW");
         assert_eq!(UpdateSource::Firmware.badge(), "FW");
 
         assert_eq!(UpdateSource::Dnf.css_class(), "src-dnf");
         assert_eq!(UpdateSource::FlatpakUser.css_class(), "src-flatpak");
         assert_eq!(UpdateSource::FlatpakSystem.css_class(), "src-flatpak");
+        assert_eq!(UpdateSource::GnomeExtensions.css_class(), "src-ext");
         assert_eq!(UpdateSource::Homebrew.css_class(), "src-brew");
         assert_eq!(UpdateSource::Firmware.css_class(), "src-firmware");
 
         assert_eq!(UpdateSource::Dnf.console_tag(), "dnf");
         assert_eq!(UpdateSource::FlatpakUser.console_tag(), "flatpak-user");
         assert_eq!(UpdateSource::FlatpakSystem.console_tag(), "flatpak-system");
+        assert_eq!(UpdateSource::GnomeExtensions.console_tag(), "gnome-ext");
         assert_eq!(UpdateSource::Homebrew.console_tag(), "brew");
         assert_eq!(UpdateSource::Firmware.console_tag(), "fwupd");
 
@@ -1296,6 +1386,7 @@ mod tests {
                 UpdateSource::Dnf,
                 UpdateSource::FlatpakUser,
                 UpdateSource::FlatpakSystem,
+                UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
                 UpdateSource::Firmware,
             ]
@@ -1303,6 +1394,10 @@ mod tests {
         assert_eq!(UpdateSource::Dnf.category(), SourceCategory::System);
         assert_eq!(UpdateSource::FlatpakUser.category(), SourceCategory::Apps);
         assert_eq!(UpdateSource::FlatpakSystem.category(), SourceCategory::Apps);
+        assert_eq!(
+            UpdateSource::GnomeExtensions.category(),
+            SourceCategory::Extensions
+        );
         assert_eq!(
             UpdateSource::Homebrew.category(),
             SourceCategory::DevAndContainers
@@ -1312,18 +1407,21 @@ mod tests {
         assert_eq!(UpdateSource::Dnf.pref_key(), "dnf");
         assert_eq!(UpdateSource::FlatpakUser.pref_key(), "flatpak");
         assert_eq!(UpdateSource::FlatpakSystem.pref_key(), "flatpak");
+        assert_eq!(UpdateSource::GnomeExtensions.pref_key(), "gnome-extensions");
         assert_eq!(UpdateSource::Homebrew.pref_key(), "homebrew");
         assert_eq!(UpdateSource::Firmware.pref_key(), "firmware");
 
         assert!(UpdateSource::Dnf.requires_root());
         assert!(!UpdateSource::FlatpakUser.requires_root());
         assert!(!UpdateSource::FlatpakSystem.requires_root());
+        assert!(!UpdateSource::GnomeExtensions.requires_root());
         assert!(!UpdateSource::Homebrew.requires_root());
         assert!(UpdateSource::Firmware.requires_root());
 
         assert!(UpdateSource::Dnf.installed_by_default());
         assert!(UpdateSource::FlatpakUser.installed_by_default());
         assert!(UpdateSource::FlatpakSystem.installed_by_default());
+        assert!(!UpdateSource::GnomeExtensions.installed_by_default());
         assert!(!UpdateSource::Homebrew.installed_by_default());
         assert!(UpdateSource::Firmware.installed_by_default());
 
@@ -1337,10 +1435,35 @@ mod tests {
             vec![
                 UpdateSource::Dnf,
                 UpdateSource::FlatpakUser,
+                UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
                 UpdateSource::Firmware,
             ]
         );
+
+        let ext_pkg = Package::new_gnome_extension(
+            "blur-my-shell@aunetx",
+            "Blur my Shell",
+            Some("v66".into()),
+            Some("Adds blur to GNOME Shell".into()),
+            Some("https://github.com/aunetx/blur-my-shell".into()),
+        );
+        assert_eq!(ext_pkg.id, "gnome-ext:blur-my-shell@aunetx");
+        assert_eq!(ext_pkg.repo, "extensions.gnome.org");
+        assert_eq!(ext_pkg.old_version.as_deref(), Some("v66"));
+        assert_eq!(ext_pkg.version, "update available");
+        assert_eq!(ext_pkg.detail, "v66 → update available");
+        assert_eq!(
+            ext_pkg.url.as_deref(),
+            Some("https://github.com/aunetx/blur-my-shell")
+        );
+
+        let ext_minimal = Package::new_gnome_extension("caffeine@patapon.info", "", None, None, None);
+        assert_eq!(ext_minimal.id, "gnome-ext:caffeine@patapon.info");
+        assert_eq!(ext_minimal.name, "caffeine@patapon.info");
+        assert!(ext_minimal.old_version.is_none());
+        assert!(ext_minimal.url.is_none());
+        assert_eq!(ext_minimal.detail, "update available · caffeine@patapon.info");
 
         let mut fp_sys = Package::new_dnf("Steam", "", "1", "flathub");
         fp_sys.source = UpdateSource::FlatpakSystem;

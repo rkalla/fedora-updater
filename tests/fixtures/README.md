@@ -93,3 +93,11 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `systemctl/logind_inhibitors.json` | `org.freedesktop.login1.Manager.ListInhibitors` | Mix of `delay`, `handle-power-key` block, and `shutdown` block inhibitors |
 | `systemctl/reboot_block_inhibitor.txt` | `systemctl reboot` (exit 1) | logind `Operation denied due to active block inhibitor` output triggering user-friendly try-again recovery message |
 | `systemctl/reboot_logind_error.txt` | `systemctl reboot` (exit 1) | Generic logind DBus/timeout failure preserved verbatim |
+
+### `gnome_extensions/` (3 fixtures)
+
+| File | Simulated D-Bus Source | Scenario & Edge-Case Signals |
+|---|---|---|
+| `gnome_extensions/list_extensions_mixed.json` | `org.gnome.Shell.Extensions.ListExtensions` | Mixed system RPM (`type: 1` with/without `hasUpdate: true`, both skipped), up-to-date user (`type: 2`, `hasUpdate: false`), full-metadata updateable user extension, float `version: 54.0` + distinct `version-name`, and minimal extension omitting optional fields |
+| `gnome_extensions/list_extensions_empty.json` | `org.gnome.Shell.Extensions.ListExtensions` | System extension + up-to-date user extension yielding zero extension updates |
+| `gnome_extensions/install_replies.json` | `org.gnome.Shell.Extensions.InstallRemoteExtension` | Canonical reply cases: `"successful"`, `"cancelled"`, `"error"`, and session D-Bus timeout error |
