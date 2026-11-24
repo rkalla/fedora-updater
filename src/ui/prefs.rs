@@ -28,7 +28,7 @@ const PREFS_FILE_NAME: &str = "ui.json";
 fn normalize_key_set(keys: BTreeSet<String>) -> BTreeSet<String> {
     keys.into_iter()
         .map(|key| key.trim().to_ascii_lowercase())
-        .filter(|key| !key.is_empty())
+        .filter(|key| !key.is_empty() && UpdateSource::is_known_pref_key(key))
         .collect()
 }
 
@@ -103,7 +103,7 @@ impl UiPrefs {
 
     pub fn set_source_enabled(&mut self, pref_key: &str, enabled: bool) {
         let normalized = pref_key.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
+        if normalized.is_empty() || !UpdateSource::is_known_pref_key(&normalized) {
             return;
         }
         if UpdateSource::pref_key_is_opt_in(&normalized) {
@@ -241,6 +241,7 @@ mod tests {
         assert_eq!(prefs.window_height, 676);
         assert!(prefs.disabled_sources.is_empty());
         assert!(prefs.enabled_opt_in_sources.is_empty());
+        assert!(prefs.custom_hooks.is_empty());
         assert!(prefs.is_source_enabled("dnf"));
         assert!(prefs.is_source_enabled("flatpak"));
         assert!(prefs.is_source_enabled("firmware"));
@@ -466,5 +467,40 @@ mod tests {
         assert_eq!(reloaded.custom_hooks[0].apply_command, "chezmoi update");
         assert!(reloaded.custom_hooks[0].enabled);
         assert!(reloaded.source_config().is_enabled(UpdateSource::CustomHook));
+    }
+
+    #[test]
+    fn legacy_ui_json_with_stale_uv_and_pipx_keys_deserializes_and_prunes_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ui.json");
+        fs::write(
+            &path,
+            r#"{
+  "sidebar_open": false,
+  "window_width": 1100,
+  "window_height": 760,
+  "disabled_sources": ["uv", "uv-tools", "pipx", "firmware", "unknown-legacy"],
+  "enabled_opt_in_sources": ["pipx", "toolbx"]
+}
+"#,
+        )
+        .expect("write legacy ui.json");
+
+        let loaded = load_from(&path);
+        assert!(!loaded.sidebar_open);
+        assert_eq!(loaded.window_width, 1100);
+        assert_eq!(loaded.window_height, 760);
+        assert_eq!(loaded.disabled_sources, BTreeSet::from(["firmware".into()]));
+        assert_eq!(
+            loaded.enabled_opt_in_sources,
+            BTreeSet::from(["toolbx".into()])
+        );
+        assert!(!loaded.is_source_enabled("firmware"));
+        assert!(loaded.is_source_enabled("toolbx"));
+        assert!(loaded.custom_hooks.is_empty());
+
+        save_to(&path, &loaded).expect("save pruned prefs");
+        let reloaded = load_from(&path);
+        assert_eq!(reloaded, loaded);
     }
 }

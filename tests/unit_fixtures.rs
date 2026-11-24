@@ -29,12 +29,6 @@ use fedora_updater::backend::mise::{
     parse_mise_outdated_json, parse_progress_line as parse_mise_progress,
     upgrade_names_from_packages as mise_upgrade_names,
 };
-use fedora_updater::backend::python_tools::{
-    parse_pipx_list_json, parse_pipx_outdated_text,
-    parse_pipx_progress_line as parse_pipx_progress, parse_uv_progress_line as parse_uv_progress,
-    parse_uv_tool_list, parse_uv_upgrade_dry_run,
-    pipx_package_names_from_packages, uv_tool_names_from_packages,
-};
 use fedora_updater::backend::rpm_ostree::{
     check_exit_is_hard_error as rpm_ostree_exit_is_hard_error,
     check_exit_is_no_updates as rpm_ostree_exit_is_no_updates,
@@ -704,7 +698,7 @@ fn containers_fixtures_cover_list_dedup_empty_and_upgrade_logs() {
 }
 
 #[test]
-fn toolchains_fixtures_cover_rustup_mise_uv_and_pipx() {
+fn toolchains_fixtures_cover_rustup_and_mise() {
     use std::collections::HashSet;
     use std::path::Path;
 
@@ -775,44 +769,6 @@ fn toolchains_fixtures_cover_rustup_mise_uv_and_pipx() {
         .any(|h| h.package_name.as_deref() == Some("node")
             && h.status == Some(PackageStatus::Completed)));
     assert!(!detect_reboot(UpdateSource::Mise, &mise_log, &mise_pkgs));
-
-    // 3. uv tool list + dry-run diff + progress
-    let uv_list_raw = read_fixture("toolchains/uv_tool_list.txt");
-    let uv_installed = parse_uv_tool_list(&uv_list_raw);
-    assert_eq!(uv_installed.len(), 2);
-    let uv_dry_raw = read_fixture("toolchains/uv_upgrade_dry_run.txt");
-    let uv_pkgs = parse_uv_upgrade_dry_run(&uv_dry_raw, &uv_installed);
-    assert_eq!(uv_pkgs.len(), 2);
-    assert!(!uv_pkgs.iter().any(|p| p.name == "urllib3"));
-    assert_eq!(
-        uv_tool_names_from_packages(None, &uv_pkgs),
-        vec!["ruff", "httpie"]
-    );
-    let uv_log = read_fixture("toolchains/uv_upgrade_log.txt");
-    assert_eq!(
-        parse_uv_progress("Updated httpie v3.2.2 -> v3.2.4").status,
-        Some(PackageStatus::Completed)
-    );
-    assert!(!detect_reboot(UpdateSource::UvTools, &uv_log, &uv_pkgs));
-
-    // 4. pipx list --json + outdated text + pinned skip + progress
-    let pipx_list_raw = read_fixture("toolchains/pipx_list.json");
-    let pipx_installed = parse_pipx_list_json(&pipx_list_raw).unwrap();
-    assert_eq!(pipx_installed.len(), 2);
-    let pipx_out_raw = read_fixture("toolchains/pipx_outdated.txt");
-    let pipx_pkgs = parse_pipx_outdated_text(&pipx_out_raw, &pipx_installed);
-    assert_eq!(pipx_pkgs.len(), 1);
-    assert_eq!(pipx_pkgs[0].id, "pipx:ansible-lint");
-    assert_eq!(
-        pipx_package_names_from_packages(None, &pipx_pkgs),
-        vec!["ansible-lint"]
-    );
-    let pipx_log = read_fixture("toolchains/pipx_upgrade_log.txt");
-    assert_eq!(
-        parse_pipx_progress("upgrading ansible-lint...").package_name.as_deref(),
-        Some("ansible-lint")
-    );
-    assert!(!detect_reboot(UpdateSource::Pipx, &pipx_log, &pipx_pkgs));
 }
 
 #[test]

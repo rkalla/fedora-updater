@@ -39,6 +39,7 @@ Single multi-call Rust binary (`fedora-updater` GNOME/GTK4/Libadwaita GUI and `f
 2. **Strict `--helper` allowlist:** `HelperCommand::argv()` in `src/helper_protocol.rs` must permit only fixed, hardcoded `/usr/bin/dnf` and `/usr/bin/fwupdmgr` argument lists, with zero environment-variable overrides in `--helper` mode.
 3. **Single portable binary & lean runtime:** Do not add `tokio` to `Cargo.toml` (use GLib/GTK main-loop channels, `async-channel`, blocking OS threads, and `zbus` blocking proxies). Keep UI preferences in standalone XDG JSON (`$XDG_CONFIG_HOME/fedora-updater/ui.json`, no GSettings schemas). Keep `libflatpak.so.0` dynamically loaded at runtime.
 4. **Offline deterministic tests:** `cargo test` must remain 100% offline using `tests/fixtures/` and test harnesses. Annotate any live-host D-Bus/DNF test with `#[ignore]`.
+5. **80/20 developer toolchain vs. Custom Hook boundary:** Built-in developer toolchain backends require an isolated, unprivileged manager with a fast, read-only check query producing exact per-item `old -> new` diffs and selective apply (`rustup`, `mise`). Everything else (`uv`, `pipx`, `cargo-update`, `npm -g`, `nvm`/`fnm`, `pyenv`, `sdkman`, `conda`, etc.) belongs in opt-in, strictly unprivileged `CustomHook` entries (assisted by static `HOOK_TEMPLATES` form presets in Preferences) rather than hardcoded CLI output parsers or DSLs.
 
 ## Verification
 

@@ -112,8 +112,6 @@ pub enum UpdateSource {
     Homebrew,
     Rustup,
     Mise,
-    UvTools,
-    Pipx,
     Distrobox,
     Toolbx,
     CustomHook,
@@ -130,8 +128,6 @@ impl UpdateSource {
         Self::Homebrew,
         Self::Rustup,
         Self::Mise,
-        Self::UvTools,
-        Self::Pipx,
         Self::Distrobox,
         Self::Toolbx,
         Self::CustomHook,
@@ -162,8 +158,6 @@ impl UpdateSource {
             Self::Homebrew
             | Self::Rustup
             | Self::Mise
-            | Self::UvTools
-            | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx
             | Self::CustomHook => SourceCategory::DevAndContainers,
@@ -180,8 +174,6 @@ impl UpdateSource {
             Self::Homebrew => "homebrew",
             Self::Rustup => "rustup",
             Self::Mise => "mise",
-            Self::UvTools => "uv",
-            Self::Pipx => "pipx",
             Self::Distrobox => "distrobox",
             Self::Toolbx => "toolbx",
             Self::CustomHook => "custom-hooks",
@@ -198,8 +190,6 @@ impl UpdateSource {
             Self::Homebrew => "Homebrew (brew)",
             Self::Rustup => "Rust Toolchains (rustup)",
             Self::Mise => "Dev Runtimes (mise)",
-            Self::UvTools => "Python CLI Tools (uv)",
-            Self::Pipx => "Python CLI Tools (pipx)",
             Self::Distrobox => "Distrobox Containers",
             Self::Toolbx => "Toolbx Containers",
             Self::CustomHook => "Custom User Hooks",
@@ -216,8 +206,6 @@ impl UpdateSource {
             | Self::Homebrew
             | Self::Rustup
             | Self::Mise
-            | Self::UvTools
-            | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx
             | Self::CustomHook => false,
@@ -236,8 +224,6 @@ impl UpdateSource {
             | Self::Homebrew
             | Self::Rustup
             | Self::Mise
-            | Self::UvTools
-            | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx
             | Self::CustomHook
@@ -256,8 +242,6 @@ impl UpdateSource {
             | Self::Homebrew
             | Self::Rustup
             | Self::Mise
-            | Self::UvTools
-            | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx
             | Self::CustomHook
@@ -279,8 +263,6 @@ impl UpdateSource {
                     | Self::Homebrew
                     | Self::Rustup
                     | Self::Mise
-                    | Self::UvTools
-                    | Self::Pipx
                     | Self::Distrobox
                     | Self::Toolbx
                     | Self::CustomHook
@@ -290,6 +272,12 @@ impl UpdateSource {
     /// True when this source stays disabled until the user explicitly enables it in Preferences.
     pub fn is_opt_in(self) -> bool {
         matches!(self, Self::Distrobox | Self::Toolbx)
+    }
+
+    /// True when a normalized preference key matches any known [`UpdateSource`].
+    pub fn is_known_pref_key(pref_key: &str) -> bool {
+        let normalized = pref_key.trim().to_ascii_lowercase();
+        Self::ALL.iter().any(|src| src.pref_key() == normalized)
     }
 
     /// True when a normalized preference key corresponds to an opt-in source.
@@ -338,8 +326,6 @@ impl UpdateSource {
             Self::Homebrew => "BREW",
             Self::Rustup => "RUST",
             Self::Mise => "MISE",
-            Self::UvTools => "UV",
-            Self::Pipx => "PIPX",
             Self::Distrobox => "DBOX",
             Self::Toolbx => "TBX",
             Self::CustomHook => "HOOK",
@@ -354,7 +340,7 @@ impl UpdateSource {
             Self::FlatpakUser | Self::FlatpakSystem => "src-flatpak",
             Self::GnomeExtensions => "src-ext",
             Self::Homebrew => "src-brew",
-            Self::Rustup | Self::Mise | Self::UvTools | Self::Pipx => "src-toolchain",
+            Self::Rustup | Self::Mise => "src-toolchain",
             Self::Distrobox | Self::Toolbx => "src-container",
             Self::CustomHook => "src-hook",
             Self::Firmware => "src-firmware",
@@ -371,8 +357,6 @@ impl UpdateSource {
             Self::Homebrew => "brew",
             Self::Rustup => "rustup",
             Self::Mise => "mise",
-            Self::UvTools => "uv",
-            Self::Pipx => "pipx",
             Self::Distrobox => "distrobox",
             Self::Toolbx => "toolbx",
             Self::CustomHook => "hook",
@@ -380,7 +364,7 @@ impl UpdateSource {
         }
     }
 
-    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Toolchains (rustup, mise, uv, pipx) → Containers (Distrobox, Toolbx) → Custom Hooks → Firmware.
+    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Toolchains (rustup, mise) → Containers (Distrobox, Toolbx) → Custom Hooks → Firmware.
     pub fn apply_order(self) -> u8 {
         match self {
             Self::Dnf | Self::RpmOstree => 0,
@@ -390,12 +374,10 @@ impl UpdateSource {
             Self::Homebrew => 4,
             Self::Rustup => 5,
             Self::Mise => 6,
-            Self::UvTools => 7,
-            Self::Pipx => 8,
-            Self::Distrobox => 9,
-            Self::Toolbx => 10,
-            Self::CustomHook => 11,
-            Self::Firmware => 12,
+            Self::Distrobox => 7,
+            Self::Toolbx => 8,
+            Self::CustomHook => 9,
+            Self::Firmware => 10,
         }
     }
 }
@@ -788,7 +770,7 @@ impl Package {
         }
     }
 
-    /// Construct a user-space developer toolchain update item (`rustup`, `mise`, `uv`, or `pipx`).
+    /// Construct a user-space developer toolchain update item (`rustup` or `mise`).
     #[allow(clippy::too_many_arguments)]
     pub fn new_toolchain(
         source: UpdateSource,
@@ -970,9 +952,6 @@ impl Package {
                 .next()
                 .is_some_and(|short| !short.is_empty() && short == hint);
         }
-        if matches!(self.source, UpdateSource::UvTools | UpdateSource::Pipx) {
-            return normalize_python_pkg_name(&self.name) == normalize_python_pkg_name(hint);
-        }
         if matches!(
             self.source,
             UpdateSource::Distrobox | UpdateSource::Toolbx | UpdateSource::CustomHook
@@ -982,26 +961,6 @@ impl Package {
         // Flatpak/fwupd ids: `flatpak:user:app/org.foo/x86_64/stable`, `fwupd:<device>`.
         self.id.split([':', '/']).any(|part| part == hint)
     }
-}
-
-fn normalize_python_pkg_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut prev_dash = false;
-    for ch in name.trim().chars() {
-        if matches!(ch, '-' | '_' | '.') {
-            if !prev_dash && !out.is_empty() {
-                out.push('-');
-                prev_dash = true;
-            }
-        } else {
-            out.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
 }
 
 #[derive(Debug, Clone)]
@@ -1338,33 +1297,6 @@ mod tests {
         );
         assert!(mise_tool.matches_progress_name("ubi:jdx/usage"));
         assert!(mise_tool.matches_progress_name("usage"));
-
-        let uv_tool = Package::new_toolchain(
-            UpdateSource::UvTools,
-            "uv:httpie_cli",
-            "httpie_cli",
-            Some("3.2.0".into()),
-            "3.2.4",
-            "uv",
-            "",
-            None,
-            None,
-        );
-        assert!(uv_tool.matches_progress_name("Httpie-Cli"));
-        assert!(uv_tool.matches_progress_name("httpie.cli"));
-
-        let pipx_tool = Package::new_toolchain(
-            UpdateSource::Pipx,
-            "pipx:ansible-lint",
-            "ansible-lint",
-            Some("24.9.0".into()),
-            "24.10.0",
-            "pipx",
-            "",
-            None,
-            None,
-        );
-        assert!(pipx_tool.matches_progress_name("ansible_lint"));
     }
 
     #[test]
@@ -1667,8 +1599,6 @@ mod tests {
         assert_eq!(UpdateSource::Homebrew.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Rustup.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Mise.label(), "Dev & Containers");
-        assert_eq!(UpdateSource::UvTools.label(), "Dev & Containers");
-        assert_eq!(UpdateSource::Pipx.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Distrobox.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Toolbx.label(), "Dev & Containers");
         assert_eq!(UpdateSource::CustomHook.label(), "Dev & Containers");
@@ -1681,8 +1611,6 @@ mod tests {
         assert_eq!(UpdateSource::Homebrew.badge(), "BREW");
         assert_eq!(UpdateSource::Rustup.badge(), "RUST");
         assert_eq!(UpdateSource::Mise.badge(), "MISE");
-        assert_eq!(UpdateSource::UvTools.badge(), "UV");
-        assert_eq!(UpdateSource::Pipx.badge(), "PIPX");
         assert_eq!(UpdateSource::Distrobox.badge(), "DBOX");
         assert_eq!(UpdateSource::Toolbx.badge(), "TBX");
         assert_eq!(UpdateSource::CustomHook.badge(), "HOOK");
@@ -1695,8 +1623,6 @@ mod tests {
         assert_eq!(UpdateSource::Homebrew.css_class(), "src-brew");
         assert_eq!(UpdateSource::Rustup.css_class(), "src-toolchain");
         assert_eq!(UpdateSource::Mise.css_class(), "src-toolchain");
-        assert_eq!(UpdateSource::UvTools.css_class(), "src-toolchain");
-        assert_eq!(UpdateSource::Pipx.css_class(), "src-toolchain");
         assert_eq!(UpdateSource::Distrobox.css_class(), "src-container");
         assert_eq!(UpdateSource::Toolbx.css_class(), "src-container");
         assert_eq!(UpdateSource::CustomHook.css_class(), "src-hook");
@@ -1709,8 +1635,6 @@ mod tests {
         assert_eq!(UpdateSource::Homebrew.console_tag(), "brew");
         assert_eq!(UpdateSource::Rustup.console_tag(), "rustup");
         assert_eq!(UpdateSource::Mise.console_tag(), "mise");
-        assert_eq!(UpdateSource::UvTools.console_tag(), "uv");
-        assert_eq!(UpdateSource::Pipx.console_tag(), "pipx");
         assert_eq!(UpdateSource::Distrobox.console_tag(), "distrobox");
         assert_eq!(UpdateSource::Toolbx.console_tag(), "toolbx");
         assert_eq!(UpdateSource::CustomHook.console_tag(), "hook");
@@ -1858,8 +1782,6 @@ mod tests {
                 UpdateSource::Homebrew,
                 UpdateSource::Rustup,
                 UpdateSource::Mise,
-                UpdateSource::UvTools,
-                UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
                 UpdateSource::CustomHook,
@@ -1887,14 +1809,6 @@ mod tests {
             SourceCategory::DevAndContainers
         );
         assert_eq!(
-            UpdateSource::UvTools.category(),
-            SourceCategory::DevAndContainers
-        );
-        assert_eq!(
-            UpdateSource::Pipx.category(),
-            SourceCategory::DevAndContainers
-        );
-        assert_eq!(
             UpdateSource::Distrobox.category(),
             SourceCategory::DevAndContainers
         );
@@ -1916,12 +1830,17 @@ mod tests {
         assert_eq!(UpdateSource::Homebrew.pref_key(), "homebrew");
         assert_eq!(UpdateSource::Rustup.pref_key(), "rustup");
         assert_eq!(UpdateSource::Mise.pref_key(), "mise");
-        assert_eq!(UpdateSource::UvTools.pref_key(), "uv");
-        assert_eq!(UpdateSource::Pipx.pref_key(), "pipx");
         assert_eq!(UpdateSource::Distrobox.pref_key(), "distrobox");
         assert_eq!(UpdateSource::Toolbx.pref_key(), "toolbx");
         assert_eq!(UpdateSource::CustomHook.pref_key(), "custom-hooks");
         assert_eq!(UpdateSource::Firmware.pref_key(), "firmware");
+
+        assert!(UpdateSource::is_known_pref_key("rustup"));
+        assert!(UpdateSource::is_known_pref_key(" MISE "));
+        assert!(UpdateSource::is_known_pref_key("dnf"));
+        assert!(!UpdateSource::is_known_pref_key("uv"));
+        assert!(!UpdateSource::is_known_pref_key("uv-tools"));
+        assert!(!UpdateSource::is_known_pref_key("pipx"));
 
         assert!(UpdateSource::Dnf.requires_root());
         assert!(UpdateSource::RpmOstree.requires_root());
@@ -1931,8 +1850,6 @@ mod tests {
         assert!(!UpdateSource::Homebrew.requires_root());
         assert!(!UpdateSource::Rustup.requires_root());
         assert!(!UpdateSource::Mise.requires_root());
-        assert!(!UpdateSource::UvTools.requires_root());
-        assert!(!UpdateSource::Pipx.requires_root());
         assert!(!UpdateSource::Distrobox.requires_root());
         assert!(!UpdateSource::Toolbx.requires_root());
         assert!(!UpdateSource::CustomHook.requires_root());
@@ -1948,8 +1865,6 @@ mod tests {
         assert!(!UpdateSource::Homebrew.installed_by_default());
         assert!(!UpdateSource::Rustup.installed_by_default());
         assert!(!UpdateSource::Mise.installed_by_default());
-        assert!(!UpdateSource::UvTools.installed_by_default());
-        assert!(!UpdateSource::Pipx.installed_by_default());
         assert!(!UpdateSource::Distrobox.installed_by_default());
         assert!(!UpdateSource::Toolbx.installed_by_default());
         assert!(!UpdateSource::CustomHook.installed_by_default());
@@ -1959,15 +1874,11 @@ mod tests {
         assert!(!UpdateSource::Homebrew.is_opt_in());
         assert!(!UpdateSource::Rustup.is_opt_in());
         assert!(!UpdateSource::Mise.is_opt_in());
-        assert!(!UpdateSource::UvTools.is_opt_in());
-        assert!(!UpdateSource::Pipx.is_opt_in());
         assert!(UpdateSource::pref_key_is_opt_in(" Distrobox "));
         assert!(UpdateSource::pref_key_is_opt_in("toolbx"));
         assert!(!UpdateSource::pref_key_is_opt_in("homebrew"));
         assert!(!UpdateSource::pref_key_is_opt_in("rustup"));
         assert!(!UpdateSource::pref_key_is_opt_in("mise"));
-        assert!(!UpdateSource::pref_key_is_opt_in("uv"));
-        assert!(!UpdateSource::pref_key_is_opt_in("pipx"));
         assert!(UpdateSource::Firmware.installed_by_default());
 
         assert_eq!(
@@ -2002,8 +1913,6 @@ mod tests {
                 UpdateSource::Homebrew,
                 UpdateSource::Rustup,
                 UpdateSource::Mise,
-                UpdateSource::UvTools,
-                UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
                 UpdateSource::Firmware,
@@ -2018,8 +1927,6 @@ mod tests {
                 UpdateSource::Homebrew,
                 UpdateSource::Rustup,
                 UpdateSource::Mise,
-                UpdateSource::UvTools,
-                UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
                 UpdateSource::Firmware,

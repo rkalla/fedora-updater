@@ -7,7 +7,7 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use libadwaita::prelude::*;
 
-use fedora_updater::backend::hooks::CustomHook;
+use fedora_updater::backend::hooks::{CustomHook, HOOK_TEMPLATES};
 use fedora_updater::model::{SourceCategory, UpdateSource};
 use fedora_updater::orchestrator::{SourceAvailability, SourceConfig};
 
@@ -344,6 +344,8 @@ fn rebuild_hook_rows(ctx: &HookUiContext) {
 pub(crate) struct HookEditorHandles {
     pub dialog: libadwaita::Dialog,
     #[cfg(test)]
+    pub template_row: Option<libadwaita::ComboRow>,
+    #[cfg(test)]
     pub name_entry: libadwaita::EntryRow,
     #[cfg(test)]
     pub check_entry: libadwaita::EntryRow,
@@ -384,6 +386,45 @@ pub(crate) fn build_hook_editor_dialog(
     let group = libadwaita::PreferencesGroup::builder()
         .description("Commands run unprivileged via `sh -c` under your user account and never request root or pkexec.")
         .build();
+
+    #[cfg(test)]
+    let mut template_row = None;
+    if existing.is_none() {
+        let mut labels = Vec::with_capacity(1 + HOOK_TEMPLATES.len());
+        labels.push("Custom (blank)");
+        for tpl in HOOK_TEMPLATES {
+            labels.push(tpl.name);
+        }
+        let model = gtk::StringList::new(&labels);
+        let combo = libadwaita::ComboRow::builder()
+            .name("hook-template-combo")
+            .title("Template")
+            .subtitle("Start from a preset or enter your own command")
+            .model(&model)
+            .selected(0)
+            .build();
+        let name_fill = name_entry.clone();
+        let check_fill = check_entry.clone();
+        let apply_fill = apply_entry.clone();
+        combo.connect_selected_notify(move |row| {
+            let selected = row.selected();
+            if selected == 0 {
+                name_fill.set_text("");
+                check_fill.set_text("");
+                apply_fill.set_text("");
+            } else if let Some(tpl) = HOOK_TEMPLATES.get((selected - 1) as usize) {
+                name_fill.set_text(tpl.name);
+                check_fill.set_text(tpl.check_command.unwrap_or(""));
+                apply_fill.set_text(tpl.apply_command);
+            }
+        });
+        group.add(&combo);
+        #[cfg(test)]
+        {
+            template_row = Some(combo);
+        }
+    }
+
     group.add(&name_entry);
     group.add(&check_entry);
     group.add(&apply_entry);
@@ -464,6 +505,8 @@ pub(crate) fn build_hook_editor_dialog(
 
     HookEditorHandles {
         dialog: editor,
+        #[cfg(test)]
+        template_row,
         #[cfg(test)]
         name_entry,
         #[cfg(test)]

@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 80, "expected 80 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 74, "expected 74 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(
@@ -429,27 +429,4 @@ fn toolchains_fixtures_contain_expected_signals() {
 
     let mise_log = read_fixture("toolchains/mise_upgrade_log.txt");
     assert!(mise_log.contains("✓ installed"));
-
-    let uv_list = read_fixture("toolchains/uv_tool_list.txt");
-    assert!(uv_list.contains("httpie v3.2.2"));
-    assert!(uv_list.contains("- http"));
-
-    let uv_dry = read_fixture("toolchains/uv_upgrade_dry_run.txt");
-    assert!(uv_dry.contains("Updated ruff v0.9.6 -> v0.9.8"));
-    assert!(uv_dry.contains("urllib3==2.3.0"));
-
-    let uv_log = read_fixture("toolchains/uv_upgrade_log.txt");
-    assert!(uv_log.contains("Updated httpie v3.2.2 -> v3.2.4"));
-
-    let pipx_list = read_fixture_value("toolchains/pipx_list.json");
-    assert_eq!(
-        pipx_list["venvs"]["black"]["metadata"]["main_package"]["pinned"],
-        true
-    );
-
-    let pipx_out = read_fixture("toolchains/pipx_outdated.txt");
-    assert!(pipx_out.contains("ansible-lint has version 24.9.0"));
-
-    let pipx_log = read_fixture("toolchains/pipx_upgrade_log.txt");
-    assert!(pipx_log.contains("upgraded package ansible-lint"));
 }

@@ -13,7 +13,6 @@ pub mod gnome_extensions;
 pub mod hooks;
 pub mod logind;
 pub mod mise;
-pub mod python_tools;
 pub mod rpm_ostree;
 pub mod rustup;
 
@@ -134,8 +133,6 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
         UpdateSource::Homebrew => brew::parse_progress_line(line),
         UpdateSource::Rustup => rustup::parse_progress_line(line),
         UpdateSource::Mise => mise::parse_progress_line(line),
-        UpdateSource::UvTools => python_tools::parse_uv_progress_line(line),
-        UpdateSource::Pipx => python_tools::parse_pipx_progress_line(line),
         UpdateSource::Distrobox | UpdateSource::Toolbx => containers::parse_progress_line(line),
         UpdateSource::CustomHook => hooks::parse_progress_line(line),
         UpdateSource::Firmware => fwupd::parse_progress_line(line),
@@ -152,8 +149,6 @@ pub fn detect_reboot(source: UpdateSource, log: &str, packages: &[Package]) -> b
         | UpdateSource::Homebrew
         | UpdateSource::Rustup
         | UpdateSource::Mise
-        | UpdateSource::UvTools
-        | UpdateSource::Pipx
         | UpdateSource::Distrobox
         | UpdateSource::Toolbx
         | UpdateSource::CustomHook => false,
@@ -223,14 +218,6 @@ mod tests {
         let mise_hint = parse_progress(UpdateSource::Mise, "mise node@22.15.0  install");
         assert_eq!(mise_hint.package_name.as_deref(), Some("node"));
         assert_eq!(mise_hint.status, Some(PackageStatus::Installing));
-
-        let uv_hint = parse_progress(UpdateSource::UvTools, "Updated httpie v3.2.2 -> v3.2.4");
-        assert_eq!(uv_hint.package_name.as_deref(), Some("httpie"));
-        assert_eq!(uv_hint.status, Some(PackageStatus::Completed));
-
-        let pipx_hint = parse_progress(UpdateSource::Pipx, "upgrading ansible-lint...");
-        assert_eq!(pipx_hint.package_name.as_deref(), Some("ansible-lint"));
-        assert_eq!(pipx_hint.status, Some(PackageStatus::Installing));
 
         let dbox_hint = parse_progress(UpdateSource::Distrobox, "Upgrading arch-dev...");
         assert_eq!(dbox_hint.package_name.as_deref(), Some("arch-dev"));
@@ -316,12 +303,7 @@ mod tests {
             "An update requires a reboot to complete.",
             &kernel
         ));
-        for toolchain in [
-            UpdateSource::Rustup,
-            UpdateSource::Mise,
-            UpdateSource::UvTools,
-            UpdateSource::Pipx,
-        ] {
+        for toolchain in [UpdateSource::Rustup, UpdateSource::Mise] {
             assert!(!detect_reboot(
                 toolchain,
                 "An update requires a reboot to complete.",

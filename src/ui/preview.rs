@@ -51,8 +51,6 @@ pub fn initial_console() -> ConsoleBuffer {
             "stable-x86_64-unknown-linux-gnu updated - rustc 1.87.0",
         );
         console.push_committed_tagged("mise", "mise node@22.15.0  ✓ installed");
-        console.push_committed_tagged("uv", "Updated httpie v3.2.2 -> v3.2.4");
-        console.push_committed_tagged("pipx", "upgraded package ansible-lint");
         console.push_committed_tagged("distrobox", "Updating fedora-dev container");
         console.push_committed_tagged("toolbx", "Upgrading fedora-toolbox-43");
         console.push_committed_tagged("fwupd", "Loaded LVFS metadata for UEFI dbx");
@@ -451,7 +449,7 @@ fn pkg(
         UpdateSource::Homebrew => {
             Package::new_homebrew(name, Some(old.into()), version, "homebrew/core", false)
         }
-        UpdateSource::Rustup | UpdateSource::Mise | UpdateSource::UvTools | UpdateSource::Pipx => {
+        UpdateSource::Rustup | UpdateSource::Mise => {
             Package::new_toolchain(
                 source,
                 format!("{}:{name}", source.console_tag()),
@@ -568,28 +566,6 @@ fn sample_toolchain_packages() -> Vec<Package> {
             "mise",
             "22.15.0 · requested 22 · config.toml",
             Some("Configured in ~/.config/mise/config.toml".into()),
-            None,
-        ),
-        Package::new_toolchain(
-            UpdateSource::UvTools,
-            "uv:httpie",
-            "httpie",
-            Some("3.2.2".into()),
-            "3.2.4",
-            "uv",
-            "3.2.4 · uv tool · http, https",
-            Some("Provides executables: http, https".into()),
-            None,
-        ),
-        Package::new_toolchain(
-            UpdateSource::Pipx,
-            "pipx:ansible-lint",
-            "ansible-lint",
-            Some("24.9.0".into()),
-            "24.10.0",
-            "pipx",
-            "24.10.0 · pipx · ansible-lint",
-            Some("Provides apps: ansible-lint".into()),
             None,
         ),
     ]
@@ -1103,11 +1079,9 @@ mod tests {
         assert!(matches!(
             &ready_toolchains.state.phase,
             Phase::Ready { packages, .. }
-                if packages.len() == 4
+                if packages.len() == 2
                     && packages.iter().any(|p| p.source == UpdateSource::Rustup)
                     && packages.iter().any(|p| p.source == UpdateSource::Mise)
-                    && packages.iter().any(|p| p.source == UpdateSource::UvTools)
-                    && packages.iter().any(|p| p.source == UpdateSource::Pipx)
         ));
         let idle_cleanup = super::config_for("idle-cleanup");
         assert_eq!(idle_cleanup.sample_cleanup.as_ref().map(|p| p.len()), Some(3));

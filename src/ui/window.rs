@@ -696,8 +696,6 @@ fn can_selective_apply(packages: &[Package], native_dnf: bool, native_fwupd: boo
             | UpdateSource::Homebrew
             | UpdateSource::Rustup
             | UpdateSource::Mise
-            | UpdateSource::UvTools
-            | UpdateSource::Pipx
             | UpdateSource::Distrobox
             | UpdateSource::Toolbx
             | UpdateSource::CustomHook => pkg.source.supports_selective_apply(),
@@ -3484,8 +3482,6 @@ mod tests {
             (UpdateSource::Homebrew, "BREW", "src-brew"),
             (UpdateSource::Rustup, "RUST", "src-toolchain"),
             (UpdateSource::Mise, "MISE", "src-toolchain"),
-            (UpdateSource::UvTools, "UV", "src-toolchain"),
-            (UpdateSource::Pipx, "PIPX", "src-toolchain"),
             (UpdateSource::Distrobox, "DBOX", "src-container"),
             (UpdateSource::Toolbx, "TBX", "src-container"),
             (UpdateSource::CustomHook, "HOOK", "src-hook"),
@@ -5245,7 +5241,7 @@ mod tests {
                 "ready-toolchains" => {
                     assert!(!widgets.ostree_booted.get());
                     assert!(widgets.ready_queue.is_selectable());
-                    assert_eq!(widgets.ready_queue.filtered_count(), 4);
+                    assert_eq!(widgets.ready_queue.filtered_count(), 2);
                     assert!(widgets.ready_selection_bar.get_visible());
                     assert!(widgets
                         .sidebar
@@ -5686,7 +5682,7 @@ mod tests {
                 subtitle: "Not installed".into(),
             },
         );
-        for key in ["rustup", "mise", "uv", "pipx"] {
+        for key in ["rustup", "mise"] {
             availability.insert(
                 key.into(),
                 SourceAvailability {
@@ -5741,7 +5737,7 @@ mod tests {
             )
         };
 
-        assert_eq!(handle.switches.len(), 11);
+        assert_eq!(handle.switches.len(), 9);
         assert_eq!(
             handle.switches["dnf"].subtitle().as_deref(),
             Some("Installed (dnf5daemon D-Bus)")
@@ -5754,7 +5750,7 @@ mod tests {
             handle.switches["homebrew"].subtitle().as_deref(),
             Some("Not installed")
         );
-        for key in ["rustup", "mise", "uv", "pipx"] {
+        for key in ["rustup", "mise"] {
             assert_eq!(
                 handle.switches[key].subtitle().as_deref(),
                 Some("Not installed")
@@ -5822,8 +5818,6 @@ mod tests {
         handle.switches["homebrew"].set_active(false);
         handle.switches["rustup"].set_active(false);
         handle.switches["mise"].set_active(false);
-        handle.switches["uv"].set_active(false);
-        handle.switches["pipx"].set_active(false);
         handle.switches["firmware"].set_active(false);
         assert!(widgets.prefs.borrow().source_config().all_disabled());
         assert!(handle.all_disabled_group.get_visible());
@@ -5961,7 +5955,7 @@ mod tests {
         let prefs = super::prefs::UiPrefs::default();
         let pref_handle =
             super::preferences::build_preferences_dialog(&prefs, &ostree_avail, |_, _| {}, |_| {});
-        assert_eq!(pref_handle.switches.len(), 11);
+        assert_eq!(pref_handle.switches.len(), 9);
         assert!(pref_handle.switches.contains_key("rpm-ostree"));
         assert!(!pref_handle.switches.contains_key("dnf"));
         assert!(!pref_handle.switches["distrobox"].is_active());
@@ -5974,8 +5968,6 @@ mod tests {
             "homebrew",
             "rustup",
             "mise",
-            "uv",
-            "pipx",
             "firmware",
         ] {
             pref_handle.switches[key].set_active(false);
@@ -6163,6 +6155,7 @@ mod tests {
         assert!(joined.contains("gdbm"));
 
         // 3) Custom Hooks preferences escape Pango characters (&, <), toggle, edit, and delete cleanly.
+        assert!(super::super::prefs::UiPrefs::default().custom_hooks.is_empty());
         let prefs = super::super::prefs::UiPrefs {
             custom_hooks: vec![CustomHook {
                 name: "Rust & Tools <dev>".into(),
@@ -6183,7 +6176,7 @@ mod tests {
                 *observed_cb.borrow_mut() = hooks.to_vec();
             },
         );
-        assert_eq!(pref_handle.switches.len(), 11);
+        assert_eq!(pref_handle.switches.len(), 9);
         assert_eq!(pref_handle.custom_hooks_group.title().as_str(), "Custom Hooks");
         let mut add_btn_labels = Vec::new();
         collect_widget_labels(pref_handle.add_hook_button.upcast_ref(), &mut add_btn_labels);
@@ -6193,20 +6186,65 @@ mod tests {
         pref_handle.hook_switches.borrow()[0].set_active(false);
         assert!(!observed.borrow()[0].enabled);
 
-        // Editor modal validates & emits normalized hook.
+        // Editor modal validates, offers static presets, & emits normalized hook.
         let saved: Rc<RefCell<Option<CustomHook>>> = Rc::new(RefCell::new(None));
         let saved_cb = saved.clone();
         let editor = super::super::preferences::build_hook_editor_dialog(None, move |hook| {
             *saved_cb.borrow_mut() = Some(hook);
         });
         assert!(!editor.save_btn.is_sensitive());
+        let combo = editor
+            .template_row
+            .as_ref()
+            .expect("new hook editor should expose Template ComboRow");
+        assert_eq!(combo.selected(), 0);
+        assert_eq!(editor.name_entry.text().as_str(), "");
+        assert_eq!(editor.check_entry.text().as_str(), "");
+        assert_eq!(editor.apply_entry.text().as_str(), "");
+
         editor.dialog.present(Some(&widgets.window));
-        editor.name_entry.set_text("Chezmoi & Dotfiles");
-        editor.check_entry.set_text("");
-        editor.apply_entry.set_text("chezmoi update");
+        combo.set_selected(1);
+        assert_eq!(editor.name_entry.text().as_str(), "uv tools");
+        assert_eq!(editor.check_entry.text().as_str(), "");
+        assert_eq!(
+            editor.apply_entry.text().as_str(),
+            "uv tool upgrade --all"
+        );
         assert!(editor.save_btn.is_sensitive());
+
+        combo.set_selected(2);
+        assert_eq!(editor.name_entry.text().as_str(), "pipx apps");
+        assert_eq!(editor.apply_entry.text().as_str(), "pipx upgrade-all");
+
+        combo.set_selected(0);
+        assert_eq!(editor.name_entry.text().as_str(), "");
+        assert_eq!(editor.check_entry.text().as_str(), "");
+        assert_eq!(editor.apply_entry.text().as_str(), "");
+        assert!(!editor.save_btn.is_sensitive());
+
+        combo.set_selected(1);
         editor.save_btn.emit_clicked();
-        let added = saved.borrow().clone().expect("saved hook");
+        let templated = saved.borrow().clone().expect("saved template hook");
+        assert_eq!(templated.name, "uv tools");
+        assert_eq!(templated.check_command, None);
+        assert_eq!(templated.apply_command, "uv tool upgrade --all");
+        assert!(templated.enabled);
+
+        let edit_existing = super::super::preferences::build_hook_editor_dialog(Some(&templated), |_| {});
+        assert!(edit_existing.template_row.is_none());
+
+        let saved2: Rc<RefCell<Option<CustomHook>>> = Rc::new(RefCell::new(None));
+        let saved2_cb = saved2.clone();
+        let editor2 = super::super::preferences::build_hook_editor_dialog(None, move |hook| {
+            *saved2_cb.borrow_mut() = Some(hook);
+        });
+        editor2.dialog.present(Some(&widgets.window));
+        editor2.name_entry.set_text("Chezmoi & Dotfiles");
+        editor2.check_entry.set_text("");
+        editor2.apply_entry.set_text("chezmoi update");
+        assert!(editor2.save_btn.is_sensitive());
+        editor2.save_btn.emit_clicked();
+        let added = saved2.borrow().clone().expect("saved hook");
         assert_eq!(added.name, "Chezmoi & Dotfiles");
         assert_eq!(added.check_command, None);
         assert_eq!(added.apply_command, "chezmoi update");

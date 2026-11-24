@@ -2,7 +2,7 @@
 
 Checked-in, deterministic, offline test inputs for unit, functional, and end-to-end suites ([rkalla/fedora-updater#20](https://github.com/rkalla/fedora-updater/issues/20)).
 
-All 80 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
+All 74 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
 
 ## Usage in Tests
 
@@ -125,7 +125,7 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `containers/toolbox_upgrade_log.txt` | `toolbox run --container fedora-toolbox-43 sudo dnf upgrade -y` (exit 0) | Unprivileged rootless Toolbx inner DNF upgrade stream ending cleanly with `Complete!` |
 | `containers/upgrade_error.txt` | `distrobox upgrade ubuntu-lts` (exit 1) | Non-zero container upgrade failure log preserved for per-container error isolation |
 
-### `toolchains/` (13 fixtures)
+### `toolchains/` (7 fixtures)
 
 | File | Simulated Command & Exit | Scenario & Edge-Case Signals |
 |---|---|---|
@@ -136,12 +136,6 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `toolchains/mise_outdated_empty.json` | `mise outdated --json` (exit 0) | Empty JSON object `{}` when all mise tools are up to date |
 | `toolchains/mise_outdated_malformed.txt` | `mise outdated --json` (exit 0) | Non-JSON warning output failing cleanly during check |
 | `toolchains/mise_upgrade_log.txt` | `mise upgrade node ubi:jdx/usage` (exit 0) | Download percentage, install phase, and `✓ installed` completion lines |
-| `toolchains/uv_tool_list.txt` | `uv tool list` (exit 0) | Installed isolated Python CLI tools (`httpie`, `ruff`) and executable lists at column 0 |
-| `toolchains/uv_upgrade_dry_run.txt` | `uv tool upgrade --all --dry-run` (exit 0) | Mixed `Updated <tool>` and `- pkg==old` / `+ pkg==new` diff lines including internal `urllib3` dep filtered out |
-| `toolchains/uv_upgrade_log.txt` | `uv tool upgrade <tool>` (exit 0) | Per-tool download, executable install, and `Updated <tool>` completion output |
-| `toolchains/pipx_list.json` | `pipx list --json` (exit 0) | Isolated pipx venv metadata with unpinned `ansible-lint` and `pinned: true` `black` |
-| `toolchains/pipx_outdated.txt` | `pipx list --outdated` (exit 0) | Outdated lines for unpinned `ansible-lint` and pinned `black` (pinned entry skipped cleanly) |
-| `toolchains/pipx_upgrade_log.txt` | `pipx upgrade ansible-lint` (exit 0) | Per-package `upgrading ...` and `upgraded package ...` completion lines |
 
 ### `cleanup/` (6 fixtures)
 

@@ -48,8 +48,6 @@ impl InspectorViewModel {
             UpdateSource::Homebrew => "Dev & Containers (Homebrew)",
             UpdateSource::Rustup => "Dev & Containers (Rustup)",
             UpdateSource::Mise => "Dev & Containers (Mise)",
-            UpdateSource::UvTools => "Dev & Containers (uv tools)",
-            UpdateSource::Pipx => "Dev & Containers (pipx)",
             UpdateSource::Distrobox => "Dev & Containers (Distrobox)",
             UpdateSource::Toolbx => "Dev & Containers (Toolbx)",
             UpdateSource::CustomHook => "Dev & Containers (Custom Hook)",

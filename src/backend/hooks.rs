@@ -56,6 +56,52 @@ impl CustomHook {
     }
 }
 
+/// Static editable form preset offered in the Preferences "New Custom Hook" dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookTemplate {
+    pub name: &'static str,
+    pub check_command: Option<&'static str>,
+    pub apply_command: &'static str,
+}
+
+impl HookTemplate {
+    /// Materialize this template as an enabled, unprivileged [`CustomHook`].
+    pub fn to_custom_hook(&self) -> CustomHook {
+        CustomHook {
+            name: self.name.to_string(),
+            check_command: self.check_command.map(ToOwned::to_owned),
+            apply_command: self.apply_command.to_string(),
+            enabled: true,
+        }
+        .normalized()
+    }
+}
+
+/// Optional user-owned presets for common unprivileged CLI managers.
+/// Never auto-seeded or auto-enabled; users pick and customize them manually.
+pub const HOOK_TEMPLATES: &[HookTemplate] = &[
+    HookTemplate {
+        name: "uv tools",
+        check_command: None,
+        apply_command: "uv tool upgrade --all",
+    },
+    HookTemplate {
+        name: "pipx apps",
+        check_command: None,
+        apply_command: "pipx upgrade-all",
+    },
+    HookTemplate {
+        name: "Cargo binaries",
+        check_command: None,
+        apply_command: "cargo install-update -a",
+    },
+    HookTemplate {
+        name: "npm global",
+        check_command: None,
+        apply_command: "npm update -g",
+    },
+];
+
 /// Outcome of evaluating a custom hook's optional `check_command`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookCheckResult {
@@ -362,5 +408,46 @@ mod tests {
         let hint = parse_progress_line("Updating plugins: 65%");
         assert_eq!(hint.progress, Some(0.65));
         assert_eq!(hint.package_name, None);
+    }
+
+    #[test]
+    fn hook_templates_are_valid_and_strictly_unprivileged() {
+        assert!(!HOOK_TEMPLATES.is_empty());
+        assert_eq!(HOOK_TEMPLATES.len(), 4);
+
+        let names: BTreeSet<&str> = HOOK_TEMPLATES.iter().map(|t| t.name).collect();
+        assert_eq!(names.len(), HOOK_TEMPLATES.len());
+
+        for tpl in HOOK_TEMPLATES {
+            let hook = tpl.to_custom_hook();
+            assert!(hook.is_valid(), "template `{}` should be valid", tpl.name);
+            assert!(hook.enabled);
+            assert_eq!(hook.check_command, None);
+
+            let apply_lower = hook.apply_command.to_ascii_lowercase();
+            for forbidden in ["sudo", "pkexec", "doas", "--helper"] {
+                assert!(
+                    !apply_lower.contains(forbidden),
+                    "template `{}` must not reference `{forbidden}`",
+                    tpl.name
+                );
+                if let Some(chk) = hook.check_command.as_deref() {
+                    assert!(
+                        !chk.to_ascii_lowercase().contains(forbidden),
+                        "template `{}` check_command must not reference `{forbidden}`",
+                        tpl.name
+                    );
+                }
+            }
+        }
+
+        assert_eq!(HOOK_TEMPLATES[0].name, "uv tools");
+        assert_eq!(HOOK_TEMPLATES[0].apply_command, "uv tool upgrade --all");
+        assert_eq!(HOOK_TEMPLATES[1].name, "pipx apps");
+        assert_eq!(HOOK_TEMPLATES[1].apply_command, "pipx upgrade-all");
+        assert_eq!(HOOK_TEMPLATES[2].name, "Cargo binaries");
+        assert_eq!(HOOK_TEMPLATES[2].apply_command, "cargo install-update -a");
+        assert_eq!(HOOK_TEMPLATES[3].name, "npm global");
+        assert_eq!(HOOK_TEMPLATES[3].apply_command, "npm update -g");
     }
 }

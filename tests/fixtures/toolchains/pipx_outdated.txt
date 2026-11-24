@@ -1,3 +1,0 @@
-venvs are in /home/alice/.local/share/pipx/venvs
-package ansible-lint has version 24.9.0, newest version is 24.10.0
-package black has version 24.10.0, newest version is 25.1.0

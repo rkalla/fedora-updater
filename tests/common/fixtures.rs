@@ -88,12 +88,6 @@ pub const ALL_FIXTURES: &[&str] = &[
     "toolchains/mise_outdated_empty.json",
     "toolchains/mise_outdated_malformed.txt",
     "toolchains/mise_upgrade_log.txt",
-    "toolchains/uv_tool_list.txt",
-    "toolchains/uv_upgrade_dry_run.txt",
-    "toolchains/uv_upgrade_log.txt",
-    "toolchains/pipx_list.json",
-    "toolchains/pipx_outdated.txt",
-    "toolchains/pipx_upgrade_log.txt",
     // cleanup/
     "cleanup/flatpak_unused.txt",
     "cleanup/flatpak_unused_empty.txt",

@@ -2098,51 +2098,27 @@ mod tests {
             None,
             None,
         );
-        let mut uv = Package::new_toolchain(
-            UpdateSource::UvTools,
-            "uv:httpie",
-            "httpie",
-            Some("3.2.2".into()),
-            "3.2.4",
-            "uv",
-            "",
-            None,
-            None,
-        );
-        let mut pipx = Package::new_toolchain(
-            UpdateSource::Pipx,
-            "pipx:ansible-lint",
-            "ansible-lint",
-            Some("24.9.0".into()),
-            "24.10.0",
-            "pipx",
-            "",
-            None,
-            None,
-        );
-        let pkgs = vec![rust.clone(), mise.clone(), uv.clone(), pipx.clone()];
+        let pkgs = vec![rust.clone(), mise.clone()];
         assert_eq!(
             source_summary_line(&pkgs),
-            "0 system · 0 apps · 0 firmware · 4 dev"
+            "0 system · 0 apps · 0 firmware · 2 dev"
         );
 
-        for p in [&mut rust, &mut mise, &mut uv, &mut pipx] {
+        for p in [&mut rust, &mut mise] {
             p.status = PackageStatus::Completed;
         }
-        let done_pkgs = vec![rust, mise, uv, pipx];
+        let done_pkgs = vec![rust, mise];
         assert_eq!(
-            done_header_subtitle_for_packages(0, 4, &done_pkgs, "12s"),
-            "4 upgraded · 0 system / 0 apps / 0 firmware / 4 dev · 12s"
+            done_header_subtitle_for_packages(0, 2, &done_pkgs, "12s"),
+            "2 upgraded · 0 system / 0 apps / 0 firmware / 2 dev · 12s"
         );
-        let clean = done_clean_summary_for_packages(4, &done_pkgs, "12s");
+        let clean = done_clean_summary_for_packages(2, &done_pkgs, "12s");
         assert!(clean.contains("No restart needed"), "{clean}");
 
         let enabled = [
             UpdateSource::Dnf,
             UpdateSource::Rustup,
             UpdateSource::Mise,
-            UpdateSource::UvTools,
-            UpdateSource::Pipx,
         ];
         let (_frac, done, total, status) =
             check_progress_for_sources(&[UpdateSource::Dnf, UpdateSource::Rustup], &enabled);

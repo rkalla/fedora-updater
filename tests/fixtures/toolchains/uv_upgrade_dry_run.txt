@@ -1,6 +1,0 @@
-Resolved 12 packages in 140ms
- - httpie==3.2.2
- + httpie==3.2.4
- - urllib3==2.2.0
- + urllib3==2.3.0
-Updated ruff v0.9.6 -> v0.9.8

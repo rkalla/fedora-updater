@@ -1,6 +1,0 @@
-Downloading httpie (140KiB) 50%
-Installed 3 executables: http, httpie, https
-Updated httpie v3.2.2 -> v3.2.4
-Downloading ruff (2.1MiB) 100%
-Installed 1 executable: ruff
-Updated ruff v0.9.6 -> v0.9.8

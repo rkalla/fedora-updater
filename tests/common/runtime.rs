@@ -147,8 +147,6 @@ struct FakeState {
     brew_binary: Option<PathBuf>,
     rustup_binary: Option<PathBuf>,
     mise_binary: Option<PathBuf>,
-    uv_binary: Option<PathBuf>,
-    pipx_binary: Option<PathBuf>,
     distrobox_binary: Option<PathBuf>,
     toolbox_binary: Option<PathBuf>,
     flatpak_queries: Vec<bool>,
@@ -215,8 +213,6 @@ impl FakeRuntime {
                 brew_binary: None,
                 rustup_binary: None,
                 mise_binary: None,
-                uv_binary: None,
-                pipx_binary: None,
                 distrobox_binary: None,
                 toolbox_binary: None,
                 flatpak_queries: Vec::new(),
@@ -439,14 +435,6 @@ impl FakeRuntime {
 
     pub fn set_mise_binary(&self, path: Option<PathBuf>) {
         self.inner.lock().unwrap().mise_binary = path;
-    }
-
-    pub fn set_uv_binary(&self, path: Option<PathBuf>) {
-        self.inner.lock().unwrap().uv_binary = path;
-    }
-
-    pub fn set_pipx_binary(&self, path: Option<PathBuf>) {
-        self.inner.lock().unwrap().pipx_binary = path;
     }
 
     pub fn set_distrobox_available(&self, available: bool) {
@@ -788,14 +776,6 @@ impl OrchestratorRuntime for FakeRuntime {
 
     fn mise_binary(&self) -> Option<PathBuf> {
         self.inner.lock().unwrap().mise_binary.clone()
-    }
-
-    fn uv_binary(&self) -> Option<PathBuf> {
-        self.inner.lock().unwrap().uv_binary.clone()
-    }
-
-    fn pipx_binary(&self) -> Option<PathBuf> {
-        self.inner.lock().unwrap().pipx_binary.clone()
     }
 
     fn distrobox_binary(&self) -> Option<PathBuf> {
