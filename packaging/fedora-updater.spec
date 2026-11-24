@@ -2,7 +2,7 @@
 %{!?src_root:%global src_root %(pwd)}
 
 Name:           fedora-updater
-Version:        %{?pkg_version}%{!?pkg_version:0.2.0}
+Version:        %{?pkg_version}%{!?pkg_version:0.5.0}
 Release:        1
 Summary:        Unified GTK4/Libadwaita updater for Fedora system, Flatpak, and firmware updates
 

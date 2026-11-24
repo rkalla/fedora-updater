@@ -1,6 +1,6 @@
 [package]
 name = "fedora-updater"
-version = "0.2.0"
+version = "0.5.0"
 edition = "2021"
 description = "A polished GNOME desktop front-end for Fedora system, Flatpak, and firmware updates"
 license = "Apache-2.0"

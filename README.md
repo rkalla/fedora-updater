@@ -5,9 +5,9 @@
 ![Fedora 42+](https://img.shields.io/badge/Fedora-42%2B-51A2DA?logo=fedora&logoColor=white)
 ![GTK4 & Libadwaita](https://img.shields.io/badge/UI-GTK4_%2F_Libadwaita-4A86CF)
 
-A fast, transparent GTK4 + Libadwaita desktop updater for Fedora that brings **system (DNF)**, **Flatpak** (user and system, including NVIDIA/runtime extensions), and **LVFS firmware** updates together in a single **Observatory** workspace.
+A fast, transparent GTK4 + Libadwaita desktop updater for Fedora that brings **system updates** (classic **DNF** and Atomic **`rpm-ostree`**), **Flatpak** (user and system, including NVIDIA/runtime extensions), **GNOME Shell Extensions**, **Homebrew**, **developer toolchains** (`rustup` & `mise`), opt-in **rootless containers** (`Distrobox` & `Toolbx`), **unprivileged Custom User Hooks**, **unused cleanup**, and **LVFS firmware** together in a single **Observatory** workspace.
 
-[![Reviewing pending system, Flatpak, and firmware updates in Fedora Updater](screenshots/ready.png)](screenshots/ready.png)
+[![Reviewing pending Flatpak and developer toolchain updates in Fedora Updater](screenshots/ready.png)](screenshots/ready.png)
 
 | Live Telemetry | Update History | Safe Completion |
 |:---:|:---:|:---:|
@@ -17,27 +17,39 @@ A fast, transparent GTK4 + Libadwaita desktop updater for Fedora that brings **s
 
 ## Features
 
-- **Unified Fedora update view:** Inspect pending **DNF** packages, **Flatpak** user/system apps and runtime extensions, and **fwupd** LVFS firmware updates in one window with source pills (`DNF` / `FP` / `FW`) and counts.
-- **Zero-password checks & history:** Update discovery (`dnf5daemon-server` D-Bus with empty session config, `libflatpak`, and `fwupd`) and transaction history browsing run unprivileged — authentication is only requested when applying privileged updates.
-- **Flexible apply modes:** Use per-package checkboxes and the `Update All` SplitButton to choose **Update All**, **Update & Restart**, **Prepare Offline Update**, or **Download Only**.
+- **Unified multi-source Observatory view:** Inspect pending **DNF** or Atomic **`rpm-ostree`** system updates, **Flatpak** user/system apps and runtime extensions, **GNOME Shell Extensions**, **Homebrew**, **`rustup`** & **`mise`** developer toolchains, opt-in **Distrobox** / **Toolbx** containers, **Custom User Hooks**, and **fwupd** LVFS firmware in one window with color-coded source pills (`DNF` / `OSTREE` / `FP` / `EXT` / `BREW` / `RUST` / `MISE` / `DBOX` / `TBX` / `HOOK` / `FW`) and counts.
+- **Dynamic source sidebar & native Preferences (`Ctrl+,`):** Automatically hides unconfigured/disabled categories in the Observatory sidebar while letting you enable or disable individual sources, opt in to rootless container updates, and manage Custom Hooks in a Libadwaita Preferences dialog.
+- **Zero-password checks & history:** Update discovery (`dnf5daemon-server` D-Bus with empty session config, `rpm-ostree`, `libflatpak`, GNOME Shell session D-Bus, user-space tools, and `fwupd`) and transaction history browsing run unprivileged — authentication is only requested when applying privileged system or firmware updates.
+- **Flexible apply modes:** Use per-package checkboxes and the `Update All` SplitButton to choose **Update All** (or **Stage System Update** on Atomic hosts), **Update & Restart**, **Prepare Offline Update**, or **Download Only**.
 - **Security advisories & Package Inspector:** Click any update row to inspect version transitions (`old → new`), CVE and Bugzilla references, advisory severity badges, install-size deltas, and summaries.
 - **Live telemetry & throughput sparkline:** Watch real-time MB/s download throughput, peak rate, 4-stage pipeline pills (`Download` → `Prepare` → `Install` → `Verify`), and cancel downloads safely mid-run.
+- **Post-update unused cleanup:** Surfaces reclaimable unused Flatpak runtimes and orphaned Homebrew leaf formulae in an opt-in banner with an explicit confirmation dialog before removing anything.
+- **Opt-in unprivileged Custom User Hooks:** Configure custom user-space check/apply commands (`sh -c` under your own account, zero `pkexec`/root) with editable static form presets (`uv tools`, `pipx apps`, `Cargo binaries`, `npm global`) right in Preferences.
 - **Hardware & reboot safety guards:** Checks AC power / battery thresholds via `fwupd` before flashing firmware and queries `systemd-logind` shutdown inhibitors before restarting.
 - **Observatory dual-mode shell:** Collapsible sidebar (`F9` / `Ctrl+\`), instant package search (`Ctrl+F`), embedded filterable **Activity Log**, **Update History** timeline, and **Fedora release-upgrade** notices.
-- **Single portable binary:** Built as one multi-call executable (`fedora-updater` + `fedora-updater --helper`) with zero GSettings schemas required (UI geometry and sidebar state persist in `$XDG_CONFIG_HOME/fedora-updater/ui.json`).
+- **Single portable binary:** Built as one multi-call executable (`fedora-updater` + `fedora-updater --helper`) with zero GSettings schemas required (UI geometry, sidebar state, source toggles, and custom hooks persist in `$XDG_CONFIG_HOME/fedora-updater/ui.json`).
 
 ---
 
 ## How It Works
 
-Fedora Updater talks to native Fedora platform daemons and libraries by default and automatically falls back to standard CLI tools (run via `--helper` when elevated privileges are needed) if a daemon is unavailable:
+Fedora Updater talks to native Fedora platform daemons, libraries, and user-space CLI managers by default and automatically falls back to standard CLI tools (run via `--helper` only when elevated privileges are needed) if a daemon is unavailable:
 
-| Area | Native Engine (Default) | Automatic Fallback |
+| Area | Native Engine (Default) | Automatic Fallback / Notes |
 |---|---|---|
 | **System (DNF)** | `dnf5daemon-server` (`org.rpm.dnf.v0`) D-Bus — zero-auth check & history, advisories, selective/offline/download-only apply | `dnf check-update` / `dnf update -y` via `--helper` |
+| **System (Atomic)** | `rpm-ostree` status/diff/advisories detection and staged deployments on OSTree hosts | Automatic host-mode adaptation (`OSTREE` badge, single-unit staging) |
 | **Flatpak** (user & system) | `libflatpak.so.0` discovery (`list_installed_refs_for_update`) & `FlatpakTransaction` with related extensions | `flatpak update --noninteractive` |
+| **GNOME Extensions** | `org.gnome.Shell.Extensions` session D-Bus discovery & selective unprivileged install/update | Silently skipped outside GNOME Shell sessions |
+| **Homebrew** | `brew outdated --json=v2` discovery & selective unprivileged `brew upgrade` | Auto-detected in `PATH` and `/home/linuxbrew/.linuxbrew/bin/brew` |
+| **Developer Toolchains** | `rustup check` & `mise outdated --json` — fast read-only checks with exact `old → new` diffs and selective apply | Strictly unprivileged (`RUST` / `MISE` badges) |
+| **Containers** *(opt-in)* | Rootless `distrobox` and `toolbx` discovery & per-container upgrade with ID deduplication | Disabled by default; opt in via Preferences (`Ctrl+,`) |
+| **Custom User Hooks** *(opt-in)* | User-defined commands executed strictly as your user account (`sh -c`), assisted by static form presets (`uv tools`, `pipx apps`, `Cargo binaries`, `npm global`) | Never routed through `--helper` or `pkexec` |
+| **Unused Cleanup** | Dry-run discovery for unused Flatpak refs (`flatpak uninstall --unused --assumeno`) & Homebrew leaves (`brew autoremove --dry-run`) | Always asks confirmation before deleting |
 | **Firmware** | `fwupd` (`org.freedesktop.fwupd`) D-Bus — battery guards, LVFS release notes, device progress & history | `fwupdmgr refresh` / `get-updates` / `update` via `--helper` |
 | **Reboot** | `systemd-logind` (`org.freedesktop.login1`) `CanReboot` / inhibitor check & `Reboot(true)` | `systemctl reboot` |
+
+> **Built-in toolchains vs. Custom Hooks (80/20 boundary):** Built-in developer toolchain backends are reserved for isolated, unprivileged managers with a fast read-only check query producing exact per-item `old → new` diffs and selective apply (`rustup`, `mise`). Other language/tool managers (`uv`, `pipx`, `cargo install-update`, `npm -g`, `nvm`/`fnm`, etc.) run cleanly as user-owned **Custom Hooks** via editable form templates without brittle output parsers or root privileges.
 
 ---
 
@@ -125,6 +137,7 @@ Choose any of the three ways to run:
 |---|---|
 | `Ctrl+R` or `F5` | Check for updates |
 | `Ctrl+F` | Focus package search |
+| `Ctrl+,` | Open Preferences |
 | `F9` or `Ctrl+\` | Toggle Observatory sidebar |
 
 ---
@@ -154,13 +167,13 @@ export FEDORA_UPDATER_HELPER=/path/to/fedora-updater
 
 ## Development & Testing
 
-The test suite runs completely offline in under a second (**280 offline tests + 5 opt-in live-host tests**) across four tiers backed by a **39-file** deterministic fixture corpus under [`tests/fixtures/`](tests/fixtures/README.md):
+The test suite runs completely offline in under a second (**367 offline tests + 6 opt-in live-host tests**) across four tiers backed by a **74-file** deterministic fixture corpus under [`tests/fixtures/`](tests/fixtures/README.md):
 
 ```bash
 # Fast offline unit, functional, and pipe-based E2E suite
 cargo test
 
-# 26 headless GTK4/Libadwaita widget, row, window, and dialog E2E tests (uses gtk4-broadwayd)
+# 30 headless GTK4/Libadwaita widget, row, window, and dialog E2E tests (uses gtk4-broadwayd)
 ./scripts/test-ui-headless.sh
 
 # Strict lint check
@@ -178,7 +191,7 @@ Inspect any application state immediately without touching system packages or ru
 FEDORA_UPDATER_PREVIEW=ready-native ./bin/fedora-updater
 ```
 
-Available presets include `idle`, `idle-current`, `idle-warning`, `auth`, `checking`, `ready`, `ready-many`, `ready-warn`, `ready-native`, `running`, `running-sparkline`, `running-many`, `running-expanded`, `done`, `done-reboot`, `done-partial`, `failed`, `history`, and `log`. Set `FEDORA_UPDATER_SCREENSHOT=/path/to/out.png` to capture a window snapshot and exit cleanly.
+Available presets include `idle`, `idle-current`, `idle-warning`, `idle-cleanup`, `auth`, `checking`, `ready`, `ready-many`, `ready-warn`, `ready-native`, `ready-ostree`, `ready-ostree-mixed`, `ready-containers`, `ready-toolchains`, `ready-hooks`, `running`, `running-sparkline`, `running-many`, `running-expanded`, `running-ostree`, `done`, `done-reboot`, `done-partial`, `done-ostree`, `done-cleanup`, `failed`, `history`, and `log`. Set `FEDORA_UPDATER_SCREENSHOT=/path/to/out.png` to capture a window snapshot and exit cleanly.
 
 <details>
 <summary>Architecture & Module Map</summary>
@@ -186,14 +199,14 @@ Available presets include `idle`, `idle-current`, `idle-warning`, `auth`, `check
 ```text
 fedora-updater (GUI)
        │
-       ├── native D-Bus / C ABI ──► dnf5daemon-server · libflatpak.so.0 · fwupd · logind
-       └── privilege fallback ──── pkexec ──► fedora-updater --helper
-                                                  └── allowlisted /usr/bin/dnf & /usr/bin/fwupdmgr
+       ├── native / user-space ──► dnf5daemon-server · rpm-ostree · libflatpak.so.0 · GNOME Shell · brew · rustup · mise · distrobox · toolbx · fwupd · logind
+       └── privilege fallback  ── pkexec ──► fedora-updater --helper
+                                               └── allowlisted /usr/bin/dnf & /usr/bin/fwupdmgr
 
 src/
 ├── main.rs                Multi-call CLI/GUI entry point (--helper dispatch & AdwApplication)
 ├── lib.rs                 Library crate root
-├── model.rs               Domain types (Package, PackageAdvisory, UpdateSource, ApplyMode, Stopwatch)
+├── model.rs               Domain types (Package, PackageAdvisory, SourceCategory, UpdateSource, ApplyMode, Stopwatch)
 ├── state.rs               Pure state machine (AppState, Phase, RunningState, reduce)
 ├── orchestrator.rs        Sequential check/apply/history pipelines, native-first + fallback, cancellation
 ├── presenter.rs           Pure UI copy, badge formatting, counts, and status helpers
@@ -203,13 +216,21 @@ src/
 ├── helper_mode.rs         Privileged allowlist worker implementation (dnf / fwupdmgr)
 ├── style.css              WCAG-checked Observatory & Libadwaita theme tokens
 ├── backend/
-│   ├── mod.rs             NativeOutcome enum, progress & reboot dispatch
+│   ├── mod.rs             NativeOutcome enum, user binary lookup, progress & reboot dispatch
+│   ├── brew.rs            Homebrew JSON discovery, progress hints, and unprivileged apply
+│   ├── cleanup.rs         Unused Flatpak ref & Homebrew autoremove dry-run discovery and cleanup
+│   ├── containers.rs      Rootless Distrobox & Toolbx container discovery, deduplication, and upgrade
 │   ├── dnf_dbus.rs        org.rpm.dnf.v0 D-Bus client (zero-auth check, advisories, history, download/transaction progress)
 │   ├── dnf.rs             dnf5 / classic DNF check, repoquery & apply stdout/stderr parsers
 │   ├── flatpak.rs         libflatpak.so.0 dynamic loader, FlatpakTransaction apply & CLI fallback
 │   ├── fwupd_dbus.rs      org.freedesktop.fwupd D-Bus client (battery safety, release notes, history, progress)
 │   ├── fwupd.rs           fwupdmgr JSON/text parsers & progress hints
-│   └── logind.rs          org.freedesktop.login1 CanReboot / inhibitor detection & reboot execution
+│   ├── gnome_extensions.rs org.gnome.Shell.Extensions session D-Bus check & selective install
+│   ├── hooks.rs           Opt-in unprivileged CustomHook definitions, static HOOK_TEMPLATES & check parser
+│   ├── logind.rs          org.freedesktop.login1 CanReboot / inhibitor detection & reboot execution
+│   ├── mise.rs            User-space mise outdated JSON parser & selective upgrade
+│   ├── rpm_ostree.rs      Atomic Fedora rpm-ostree status, diff, advisories & staged deployment
+│   └── rustup.rs          User-space rustup check parser & selective toolchain/self-update plan
 ├── privilege/
 │   ├── mod.rs             Privilege session module exports
 │   ├── pool.rs            Pooled privileged session lifecycle
@@ -224,9 +245,10 @@ src/
     ├── history.rs         Searchable/filterable merged DNF5 + fwupd Update History timeline
     ├── activity_log.rs    Embedded filterable Activity Log view
     ├── charts.rs          Cairo-rendered throughput sparkline & progress charts
-    ├── dialogs.rs         About, Release Upgrade, error detail, and confirmation dialogs
+    ├── dialogs.rs         About, Release Upgrade, cleanup confirm, error detail & confirmation dialogs
+    ├── preferences.rs     Libadwaita Preferences dialog, source switches, and Custom Hook editor with presets
     ├── rows.rs            Package row widgets and status badges
-    ├── prefs.rs           Standalone XDG JSON UI geometry/sidebar persistence ($XDG_CONFIG_HOME/fedora-updater/ui.json)
+    ├── prefs.rs           Standalone XDG JSON UI/source/hook persistence ($XDG_CONFIG_HOME/fedora-updater/ui.json)
     └── preview.rs         FEDORA_UPDATER_PREVIEW states & FEDORA_UPDATER_SCREENSHOT capture
 ```
 
