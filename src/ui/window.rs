@@ -558,6 +558,10 @@ fn can_selective_apply(packages: &[Package], native_dnf: bool, native_fwupd: boo
             | UpdateSource::FlatpakSystem
             | UpdateSource::GnomeExtensions
             | UpdateSource::Homebrew
+            | UpdateSource::Rustup
+            | UpdateSource::Mise
+            | UpdateSource::UvTools
+            | UpdateSource::Pipx
             | UpdateSource::Distrobox
             | UpdateSource::Toolbx => pkg.source.supports_selective_apply(),
         })
@@ -3149,6 +3153,10 @@ mod tests {
             (UpdateSource::FlatpakSystem, "FP", "src-flatpak"),
             (UpdateSource::GnomeExtensions, "EXT", "src-ext"),
             (UpdateSource::Homebrew, "BREW", "src-brew"),
+            (UpdateSource::Rustup, "RUST", "src-toolchain"),
+            (UpdateSource::Mise, "MISE", "src-toolchain"),
+            (UpdateSource::UvTools, "UV", "src-toolchain"),
+            (UpdateSource::Pipx, "PIPX", "src-toolchain"),
             (UpdateSource::Distrobox, "DBOX", "src-container"),
             (UpdateSource::Toolbx, "TBX", "src-container"),
             (UpdateSource::Firmware, "FW", "src-firmware"),
@@ -4779,6 +4787,7 @@ mod tests {
             "ready-ostree",
             "ready-ostree-mixed",
             "ready-containers",
+            "ready-toolchains",
             "running-ostree",
             "done-ostree",
         ];
@@ -4901,6 +4910,22 @@ mod tests {
                             .inspector
                             .note_body_text()
                             .contains("inside the container when run"));
+                    }
+                }
+                "ready-toolchains" => {
+                    assert!(!widgets.ostree_booted.get());
+                    assert!(widgets.ready_queue.is_selectable());
+                    assert_eq!(widgets.ready_queue.filtered_count(), 4);
+                    assert!(widgets.ready_selection_bar.get_visible());
+                    assert!(widgets
+                        .sidebar
+                        .category_row(fedora_updater::model::SourceCategory::DevAndContainers)
+                        .get_visible());
+                    if let Some(tc_pkg) = cfg.state.packages().first() {
+                        widgets.inspector.paint(tc_pkg);
+                        assert_eq!(widgets.inspector.repo_label_text(), "Repository");
+                        assert_eq!(widgets.inspector.version_label_text(), "Available");
+                        assert!(!widgets.inspector.note_card_visible());
                     }
                 }
                 "running-ostree" => {
@@ -5331,6 +5356,16 @@ mod tests {
                 subtitle: "Not installed".into(),
             },
         );
+        for key in ["rustup", "mise", "uv", "pipx"] {
+            availability.insert(
+                key.into(),
+                SourceAvailability {
+                    pref_key: key,
+                    installed: false,
+                    subtitle: "Not installed".into(),
+                },
+            );
+        }
         availability.insert(
             "distrobox".into(),
             SourceAvailability {
@@ -5375,7 +5410,7 @@ mod tests {
             )
         };
 
-        assert_eq!(handle.switches.len(), 7);
+        assert_eq!(handle.switches.len(), 11);
         assert_eq!(
             handle.switches["dnf"].subtitle().as_deref(),
             Some("Installed (dnf5daemon D-Bus)")
@@ -5388,6 +5423,13 @@ mod tests {
             handle.switches["homebrew"].subtitle().as_deref(),
             Some("Not installed")
         );
+        for key in ["rustup", "mise", "uv", "pipx"] {
+            assert_eq!(
+                handle.switches[key].subtitle().as_deref(),
+                Some("Not installed")
+            );
+            assert!(handle.switches[key].is_active());
+        }
         assert_eq!(
             handle.switches["distrobox"].subtitle().as_deref(),
             Some("Not installed")
@@ -5447,6 +5489,10 @@ mod tests {
         handle.switches["dnf"].set_active(false);
         handle.switches["gnome-extensions"].set_active(false);
         handle.switches["homebrew"].set_active(false);
+        handle.switches["rustup"].set_active(false);
+        handle.switches["mise"].set_active(false);
+        handle.switches["uv"].set_active(false);
+        handle.switches["pipx"].set_active(false);
         handle.switches["firmware"].set_active(false);
         assert!(widgets.prefs.borrow().source_config().all_disabled());
         assert!(handle.all_disabled_group.get_visible());
@@ -5584,7 +5630,7 @@ mod tests {
         let prefs = super::prefs::UiPrefs::default();
         let pref_handle =
             super::preferences::build_preferences_dialog(&prefs, &ostree_avail, |_, _| {});
-        assert_eq!(pref_handle.switches.len(), 7);
+        assert_eq!(pref_handle.switches.len(), 11);
         assert!(pref_handle.switches.contains_key("rpm-ostree"));
         assert!(!pref_handle.switches.contains_key("dnf"));
         assert!(!pref_handle.switches["distrobox"].is_active());
@@ -5595,6 +5641,10 @@ mod tests {
             "flatpak",
             "gnome-extensions",
             "homebrew",
+            "rustup",
+            "mise",
+            "uv",
+            "pipx",
             "firmware",
         ] {
             pref_handle.switches[key].set_active(false);

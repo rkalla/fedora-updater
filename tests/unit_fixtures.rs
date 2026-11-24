@@ -25,11 +25,25 @@ use fedora_updater::backend::fwupd::{
 use fedora_updater::backend::gnome_extensions::{
     extension_uuids_from_packages, interpret_install_reply, parse_extensions_json,
 };
+use fedora_updater::backend::mise::{
+    parse_mise_outdated_json, parse_progress_line as parse_mise_progress,
+    upgrade_names_from_packages as mise_upgrade_names,
+};
+use fedora_updater::backend::python_tools::{
+    parse_pipx_list_json, parse_pipx_outdated_text,
+    parse_pipx_progress_line as parse_pipx_progress, parse_uv_progress_line as parse_uv_progress,
+    parse_uv_tool_list, parse_uv_upgrade_dry_run,
+    pipx_package_names_from_packages, uv_tool_names_from_packages,
+};
 use fedora_updater::backend::rpm_ostree::{
     check_exit_is_hard_error as rpm_ostree_exit_is_hard_error,
     check_exit_is_no_updates as rpm_ostree_exit_is_no_updates,
     detect_reboot_needed as rpm_ostree_detect_reboot, parse_progress_line as parse_rpm_ostree_progress,
     parse_status_json, parse_upgrade_check,
+};
+use fedora_updater::backend::rustup::{
+    check_exit_is_ok as rustup_exit_is_ok, parse_progress_line as parse_rustup_progress,
+    parse_rustup_check, parse_rustup_check_for_binary, split_apply_targets,
 };
 use fedora_updater::backend::{detect_reboot, parse_progress, ProgressHint};
 use fedora_updater::model::{total_download_bytes, Package, PackageStatus, UpdateSource};
@@ -687,4 +701,116 @@ fn containers_fixtures_cover_list_dedup_empty_and_upgrade_logs() {
     let err_log = read_fixture("containers/upgrade_error.txt");
     assert!(!detect_reboot(UpdateSource::Distrobox, &err_log, &pkgs));
     assert!(!detect_reboot(UpdateSource::Toolbx, &err_log, &pkgs));
+}
+
+#[test]
+fn toolchains_fixtures_cover_rustup_mise_uv_and_pipx() {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    // 1. rustup check + RPM filter + apply split + progress hints
+    let rust_raw = read_fixture("toolchains/rustup_check.txt");
+    let rust_user = parse_rustup_check(&rust_raw);
+    assert!(rustup_exit_is_ok(100));
+    assert!(rustup_exit_is_ok(0));
+    assert!(!rustup_exit_is_ok(1));
+    assert_eq!(rust_user.len(), 3);
+    let plan_user =
+        split_apply_targets(None, &rust_user, Some(Path::new("/home/alice/.cargo/bin/rustup")));
+    assert_eq!(
+        plan_user.toolchains,
+        vec![
+            "stable-x86_64-unknown-linux-gnu",
+            "nightly-x86_64-unknown-linux-gnu"
+        ]
+    );
+    assert!(plan_user.self_update);
+
+    let rust_rpm =
+        parse_rustup_check_for_binary(&rust_raw, Some(Path::new("/usr/bin/rustup")));
+    assert_eq!(rust_rpm.len(), 2);
+    assert!(!rust_rpm.iter().any(|p| p.name == "rustup"));
+
+    let rust_empty = read_fixture("toolchains/rustup_check_empty.txt");
+    assert!(parse_rustup_check(&rust_empty).is_empty());
+
+    let rust_log = read_fixture("toolchains/rustup_update_log.txt");
+    let rust_hints: Vec<_> = rust_log.lines().map(parse_rustup_progress).collect();
+    assert!(rust_hints
+        .iter()
+        .any(|h| h.status == Some(PackageStatus::Downloading)));
+    assert!(rust_hints
+        .iter()
+        .any(|h| h.status == Some(PackageStatus::Installing)));
+    assert!(rust_hints
+        .iter()
+        .any(|h| h.status == Some(PackageStatus::Completed)));
+    assert!(!detect_reboot(UpdateSource::Rustup, &rust_log, &rust_user));
+
+    // 2. mise outdated --json + selective upgrade names + errors
+    let mise_raw = read_fixture("toolchains/mise_outdated.json");
+    let mise_pkgs = parse_mise_outdated_json(&mise_raw).unwrap();
+    assert_eq!(mise_pkgs.len(), 3);
+    assert_eq!(mise_pkgs[0].id, "mise:node");
+    assert_eq!(mise_pkgs[0].old_version.as_deref(), Some("22.14.0"));
+    assert_eq!(mise_pkgs[0].version, "22.15.0");
+    assert_eq!(mise_pkgs[2].id, "mise:ubi:jdx/usage");
+    assert_eq!(mise_pkgs[2].old_version, None);
+
+    let mise_empty = read_fixture("toolchains/mise_outdated_empty.json");
+    assert!(parse_mise_outdated_json(&mise_empty).unwrap().is_empty());
+
+    let mise_bad = read_fixture("toolchains/mise_outdated_malformed.txt");
+    assert!(parse_mise_outdated_json(&mise_bad).is_err());
+
+    let selected_mise: HashSet<String> = ["mise:node".to_string()].into_iter().collect();
+    assert_eq!(
+        mise_upgrade_names(Some(&selected_mise), &mise_pkgs),
+        vec!["node"]
+    );
+    let mise_log = read_fixture("toolchains/mise_upgrade_log.txt");
+    let mise_hints: Vec<_> = mise_log.lines().map(parse_mise_progress).collect();
+    assert!(mise_hints
+        .iter()
+        .any(|h| h.package_name.as_deref() == Some("node")
+            && h.status == Some(PackageStatus::Completed)));
+    assert!(!detect_reboot(UpdateSource::Mise, &mise_log, &mise_pkgs));
+
+    // 3. uv tool list + dry-run diff + progress
+    let uv_list_raw = read_fixture("toolchains/uv_tool_list.txt");
+    let uv_installed = parse_uv_tool_list(&uv_list_raw);
+    assert_eq!(uv_installed.len(), 2);
+    let uv_dry_raw = read_fixture("toolchains/uv_upgrade_dry_run.txt");
+    let uv_pkgs = parse_uv_upgrade_dry_run(&uv_dry_raw, &uv_installed);
+    assert_eq!(uv_pkgs.len(), 2);
+    assert!(!uv_pkgs.iter().any(|p| p.name == "urllib3"));
+    assert_eq!(
+        uv_tool_names_from_packages(None, &uv_pkgs),
+        vec!["ruff", "httpie"]
+    );
+    let uv_log = read_fixture("toolchains/uv_upgrade_log.txt");
+    assert_eq!(
+        parse_uv_progress("Updated httpie v3.2.2 -> v3.2.4").status,
+        Some(PackageStatus::Completed)
+    );
+    assert!(!detect_reboot(UpdateSource::UvTools, &uv_log, &uv_pkgs));
+
+    // 4. pipx list --json + outdated text + pinned skip + progress
+    let pipx_list_raw = read_fixture("toolchains/pipx_list.json");
+    let pipx_installed = parse_pipx_list_json(&pipx_list_raw).unwrap();
+    assert_eq!(pipx_installed.len(), 2);
+    let pipx_out_raw = read_fixture("toolchains/pipx_outdated.txt");
+    let pipx_pkgs = parse_pipx_outdated_text(&pipx_out_raw, &pipx_installed);
+    assert_eq!(pipx_pkgs.len(), 1);
+    assert_eq!(pipx_pkgs[0].id, "pipx:ansible-lint");
+    assert_eq!(
+        pipx_package_names_from_packages(None, &pipx_pkgs),
+        vec!["ansible-lint"]
+    );
+    let pipx_log = read_fixture("toolchains/pipx_upgrade_log.txt");
+    assert_eq!(
+        parse_pipx_progress("upgrading ansible-lint...").package_name.as_deref(),
+        Some("ansible-lint")
+    );
+    assert!(!detect_reboot(UpdateSource::Pipx, &pipx_log, &pipx_pkgs));
 }

@@ -4418,3 +4418,443 @@ fn containers_failure_isolation_mode_skips_and_work_cancel() {
     assert!(rt_cancel.helper_calls().is_empty());
     assert!(matches!(h_cancel.state.phase, Phase::Running(_)));
 }
+
+fn toolchains_only_config(rustup: bool, mise: bool, uv: bool, pipx: bool) -> SourceConfig {
+    let mut cfg = SourceConfig::all_enabled();
+    for key in [
+        "dnf",
+        "rpm-ostree",
+        "flatpak",
+        "gnome-extensions",
+        "homebrew",
+        "distrobox",
+        "toolbx",
+        "firmware",
+    ] {
+        cfg.disable(key);
+    }
+    if !rustup {
+        cfg.disable("rustup");
+    }
+    if !mise {
+        cfg.disable("mise");
+    }
+    if !uv {
+        cfg.disable("uv");
+    }
+    if !pipx {
+        cfg.disable("pipx");
+    }
+    cfg
+}
+
+#[test]
+fn toolchains_missing_binaries_stay_silent_and_disabled_prefs_skip() {
+    let rt = FakeRuntime::new();
+    let cfg = toolchains_only_config(true, true, true, true);
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    execute_check_all_with_config(&tx, &rt, &WorkCancel::new(), &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    assert!(rt.local_calls().is_empty());
+    assert!(rt.helper_calls().is_empty());
+    assert!(matches!(
+        h.state.phase,
+        Phase::Idle(IdleScreen::Current { .. })
+    ));
+
+    // Binaries present, but all four toolchain toggles disabled in preferences.
+    let rt_disabled = FakeRuntime::new();
+    rt_disabled.set_rustup_binary(Some("/home/alice/.cargo/bin/rustup".into()));
+    rt_disabled.set_mise_binary(Some("/home/alice/.local/bin/mise".into()));
+    rt_disabled.set_uv_binary(Some("/home/alice/.local/bin/uv".into()));
+    rt_disabled.set_pipx_binary(Some("/home/alice/.local/bin/pipx".into()));
+    let disabled_cfg = toolchains_only_config(false, false, false, false);
+    let mut h_dis = FlowHarness::new();
+    h_dis.dispatch(Event::StartCheck { then_apply: false });
+    let (tx2, rx2) = async_channel::unbounded();
+    execute_check_all_with_config(&tx2, &rt_disabled, &WorkCancel::new(), &disabled_cfg);
+    drop(tx2);
+    h_dis.drain(&rx2);
+
+    assert!(rt_disabled.local_calls().is_empty());
+    assert!(rt_disabled.helper_calls().is_empty());
+}
+
+#[test]
+fn toolchains_check_selective_apply_and_zero_helper_isolation() {
+    let rustup_bin = "/home/alice/.cargo/bin/rustup";
+    let mise_bin = "/home/alice/.local/bin/mise";
+    let uv_bin = "/home/alice/.local/bin/uv";
+    let pipx_bin = "/home/alice/.local/bin/pipx";
+
+    let cfg = toolchains_only_config(true, true, true, true);
+    let rt = FakeRuntime::new();
+    rt.set_rustup_binary(Some(rustup_bin.into()));
+    rt.set_mise_binary(Some(mise_bin.into()));
+    rt.set_uv_binary(Some(uv_bin.into()));
+    rt.set_pipx_binary(Some(pipx_bin.into()));
+
+    rt.push_local_fixture(rustup_bin, &["check"], "toolchains/rustup_check.txt", 100);
+    rt.push_local_fixture(mise_bin, &["outdated", "--json"], "toolchains/mise_outdated.json", 0);
+    rt.push_local_fixture(uv_bin, &["tool", "list"], "toolchains/uv_tool_list.txt", 0);
+    rt.push_local_fixture(
+        uv_bin,
+        &["tool", "upgrade", "--all", "--dry-run"],
+        "toolchains/uv_upgrade_dry_run.txt",
+        0,
+    );
+    rt.push_local_fixture(pipx_bin, &["list", "--json"], "toolchains/pipx_list.json", 0);
+    rt.push_local_fixture(
+        pipx_bin,
+        &["list", "--outdated"],
+        "toolchains/pipx_outdated.txt",
+        0,
+    );
+
+    let mut check_h = FlowHarness::new();
+    check_h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx_c, rx_c) = async_channel::unbounded();
+    execute_check_all_with_config(&tx_c, &rt, &WorkCancel::new(), &cfg);
+    drop(tx_c);
+    check_h.drain(&rx_c);
+
+    let discovered = match &check_h.state.phase {
+        Phase::Ready { packages, soft_errors } => {
+            assert!(soft_errors.is_empty(), "{soft_errors:?}");
+            packages.clone()
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    };
+    // 3 rustup (2 toolchains + self) + 3 mise + 2 uv + 1 unpinned pipx = 9 items
+    assert_eq!(discovered.len(), 9);
+    assert!(!discovered.iter().any(|p| p.name == "urllib3"));
+    assert!(!discovered.iter().any(|p| p.name == "black"));
+
+    // Select a subset across all 4 sources.
+    let selected: Vec<Package> = discovered
+        .into_iter()
+        .filter(|p| {
+            matches!(
+                p.id.as_str(),
+                "rustup:stable-x86_64-unknown-linux-gnu"
+                    | "rustup:rustup"
+                    | "mise:node"
+                    | "mise:ubi:jdx/usage"
+                    | "uv:httpie"
+                    | "pipx:ansible-lint"
+            )
+        })
+        .collect();
+    assert_eq!(selected.len(), 6);
+    assert!(apply_skips_helper_auth_ui(&selected, ApplyMode::Live, false, false));
+
+    rt.push_local_fixture(
+        rustup_bin,
+        &["update", "--no-self-update", "stable-x86_64-unknown-linux-gnu"],
+        "toolchains/rustup_update_log.txt",
+        0,
+    );
+    rt.push_local_step(
+        rustup_bin,
+        &["self", "update"],
+        LocalStep {
+            lines: vec!["info: self-update installed - rustup 1.29.0".into()],
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+    rt.push_local_fixture(
+        mise_bin,
+        &["upgrade", "node", "ubi:jdx/usage"],
+        "toolchains/mise_upgrade_log.txt",
+        0,
+    );
+    rt.push_local_fixture(
+        uv_bin,
+        &["tool", "upgrade", "httpie"],
+        "toolchains/uv_upgrade_log.txt",
+        0,
+    );
+    rt.push_local_fixture(
+        pipx_bin,
+        &["upgrade", "ansible-lint"],
+        "toolchains/pipx_upgrade_log.txt",
+        0,
+    );
+
+    let mut apply_h = FlowHarness::ready(selected.clone());
+    apply_h.console.clear();
+    apply_h.dispatch(Event::StartApply);
+    apply_h.dispatch(session_started_event(
+        session_started_purpose(&apply_h.state.phase).unwrap(),
+    ));
+    let (tx_a, rx_a) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_a,
+        selected,
+        ApplyMode::Live,
+        &rt,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_a);
+    apply_h.drain(&rx_a);
+
+    assert!(rt.helper_calls().is_empty());
+    assert_eq!(rt.ensure_session_calls(), 0);
+
+    let calls = rt.local_calls();
+    assert!(!calls
+        .iter()
+        .any(|(_, args)| args.iter().any(|a| a == "ripgrep" || a == "ruff" || a.contains("nightly"))));
+    let env_calls = rt.local_env_calls();
+    assert!(env_calls.iter().any(|(bin, args, envs)| {
+        bin == mise_bin
+            && args == &["upgrade", "node", "ubi:jdx/usage"]
+            && envs.iter().any(|(k, v)| k == "MISE_YES" && v == "1")
+    }));
+
+    match &apply_h.state.phase {
+        Phase::Done {
+            packages,
+            needs_reboot,
+            failed,
+            failure_reasons,
+            ..
+        } => {
+            assert!(!needs_reboot);
+            assert_eq!(*failed, 0);
+            assert!(failure_reasons.is_empty());
+            assert_eq!(packages.len(), 6);
+            assert!(packages.iter().all(|p| p.status == PackageStatus::Completed));
+        }
+        other => panic!("expected Phase::Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn toolchains_edge_cases_rpm_rustup_pipx_uv_fallbacks_mode_skips_and_cancel() {
+    // 1) RPM-managed /usr/bin/rustup skips self-update even on exit 100.
+    let rt_rpm = FakeRuntime::new();
+    rt_rpm.set_rustup_binary(Some("/usr/bin/rustup".into()));
+    rt_rpm.push_local_step(
+        "/usr/bin/rustup",
+        &["check"],
+        LocalStep {
+            lines: vec!["rustup - Update available : 1.28.1 -> 1.29.0".into()],
+            result: Ok(100),
+            hook_after_line: None,
+        },
+    );
+    let mut h_rpm = FlowHarness::new();
+    h_rpm.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    execute_check_all_with_config(
+        &tx,
+        &rt_rpm,
+        &WorkCancel::new(),
+        &toolchains_only_config(true, false, false, false),
+    );
+    drop(tx);
+    h_rpm.drain(&rx);
+    assert!(matches!(
+        h_rpm.state.phase,
+        Phase::Idle(IdleScreen::Current { .. })
+    ));
+
+    // 2) Unsupported pipx --outdated & uv --dry-run fallbacks stay safe (no false positives, soft-error isolation).
+    let uv_bin = "/home/alice/.local/bin/uv";
+    let pipx_bin = "/home/alice/.local/bin/pipx";
+    let mise_bin = "/home/alice/.local/bin/mise";
+    let rt_fb = FakeRuntime::new();
+    rt_fb.set_mise_binary(Some(mise_bin.into()));
+    rt_fb.set_uv_binary(Some(uv_bin.into()));
+    rt_fb.set_pipx_binary(Some(pipx_bin.into()));
+    rt_fb.push_local_fixture(
+        mise_bin,
+        &["outdated", "--json"],
+        "toolchains/mise_outdated_malformed.txt",
+        0,
+    );
+    // Keep FIFO order: shorter ["tool", "list"] BEFORE ["tool", "list", "--outdated"].
+    rt_fb.push_local_fixture(uv_bin, &["tool", "list"], "toolchains/uv_tool_list.txt", 0);
+    rt_fb.push_local_step(
+        uv_bin,
+        &["tool", "upgrade", "--all", "--dry-run"],
+        LocalStep {
+            lines: vec!["error: unexpected argument '--dry-run' found".into()],
+            result: Ok(2),
+            hook_after_line: None,
+        },
+    );
+    rt_fb.push_local_step(
+        uv_bin,
+        &["tool", "list", "--outdated"],
+        LocalStep {
+            lines: vec!["ruff 0.9.6 (latest: 0.9.9)".into()],
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+    rt_fb.push_local_fixture(pipx_bin, &["list", "--json"], "toolchains/pipx_list.json", 0);
+    rt_fb.push_local_step(
+        pipx_bin,
+        &["list", "--outdated"],
+        LocalStep {
+            lines: vec!["pipx list: error: unrecognized arguments: --outdated".into()],
+            result: Ok(2),
+            hook_after_line: None,
+        },
+    );
+
+    let mut h_fb = FlowHarness::new();
+    h_fb.dispatch(Event::StartCheck { then_apply: false });
+    let (tx_f, rx_f) = async_channel::unbounded();
+    execute_check_all_with_config(
+        &tx_f,
+        &rt_fb,
+        &WorkCancel::new(),
+        &toolchains_only_config(false, true, true, true),
+    );
+    drop(tx_f);
+    h_fb.drain(&rx_f);
+
+    match &h_fb.state.phase {
+        Phase::Ready { packages, soft_errors } => {
+            assert_eq!(soft_errors.len(), 1);
+            assert!(soft_errors[0].contains("mise"), "{soft_errors:?}");
+            assert_eq!(packages.len(), 1);
+            assert_eq!(packages[0].id, "uv:ruff");
+            assert_eq!(packages[0].version, "0.9.9");
+        }
+        other => panic!("expected Ready with mise soft error and uv fallback item, got {other:?}"),
+    }
+
+    // 3) DownloadOnly and OfflineOnReboot skip all toolchain applies with zero subprocesses.
+    let cfg = toolchains_only_config(true, true, true, true);
+    let sample_pkgs = vec![
+        Package::new_toolchain(
+            UpdateSource::Rustup,
+            "rustup:stable-x86_64-unknown-linux-gnu",
+            "stable-x86_64-unknown-linux-gnu",
+            Some("1.86.0".into()),
+            "1.87.0",
+            "rustup",
+            "",
+            None,
+            None,
+        ),
+        Package::new_toolchain(
+            UpdateSource::Mise,
+            "mise:node",
+            "node",
+            Some("22.14.0".into()),
+            "22.15.0",
+            "mise",
+            "",
+            None,
+            None,
+        ),
+        Package::new_toolchain(
+            UpdateSource::UvTools,
+            "uv:httpie",
+            "httpie",
+            Some("3.2.2".into()),
+            "3.2.4",
+            "uv",
+            "",
+            None,
+            None,
+        ),
+        Package::new_toolchain(
+            UpdateSource::Pipx,
+            "pipx:ansible-lint",
+            "ansible-lint",
+            Some("24.9.0".into()),
+            "24.10.0",
+            "pipx",
+            "",
+            None,
+            None,
+        ),
+    ];
+
+    for mode in [ApplyMode::DownloadOnly, ApplyMode::OfflineOnReboot] {
+        let rt_skip = FakeRuntime::new();
+        rt_skip.set_rustup_binary(Some("/home/alice/.cargo/bin/rustup".into()));
+        rt_skip.set_mise_binary(Some(mise_bin.into()));
+        rt_skip.set_uv_binary(Some(uv_bin.into()));
+        rt_skip.set_pipx_binary(Some(pipx_bin.into()));
+        let mut h_skip = FlowHarness::ready(sample_pkgs.clone());
+        h_skip.console.clear();
+        h_skip.dispatch(Event::StartApply);
+        h_skip.dispatch(session_started_event(
+            session_started_purpose(&h_skip.state.phase).unwrap(),
+        ));
+        let (tx_s, rx_s) = async_channel::unbounded();
+        execute_apply_all_with_mode_and_config(
+            &tx_s,
+            sample_pkgs.clone(),
+            mode,
+            &rt_skip,
+            &WorkCancel::new(),
+            &cfg,
+        );
+        drop(tx_s);
+        h_skip.drain(&rx_s);
+
+        assert!(rt_skip.local_calls().is_empty());
+        assert!(rt_skip.helper_calls().is_empty());
+        let text = h_skip.console.lines().collect::<Vec<_>>().join("\n");
+        assert!(text.contains("[rustup] Skipping Rustup"));
+        assert!(text.contains("[mise] Skipping Mise"));
+        assert!(text.contains("[uv] Skipping uv tools"));
+        assert!(text.contains("[pipx] Skipping pipx packages"));
+    }
+
+    // 4) WorkCancel mid-apply stops before subsequent toolchain managers and leaves helper untouched.
+    let cancel = WorkCancel::new();
+    let cancel_hook = cancel.clone();
+    let rt_cancel = FakeRuntime::new();
+    rt_cancel.set_uv_binary(Some(uv_bin.into()));
+    rt_cancel.set_pipx_binary(Some(pipx_bin.into()));
+    rt_cancel.push_local_step(
+        uv_bin,
+        &["tool", "upgrade", "httpie"],
+        LocalStep {
+            lines: vec!["Downloading httpie 50%".into()],
+            result: Ok(0),
+            hook_after_line: Some((
+                0,
+                Box::new(move || {
+                    cancel_hook.cancel();
+                }),
+            )),
+        },
+    );
+    let cancel_pkgs = sample_pkgs.into_iter().skip(2).collect::<Vec<_>>();
+    let mut h_cancel = FlowHarness::ready(cancel_pkgs.clone());
+    h_cancel.dispatch(Event::StartApply);
+    h_cancel.dispatch(session_started_event(
+        session_started_purpose(&h_cancel.state.phase).unwrap(),
+    ));
+    let (tx_k, rx_k) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_k,
+        cancel_pkgs,
+        ApplyMode::Live,
+        &rt_cancel,
+        &cancel,
+        &cfg,
+    );
+    drop(tx_k);
+    h_cancel.drain(&rx_k);
+
+    assert_eq!(rt_cancel.local_calls().len(), 1);
+    assert!(rt_cancel.helper_calls().is_empty());
+    assert!(matches!(h_cancel.state.phase, Phase::Running(_)));
+}

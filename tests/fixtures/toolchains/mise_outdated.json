@@ -1,0 +1,35 @@
+{
+  "node": {
+    "name": "node",
+    "requested": "22",
+    "current": "22.14.0",
+    "latest": "22.15.0",
+    "bump": "22.15.0",
+    "source": {
+      "type": "mise.toml",
+      "path": "/home/alice/.config/mise/config.toml"
+    }
+  },
+  "ripgrep": {
+    "name": "ripgrep",
+    "requested": "latest",
+    "current": "14.1.0",
+    "latest": "14.1.1",
+    "bump": "14.1.1",
+    "source": {
+      "type": "mise.toml",
+      "path": "/home/alice/.config/mise/config.toml"
+    }
+  },
+  "ubi:jdx/usage": {
+    "name": "ubi:jdx/usage",
+    "requested": "latest",
+    "current": null,
+    "latest": "2.1.0",
+    "bump": "2.1.0",
+    "source": {
+      "type": "mise.toml",
+      "path": "/home/alice/.config/mise/config.toml"
+    }
+  }
+}

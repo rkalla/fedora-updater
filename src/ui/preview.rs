@@ -42,6 +42,13 @@ pub fn initial_console() -> ConsoleBuffer {
             "Update available: Blur my Shell (v47 -> v48)",
         );
         console.push_committed_tagged("brew", "==> Upgrading ripgrep 14.1.0 -> 14.1.1");
+        console.push_committed_tagged(
+            "rustup",
+            "stable-x86_64-unknown-linux-gnu updated - rustc 1.87.0",
+        );
+        console.push_committed_tagged("mise", "mise node@22.15.0  ✓ installed");
+        console.push_committed_tagged("uv", "Updated httpie v3.2.2 -> v3.2.4");
+        console.push_committed_tagged("pipx", "upgraded package ansible-lint");
         console.push_committed_tagged("distrobox", "Updating fedora-dev container");
         console.push_committed_tagged("toolbx", "Upgrading fedora-toolbox-43");
         console.push_committed_tagged("fwupd", "Loaded LVFS metadata for UEFI dbx");
@@ -330,6 +337,10 @@ pub fn config_for(phase: &str) -> PreviewConfig {
             packages: sample_container_packages(),
             soft_errors: vec![],
         },
+        "ready-toolchains" => Phase::Ready {
+            packages: sample_toolchain_packages(),
+            soft_errors: vec![],
+        },
         other => {
             eprintln!("unknown FEDORA_UPDATER_PREVIEW={other}, using idle");
             Phase::Idle(IdleScreen::Fresh)
@@ -400,6 +411,19 @@ fn pkg(
         UpdateSource::Homebrew => {
             Package::new_homebrew(name, Some(old.into()), version, "homebrew/core", false)
         }
+        UpdateSource::Rustup | UpdateSource::Mise | UpdateSource::UvTools | UpdateSource::Pipx => {
+            Package::new_toolchain(
+                source,
+                format!("{}:{name}", source.console_tag()),
+                name,
+                Some(old.into()),
+                version,
+                source.console_tag(),
+                "",
+                None,
+                None,
+            )
+        }
         UpdateSource::Distrobox | UpdateSource::Toolbx => {
             Package::new_container(source, "c0ffee123456", name, old, version, None)
         }
@@ -410,6 +434,55 @@ fn pkg(
     p.size_bytes = parse_size_bytes(size);
     p.status = status;
     p
+}
+
+fn sample_toolchain_packages() -> Vec<Package> {
+    vec![
+        Package::new_toolchain(
+            UpdateSource::Rustup,
+            "rustup:stable-x86_64-unknown-linux-gnu",
+            "stable-x86_64-unknown-linux-gnu",
+            Some("1.86.0".into()),
+            "1.87.0",
+            "rustup",
+            "1.87.0 · rustup toolchain",
+            None,
+            None,
+        ),
+        Package::new_toolchain(
+            UpdateSource::Mise,
+            "mise:node",
+            "node",
+            Some("22.14.0".into()),
+            "22.15.0",
+            "mise",
+            "22.15.0 · requested 22 · config.toml",
+            Some("Configured in ~/.config/mise/config.toml".into()),
+            None,
+        ),
+        Package::new_toolchain(
+            UpdateSource::UvTools,
+            "uv:httpie",
+            "httpie",
+            Some("3.2.2".into()),
+            "3.2.4",
+            "uv",
+            "3.2.4 · uv tool · http, https",
+            Some("Provides executables: http, https".into()),
+            None,
+        ),
+        Package::new_toolchain(
+            UpdateSource::Pipx,
+            "pipx:ansible-lint",
+            "ansible-lint",
+            Some("24.9.0".into()),
+            "24.10.0",
+            "pipx",
+            "24.10.0 · pipx · ansible-lint",
+            Some("Provides apps: ansible-lint".into()),
+            None,
+        ),
+    ]
 }
 
 fn sample_container_packages() -> Vec<Package> {
@@ -914,6 +987,17 @@ mod tests {
                 if packages.len() == 2
                     && packages.iter().any(|p| p.source == UpdateSource::Distrobox)
                     && packages.iter().any(|p| p.source == UpdateSource::Toolbx)
+        ));
+        let ready_toolchains = super::config_for("ready-toolchains");
+        assert!(!ready_toolchains.ostree_booted);
+        assert!(matches!(
+            &ready_toolchains.state.phase,
+            Phase::Ready { packages, .. }
+                if packages.len() == 4
+                    && packages.iter().any(|p| p.source == UpdateSource::Rustup)
+                    && packages.iter().any(|p| p.source == UpdateSource::Mise)
+                    && packages.iter().any(|p| p.source == UpdateSource::UvTools)
+                    && packages.iter().any(|p| p.source == UpdateSource::Pipx)
         ));
 
         if std::env::var_os("FEDORA_UPDATER_PREVIEW").is_none() {

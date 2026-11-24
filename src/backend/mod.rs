@@ -10,9 +10,94 @@ pub mod fwupd;
 pub mod fwupd_dbus;
 pub mod gnome_extensions;
 pub mod logind;
+pub mod mise;
+pub mod python_tools;
 pub mod rpm_ostree;
+pub mod rustup;
+
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use crate::model::{Package, PackageStatus, UpdateSource};
+
+/// Locate a user-space binary by checking `PATH` and then fallback directories.
+/// Returns `None` without side effects when missing.
+pub fn find_user_binary(name: &str, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH");
+    find_user_binary_with(name, path_env.as_deref(), extra_dirs)
+}
+
+/// Injectable variant of [`find_user_binary`] for deterministic offline tests.
+pub fn find_user_binary_with(
+    name: &str,
+    path_env: Option<&OsStr>,
+    extra_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    if name.trim().is_empty() {
+        return None;
+    }
+    if let Some(paths) = path_env.filter(|p| !p.is_empty()) {
+        for dir in std::env::split_paths(paths) {
+            let candidate = dir.join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    for dir in extra_dirs {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub(super) fn home_dir_from(home_env: Option<&OsStr>) -> Option<PathBuf> {
+    home_env.filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
+pub(super) fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.is_file() && (meta.permissions().mode() & 0o111) != 0
+}
+
+pub(super) fn strip_ansi_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+pub(super) fn find_json_object_start(trimmed: &str) -> Option<&str> {
+    if trimmed.starts_with('{') {
+        return Some(trimmed);
+    }
+    let mut offset = 0usize;
+    for line in trimmed.split_inclusive('\n') {
+        if line.trim_start().starts_with('{') {
+            return Some(trimmed[offset..].trim_start());
+        }
+        offset += line.len();
+    }
+    None
+}
 
 /// Result of attempting a native Fedora D-Bus or library operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +130,10 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
         }
         UpdateSource::GnomeExtensions => ProgressHint::default(),
         UpdateSource::Homebrew => brew::parse_progress_line(line),
+        UpdateSource::Rustup => rustup::parse_progress_line(line),
+        UpdateSource::Mise => mise::parse_progress_line(line),
+        UpdateSource::UvTools => python_tools::parse_uv_progress_line(line),
+        UpdateSource::Pipx => python_tools::parse_pipx_progress_line(line),
         UpdateSource::Distrobox | UpdateSource::Toolbx => containers::parse_progress_line(line),
         UpdateSource::Firmware => fwupd::parse_progress_line(line),
     }
@@ -58,6 +147,10 @@ pub fn detect_reboot(source: UpdateSource, log: &str, packages: &[Package]) -> b
         | UpdateSource::FlatpakSystem
         | UpdateSource::GnomeExtensions
         | UpdateSource::Homebrew
+        | UpdateSource::Rustup
+        | UpdateSource::Mise
+        | UpdateSource::UvTools
+        | UpdateSource::Pipx
         | UpdateSource::Distrobox
         | UpdateSource::Toolbx => false,
         UpdateSource::Firmware => fwupd::detect_reboot_needed(log),
@@ -119,6 +212,22 @@ mod tests {
         assert_eq!(brew_hint.package_name.as_deref(), Some("ripgrep"));
         assert_eq!(brew_hint.status, Some(PackageStatus::Installing));
 
+        let rust_hint = parse_progress(UpdateSource::Rustup, "info: downloading component 'rustc' 50%");
+        assert_eq!(rust_hint.status, Some(PackageStatus::Downloading));
+        assert_eq!(rust_hint.progress, Some(0.5));
+
+        let mise_hint = parse_progress(UpdateSource::Mise, "mise node@22.15.0  install");
+        assert_eq!(mise_hint.package_name.as_deref(), Some("node"));
+        assert_eq!(mise_hint.status, Some(PackageStatus::Installing));
+
+        let uv_hint = parse_progress(UpdateSource::UvTools, "Updated httpie v3.2.2 -> v3.2.4");
+        assert_eq!(uv_hint.package_name.as_deref(), Some("httpie"));
+        assert_eq!(uv_hint.status, Some(PackageStatus::Completed));
+
+        let pipx_hint = parse_progress(UpdateSource::Pipx, "upgrading ansible-lint...");
+        assert_eq!(pipx_hint.package_name.as_deref(), Some("ansible-lint"));
+        assert_eq!(pipx_hint.status, Some(PackageStatus::Installing));
+
         let dbox_hint = parse_progress(UpdateSource::Distrobox, "Upgrading arch-dev...");
         assert_eq!(dbox_hint.package_name.as_deref(), Some("arch-dev"));
         assert_eq!(dbox_hint.status, Some(PackageStatus::Installing));
@@ -137,12 +246,52 @@ mod tests {
     }
 
     #[test]
+    fn find_user_binary_with_resolves_path_then_extra_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let extra = dir.path().join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        let tool = extra.join("mytool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+
+        // Missing execute bit is ignored.
+        assert_eq!(
+            find_user_binary_with("mytool", None, std::slice::from_ref(&extra)),
+            None
+        );
+
+        let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tool, perms).unwrap();
+        assert_eq!(
+            find_user_binary_with("mytool", None, std::slice::from_ref(&extra)).as_deref(),
+            Some(tool.as_path())
+        );
+
+        let path_dir = dir.path().join("path");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let path_tool = path_dir.join("mytool");
+        std::fs::write(&path_tool, "#!/bin/sh\n").unwrap();
+        let mut perms = std::fs::metadata(&path_tool).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path_tool, perms).unwrap();
+        assert_eq!(
+            find_user_binary_with(
+                "mytool",
+                Some(path_dir.as_os_str()),
+                std::slice::from_ref(&extra),
+            )
+            .as_deref(),
+            Some(path_tool.as_path())
+        );
+    }
+
+    #[test]
     fn detect_reboot_dispatches_by_source_and_never_triggers_for_flatpak() {
         let kernel = vec![Package::new_dnf("kernel", "x86_64", "7.1.12-200.fc44", "updates")];
         assert!(detect_reboot(UpdateSource::Dnf, "", &kernel));
         assert!(!detect_reboot(UpdateSource::Dnf, "Complete!", &[]));
 
-        // Flatpak, GNOME Extensions, Homebrew, and container backends never request a system reboot regardless of log text or package list.
+        // Flatpak, GNOME Extensions, Homebrew, user-space toolchains, and container backends never request a system reboot regardless of log text or package list.
         assert!(!detect_reboot(
             UpdateSource::FlatpakUser,
             "An update requires a reboot to complete.",
@@ -163,6 +312,18 @@ mod tests {
             "An update requires a reboot to complete.",
             &kernel
         ));
+        for toolchain in [
+            UpdateSource::Rustup,
+            UpdateSource::Mise,
+            UpdateSource::UvTools,
+            UpdateSource::Pipx,
+        ] {
+            assert!(!detect_reboot(
+                toolchain,
+                "An update requires a reboot to complete.",
+                &kernel
+            ));
+        }
         assert!(!detect_reboot(
             UpdateSource::Distrobox,
             "An update requires a reboot to complete.",

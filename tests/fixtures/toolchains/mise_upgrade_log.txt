@@ -1,0 +1,6 @@
+mise node@22.15.0  download 50%
+mise node@22.15.0  install
+mise node@22.15.0  ✓ installed
+mise ubi:jdx/usage@2.1.0  download 100%
+mise ubi:jdx/usage@2.1.0  install
+mise ubi:jdx/usage@2.1.0  ✓ installed

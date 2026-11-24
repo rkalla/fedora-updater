@@ -46,6 +46,10 @@ impl InspectorViewModel {
             UpdateSource::FlatpakSystem => "Apps (Flatpak · System)",
             UpdateSource::GnomeExtensions => "Extensions (GNOME Shell)",
             UpdateSource::Homebrew => "Dev & Containers (Homebrew)",
+            UpdateSource::Rustup => "Dev & Containers (Rustup)",
+            UpdateSource::Mise => "Dev & Containers (Mise)",
+            UpdateSource::UvTools => "Dev & Containers (uv tools)",
+            UpdateSource::Pipx => "Dev & Containers (pipx)",
             UpdateSource::Distrobox => "Dev & Containers (Distrobox)",
             UpdateSource::Toolbx => "Dev & Containers (Toolbx)",
             UpdateSource::Firmware => "Firmware (LVFS)",
@@ -1085,5 +1089,23 @@ mod tests {
         assert_eq!(tbx_vm.version_label, "Container State");
         assert_eq!(tbx_vm.version, "exited");
         assert_eq!(tbx_vm.note_title, "Container Note");
+
+        let rust_pkg = Package::new_toolchain(
+            UpdateSource::Rustup,
+            "rustup:stable-x86_64-unknown-linux-gnu",
+            "stable-x86_64-unknown-linux-gnu",
+            Some("1.86.0".into()),
+            "1.87.0",
+            "rustup",
+            "1.87.0 · rustup toolchain",
+            None,
+            None,
+        );
+        let rust_vm = InspectorViewModel::from_package(&rust_pkg);
+        assert_eq!(rust_vm.badge, "RUST");
+        assert_eq!(rust_vm.badge_css, "src-toolchain");
+        assert_eq!(rust_vm.source_title, "Dev & Containers (Rustup)");
+        assert_eq!(rust_vm.version_display, "1.86.0 → 1.87.0");
+        assert!(!rust_vm.needs_reboot);
     }
 }

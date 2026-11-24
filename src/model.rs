@@ -110,6 +110,10 @@ pub enum UpdateSource {
     FlatpakSystem,
     GnomeExtensions,
     Homebrew,
+    Rustup,
+    Mise,
+    UvTools,
+    Pipx,
     Distrobox,
     Toolbx,
     Firmware,
@@ -123,6 +127,10 @@ impl UpdateSource {
         Self::FlatpakSystem,
         Self::GnomeExtensions,
         Self::Homebrew,
+        Self::Rustup,
+        Self::Mise,
+        Self::UvTools,
+        Self::Pipx,
         Self::Distrobox,
         Self::Toolbx,
         Self::Firmware,
@@ -149,7 +157,13 @@ impl UpdateSource {
             Self::Dnf | Self::RpmOstree => SourceCategory::System,
             Self::FlatpakUser | Self::FlatpakSystem => SourceCategory::Apps,
             Self::GnomeExtensions => SourceCategory::Extensions,
-            Self::Homebrew | Self::Distrobox | Self::Toolbx => SourceCategory::DevAndContainers,
+            Self::Homebrew
+            | Self::Rustup
+            | Self::Mise
+            | Self::UvTools
+            | Self::Pipx
+            | Self::Distrobox
+            | Self::Toolbx => SourceCategory::DevAndContainers,
             Self::Firmware => SourceCategory::Firmware,
         }
     }
@@ -161,6 +175,10 @@ impl UpdateSource {
             Self::FlatpakUser | Self::FlatpakSystem => "flatpak",
             Self::GnomeExtensions => "gnome-extensions",
             Self::Homebrew => "homebrew",
+            Self::Rustup => "rustup",
+            Self::Mise => "mise",
+            Self::UvTools => "uv",
+            Self::Pipx => "pipx",
             Self::Distrobox => "distrobox",
             Self::Toolbx => "toolbx",
             Self::Firmware => "firmware",
@@ -174,6 +192,10 @@ impl UpdateSource {
             Self::FlatpakUser | Self::FlatpakSystem => "Flatpak Apps",
             Self::GnomeExtensions => "GNOME Shell Extensions",
             Self::Homebrew => "Homebrew (brew)",
+            Self::Rustup => "Rust Toolchains (rustup)",
+            Self::Mise => "Dev Runtimes (mise)",
+            Self::UvTools => "Python CLI Tools (uv)",
+            Self::Pipx => "Python CLI Tools (pipx)",
             Self::Distrobox => "Distrobox Containers",
             Self::Toolbx => "Toolbx Containers",
             Self::Firmware => "Firmware (fwupd / LVFS)",
@@ -187,6 +209,10 @@ impl UpdateSource {
             | Self::FlatpakSystem
             | Self::GnomeExtensions
             | Self::Homebrew
+            | Self::Rustup
+            | Self::Mise
+            | Self::UvTools
+            | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx => false,
         }
@@ -202,6 +228,10 @@ impl UpdateSource {
             | Self::FlatpakSystem
             | Self::GnomeExtensions
             | Self::Homebrew
+            | Self::Rustup
+            | Self::Mise
+            | Self::UvTools
+            | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx
             | Self::Firmware => true,
@@ -217,6 +247,10 @@ impl UpdateSource {
             | Self::FlatpakSystem
             | Self::GnomeExtensions
             | Self::Homebrew
+            | Self::Rustup
+            | Self::Mise
+            | Self::UvTools
+            | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx
             | Self::Firmware => true,
@@ -233,7 +267,14 @@ impl UpdateSource {
         self.is_applicable_for_host(ostree_booted)
             && !matches!(
                 self,
-                Self::GnomeExtensions | Self::Homebrew | Self::Distrobox | Self::Toolbx
+                Self::GnomeExtensions
+                    | Self::Homebrew
+                    | Self::Rustup
+                    | Self::Mise
+                    | Self::UvTools
+                    | Self::Pipx
+                    | Self::Distrobox
+                    | Self::Toolbx
             )
     }
 
@@ -284,6 +325,10 @@ impl UpdateSource {
             Self::FlatpakSystem => "FP",
             Self::GnomeExtensions => "EXT",
             Self::Homebrew => "BREW",
+            Self::Rustup => "RUST",
+            Self::Mise => "MISE",
+            Self::UvTools => "UV",
+            Self::Pipx => "PIPX",
             Self::Distrobox => "DBOX",
             Self::Toolbx => "TBX",
             Self::Firmware => "FW",
@@ -297,6 +342,7 @@ impl UpdateSource {
             Self::FlatpakUser | Self::FlatpakSystem => "src-flatpak",
             Self::GnomeExtensions => "src-ext",
             Self::Homebrew => "src-brew",
+            Self::Rustup | Self::Mise | Self::UvTools | Self::Pipx => "src-toolchain",
             Self::Distrobox | Self::Toolbx => "src-container",
             Self::Firmware => "src-firmware",
         }
@@ -310,13 +356,17 @@ impl UpdateSource {
             Self::FlatpakSystem => "flatpak-system",
             Self::GnomeExtensions => "gnome-ext",
             Self::Homebrew => "brew",
+            Self::Rustup => "rustup",
+            Self::Mise => "mise",
+            Self::UvTools => "uv",
+            Self::Pipx => "pipx",
             Self::Distrobox => "distrobox",
             Self::Toolbx => "toolbx",
             Self::Firmware => "fwupd",
         }
     }
 
-    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Distrobox → Toolbx → Firmware.
+    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Toolchains (rustup, mise, uv, pipx) → Containers (Distrobox, Toolbx) → Firmware.
     pub fn apply_order(self) -> u8 {
         match self {
             Self::Dnf | Self::RpmOstree => 0,
@@ -324,9 +374,13 @@ impl UpdateSource {
             Self::FlatpakSystem => 2,
             Self::GnomeExtensions => 3,
             Self::Homebrew => 4,
-            Self::Distrobox => 5,
-            Self::Toolbx => 6,
-            Self::Firmware => 7,
+            Self::Rustup => 5,
+            Self::Mise => 6,
+            Self::UvTools => 7,
+            Self::Pipx => 8,
+            Self::Distrobox => 9,
+            Self::Toolbx => 10,
+            Self::Firmware => 11,
         }
     }
 }
@@ -719,6 +773,59 @@ impl Package {
         }
     }
 
+    /// Construct a user-space developer toolchain update item (`rustup`, `mise`, `uv`, or `pipx`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_toolchain(
+        source: UpdateSource,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        old_version: Option<String>,
+        version: impl Into<String>,
+        repo: impl Into<String>,
+        detail: impl Into<String>,
+        summary: Option<String>,
+        url: Option<String>,
+    ) -> Self {
+        let name = name.into().trim().to_string();
+        let version = version.into().trim().to_string();
+        let raw_repo = repo.into();
+        let repo = if raw_repo.trim().is_empty() {
+            source.console_tag().to_string()
+        } else {
+            raw_repo.trim().to_string()
+        };
+        let old_version = old_version
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let raw_detail = detail.into();
+        let detail = if raw_detail.trim().is_empty() {
+            format!("{version} · {repo}")
+        } else {
+            raw_detail.trim().to_string()
+        };
+        Self {
+            id: id.into().trim().to_string(),
+            name,
+            arch: String::new(),
+            version,
+            repo,
+            size_bytes: None,
+            old_version,
+            status: PackageStatus::Pending,
+            source,
+            detail,
+            summary: summary
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            url: url
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            install_size_delta: None,
+            advisories: Vec::new(),
+            preflight_warning: None,
+        }
+    }
+
     /// Related extensions extracted from Flatpak `detail` (`... · installs a, b`).
     pub fn related_extensions(&self) -> Vec<String> {
         let Some((_, rest)) = self.detail.split_once("installs ") else {
@@ -838,12 +945,45 @@ impl Package {
             let short_name = self.name.rsplit('/').next().unwrap_or(&self.name);
             return hint == short_name;
         }
+        if self.source == UpdateSource::Rustup {
+            return false;
+        }
+        if self.source == UpdateSource::Mise {
+            return self
+                .name
+                .rsplit([':', '/'])
+                .next()
+                .is_some_and(|short| !short.is_empty() && short == hint);
+        }
+        if matches!(self.source, UpdateSource::UvTools | UpdateSource::Pipx) {
+            return normalize_python_pkg_name(&self.name) == normalize_python_pkg_name(hint);
+        }
         if matches!(self.source, UpdateSource::Distrobox | UpdateSource::Toolbx) {
             return false;
         }
         // Flatpak/fwupd ids: `flatpak:user:app/org.foo/x86_64/stable`, `fwupd:<device>`.
         self.id.split([':', '/']).any(|part| part == hint)
     }
+}
+
+fn normalize_python_pkg_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.trim().chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !prev_dash && !out.is_empty() {
+                out.push('-');
+                prev_dash = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -1151,6 +1291,62 @@ mod tests {
         assert!(tbx.matches_progress_name("fedora-toolbox-44"));
         assert!(tbx.matches_progress_name("toolbx:fedora-toolbox-44"));
         assert!(!tbx.matches_progress_name("toolbx"));
+
+        let rust_tc = Package::new_toolchain(
+            UpdateSource::Rustup,
+            "rustup:stable-x86_64-unknown-linux-gnu",
+            "stable-x86_64-unknown-linux-gnu",
+            Some("1.86.0".into()),
+            "1.87.0",
+            "rustup",
+            "",
+            None,
+            None,
+        );
+        assert!(rust_tc.matches_progress_name("stable-x86_64-unknown-linux-gnu"));
+        assert!(rust_tc.matches_progress_name("rustup:stable-x86_64-unknown-linux-gnu"));
+        assert!(!rust_tc.matches_progress_name("stable"));
+
+        let mise_tool = Package::new_toolchain(
+            UpdateSource::Mise,
+            "mise:ubi:jdx/usage",
+            "ubi:jdx/usage",
+            Some("2.0.0".into()),
+            "2.1.0",
+            "mise",
+            "",
+            None,
+            None,
+        );
+        assert!(mise_tool.matches_progress_name("ubi:jdx/usage"));
+        assert!(mise_tool.matches_progress_name("usage"));
+
+        let uv_tool = Package::new_toolchain(
+            UpdateSource::UvTools,
+            "uv:httpie_cli",
+            "httpie_cli",
+            Some("3.2.0".into()),
+            "3.2.4",
+            "uv",
+            "",
+            None,
+            None,
+        );
+        assert!(uv_tool.matches_progress_name("Httpie-Cli"));
+        assert!(uv_tool.matches_progress_name("httpie.cli"));
+
+        let pipx_tool = Package::new_toolchain(
+            UpdateSource::Pipx,
+            "pipx:ansible-lint",
+            "ansible-lint",
+            Some("24.9.0".into()),
+            "24.10.0",
+            "pipx",
+            "",
+            None,
+            None,
+        );
+        assert!(pipx_tool.matches_progress_name("ansible_lint"));
     }
 
     #[test]
@@ -1451,6 +1647,10 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.label(), "Apps");
         assert_eq!(UpdateSource::GnomeExtensions.label(), "Extensions");
         assert_eq!(UpdateSource::Homebrew.label(), "Dev & Containers");
+        assert_eq!(UpdateSource::Rustup.label(), "Dev & Containers");
+        assert_eq!(UpdateSource::Mise.label(), "Dev & Containers");
+        assert_eq!(UpdateSource::UvTools.label(), "Dev & Containers");
+        assert_eq!(UpdateSource::Pipx.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Distrobox.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Toolbx.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Firmware.label(), "Firmware");
@@ -1460,6 +1660,10 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.badge(), "FP");
         assert_eq!(UpdateSource::GnomeExtensions.badge(), "EXT");
         assert_eq!(UpdateSource::Homebrew.badge(), "BREW");
+        assert_eq!(UpdateSource::Rustup.badge(), "RUST");
+        assert_eq!(UpdateSource::Mise.badge(), "MISE");
+        assert_eq!(UpdateSource::UvTools.badge(), "UV");
+        assert_eq!(UpdateSource::Pipx.badge(), "PIPX");
         assert_eq!(UpdateSource::Distrobox.badge(), "DBOX");
         assert_eq!(UpdateSource::Toolbx.badge(), "TBX");
         assert_eq!(UpdateSource::Firmware.badge(), "FW");
@@ -1469,6 +1673,10 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.css_class(), "src-flatpak");
         assert_eq!(UpdateSource::GnomeExtensions.css_class(), "src-ext");
         assert_eq!(UpdateSource::Homebrew.css_class(), "src-brew");
+        assert_eq!(UpdateSource::Rustup.css_class(), "src-toolchain");
+        assert_eq!(UpdateSource::Mise.css_class(), "src-toolchain");
+        assert_eq!(UpdateSource::UvTools.css_class(), "src-toolchain");
+        assert_eq!(UpdateSource::Pipx.css_class(), "src-toolchain");
         assert_eq!(UpdateSource::Distrobox.css_class(), "src-container");
         assert_eq!(UpdateSource::Toolbx.css_class(), "src-container");
         assert_eq!(UpdateSource::Firmware.css_class(), "src-firmware");
@@ -1478,6 +1686,10 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.console_tag(), "flatpak-system");
         assert_eq!(UpdateSource::GnomeExtensions.console_tag(), "gnome-ext");
         assert_eq!(UpdateSource::Homebrew.console_tag(), "brew");
+        assert_eq!(UpdateSource::Rustup.console_tag(), "rustup");
+        assert_eq!(UpdateSource::Mise.console_tag(), "mise");
+        assert_eq!(UpdateSource::UvTools.console_tag(), "uv");
+        assert_eq!(UpdateSource::Pipx.console_tag(), "pipx");
         assert_eq!(UpdateSource::Distrobox.console_tag(), "distrobox");
         assert_eq!(UpdateSource::Toolbx.console_tag(), "toolbx");
         assert_eq!(UpdateSource::Firmware.console_tag(), "fwupd");
@@ -1622,6 +1834,10 @@ mod tests {
                 UpdateSource::FlatpakSystem,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Rustup,
+                UpdateSource::Mise,
+                UpdateSource::UvTools,
+                UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
                 UpdateSource::Firmware,
@@ -1640,6 +1856,22 @@ mod tests {
             SourceCategory::DevAndContainers
         );
         assert_eq!(
+            UpdateSource::Rustup.category(),
+            SourceCategory::DevAndContainers
+        );
+        assert_eq!(
+            UpdateSource::Mise.category(),
+            SourceCategory::DevAndContainers
+        );
+        assert_eq!(
+            UpdateSource::UvTools.category(),
+            SourceCategory::DevAndContainers
+        );
+        assert_eq!(
+            UpdateSource::Pipx.category(),
+            SourceCategory::DevAndContainers
+        );
+        assert_eq!(
             UpdateSource::Distrobox.category(),
             SourceCategory::DevAndContainers
         );
@@ -1655,6 +1887,10 @@ mod tests {
         assert_eq!(UpdateSource::FlatpakSystem.pref_key(), "flatpak");
         assert_eq!(UpdateSource::GnomeExtensions.pref_key(), "gnome-extensions");
         assert_eq!(UpdateSource::Homebrew.pref_key(), "homebrew");
+        assert_eq!(UpdateSource::Rustup.pref_key(), "rustup");
+        assert_eq!(UpdateSource::Mise.pref_key(), "mise");
+        assert_eq!(UpdateSource::UvTools.pref_key(), "uv");
+        assert_eq!(UpdateSource::Pipx.pref_key(), "pipx");
         assert_eq!(UpdateSource::Distrobox.pref_key(), "distrobox");
         assert_eq!(UpdateSource::Toolbx.pref_key(), "toolbx");
         assert_eq!(UpdateSource::Firmware.pref_key(), "firmware");
@@ -1665,6 +1901,10 @@ mod tests {
         assert!(!UpdateSource::FlatpakSystem.requires_root());
         assert!(!UpdateSource::GnomeExtensions.requires_root());
         assert!(!UpdateSource::Homebrew.requires_root());
+        assert!(!UpdateSource::Rustup.requires_root());
+        assert!(!UpdateSource::Mise.requires_root());
+        assert!(!UpdateSource::UvTools.requires_root());
+        assert!(!UpdateSource::Pipx.requires_root());
         assert!(!UpdateSource::Distrobox.requires_root());
         assert!(!UpdateSource::Toolbx.requires_root());
         assert!(UpdateSource::Firmware.requires_root());
@@ -1677,14 +1917,26 @@ mod tests {
         assert!(UpdateSource::FlatpakSystem.installed_by_default());
         assert!(!UpdateSource::GnomeExtensions.installed_by_default());
         assert!(!UpdateSource::Homebrew.installed_by_default());
+        assert!(!UpdateSource::Rustup.installed_by_default());
+        assert!(!UpdateSource::Mise.installed_by_default());
+        assert!(!UpdateSource::UvTools.installed_by_default());
+        assert!(!UpdateSource::Pipx.installed_by_default());
         assert!(!UpdateSource::Distrobox.installed_by_default());
         assert!(!UpdateSource::Toolbx.installed_by_default());
         assert!(UpdateSource::Distrobox.is_opt_in());
         assert!(UpdateSource::Toolbx.is_opt_in());
         assert!(!UpdateSource::Homebrew.is_opt_in());
+        assert!(!UpdateSource::Rustup.is_opt_in());
+        assert!(!UpdateSource::Mise.is_opt_in());
+        assert!(!UpdateSource::UvTools.is_opt_in());
+        assert!(!UpdateSource::Pipx.is_opt_in());
         assert!(UpdateSource::pref_key_is_opt_in(" Distrobox "));
         assert!(UpdateSource::pref_key_is_opt_in("toolbx"));
         assert!(!UpdateSource::pref_key_is_opt_in("homebrew"));
+        assert!(!UpdateSource::pref_key_is_opt_in("rustup"));
+        assert!(!UpdateSource::pref_key_is_opt_in("mise"));
+        assert!(!UpdateSource::pref_key_is_opt_in("uv"));
+        assert!(!UpdateSource::pref_key_is_opt_in("pipx"));
         assert!(UpdateSource::Firmware.installed_by_default());
 
         assert_eq!(
@@ -1717,6 +1969,10 @@ mod tests {
                 UpdateSource::FlatpakUser,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Rustup,
+                UpdateSource::Mise,
+                UpdateSource::UvTools,
+                UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
                 UpdateSource::Firmware,
@@ -1729,6 +1985,10 @@ mod tests {
                 UpdateSource::FlatpakUser,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Rustup,
+                UpdateSource::Mise,
+                UpdateSource::UvTools,
+                UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
                 UpdateSource::Firmware,
@@ -1775,6 +2035,36 @@ mod tests {
         assert_eq!(brew_cask.repo, "homebrew/cask");
         assert_eq!(brew_cask.detail, "3.3.0 · homebrew/cask · cask");
 
+        let rust_pkg = Package::new_toolchain(
+            UpdateSource::Rustup,
+            "rustup:stable-x86_64-unknown-linux-gnu",
+            "stable-x86_64-unknown-linux-gnu",
+            Some("1.86.0".into()),
+            "1.87.0",
+            "",
+            "",
+            None,
+            None,
+        );
+        assert_eq!(rust_pkg.repo, "rustup");
+        assert_eq!(rust_pkg.detail, "1.87.0 · rustup");
+        assert_eq!(rust_pkg.version_line(), "1.86.0 → 1.87.0");
+
+        let mise_pkg = Package::new_toolchain(
+            UpdateSource::Mise,
+            "mise:node",
+            "node",
+            None,
+            "22.15.0",
+            "mise",
+            "22.15.0 · requested 22",
+            Some("Configured in mise.toml".into()),
+            Some("https://nodejs.org".into()),
+        );
+        assert_eq!(mise_pkg.detail, "22.15.0 · requested 22");
+        assert_eq!(mise_pkg.summary.as_deref(), Some("Configured in mise.toml"));
+        assert_eq!(mise_pkg.url.as_deref(), Some("https://nodejs.org"));
+
         let dbox = Package::new_container(
             UpdateSource::Distrobox,
             "a1b2c3d4e5f6ffff",
@@ -1811,6 +2101,8 @@ mod tests {
             fp_user,
             fp_sys,
             brew_pkg,
+            rust_pkg,
+            mise_pkg,
             dbox,
             tbx,
             firmware_pkg("UEFI"),
@@ -1818,7 +2110,7 @@ mod tests {
         let by_cat = count_by_category(&pkgs);
         assert_eq!(by_cat.get(&SourceCategory::System), Some(&1));
         assert_eq!(by_cat.get(&SourceCategory::Apps), Some(&2));
-        assert_eq!(by_cat.get(&SourceCategory::DevAndContainers), Some(&3));
+        assert_eq!(by_cat.get(&SourceCategory::DevAndContainers), Some(&5));
         assert_eq!(by_cat.get(&SourceCategory::Firmware), Some(&1));
         assert_eq!(by_cat.get(&SourceCategory::Extensions), None);
         assert_eq!(count_for_category(&pkgs, SourceCategory::Apps), 2);

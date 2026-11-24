@@ -33,7 +33,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 
 #[test]
 fn all_fixtures_exist_are_non_empty_and_indexed_in_readme() {
-    assert_eq!(ALL_FIXTURES.len(), 61, "expected 61 fixtures in corpus");
+    assert_eq!(ALL_FIXTURES.len(), 74, "expected 74 fixtures in corpus");
 
     let expected: BTreeSet<String> = ALL_FIXTURES.iter().map(|s| (*s).to_string()).collect();
     assert_eq!(
@@ -400,4 +400,56 @@ fn containers_fixtures_contain_expected_signals() {
 
     let err = read_fixture("containers/upgrade_error.txt");
     assert!(err.contains("could not upgrade container"));
+}
+
+#[test]
+fn toolchains_fixtures_contain_expected_signals() {
+    let rust_check = read_fixture("toolchains/rustup_check.txt");
+    assert!(rust_check.contains("stable-x86_64-unknown-linux-gnu"));
+    assert!(rust_check.contains("nightly-x86_64-unknown-linux-gnu"));
+    assert!(rust_check.contains("rustup - Update available"));
+
+    let rust_empty = read_fixture("toolchains/rustup_check_empty.txt");
+    assert!(rust_empty.contains("Up to date"));
+
+    let rust_log = read_fixture("toolchains/rustup_update_log.txt");
+    assert!(rust_log.contains("downloading component"));
+    assert!(rust_log.contains("installing component"));
+    assert!(rust_log.contains("updated - rustc"));
+
+    let mise = read_fixture_value("toolchains/mise_outdated.json");
+    assert_eq!(mise["node"]["latest"], "22.15.0");
+    assert!(mise["ubi:jdx/usage"]["current"].is_null());
+
+    let mise_empty = read_fixture_value("toolchains/mise_outdated_empty.json");
+    assert_eq!(mise_empty.as_object().map(|o| o.len()), Some(0));
+
+    let mise_malformed = read_fixture("toolchains/mise_outdated_malformed.txt");
+    assert!(mise_malformed.contains("WARN mise"));
+
+    let mise_log = read_fixture("toolchains/mise_upgrade_log.txt");
+    assert!(mise_log.contains("✓ installed"));
+
+    let uv_list = read_fixture("toolchains/uv_tool_list.txt");
+    assert!(uv_list.contains("httpie v3.2.2"));
+    assert!(uv_list.contains("- http"));
+
+    let uv_dry = read_fixture("toolchains/uv_upgrade_dry_run.txt");
+    assert!(uv_dry.contains("Updated ruff v0.9.6 -> v0.9.8"));
+    assert!(uv_dry.contains("urllib3==2.3.0"));
+
+    let uv_log = read_fixture("toolchains/uv_upgrade_log.txt");
+    assert!(uv_log.contains("Updated httpie v3.2.2 -> v3.2.4"));
+
+    let pipx_list = read_fixture_value("toolchains/pipx_list.json");
+    assert_eq!(
+        pipx_list["venvs"]["black"]["metadata"]["main_package"]["pinned"],
+        true
+    );
+
+    let pipx_out = read_fixture("toolchains/pipx_outdated.txt");
+    assert!(pipx_out.contains("ansible-lint has version 24.9.0"));
+
+    let pipx_log = read_fixture("toolchains/pipx_upgrade_log.txt");
+    assert!(pipx_log.contains("upgraded package ansible-lint"));
 }

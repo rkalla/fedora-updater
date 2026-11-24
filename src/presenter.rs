@@ -2073,4 +2073,81 @@ mod tests {
             "System done · Apps in progress · Extensions queued · Firmware queued"
         );
     }
+
+    #[test]
+    fn user_space_toolchains_aggregate_under_dev_and_never_trigger_reboot() {
+        let mut rust = Package::new_toolchain(
+            UpdateSource::Rustup,
+            "rustup:stable",
+            "stable",
+            Some("1.86.0".into()),
+            "1.87.0",
+            "rustup",
+            "",
+            None,
+            None,
+        );
+        let mut mise = Package::new_toolchain(
+            UpdateSource::Mise,
+            "mise:node",
+            "node",
+            Some("22.14.0".into()),
+            "22.15.0",
+            "mise",
+            "",
+            None,
+            None,
+        );
+        let mut uv = Package::new_toolchain(
+            UpdateSource::UvTools,
+            "uv:httpie",
+            "httpie",
+            Some("3.2.2".into()),
+            "3.2.4",
+            "uv",
+            "",
+            None,
+            None,
+        );
+        let mut pipx = Package::new_toolchain(
+            UpdateSource::Pipx,
+            "pipx:ansible-lint",
+            "ansible-lint",
+            Some("24.9.0".into()),
+            "24.10.0",
+            "pipx",
+            "",
+            None,
+            None,
+        );
+        let pkgs = vec![rust.clone(), mise.clone(), uv.clone(), pipx.clone()];
+        assert_eq!(
+            source_summary_line(&pkgs),
+            "0 system · 0 apps · 0 firmware · 4 dev"
+        );
+
+        for p in [&mut rust, &mut mise, &mut uv, &mut pipx] {
+            p.status = PackageStatus::Completed;
+        }
+        let done_pkgs = vec![rust, mise, uv, pipx];
+        assert_eq!(
+            done_header_subtitle_for_packages(0, 4, &done_pkgs, "12s"),
+            "4 upgraded · 0 system / 0 apps / 0 firmware / 4 dev · 12s"
+        );
+        let clean = done_clean_summary_for_packages(4, &done_pkgs, "12s");
+        assert!(clean.contains("No restart needed"), "{clean}");
+
+        let enabled = [
+            UpdateSource::Dnf,
+            UpdateSource::Rustup,
+            UpdateSource::Mise,
+            UpdateSource::UvTools,
+            UpdateSource::Pipx,
+        ];
+        let (_frac, done, total, status) =
+            check_progress_for_sources(&[UpdateSource::Dnf, UpdateSource::Rustup], &enabled);
+        assert_eq!(done, 1);
+        assert_eq!(total, 2);
+        assert_eq!(status, "System done · Dev & Containers in progress");
+    }
 }

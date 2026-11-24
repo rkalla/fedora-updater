@@ -80,6 +80,20 @@ pub const ALL_FIXTURES: &[&str] = &[
     "containers/distrobox_upgrade_log.txt",
     "containers/toolbox_upgrade_log.txt",
     "containers/upgrade_error.txt",
+    // toolchains/
+    "toolchains/rustup_check.txt",
+    "toolchains/rustup_check_empty.txt",
+    "toolchains/rustup_update_log.txt",
+    "toolchains/mise_outdated.json",
+    "toolchains/mise_outdated_empty.json",
+    "toolchains/mise_outdated_malformed.txt",
+    "toolchains/mise_upgrade_log.txt",
+    "toolchains/uv_tool_list.txt",
+    "toolchains/uv_upgrade_dry_run.txt",
+    "toolchains/uv_upgrade_log.txt",
+    "toolchains/pipx_list.json",
+    "toolchains/pipx_outdated.txt",
+    "toolchains/pipx_upgrade_log.txt",
 ];
 
 #[derive(Debug, Clone)]

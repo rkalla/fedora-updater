@@ -1,0 +1,6 @@
+checking for self-update
+stable-x86_64-unknown-linux-gnu - Update available : 1.86.0 (05f9846f8 2025-03-31) -> 1.87.0 (17067e9ac 2025-05-09)
+beta-x86_64-unknown-linux-gnu - Up to date : 1.87.0-beta.2 (abcdef12 2025-04-20)
+nightly-x86_64-unknown-linux-gnu - update available: 1.88.0-nightly (1111aaaa 2025-05-01) -> 1.88.0-nightly (2222bbbb 2025-05-10)
+rustc 1.86.0 (05f9846f8 2025-03-31)
+rustup - Update available : 1.28.1 -> 1.29.0

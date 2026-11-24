@@ -11,7 +11,7 @@ use async_channel::Sender;
 
 use crate::backend::{
     self, brew, containers, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, gnome_extensions, logind,
-    rpm_ostree, ProgressHint,
+    mise, python_tools, rpm_ostree, rustup, ProgressHint,
 };
 pub use crate::backend::NativeOutcome;
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
@@ -150,6 +150,10 @@ fn command_exists(program: &str) -> bool {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostBinaryPaths<'a> {
     pub brew_bin: Option<&'a Path>,
+    pub rustup_bin: Option<&'a Path>,
+    pub mise_bin: Option<&'a Path>,
+    pub uv_bin: Option<&'a Path>,
+    pub pipx_bin: Option<&'a Path>,
     pub rpm_ostree_bin: Option<&'a Path>,
     pub distrobox_bin: Option<&'a Path>,
     pub toolbox_bin: Option<&'a Path>,
@@ -172,6 +176,10 @@ pub fn probe_source_availability_for_host(
     gnome_ext_available: bool,
 ) -> BTreeMap<String, SourceAvailability> {
     let brew_bin = brew::find_brew_binary();
+    let rustup_bin = rustup::find_rustup_binary();
+    let mise_bin = mise::find_mise_binary();
+    let uv_bin = python_tools::find_uv_binary();
+    let pipx_bin = python_tools::find_pipx_binary();
     let distrobox_bin = containers::find_distrobox_binary();
     let toolbox_bin = containers::find_toolbox_binary();
     let rpm_ostree_bin = if ostree_booted {
@@ -186,6 +194,10 @@ pub fn probe_source_availability_for_host(
         gnome_ext_available,
         HostBinaryPaths {
             brew_bin: brew_bin.as_deref(),
+            rustup_bin: rustup_bin.as_deref(),
+            mise_bin: mise_bin.as_deref(),
+            uv_bin: uv_bin.as_deref(),
+            pipx_bin: pipx_bin.as_deref(),
             rpm_ostree_bin: rpm_ostree_bin.as_deref(),
             distrobox_bin: distrobox_bin.as_deref(),
             toolbox_bin: toolbox_bin.as_deref(),
@@ -270,11 +282,6 @@ pub fn probe_source_availability_for_host_with(
         },
     );
 
-    let brew_installed = paths.brew_bin.is_some();
-    let brew_sub = match paths.brew_bin {
-        Some(path) => format!("Installed ({})", path.display()),
-        None => "Not installed".into(),
-    };
     map.insert(
         "gnome-extensions".into(),
         SourceAvailability {
@@ -288,14 +295,27 @@ pub fn probe_source_availability_for_host_with(
         },
     );
 
-    map.insert(
-        "homebrew".into(),
-        SourceAvailability {
-            pref_key: "homebrew",
-            installed: brew_installed,
-            subtitle: brew_sub,
-        },
-    );
+    for (key, bin) in [
+        ("homebrew", paths.brew_bin),
+        ("rustup", paths.rustup_bin),
+        ("mise", paths.mise_bin),
+        ("uv", paths.uv_bin),
+        ("pipx", paths.pipx_bin),
+    ] {
+        let installed = bin.is_some();
+        let subtitle = match bin {
+            Some(path) => format!("Installed ({})", path.display()),
+            None => "Not installed".into(),
+        };
+        map.insert(
+            key.into(),
+            SourceAvailability {
+                pref_key: key,
+                installed,
+                subtitle,
+            },
+        );
+    }
 
     for (key, bin) in [
         ("distrobox", paths.distrobox_bin),
@@ -565,6 +585,18 @@ pub trait OrchestratorRuntime: Send + 'static {
     fn brew_available(&self) -> bool {
         self.brew_binary().is_some()
     }
+    fn rustup_binary(&self) -> Option<PathBuf> {
+        None
+    }
+    fn mise_binary(&self) -> Option<PathBuf> {
+        None
+    }
+    fn uv_binary(&self) -> Option<PathBuf> {
+        None
+    }
+    fn pipx_binary(&self) -> Option<PathBuf> {
+        None
+    }
     fn distrobox_binary(&self) -> Option<PathBuf> {
         None
     }
@@ -722,6 +754,22 @@ impl OrchestratorRuntime for SystemRuntime {
     }
     fn brew_binary(&self) -> Option<PathBuf> {
         brew::find_brew_binary()
+    }
+
+    fn rustup_binary(&self) -> Option<PathBuf> {
+        rustup::find_rustup_binary()
+    }
+
+    fn mise_binary(&self) -> Option<PathBuf> {
+        mise::find_mise_binary()
+    }
+
+    fn uv_binary(&self) -> Option<PathBuf> {
+        python_tools::find_uv_binary()
+    }
+
+    fn pipx_binary(&self) -> Option<PathBuf> {
+        python_tools::find_pipx_binary()
     }
 
     fn distrobox_binary(&self) -> Option<PathBuf> {
@@ -1160,6 +1208,50 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
                 &mut soft_errors,
             );
         }
+    }
+
+    // 5b) User-space developer toolchains (rustup, mise, uv, pipx) — silent when absent.
+    for (tc_source, tc_res) in [
+        (
+            UpdateSource::Rustup,
+            config
+                .is_enabled(UpdateSource::Rustup)
+                .then(|| path_program(runtime.rustup_binary()))
+                .flatten()
+                .map(|bin| run_rustup_check(&ch, runtime, &bin)),
+        ),
+        (
+            UpdateSource::Mise,
+            config
+                .is_enabled(UpdateSource::Mise)
+                .then(|| path_program(runtime.mise_binary()))
+                .flatten()
+                .map(|bin| run_mise_check(&ch, runtime, &bin)),
+        ),
+        (
+            UpdateSource::UvTools,
+            config
+                .is_enabled(UpdateSource::UvTools)
+                .then(|| path_program(runtime.uv_binary()))
+                .flatten()
+                .map(|bin| run_uv_check(&ch, runtime, &bin)),
+        ),
+        (
+            UpdateSource::Pipx,
+            config
+                .is_enabled(UpdateSource::Pipx)
+                .then(|| path_program(runtime.pipx_binary()))
+                .flatten()
+                .map(|bin| run_pipx_check(&ch, runtime, &bin)),
+        ),
+    ] {
+        let Some(res) = tc_res else {
+            continue;
+        };
+        if !ch.is_current() {
+            return;
+        }
+        emit_backend_check(&ch, tc_source, res, &mut all, &mut soft_errors);
     }
 
     // 6) Distrobox & Toolbx — unprivileged rootless container discovery when opted-in and installed.
@@ -1907,6 +1999,638 @@ fn run_brew_check<R: OrchestratorRuntime>(
     }
 }
 
+fn path_program(path: Option<PathBuf>) -> Option<String> {
+    path.map(|p| p.to_string_lossy().into_owned())
+}
+
+fn unsupported_apply_mode_reason(label: &str, mode: ApplyMode) -> Option<String> {
+    match mode {
+        ApplyMode::DownloadOnly => Some(format!("Skipping {label} during Download Only mode.")),
+        ApplyMode::OfflineOnReboot => Some(format!(
+            "Skipping {label} during offline reboot transaction (apply live instead)."
+        )),
+        ApplyMode::Live | ApplyMode::LiveAndReboot => None,
+    }
+}
+
+fn log_truncated_lines(ch: &WorkChannel, tag: &str, log: &str) {
+    for line in log
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(8)
+    {
+        ch.line(tag, line.to_string());
+    }
+}
+
+fn log_discovered_toolchain_packages(ch: &WorkChannel, tag: &str, pkgs: &[Package]) {
+    ch.line(tag, format!("{} update(s) ({tag})", pkgs.len()));
+    for pkg in pkgs {
+        ch.line(tag, format!("  {} ({})", pkg.name, pkg.version_line()));
+    }
+}
+
+fn run_capture_local<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    bin: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    work_cancel: &WorkCancel,
+    tag: &str,
+) -> Result<(i32, String), String> {
+    let mut log = String::new();
+    let code = runtime
+        .run_cancellable_local_env(bin, args, envs, Some(work_cancel), &mut |l| {
+            log.push_str(&l);
+            log.push('\n');
+        })
+        .map_err(|e| format!("{tag}: {e}"))?;
+    if !ch.is_current() || work_cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
+    Ok((code, log))
+}
+
+fn run_rustup_check<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    rustup_bin: &str,
+) -> Result<Vec<Package>, String> {
+    let work_cancel = ch.cancel.work_cancel();
+    let (code, log) = run_capture_local(
+        ch,
+        runtime,
+        rustup_bin,
+        &["check"],
+        &[],
+        &work_cancel,
+        "rustup",
+    )?;
+    if !rustup::check_exit_is_ok(code) {
+        log_truncated_lines(ch, "rustup", &log);
+        return Err(format!("rustup: rustup check exited with {code}"));
+    }
+    let pkgs = rustup::parse_rustup_check_for_binary(&log, Some(Path::new(rustup_bin)));
+    log_discovered_toolchain_packages(ch, "rustup", &pkgs);
+    Ok(pkgs)
+}
+
+fn run_mise_check<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    mise_bin: &str,
+) -> Result<Vec<Package>, String> {
+    let work_cancel = ch.cancel.work_cancel();
+    let (code, json_log) = run_capture_local(
+        ch,
+        runtime,
+        mise_bin,
+        &["outdated", "--json"],
+        &[("MISE_YES", "1")],
+        &work_cancel,
+        "mise",
+    )?;
+    if code != 0 {
+        log_truncated_lines(ch, "mise", &json_log);
+        return Err(format!("mise: mise outdated exited with {code}"));
+    }
+    match mise::parse_mise_outdated_json(&json_log) {
+        Ok(pkgs) => {
+            log_discovered_toolchain_packages(ch, "mise", &pkgs);
+            Ok(pkgs)
+        }
+        Err(err) => {
+            log_truncated_lines(ch, "mise", &json_log);
+            Err(format!("mise: {err}"))
+        }
+    }
+}
+
+fn run_uv_check<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    uv_bin: &str,
+) -> Result<Vec<Package>, String> {
+    let work_cancel = ch.cancel.work_cancel();
+    let (code, list_log) =
+        run_capture_local(ch, runtime, uv_bin, &["tool", "list"], &[], &work_cancel, "uv")?;
+    if code != 0 {
+        log_truncated_lines(ch, "uv", &list_log);
+        return Err(format!("uv: uv tool list exited with {code}"));
+    }
+    let installed = python_tools::parse_uv_tool_list(&list_log);
+    if installed.is_empty() {
+        ch.line("uv", "0 update(s) (uv)".into());
+        return Ok(Vec::new());
+    }
+
+    let (dry_code, dry_log) = run_capture_local(
+        ch,
+        runtime,
+        uv_bin,
+        &["tool", "upgrade", "--all", "--dry-run"],
+        &[],
+        &work_cancel,
+        "uv",
+    )?;
+    if dry_code == 0 {
+        let pkgs = python_tools::parse_uv_upgrade_dry_run(&dry_log, &installed);
+        log_discovered_toolchain_packages(ch, "uv", &pkgs);
+        return Ok(pkgs);
+    }
+    if !python_tools::flag_is_unsupported(&dry_log) {
+        log_truncated_lines(ch, "uv", &dry_log);
+        return Err(format!(
+            "uv: uv tool upgrade --all --dry-run exited with {dry_code}"
+        ));
+    }
+
+    let (out_code, out_log) = run_capture_local(
+        ch,
+        runtime,
+        uv_bin,
+        &["tool", "list", "--outdated"],
+        &[],
+        &work_cancel,
+        "uv",
+    )?;
+    if out_code == 0 {
+        let pkgs = python_tools::parse_uv_tool_list_outdated(&out_log, &installed);
+        log_discovered_toolchain_packages(ch, "uv", &pkgs);
+        return Ok(pkgs);
+    }
+    if !python_tools::flag_is_unsupported(&out_log) {
+        log_truncated_lines(ch, "uv", &out_log);
+        return Err(format!("uv: uv tool list --outdated exited with {out_code}"));
+    }
+
+    let (dir_code, dir_log) =
+        run_capture_local(ch, runtime, uv_bin, &["tool", "dir"], &[], &work_cancel, "uv")?;
+    if dir_code == 0 {
+        if let Some(tool_dir) = dir_log.lines().map(str::trim).find(|l| !l.is_empty()) {
+            let mut pkgs = Vec::new();
+            let mut checked_any_venv = false;
+            for tool in &installed {
+                let raw_python = Path::new(tool_dir).join(&tool.name).join("bin/python");
+                let python = if raw_python.is_file() {
+                    raw_python
+                } else {
+                    let norm_name = python_tools::normalize_python_name(&tool.name);
+                    let norm_python = Path::new(tool_dir).join(norm_name).join("bin/python");
+                    if !norm_python.is_file() {
+                        continue;
+                    }
+                    norm_python
+                };
+                let python_str = python.to_string_lossy();
+                let (pip_code, pip_json) = run_capture_local(
+                    ch,
+                    runtime,
+                    uv_bin,
+                    &[
+                        "pip",
+                        "list",
+                        "--outdated",
+                        "--format",
+                        "json",
+                        "--python",
+                        &python_str,
+                    ],
+                    &[],
+                    &work_cancel,
+                    "uv",
+                )?;
+                if pip_code != 0 {
+                    continue;
+                }
+                checked_any_venv = true;
+                if let Ok(Some(pkg)) = python_tools::parse_uv_pip_outdated_json(&pip_json, tool) {
+                    pkgs.push(pkg);
+                }
+            }
+            if checked_any_venv {
+                log_discovered_toolchain_packages(ch, "uv", &pkgs);
+                return Ok(pkgs);
+            }
+        }
+    }
+
+    ch.line(
+        "uv",
+        "Check-only outdated inspection is not supported by this uv version; leaving uv tools untouched.".into(),
+    );
+    Ok(Vec::new())
+}
+
+fn run_pipx_check<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    pipx_bin: &str,
+) -> Result<Vec<Package>, String> {
+    let work_cancel = ch.cancel.work_cancel();
+    let (list_code, list_json) = run_capture_local(
+        ch,
+        runtime,
+        pipx_bin,
+        &["list", "--json"],
+        &[],
+        &work_cancel,
+        "pipx",
+    )?;
+    if list_code != 0 {
+        log_truncated_lines(ch, "pipx", &list_json);
+        return Err(format!("pipx: pipx list --json exited with {list_code}"));
+    }
+    let installed = match python_tools::parse_pipx_list_json(&list_json) {
+        Ok(items) => items,
+        Err(err) => {
+            log_truncated_lines(ch, "pipx", &list_json);
+            return Err(format!("pipx: {err}"));
+        }
+    };
+    if installed.iter().all(|pkg| pkg.pinned) {
+        ch.line("pipx", "0 update(s) (pipx)".into());
+        return Ok(Vec::new());
+    }
+
+    let (out_code, out_log) = run_capture_local(
+        ch,
+        runtime,
+        pipx_bin,
+        &["list", "--outdated"],
+        &[],
+        &work_cancel,
+        "pipx",
+    )?;
+    if out_code == 0 {
+        let pkgs = python_tools::parse_pipx_outdated_text(&out_log, &installed);
+        log_discovered_toolchain_packages(ch, "pipx", &pkgs);
+        return Ok(pkgs);
+    }
+    if python_tools::flag_is_unsupported(&out_log) {
+        ch.line(
+            "pipx",
+            "pipx list --outdated is unsupported by this pipx version; skipping without mutating venvs.".into(),
+        );
+        return Ok(Vec::new());
+    }
+    log_truncated_lines(ch, "pipx", &out_log);
+    Err(format!("pipx: pipx list --outdated exited with {out_code}"))
+}
+
+enum ToolchainApplyOutcome {
+    Cancelled,
+    Finished {
+        code: i32,
+        log: String,
+        error: Option<String>,
+    },
+}
+
+fn run_rustup_apply<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    packages: &[Package],
+    mode: ApplyMode,
+) -> ToolchainApplyOutcome {
+    let tag = UpdateSource::Rustup.console_tag();
+    if let Some(reason) = unsupported_apply_mode_reason("Rustup", mode) {
+        ch.line(tag, reason);
+        return ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+    let Some(bin) = path_program(runtime.rustup_binary()) else {
+        let msg = "rustup executable not found".to_string();
+        ch.line(tag, format!("error: {msg}"));
+        return ToolchainApplyOutcome::Finished {
+            code: -1,
+            log: msg,
+            error: None,
+        };
+    };
+
+    let plan = rustup::split_apply_targets(None, packages, Some(Path::new(&bin)));
+    if plan.toolchains.is_empty() && !plan.self_update {
+        return ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+
+    let work_cancel = ch.cancel.work_cancel();
+    let mut combined_log = String::new();
+    let mut exit_code = 0;
+
+    if !plan.toolchains.is_empty() {
+        let mut args = vec!["update", "--no-self-update"];
+        args.extend(plan.toolchains.iter().map(String::as_str));
+        let (code, log) = run_local_apply_with_env(
+            ch,
+            runtime,
+            &bin,
+            &args,
+            &[],
+            Some(&work_cancel),
+            tag,
+            UpdateSource::Rustup,
+        );
+        combined_log.push_str(&log);
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return ToolchainApplyOutcome::Cancelled;
+        }
+        if code != 0 {
+            return ToolchainApplyOutcome::Finished {
+                code,
+                log: combined_log,
+                error: None,
+            };
+        }
+        exit_code = code;
+    }
+
+    if plan.self_update {
+        let (code, log) = run_local_apply_with_env(
+            ch,
+            runtime,
+            &bin,
+            &["self", "update"],
+            &[],
+            Some(&work_cancel),
+            tag,
+            UpdateSource::Rustup,
+        );
+        if !combined_log.is_empty() && !log.is_empty() {
+            combined_log.push('\n');
+        }
+        combined_log.push_str(&log);
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return ToolchainApplyOutcome::Cancelled;
+        }
+        exit_code = code;
+    }
+
+    ToolchainApplyOutcome::Finished {
+        code: exit_code,
+        log: combined_log,
+        error: None,
+    }
+}
+
+fn run_mise_apply<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    packages: &[Package],
+    mode: ApplyMode,
+) -> ToolchainApplyOutcome {
+    let tag = UpdateSource::Mise.console_tag();
+    if let Some(reason) = unsupported_apply_mode_reason("Mise", mode) {
+        ch.line(tag, reason);
+        return ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+    let Some(bin) = path_program(runtime.mise_binary()) else {
+        let msg = "mise executable not found".to_string();
+        ch.line(tag, format!("error: {msg}"));
+        return ToolchainApplyOutcome::Finished {
+            code: -1,
+            log: msg,
+            error: None,
+        };
+    };
+
+    let names = mise::upgrade_names_from_packages(None, packages);
+    if names.is_empty() {
+        return ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+
+    let mut args = Vec::with_capacity(1 + names.len());
+    args.push("upgrade");
+    args.extend(names.iter().map(String::as_str));
+    let work_cancel = ch.cancel.work_cancel();
+    let (code, log) = run_local_apply_with_env(
+        ch,
+        runtime,
+        &bin,
+        &args,
+        &[("MISE_YES", "1")],
+        Some(&work_cancel),
+        tag,
+        UpdateSource::Mise,
+    );
+    if !ch.is_current() || work_cancel.is_cancelled() {
+        return ToolchainApplyOutcome::Cancelled;
+    }
+    ToolchainApplyOutcome::Finished {
+        code,
+        log,
+        error: None,
+    }
+}
+
+fn run_per_tool_local_apply<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    source: UpdateSource,
+    packages: &[Package],
+    mode: ApplyMode,
+) -> ToolchainApplyOutcome {
+    let tag = source.console_tag();
+    let (display_name, bin_name, bin, names) = match source {
+        UpdateSource::UvTools => (
+            "uv tools",
+            "uv",
+            path_program(runtime.uv_binary()),
+            python_tools::uv_tool_names_from_packages(None, packages),
+        ),
+        UpdateSource::Pipx => (
+            "pipx packages",
+            "pipx",
+            path_program(runtime.pipx_binary()),
+            python_tools::pipx_package_names_from_packages(None, packages),
+        ),
+        _ => {
+            return ToolchainApplyOutcome::Finished {
+                code: 0,
+                log: String::new(),
+                error: None,
+            }
+        }
+    };
+
+    if let Some(reason) = unsupported_apply_mode_reason(display_name, mode) {
+        ch.line(tag, reason);
+        return ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+    let Some(bin) = bin else {
+        let msg = format!("{bin_name} executable not found");
+        ch.line(tag, format!("error: {msg}"));
+        return ToolchainApplyOutcome::Finished {
+            code: -1,
+            log: msg.clone(),
+            error: Some(format!("{}: {msg}", source.label())),
+        };
+    };
+    if names.is_empty() {
+        return ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+
+    let work_cancel = ch.cancel.work_cancel();
+    let mut full_log = String::new();
+    let mut failed_errors = Vec::new();
+    let label_prefix = format!("{}: ", source.label());
+
+    for name in names {
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return ToolchainApplyOutcome::Cancelled;
+        }
+        ch.line(tag, format!("── Upgrading {name} ──"));
+        emit_progress_hint(
+            ch,
+            source,
+            ProgressHint {
+                package_name: Some(name.clone()),
+                status: Some(PackageStatus::Installing),
+                progress: None,
+                phase_label: Some(format!("Upgrading {name}")),
+                stage_current: None,
+                stage_total: None,
+            },
+        );
+
+        let args: Vec<&str> = match source {
+            UpdateSource::UvTools => vec!["tool", "upgrade", name.as_str()],
+            UpdateSource::Pipx => vec!["upgrade", name.as_str()],
+            _ => unreachable!(),
+        };
+        let mut per_log = String::new();
+        let exec_res = runtime.run_cancellable_local_env(
+            &bin,
+            &args,
+            &[],
+            Some(&work_cancel),
+            &mut |l| {
+                per_log.push_str(&l);
+                per_log.push('\n');
+                full_log.push_str(&l);
+                full_log.push('\n');
+                ch.line(tag, l.clone());
+
+                let mut hint = backend::parse_progress(source, &l);
+                if hint.status.is_some() || hint.progress.is_some() || hint.phase_label.is_some() {
+                    if hint.package_name.is_none() {
+                        hint.package_name = Some(name.clone());
+                    }
+                    emit_progress_hint(ch, source, hint);
+                }
+            },
+        );
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return ToolchainApplyOutcome::Cancelled;
+        }
+
+        match exec_res {
+            Ok(0) => {
+                emit_progress_hint(
+                    ch,
+                    source,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Completed),
+                        progress: Some(1.0),
+                        phase_label: Some("Complete".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+            Ok(code) => {
+                let base_reason = summarize_apply_failure(source, &per_log, code);
+                let stripped = strip_prefix_ascii_ci(&base_reason, &label_prefix)
+                    .unwrap_or(&base_reason)
+                    .trim();
+                let reason = if stripped.contains(&name) {
+                    stripped.to_string()
+                } else {
+                    format!("{name}: {stripped}")
+                };
+                if !per_log
+                    .lines()
+                    .any(|l| strip_prefix_ascii_ci(l.trim(), "error:").is_some())
+                {
+                    ch.line(tag, format!("error: {reason}"));
+                }
+                failed_errors.push(reason);
+                emit_progress_hint(
+                    ch,
+                    source,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Failed),
+                        progress: None,
+                        phase_label: Some("Failed".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+            Err(err) => {
+                let reason = format!("{name}: {err}");
+                ch.line(tag, format!("error: {reason}"));
+                full_log.push_str(&reason);
+                full_log.push('\n');
+                failed_errors.push(reason);
+                emit_progress_hint(
+                    ch,
+                    source,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Failed),
+                        progress: None,
+                        phase_label: Some("Failed".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+        }
+    }
+
+    if failed_errors.is_empty() {
+        ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: full_log,
+            error: None,
+        }
+    } else {
+        ToolchainApplyOutcome::Finished {
+            code: 1,
+            log: full_log,
+            error: Some(format!("{}: {}", source.label(), failed_errors.join("; "))),
+        }
+    }
+}
+
 /// Apply all pending sources sequentially (`ApplyMode::Live`). Reuses the
 /// shared helper session when still open (no second password).
 pub fn run_apply_all(tx: Sender<WorkerMsg>, packages: Vec<Package>) {
@@ -2380,6 +3104,26 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                                 (c, l, false, None)
                             }
                         }
+                    }
+                }
+            }
+            UpdateSource::Rustup => match run_rustup_apply(&ch, runtime, &packages, mode) {
+                ToolchainApplyOutcome::Cancelled => return,
+                ToolchainApplyOutcome::Finished { code, log, error } => {
+                    (code, log, false, error)
+                }
+            },
+            UpdateSource::Mise => match run_mise_apply(&ch, runtime, &packages, mode) {
+                ToolchainApplyOutcome::Cancelled => return,
+                ToolchainApplyOutcome::Finished { code, log, error } => {
+                    (code, log, false, error)
+                }
+            },
+            UpdateSource::UvTools | UpdateSource::Pipx => {
+                match run_per_tool_local_apply(&ch, runtime, source, &packages, mode) {
+                    ToolchainApplyOutcome::Cancelled => return,
+                    ToolchainApplyOutcome::Finished { code, log, error } => {
+                        (code, log, false, error)
                     }
                 }
             }
@@ -3231,6 +3975,10 @@ mod tests {
         assert!(!default_cfg.is_enabled(UpdateSource::Distrobox));
         assert!(!default_cfg.is_enabled(UpdateSource::Toolbx));
         assert!(default_cfg.is_enabled(UpdateSource::Dnf));
+        assert!(default_cfg.is_enabled(UpdateSource::Rustup));
+        assert!(default_cfg.is_enabled(UpdateSource::Mise));
+        assert!(default_cfg.is_enabled(UpdateSource::UvTools));
+        assert!(default_cfg.is_enabled(UpdateSource::Pipx));
 
         let mut cfg = SourceConfig::all_enabled();
         assert!(!cfg.all_disabled());
@@ -3241,6 +3989,10 @@ mod tests {
             UpdateSource::FlatpakSystem,
             UpdateSource::GnomeExtensions,
             UpdateSource::Homebrew,
+            UpdateSource::Rustup,
+            UpdateSource::Mise,
+            UpdateSource::UvTools,
+            UpdateSource::Pipx,
             UpdateSource::Distrobox,
             UpdateSource::Toolbx,
             UpdateSource::Firmware,
@@ -3255,6 +4007,10 @@ mod tests {
                 UpdateSource::FlatpakSystem,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Rustup,
+                UpdateSource::Mise,
+                UpdateSource::UvTools,
+                UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
                 UpdateSource::Firmware,
@@ -3268,6 +4024,10 @@ mod tests {
         assert!(cfg.is_enabled(UpdateSource::RpmOstree));
         assert!(cfg.is_enabled(UpdateSource::GnomeExtensions));
         assert!(cfg.is_enabled(UpdateSource::Homebrew));
+        assert!(cfg.is_enabled(UpdateSource::Rustup));
+        assert!(cfg.is_enabled(UpdateSource::Mise));
+        assert!(cfg.is_enabled(UpdateSource::UvTools));
+        assert!(cfg.is_enabled(UpdateSource::Pipx));
         assert!(cfg.is_enabled(UpdateSource::Distrobox));
         assert!(cfg.is_enabled(UpdateSource::Toolbx));
         assert!(cfg.is_enabled(UpdateSource::Firmware));
@@ -3277,6 +4037,10 @@ mod tests {
                 UpdateSource::Dnf,
                 UpdateSource::GnomeExtensions,
                 UpdateSource::Homebrew,
+                UpdateSource::Rustup,
+                UpdateSource::Mise,
+                UpdateSource::UvTools,
+                UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
                 UpdateSource::Firmware,
@@ -3286,6 +4050,10 @@ mod tests {
         cfg.disable("dnf");
         cfg.disable("gnome-extensions");
         cfg.disable("homebrew");
+        cfg.disable("rustup");
+        cfg.disable("mise");
+        cfg.disable("uv");
+        cfg.disable("pipx");
         cfg.disable("distrobox");
         cfg.disable("toolbx");
         cfg.disable("firmware");
@@ -3308,6 +4076,10 @@ mod tests {
         assert!(from_keys.is_enabled(UpdateSource::Dnf));
         assert!(from_keys.is_enabled(UpdateSource::GnomeExtensions));
         assert!(from_keys.is_enabled(UpdateSource::Homebrew));
+        assert!(from_keys.is_enabled(UpdateSource::Rustup));
+        assert!(from_keys.is_enabled(UpdateSource::Mise));
+        assert!(from_keys.is_enabled(UpdateSource::UvTools));
+        assert!(from_keys.is_enabled(UpdateSource::Pipx));
         assert!(!from_keys.is_enabled(UpdateSource::Distrobox));
         assert!(!from_keys.is_enabled(UpdateSource::Toolbx));
 
@@ -3346,12 +4118,10 @@ mod tests {
             probed_no_brew.get("gnome-extensions").unwrap().subtitle,
             "Not available (requires GNOME Shell)"
         );
-        assert!(!probed_no_brew.get("homebrew").unwrap().installed);
-        assert_eq!(probed_no_brew.get("homebrew").unwrap().subtitle, "Not installed");
-        assert!(!probed_no_brew.get("distrobox").unwrap().installed);
-        assert_eq!(probed_no_brew.get("distrobox").unwrap().subtitle, "Not installed");
-        assert!(!probed_no_brew.get("toolbx").unwrap().installed);
-        assert_eq!(probed_no_brew.get("toolbx").unwrap().subtitle, "Not installed");
+        for key in ["homebrew", "rustup", "mise", "uv", "pipx", "distrobox", "toolbx"] {
+            assert!(!probed_no_brew.get(key).unwrap().installed);
+            assert_eq!(probed_no_brew.get(key).unwrap().subtitle, "Not installed");
+        }
         assert!(probed_no_brew.contains_key("firmware"));
 
         let probed_with_brew_and_ext = probe_source_availability_with(
@@ -3381,6 +4151,10 @@ mod tests {
             false,
             HostBinaryPaths {
                 rpm_ostree_bin: Some(std::path::Path::new(rpm_ostree::RPM_OSTREE_DEFAULT_PATH)),
+                rustup_bin: Some(std::path::Path::new("/home/alice/.cargo/bin/rustup")),
+                mise_bin: Some(std::path::Path::new("/home/alice/.local/bin/mise")),
+                uv_bin: Some(std::path::Path::new("/home/alice/.local/bin/uv")),
+                pipx_bin: Some(std::path::Path::new("/home/alice/.local/bin/pipx")),
                 distrobox_bin: Some(std::path::Path::new(containers::DISTROBOX_DEFAULT_PATH)),
                 toolbox_bin: Some(std::path::Path::new(containers::TOOLBOX_DEFAULT_PATH)),
                 ..Default::default()
@@ -3392,6 +4166,14 @@ mod tests {
             probed_ostree["rpm-ostree"].subtitle,
             "Installed (/usr/bin/rpm-ostree)"
         );
+        assert!(probed_ostree["rustup"].installed);
+        assert_eq!(
+            probed_ostree["rustup"].subtitle,
+            "Installed (/home/alice/.cargo/bin/rustup)"
+        );
+        assert!(probed_ostree["mise"].installed);
+        assert!(probed_ostree["uv"].installed);
+        assert!(probed_ostree["pipx"].installed);
         assert!(probed_ostree["distrobox"].installed);
         assert_eq!(
             probed_ostree["distrobox"].subtitle,
