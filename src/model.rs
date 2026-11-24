@@ -1,7 +1,95 @@
 //! Shared application model (no GTK).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Instant;
+
+/// Coarse navigation category grouping one or more [`UpdateSource`] backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SourceCategory {
+    System,
+    Apps,
+    Extensions,
+    DevAndContainers,
+    Firmware,
+}
+
+impl SourceCategory {
+    pub const ALL: &'static [SourceCategory] = &[
+        Self::System,
+        Self::Apps,
+        Self::Extensions,
+        Self::DevAndContainers,
+        Self::Firmware,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Apps => "Apps",
+            Self::Extensions => "Extensions",
+            Self::DevAndContainers => "Dev & Containers",
+            Self::Firmware => "Firmware",
+        }
+    }
+
+    pub fn sidebar_label(self) -> &'static str {
+        match self {
+            Self::System => "System · DNF",
+            Self::Apps => "Apps · Flatpak",
+            Self::Extensions => "Extensions",
+            Self::DevAndContainers => "Dev & Containers",
+            Self::Firmware => "Firmware · LVFS",
+        }
+    }
+
+    pub fn filter_key(self) -> &'static str {
+        match self {
+            Self::System => "source:system",
+            Self::Apps => "source:apps",
+            Self::Extensions => "source:extensions",
+            Self::DevAndContainers => "source:dev-containers",
+            Self::Firmware => "source:firmware",
+        }
+    }
+
+    pub fn from_filter_key(key: &str) -> Option<Self> {
+        match key {
+            "source:system" => Some(Self::System),
+            "source:apps" => Some(Self::Apps),
+            "source:extensions" => Some(Self::Extensions),
+            "source:dev-containers" => Some(Self::DevAndContainers),
+            "source:firmware" => Some(Self::Firmware),
+            _ => None,
+        }
+    }
+
+    pub fn dot_css_class(self) -> &'static str {
+        match self {
+            Self::System => "src-dnf",
+            Self::Apps => "src-flatpak",
+            Self::Extensions => "src-ext",
+            Self::DevAndContainers => "src-container",
+            Self::Firmware => "src-firmware",
+        }
+    }
+
+    pub fn sort_order(self) -> u8 {
+        match self {
+            Self::System => 0,
+            Self::Apps => 1,
+            Self::Extensions => 2,
+            Self::DevAndContainers => 3,
+            Self::Firmware => 4,
+        }
+    }
+}
+
+impl fmt::Display for SourceCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
 
 /// Where an update item came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -13,13 +101,81 @@ pub enum UpdateSource {
 }
 
 impl UpdateSource {
-    pub fn label(self) -> &'static str {
+    pub const ALL: &'static [UpdateSource] = &[
+        Self::Dnf,
+        Self::FlatpakUser,
+        Self::FlatpakSystem,
+        Self::Firmware,
+    ];
+
+    pub const ALL_CSS_CLASSES: &'static [&'static str] = &[
+        "src-dnf",
+        "src-flatpak",
+        "src-firmware",
+        "src-ostree",
+        "src-brew",
+        "src-ext",
+        "src-container",
+        "src-toolchain",
+        "src-hook",
+    ];
+
+    pub fn all_sources() -> &'static [UpdateSource] {
+        Self::ALL
+    }
+
+    pub fn category(self) -> SourceCategory {
         match self {
-            Self::Dnf => "System",
-            Self::FlatpakUser => "Apps",
-            Self::FlatpakSystem => "Apps",
-            Self::Firmware => "Firmware",
+            Self::Dnf => SourceCategory::System,
+            Self::FlatpakUser | Self::FlatpakSystem => SourceCategory::Apps,
+            Self::Firmware => SourceCategory::Firmware,
         }
+    }
+
+    pub fn pref_key(self) -> &'static str {
+        match self {
+            Self::Dnf => "dnf",
+            Self::FlatpakUser | Self::FlatpakSystem => "flatpak",
+            Self::Firmware => "firmware",
+        }
+    }
+
+    pub fn pref_title(self) -> &'static str {
+        match self {
+            Self::Dnf => "System Packages (DNF)",
+            Self::FlatpakUser | Self::FlatpakSystem => "Flatpak Apps",
+            Self::Firmware => "Firmware (fwupd / LVFS)",
+        }
+    }
+
+    pub fn requires_root(self) -> bool {
+        match self {
+            Self::Dnf | Self::Firmware => true,
+            Self::FlatpakUser | Self::FlatpakSystem => false,
+        }
+    }
+
+    /// True when individual items from this source can be selectively applied.
+    /// Future atomic/toolchain sources may override to `false`.
+    pub fn supports_selective_apply(self) -> bool {
+        match self {
+            Self::Dnf | Self::FlatpakUser | Self::FlatpakSystem | Self::Firmware => true,
+        }
+    }
+
+    /// Deduplicated preference-level sources preserving canonical order.
+    pub fn pref_sources() -> Vec<UpdateSource> {
+        let mut out = Vec::new();
+        for &src in Self::ALL {
+            if !out.iter().any(|existing: &UpdateSource| existing.pref_key() == src.pref_key()) {
+                out.push(src);
+            }
+        }
+        out
+    }
+
+    pub fn label(self) -> &'static str {
+        self.category().label()
     }
 
     pub fn badge(self) -> &'static str {
@@ -373,18 +529,36 @@ impl Stopwatch {
     }
 }
 
-pub fn count_by_source(packages: &[Package]) -> (usize, usize, usize) {
-    let mut dnf = 0;
-    let mut flatpak = 0;
-    let mut firmware = 0;
+pub fn count_by_category(packages: &[Package]) -> BTreeMap<SourceCategory, usize> {
+    let mut counts = BTreeMap::new();
     for p in packages {
-        match p.source {
-            UpdateSource::Dnf => dnf += 1,
-            UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem => flatpak += 1,
-            UpdateSource::Firmware => firmware += 1,
-        }
+        *counts.entry(p.source.category()).or_insert(0) += 1;
     }
-    (dnf, flatpak, firmware)
+    counts
+}
+
+pub fn count_for_category(packages: &[Package], category: SourceCategory) -> usize {
+    packages
+        .iter()
+        .filter(|p| p.source.category() == category)
+        .count()
+}
+
+pub fn categories_present(packages: &[Package]) -> Vec<SourceCategory> {
+    SourceCategory::ALL
+        .iter()
+        .copied()
+        .filter(|cat| packages.iter().any(|p| p.source.category() == *cat))
+        .collect()
+}
+
+pub fn count_by_source(packages: &[Package]) -> (usize, usize, usize) {
+    let counts = count_by_category(packages);
+    (
+        counts.get(&SourceCategory::System).copied().unwrap_or(0),
+        counts.get(&SourceCategory::Apps).copied().unwrap_or(0),
+        counts.get(&SourceCategory::Firmware).copied().unwrap_or(0),
+    )
 }
 
 /// Number of packages carrying at least one security advisory or CVE reference.
@@ -462,18 +636,11 @@ pub fn sort_for_apply(packages: &mut [Package]) {
 }
 
 pub fn sources_present(packages: &[Package]) -> Vec<UpdateSource> {
-    let mut out = Vec::new();
-    for src in [
-        UpdateSource::Dnf,
-        UpdateSource::FlatpakUser,
-        UpdateSource::FlatpakSystem,
-        UpdateSource::Firmware,
-    ] {
-        if packages.iter().any(|p| p.source == src) {
-            out.push(src);
-        }
-    }
-    out
+    UpdateSource::ALL
+        .iter()
+        .copied()
+        .filter(|src| packages.iter().any(|p| p.source == *src))
+        .collect()
 }
 
 /// Mark all items for a source as completed/failed based on exit code.
@@ -1013,5 +1180,90 @@ mod tests {
         pkg.advisories[0].cves.clear();
         assert_eq!(pkg.primary_security_tag().as_deref(), Some("Security"));
         assert!(pkg.has_security_advisory());
+    }
+
+    #[test]
+    fn source_category_and_update_source_metadata_cover_all_variants() {
+        assert_eq!(
+            SourceCategory::ALL,
+            &[
+                SourceCategory::System,
+                SourceCategory::Apps,
+                SourceCategory::Extensions,
+                SourceCategory::DevAndContainers,
+                SourceCategory::Firmware,
+            ]
+        );
+        for (idx, &cat) in SourceCategory::ALL.iter().enumerate() {
+            assert_eq!(cat.sort_order() as usize, idx);
+            assert_eq!(cat.to_string(), cat.label());
+            assert_eq!(SourceCategory::from_filter_key(cat.filter_key()), Some(cat));
+            assert!(!cat.sidebar_label().is_empty());
+            assert!(cat.dot_css_class().starts_with("src-"));
+        }
+        assert_eq!(SourceCategory::from_filter_key("source:unknown"), None);
+
+        assert_eq!(
+            UpdateSource::all_sources(),
+            &[
+                UpdateSource::Dnf,
+                UpdateSource::FlatpakUser,
+                UpdateSource::FlatpakSystem,
+                UpdateSource::Firmware,
+            ]
+        );
+        assert_eq!(UpdateSource::Dnf.category(), SourceCategory::System);
+        assert_eq!(UpdateSource::FlatpakUser.category(), SourceCategory::Apps);
+        assert_eq!(UpdateSource::FlatpakSystem.category(), SourceCategory::Apps);
+        assert_eq!(UpdateSource::Firmware.category(), SourceCategory::Firmware);
+
+        assert_eq!(UpdateSource::Dnf.pref_key(), "dnf");
+        assert_eq!(UpdateSource::FlatpakUser.pref_key(), "flatpak");
+        assert_eq!(UpdateSource::FlatpakSystem.pref_key(), "flatpak");
+        assert_eq!(UpdateSource::Firmware.pref_key(), "firmware");
+
+        assert!(UpdateSource::Dnf.requires_root());
+        assert!(!UpdateSource::FlatpakUser.requires_root());
+        assert!(!UpdateSource::FlatpakSystem.requires_root());
+        assert!(UpdateSource::Firmware.requires_root());
+
+        for &src in UpdateSource::all_sources() {
+            assert!(src.supports_selective_apply());
+            assert!(!src.pref_title().is_empty());
+        }
+
+        assert_eq!(
+            UpdateSource::pref_sources(),
+            vec![
+                UpdateSource::Dnf,
+                UpdateSource::FlatpakUser,
+                UpdateSource::Firmware,
+            ]
+        );
+
+        let mut fp_sys = Package::new_dnf("Steam", "", "1", "flathub");
+        fp_sys.source = UpdateSource::FlatpakSystem;
+        let mut fp_user = Package::new_dnf("Signal", "", "1", "flathub");
+        fp_user.source = UpdateSource::FlatpakUser;
+        let pkgs = vec![
+            Package::new_dnf("bash", "x86_64", "1", "updates"),
+            fp_user,
+            fp_sys,
+            firmware_pkg("UEFI"),
+        ];
+        let by_cat = count_by_category(&pkgs);
+        assert_eq!(by_cat.get(&SourceCategory::System), Some(&1));
+        assert_eq!(by_cat.get(&SourceCategory::Apps), Some(&2));
+        assert_eq!(by_cat.get(&SourceCategory::Firmware), Some(&1));
+        assert_eq!(by_cat.get(&SourceCategory::Extensions), None);
+        assert_eq!(count_for_category(&pkgs, SourceCategory::Apps), 2);
+        assert_eq!(
+            categories_present(&pkgs),
+            vec![
+                SourceCategory::System,
+                SourceCategory::Apps,
+                SourceCategory::Firmware,
+            ]
+        );
     }
 }

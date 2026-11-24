@@ -437,7 +437,7 @@ impl PackageInspector {
     pub fn paint(&self, package: &Package) {
         let vm = InspectorViewModel::from_package(package);
 
-        for cls in ["src-dnf", "src-flatpak", "src-firmware"] {
+        for cls in UpdateSource::ALL_CSS_CLASSES {
             self.source_badge.remove_css_class(cls);
         }
         self.source_badge.set_label(vm.badge);

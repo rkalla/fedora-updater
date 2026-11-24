@@ -5,11 +5,13 @@
 //! `$XDG_CONFIG_HOME/fedora-updater/ui.json` (falling back to
 //! `$HOME/.config/fedora-updater/ui.json`).
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use fedora_updater::orchestrator::SourceConfig;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_WINDOW_WIDTH: i32 = 960;
@@ -21,12 +23,14 @@ const MAX_WINDOW_EXTENT: i32 = 16_384;
 const APP_CONFIG_DIR: &str = "fedora-updater";
 const PREFS_FILE_NAME: &str = "ui.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiPrefs {
     pub sidebar_open: bool,
     pub window_width: i32,
     pub window_height: i32,
+    #[serde(default)]
+    pub disabled_sources: BTreeSet<String>,
 }
 
 impl Default for UiPrefs {
@@ -35,13 +39,14 @@ impl Default for UiPrefs {
             sidebar_open: true,
             window_width: DEFAULT_WINDOW_WIDTH,
             window_height: DEFAULT_WINDOW_HEIGHT,
+            disabled_sources: BTreeSet::new(),
         }
     }
 }
 
 impl UiPrefs {
     /// Clamp out-of-range dimensions back to Observatory defaults while keeping
-    /// the sidebar toggle intact.
+    /// the sidebar toggle and normalized disabled source keys intact.
     pub fn normalized(self) -> Self {
         let window_width =
             if (MIN_WINDOW_WIDTH..=MAX_WINDOW_EXTENT).contains(&self.window_width) {
@@ -55,11 +60,39 @@ impl UiPrefs {
             } else {
                 DEFAULT_WINDOW_HEIGHT
             };
+        let disabled_sources = self
+            .disabled_sources
+            .into_iter()
+            .map(|key| key.trim().to_ascii_lowercase())
+            .filter(|key| !key.is_empty())
+            .collect();
         Self {
             sidebar_open: self.sidebar_open,
             window_width,
             window_height,
+            disabled_sources,
         }
+    }
+
+    pub fn is_source_enabled(&self, pref_key: &str) -> bool {
+        let normalized = pref_key.trim().to_ascii_lowercase();
+        !self.disabled_sources.contains(&normalized)
+    }
+
+    pub fn set_source_enabled(&mut self, pref_key: &str, enabled: bool) {
+        let normalized = pref_key.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return;
+        }
+        if enabled {
+            self.disabled_sources.remove(&normalized);
+        } else {
+            self.disabled_sources.insert(normalized);
+        }
+    }
+
+    pub fn source_config(&self) -> SourceConfig {
+        SourceConfig::from_disabled_keys(self.disabled_sources.iter().cloned())
     }
 }
 
@@ -118,7 +151,7 @@ pub fn save_to(path: &Path, prefs: &UiPrefs) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let normalized = prefs.normalized();
+    let normalized = prefs.clone().normalized();
     let mut payload = serde_json::to_string_pretty(&normalized)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     payload.push('\n');
@@ -173,6 +206,10 @@ mod tests {
         assert!(prefs.sidebar_open);
         assert_eq!(prefs.window_width, 960);
         assert_eq!(prefs.window_height, 676);
+        assert!(prefs.disabled_sources.is_empty());
+        assert!(prefs.is_source_enabled("dnf"));
+        assert!(prefs.is_source_enabled("flatpak"));
+        assert!(prefs.is_source_enabled("firmware"));
     }
 
     #[test]
@@ -200,15 +237,18 @@ mod tests {
     fn save_and_load_round_trip_creates_missing_parent_dirs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nested/fedora-updater/ui.json");
-        let prefs = UiPrefs {
+        let mut prefs = UiPrefs {
             sidebar_open: false,
             window_width: 1120,
             window_height: 740,
+            disabled_sources: BTreeSet::new(),
         };
+        prefs.set_source_enabled("firmware", false);
 
         save_to(&path, &prefs).expect("save ui prefs");
         assert!(path.is_file());
         assert_eq!(load_from(&path), prefs);
+        assert!(!load_from(&path).is_source_enabled("firmware"));
     }
 
     #[test]
@@ -234,6 +274,7 @@ mod tests {
                 sidebar_open: false,
                 window_width: DEFAULT_WINDOW_WIDTH,
                 window_height: DEFAULT_WINDOW_HEIGHT,
+                disabled_sources: BTreeSet::new(),
             }
         );
 
@@ -249,8 +290,47 @@ mod tests {
                 sidebar_open: false,
                 window_width: DEFAULT_WINDOW_WIDTH,
                 window_height: DEFAULT_WINDOW_HEIGHT,
+                disabled_sources: BTreeSet::new(),
             }
         );
+    }
+
+    #[test]
+    fn legacy_ui_json_without_disabled_sources_enables_all_sources_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy_path = dir.path().join("ui.json");
+        fs::write(
+            &legacy_path,
+            r#"{
+  "sidebar_open": false,
+  "window_width": 1080,
+  "window_height": 720
+}
+"#,
+        )
+        .expect("write legacy json");
+
+        let mut loaded = load_from(&legacy_path);
+        assert!(!loaded.sidebar_open);
+        assert_eq!(loaded.window_width, 1080);
+        assert_eq!(loaded.window_height, 720);
+        assert!(loaded.disabled_sources.is_empty());
+        assert!(loaded.is_source_enabled("dnf"));
+        assert!(loaded.is_source_enabled("flatpak"));
+        assert!(loaded.is_source_enabled("firmware"));
+
+        loaded.set_source_enabled("  Flatpak  ", false);
+        loaded.set_source_enabled("dnf", false);
+        loaded.set_source_enabled("dnf", true);
+        loaded.set_source_enabled("   ", false);
+        assert!(!loaded.is_source_enabled("flatpak"));
+        assert!(loaded.is_source_enabled("dnf"));
+
+        save_to(&legacy_path, &loaded).expect("save updated prefs");
+        let reloaded = load_from(&legacy_path);
+        assert_eq!(reloaded.disabled_sources, BTreeSet::from(["flatpak".into()]));
+        assert!(!reloaded.is_source_enabled("FLATPAK"));
+        assert!(reloaded.is_source_enabled("firmware"));
     }
 
     #[test]
@@ -268,6 +348,7 @@ mod tests {
             sidebar_open: false,
             window_width: 1024,
             window_height: 700,
+            disabled_sources: BTreeSet::from(["firmware".into()]),
         };
 
         assert!(!save_if_enabled(Some(&path), &custom, true));

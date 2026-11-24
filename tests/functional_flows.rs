@@ -37,8 +37,9 @@ use fedora_updater::model::{
 };
 use fedora_updater::orchestrator::{
     can_skip_apply_auth_ui, can_skip_check_auth_ui, execute_apply_all, execute_apply_all_with_mode,
-    execute_check_all, execute_load_history, execute_systemctl_reboot, run_apply_all_with,
-    run_check_all_with, run_systemctl_reboot_with, session_started_event, WorkCancel, WorkerMsg,
+    execute_apply_all_with_mode_and_config, execute_check_all, execute_check_all_with_config,
+    execute_load_history, execute_systemctl_reboot, run_apply_all_with, run_check_all_with,
+    run_systemctl_reboot_with, session_started_event, SourceConfig, WorkCancel, WorkerMsg,
     REBOOT_FAILED_TITLE, REBOOT_SPAWN_FAILED_TITLE,
 };
 use fedora_updater::presenter::{
@@ -2543,4 +2544,171 @@ fn native_apply_errors_are_logged_to_activity_console_without_duplication() {
         1,
         "fwupd error should appear exactly once: {log_lines2:#?}"
     );
+}
+
+#[test]
+fn disabled_source_is_skipped_cleanly_without_warnings() {
+    // 1) Firmware disabled: neither fwupd D-Bus nor fwupdmgr helper is touched, zero soft errors.
+    let rt = FakeRuntime::new();
+    rt.push_helper_fixture(HelperCommand::CheckDnf, "dnf/check_update_classic.txt", 100);
+    rt.push_local_fixture(
+        "dnf",
+        dnf::REPOQUERY_UPGRADES_ARGS,
+        "dnf/repoquery_sizes.txt",
+        0,
+    );
+    rt.push_flatpak_appstream_ok();
+    rt.push_flatpak_query(
+        true,
+        Ok(flatpak_check_from_fixture("flatpak/check_user_normal.json", None)),
+    );
+    rt.push_flatpak_query(
+        false,
+        Ok(flatpak_check_from_fixture(
+            "flatpak/check_system_nvidia_extension.json",
+            None,
+        )),
+    );
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("firmware");
+
+    let mut h = FlowHarness::new();
+    h.console.clear();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_check_all_with_config(&tx, &rt, &cancel, &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    assert_eq!(rt.fwupd_dbus_check_calls(), 0);
+    assert!(!rt.helper_calls().contains(&HelperCommand::CheckFwupd));
+    match &h.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert!(soft_errors.is_empty(), "expected zero warnings, got {soft_errors:?}");
+            assert!(!packages.is_empty());
+            assert!(packages.iter().all(|p| p.source != UpdateSource::Firmware));
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    }
+
+    // 2) DNF disabled: ensure_session() is never invoked and only unprivileged Flatpak runs.
+    let rt_no_dnf = FakeRuntime::new();
+    rt_no_dnf.push_flatpak_appstream_ok();
+    rt_no_dnf.push_flatpak_query(
+        true,
+        Ok(flatpak_check_from_fixture("flatpak/check_user_normal.json", None)),
+    );
+    rt_no_dnf.push_flatpak_empty(false);
+
+    let mut cfg_no_dnf = SourceConfig::all_enabled();
+    cfg_no_dnf.disable("dnf");
+    cfg_no_dnf.disable("firmware");
+
+    let mut h2 = FlowHarness::new();
+    h2.dispatch(Event::StartCheck { then_apply: false });
+    let (tx2, rx2) = async_channel::unbounded();
+    let cancel2 = WorkCancel::new();
+    execute_check_all_with_config(&tx2, &rt_no_dnf, &cancel2, &cfg_no_dnf);
+    drop(tx2);
+    h2.drain(&rx2);
+
+    assert_eq!(rt_no_dnf.ensure_session_calls(), 0);
+    assert!(rt_no_dnf.helper_calls().is_empty());
+    match &h2.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert!(soft_errors.is_empty());
+            assert!(packages.iter().all(|p| p.source == UpdateSource::FlatpakUser));
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    }
+}
+
+#[test]
+fn single_source_soft_failure_isolated_while_other_enabled_sources_succeed() {
+    let rt = FakeRuntime::new();
+    rt.set_dnf_dbus_available(true);
+    rt.push_dnf_dbus_check(NativeOutcome::Handled(Err("DNF repo metadata expired".into())));
+    rt.push_flatpak_appstream_ok();
+    rt.push_flatpak_query(
+        true,
+        Ok(flatpak_check_from_fixture("flatpak/check_user_normal.json", None)),
+    );
+    rt.push_flatpak_empty(false);
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("firmware");
+
+    let mut h = FlowHarness::new();
+    h.dispatch(Event::StartCheck { then_apply: false });
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_check_all_with_config(&tx, &rt, &cancel, &cfg);
+    drop(tx);
+    h.drain(&rx);
+
+    match &h.state.phase {
+        Phase::Ready {
+            packages,
+            soft_errors,
+        } => {
+            assert_eq!(soft_errors, &vec!["DNF repo metadata expired".to_string()]);
+            assert!(!packages.is_empty());
+            assert!(packages.iter().all(|p| p.source == UpdateSource::FlatpakUser));
+        }
+        other => panic!("expected Phase::Ready, got {other:?}"),
+    }
+}
+
+#[test]
+fn apply_honors_disabled_source_config() {
+    let rt = FakeRuntime::new();
+    rt.set_dnf_dbus_available(true);
+    rt.push_dnf_dbus_apply(DnfDbusApplyStep {
+        lines: vec!["Upgrading bash".into()],
+        draws: vec![],
+        hints: vec![],
+        throughput: vec![],
+        on_start: None,
+        outcome: NativeOutcome::Handled(Ok(DnfApplyOutcome {
+            needs_reboot: false,
+            cancelled: false,
+            offline_scheduled: false,
+            download_only: false,
+        })),
+    });
+
+    let bash = Package::new_dnf("bash", "x86_64", "5.2.37-1.fc44", "updates");
+    let mut fw = Package::new_dnf("System Firmware", "", "1.2.3", "LVFS");
+    fw.id = "fwupd:sys".into();
+    fw.source = UpdateSource::Firmware;
+
+    let mut cfg = SourceConfig::all_enabled();
+    cfg.disable("firmware");
+
+    let mut h = FlowHarness::ready(vec![bash.clone(), fw.clone()]);
+    h.dispatch(Event::StartApply);
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    execute_apply_all_with_mode_and_config(
+        &tx,
+        vec![bash, fw],
+        ApplyMode::Live,
+        &rt,
+        &cancel,
+        &cfg,
+    );
+    drop(tx);
+    h.drain(&rx);
+
+    assert_eq!(rt.fwupd_dbus_apply_calls(), 0);
+    assert_eq!(rt.dnf_dbus_apply_calls().len(), 1);
+    assert!(matches!(h.state.phase, Phase::Done { failed: 0, .. }));
 }

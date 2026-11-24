@@ -1,5 +1,7 @@
 //! Sequential multi-backend check/apply using one privileged helper session.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,6 +20,158 @@ use crate::privilege::{
     session_is_alive, with_session, SessionError, SessionEvent,
 };
 use crate::state::Event as StateEvent;
+
+/// Enabled/disabled source filter applied during check and apply pipelines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceConfig {
+    pub disabled_keys: BTreeSet<String>,
+}
+
+impl SourceConfig {
+    pub fn all_enabled() -> Self {
+        Self::default()
+    }
+
+    pub fn from_disabled_keys(keys: impl IntoIterator<Item = String>) -> Self {
+        let mut disabled_keys = BTreeSet::new();
+        for key in keys {
+            let trimmed = key.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() {
+                disabled_keys.insert(trimmed);
+            }
+        }
+        Self { disabled_keys }
+    }
+
+    pub fn is_key_enabled(&self, pref_key: &str) -> bool {
+        let normalized = pref_key.trim().to_ascii_lowercase();
+        !self.disabled_keys.contains(&normalized)
+    }
+
+    pub fn is_enabled(&self, source: UpdateSource) -> bool {
+        self.is_key_enabled(source.pref_key())
+    }
+
+    pub fn enabled_sources(&self) -> Vec<UpdateSource> {
+        UpdateSource::ALL
+            .iter()
+            .copied()
+            .filter(|s| self.is_enabled(*s))
+            .collect()
+    }
+
+    pub fn all_disabled(&self) -> bool {
+        UpdateSource::ALL.iter().all(|s| !self.is_enabled(*s))
+    }
+
+    pub fn disable(&mut self, pref_key: &str) {
+        let normalized = pref_key.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            self.disabled_keys.insert(normalized);
+        }
+    }
+
+    pub fn enable(&mut self, pref_key: &str) {
+        let normalized = pref_key.trim().to_ascii_lowercase();
+        self.disabled_keys.remove(&normalized);
+    }
+}
+
+/// Detected host availability for a preference-level update source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceAvailability {
+    pub pref_key: &'static str,
+    pub installed: bool,
+    pub subtitle: String,
+}
+
+fn command_exists(program: &str) -> bool {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.join(program).is_file() {
+                return true;
+            }
+        }
+    }
+    Path::new("/usr/bin").join(program).is_file()
+}
+
+/// Probe host availability of supported update sources without spawning processes.
+pub fn probe_source_availability(
+    native_dnf: bool,
+    native_fwupd: bool,
+) -> BTreeMap<String, SourceAvailability> {
+    let mut map = BTreeMap::new();
+    let dnf_cli = command_exists("dnf");
+    let dnf_installed = native_dnf || dnf_cli;
+    let dnf_sub = if native_dnf {
+        "Installed (dnf5daemon D-Bus)"
+    } else if dnf_cli {
+        "Installed (CLI)"
+    } else {
+        "Not installed"
+    };
+    map.insert(
+        "dnf".into(),
+        SourceAvailability {
+            pref_key: "dnf",
+            installed: dnf_installed,
+            subtitle: dnf_sub.into(),
+        },
+    );
+
+    let fp_installed = command_exists("flatpak");
+    map.insert(
+        "flatpak".into(),
+        SourceAvailability {
+            pref_key: "flatpak",
+            installed: fp_installed,
+            subtitle: if fp_installed {
+                "Installed"
+            } else {
+                "Not installed"
+            }
+            .into(),
+        },
+    );
+
+    let fw_cli = command_exists("fwupdmgr");
+    let fw_installed = native_fwupd || fw_cli;
+    let fw_sub = if native_fwupd {
+        "Installed (fwupd D-Bus)"
+    } else if fw_cli {
+        "Installed (CLI)"
+    } else {
+        "Not installed"
+    };
+    map.insert(
+        "firmware".into(),
+        SourceAvailability {
+            pref_key: "firmware",
+            installed: fw_installed,
+            subtitle: fw_sub.into(),
+        },
+    );
+
+    map
+}
+
+/// Optimistic default availability used before live host probing or in offline tests.
+pub fn default_source_availability() -> BTreeMap<String, SourceAvailability> {
+    let mut map = BTreeMap::new();
+    for src in UpdateSource::pref_sources() {
+        let key = src.pref_key();
+        map.insert(
+            key.into(),
+            SourceAvailability {
+                pref_key: key,
+                installed: true,
+                subtitle: "Installed".into(),
+            },
+        );
+    }
+    map
+}
 
 #[derive(Debug, Clone)]
 pub enum WorkerMsg {
@@ -453,9 +607,14 @@ fn map_session_start_err(ch: &WorkChannel, e: SessionError, retry: RetryAction) 
 /// Full check pipeline. Reuses the shared helper session when already elevated
 /// (no second password); otherwise starts it once via polkit.
 pub fn run_check_all(tx: Sender<WorkerMsg>) {
+    run_check_with_config(tx, SourceConfig::all_enabled());
+}
+
+/// Full check pipeline honoring disabled sources in `config`.
+pub fn run_check_with_config(tx: Sender<WorkerMsg>, config: SourceConfig) {
     let gen = begin_background_work();
     thread::spawn(move || {
-        execute_check_all_inner(&tx, &SystemRuntime, CancelCheck::GlobalGen(gen));
+        execute_check_all_inner(&tx, &SystemRuntime, CancelCheck::GlobalGen(gen), &config);
     });
 }
 
@@ -464,10 +623,19 @@ pub fn run_check_all_with<R: OrchestratorRuntime>(
     tx: Sender<WorkerMsg>,
     runtime: R,
 ) -> WorkCancel {
+    run_check_all_with_config(tx, runtime, SourceConfig::all_enabled())
+}
+
+/// Spawn [`execute_check_all_with_config`] on a background thread using a custom [`OrchestratorRuntime`].
+pub fn run_check_all_with_config<R: OrchestratorRuntime>(
+    tx: Sender<WorkerMsg>,
+    runtime: R,
+    config: SourceConfig,
+) -> WorkCancel {
     let cancel = WorkCancel::new();
     let worker_cancel = cancel.clone();
     thread::spawn(move || {
-        execute_check_all_inner(&tx, &runtime, CancelCheck::Token(worker_cancel));
+        execute_check_all_inner(&tx, &runtime, CancelCheck::Token(worker_cancel), &config);
     });
     cancel
 }
@@ -478,20 +646,41 @@ pub fn execute_check_all<R: OrchestratorRuntime>(
     runtime: &R,
     cancel: &WorkCancel,
 ) {
-    execute_check_all_inner(tx, runtime, CancelCheck::Token(cancel.clone()));
+    execute_check_all_with_config(tx, runtime, cancel, &SourceConfig::all_enabled());
+}
+
+/// Synchronously run the check pipeline against `runtime`, skipping sources disabled in `config`.
+pub fn execute_check_all_with_config<R: OrchestratorRuntime>(
+    tx: &Sender<WorkerMsg>,
+    runtime: &R,
+    cancel: &WorkCancel,
+    config: &SourceConfig,
+) {
+    execute_check_all_inner(tx, runtime, CancelCheck::Token(cancel.clone()), config);
 }
 
 fn execute_check_all_inner<R: OrchestratorRuntime>(
     tx: &Sender<WorkerMsg>,
     runtime: &R,
     cancel: CancelCheck,
+    config: &SourceConfig,
 ) {
     let ch = WorkChannel { tx, cancel };
+    if config.all_disabled() {
+        ch.event(StateEvent::Fail {
+            title: "All update sources are disabled".into(),
+            detail: "Enable at least one update source in Preferences (Ctrl+,) to check for updates.".into(),
+            retry: RetryAction::CheckAgain,
+        });
+        return;
+    }
+
+    let dnf_enabled = config.is_enabled(UpdateSource::Dnf);
     // Use zero-password dnf5daemon SessionManager.open_session({}) when available;
     // only elevate the helper session up front when falling back to CLI DNF.
-    let use_native_dnf = runtime.dnf_dbus_available();
+    let use_native_dnf = dnf_enabled && runtime.dnf_dbus_available();
     let mut session_ensured = false;
-    if !use_native_dnf {
+    if dnf_enabled && !use_native_dnf {
         let started = runtime.ensure_session();
         if !ch.is_current() {
             return;
@@ -512,163 +701,177 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
     }
 
     // 1) DNF — prefer native org.rpm.dnf.v0 (zero-password), falling back to CLI helper.
-    let dnf_res = if use_native_dnf {
-        match runtime.check_dnf_dbus(&mut |l| ch.line("dnf", l)) {
-            NativeOutcome::Handled(res) => res,
-            NativeOutcome::Unavailable(_) => {
-                if !session_ensured {
-                    match runtime.ensure_session() {
-                        Ok(()) => session_ensured = true,
-                        Err(e) => return map_session_start_err(&ch, e, RetryAction::CheckAgain),
+    if dnf_enabled {
+        let dnf_res = if use_native_dnf {
+            match runtime.check_dnf_dbus(&mut |l| ch.line("dnf", l)) {
+                NativeOutcome::Handled(res) => res,
+                NativeOutcome::Unavailable(_) => {
+                    if !session_ensured {
+                        match runtime.ensure_session() {
+                            Ok(()) => session_ensured = true,
+                            Err(e) => return map_session_start_err(&ch, e, RetryAction::CheckAgain),
+                        }
                     }
-                }
-                if !ch.is_current() {
-                    return;
-                }
-                run_helper_check(&ch, runtime, HelperCommand::CheckDnf, "dnf", |log, code| {
-                    let mut pkgs = dnf::parse_check_update(log);
-                    if dnf::check_exit_is_hard_error(code, &pkgs) {
-                        Err(format!("dnf check-update failed (exit {code})"))
-                    } else {
-                        attach_dnf_download_sizes(&ch, runtime, &mut pkgs);
-                        Ok(pkgs)
+                    if !ch.is_current() {
+                        return;
                     }
-                })
+                    run_helper_check(&ch, runtime, HelperCommand::CheckDnf, "dnf", |log, code| {
+                        let mut pkgs = dnf::parse_check_update(log);
+                        if dnf::check_exit_is_hard_error(code, &pkgs) {
+                            Err(format!("dnf check-update failed (exit {code})"))
+                        } else {
+                            attach_dnf_download_sizes(&ch, runtime, &mut pkgs);
+                            Ok(pkgs)
+                        }
+                    })
+                }
             }
+        } else {
+            run_helper_check(&ch, runtime, HelperCommand::CheckDnf, "dnf", |log, code| {
+                let mut pkgs = dnf::parse_check_update(log);
+                if dnf::check_exit_is_hard_error(code, &pkgs) {
+                    Err(format!("dnf check-update failed (exit {code})"))
+                } else {
+                    attach_dnf_download_sizes(&ch, runtime, &mut pkgs);
+                    Ok(pkgs)
+                }
+            })
+        };
+        if !ch.is_current() {
+            return;
         }
-    } else {
-        run_helper_check(&ch, runtime, HelperCommand::CheckDnf, "dnf", |log, code| {
-            let mut pkgs = dnf::parse_check_update(log);
-            if dnf::check_exit_is_hard_error(code, &pkgs) {
-                Err(format!("dnf check-update failed (exit {code})"))
-            } else {
-                attach_dnf_download_sizes(&ch, runtime, &mut pkgs);
-                Ok(pkgs)
-            }
-        })
-    };
-    if !ch.is_current() {
-        return;
+        emit_backend_check(&ch, UpdateSource::Dnf, dnf_res, &mut all, &mut soft_errors);
     }
-    emit_backend_check(&ch, UpdateSource::Dnf, dnf_res, &mut all, &mut soft_errors);
 
     // 2) Flatpak appstream (unprivileged). Names and versions come from this
     // metadata; the update set itself comes from libflatpak below.
-    if !ch.is_current() {
-        return;
+    let fp_user_enabled = config.is_enabled(UpdateSource::FlatpakUser);
+    let fp_sys_enabled = config.is_enabled(UpdateSource::FlatpakSystem);
+    if fp_user_enabled {
+        if !ch.is_current() {
+            return;
+        }
+        let _ = runtime.run_cancellable_local(
+            "flatpak",
+            &["update", "--user", "--appstream", "--noninteractive"],
+            &mut |l| ch.line("flatpak-user", l),
+        );
     }
-    let _ = runtime.run_cancellable_local(
-        "flatpak",
-        &["update", "--user", "--appstream", "--noninteractive"],
-        &mut |l| ch.line("flatpak-user", l),
-    );
-    if !ch.is_current() {
-        return;
+    if fp_sys_enabled {
+        if !ch.is_current() {
+            return;
+        }
+        let _ = runtime.run_cancellable_local(
+            "flatpak",
+            &["update", "--system", "--appstream", "--noninteractive"],
+            &mut |l| ch.line("flatpak-system", l),
+        );
     }
-    let _ = runtime.run_cancellable_local(
-        "flatpak",
-        &["update", "--system", "--appstream", "--noninteractive"],
-        &mut |l| ch.line("flatpak-system", l),
-    );
 
     // 3–4) Flatpak lists. Same decision as GNOME Software: a ref is included
     // when its commit changed or a related extension still needs installing.
-    if !ch.is_current() {
-        return;
+    if fp_user_enabled {
+        if !ch.is_current() {
+            return;
+        }
+        let flatpak_user_res =
+            run_flatpak_check(&ch, runtime, true).map_err(|e| format!("flatpak user: {e}"));
+        if !ch.is_current() {
+            return;
+        }
+        emit_backend_check(
+            &ch,
+            UpdateSource::FlatpakUser,
+            flatpak_user_res,
+            &mut all,
+            &mut soft_errors,
+        );
     }
-    let flatpak_user_res =
-        run_flatpak_check(&ch, runtime, true).map_err(|e| format!("flatpak user: {e}"));
-    if !ch.is_current() {
-        return;
+    if fp_sys_enabled {
+        if !ch.is_current() {
+            return;
+        }
+        let flatpak_system_res =
+            run_flatpak_check(&ch, runtime, false).map_err(|e| format!("flatpak system: {e}"));
+        if !ch.is_current() {
+            return;
+        }
+        emit_backend_check(
+            &ch,
+            UpdateSource::FlatpakSystem,
+            flatpak_system_res,
+            &mut all,
+            &mut soft_errors,
+        );
     }
-    emit_backend_check(
-        &ch,
-        UpdateSource::FlatpakUser,
-        flatpak_user_res,
-        &mut all,
-        &mut soft_errors,
-    );
-    if !ch.is_current() {
-        return;
-    }
-    let flatpak_system_res =
-        run_flatpak_check(&ch, runtime, false).map_err(|e| format!("flatpak system: {e}"));
-    if !ch.is_current() {
-        return;
-    }
-    emit_backend_check(
-        &ch,
-        UpdateSource::FlatpakSystem,
-        flatpak_system_res,
-        &mut all,
-        &mut soft_errors,
-    );
 
     // 5) fwupd — prefer native org.freedesktop.fwupd D-Bus, falling back cleanly
     // to the Phase 1 privileged fwupdmgr CLI helper when unavailable.
-    if !ch.is_current() {
-        return;
-    }
-    let fwupd_res = match runtime.check_fwupd_dbus(&mut |l| ch.line("fwupd", l)) {
-        NativeOutcome::Handled(res) => res,
-        NativeOutcome::Unavailable(_) => {
-            let ready = if session_ensured {
-                Ok(())
-            } else {
-                match runtime.ensure_session() {
-                    Ok(()) => {
-                        session_ensured = true;
-                        Ok(())
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
-            };
-            match ready {
-                Ok(()) => {
-                    if !ch.is_current() {
-                        return;
-                    }
-                    let _ = run_helper_check(
-                        &ch,
-                        runtime,
-                        HelperCommand::CheckFwupdRefresh,
-                        "fwupd",
-                        |_log, _code| Ok(Vec::new()),
-                    );
-                    if !ch.is_current() {
-                        return;
-                    }
-
-                    run_helper_check(&ch, runtime, HelperCommand::CheckFwupd, "fwupd", |log, code| {
-                        let pkgs = fwupd::parse_get_updates(log);
-                        if code != 0 && pkgs.is_empty() {
-                            let lower = log.to_ascii_lowercase();
-                            if lower.contains("not found") || lower.contains("no such file") {
-                                return Err("fwupd not available".into());
-                            }
-                            if fwupd::check_output_is_no_updates(log, code) {
-                                return Ok(vec![]);
-                            }
-                            return Err(format!("fwupdmgr get-updates exit {code}"));
-                        }
-                        Ok(pkgs)
-                    })
-                }
-                Err(err) => Err(err),
-            }
+    if config.is_enabled(UpdateSource::Firmware) {
+        if !ch.is_current() {
+            return;
         }
-    };
-    let _ = session_ensured;
-    if !ch.is_current() {
-        return;
+        let fwupd_res = match runtime.check_fwupd_dbus(&mut |l| ch.line("fwupd", l)) {
+            NativeOutcome::Handled(res) => res,
+            NativeOutcome::Unavailable(_) => {
+                let ready = if session_ensured {
+                    Ok(())
+                } else {
+                    match runtime.ensure_session() {
+                        Ok(()) => {
+                            session_ensured = true;
+                            Ok(())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                };
+                match ready {
+                    Ok(()) => {
+                        if !ch.is_current() {
+                            return;
+                        }
+                        let _ = run_helper_check(
+                            &ch,
+                            runtime,
+                            HelperCommand::CheckFwupdRefresh,
+                            "fwupd",
+                            |_log, _code| Ok(Vec::new()),
+                        );
+                        if !ch.is_current() {
+                            return;
+                        }
+
+                        run_helper_check(&ch, runtime, HelperCommand::CheckFwupd, "fwupd", |log, code| {
+                            let pkgs = fwupd::parse_get_updates(log);
+                            if code != 0 && pkgs.is_empty() {
+                                let lower = log.to_ascii_lowercase();
+                                if lower.contains("not found") || lower.contains("no such file") {
+                                    return Err("fwupd not available".into());
+                                }
+                                if fwupd::check_output_is_no_updates(log, code) {
+                                    return Ok(vec![]);
+                                }
+                                return Err(format!("fwupdmgr get-updates exit {code}"));
+                            }
+                            Ok(pkgs)
+                        })
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        };
+        if !ch.is_current() {
+            return;
+        }
+        emit_backend_check(
+            &ch,
+            UpdateSource::Firmware,
+            fwupd_res,
+            &mut all,
+            &mut soft_errors,
+        );
     }
-    emit_backend_check(
-        &ch,
-        UpdateSource::Firmware,
-        fwupd_res,
-        &mut all,
-        &mut soft_errors,
-    );
+    let _ = session_ensured;
 
     if !ch.is_current() {
         return;
@@ -796,6 +999,16 @@ pub fn run_apply_all(tx: Sender<WorkerMsg>, packages: Vec<Package>) {
 
 /// Apply selected packages using the specified execution mode.
 pub fn run_apply_all_with_mode(tx: Sender<WorkerMsg>, packages: Vec<Package>, mode: ApplyMode) {
+    run_apply_all_with_mode_and_config(tx, packages, mode, SourceConfig::all_enabled());
+}
+
+/// Apply selected packages using the specified execution mode and [`SourceConfig`].
+pub fn run_apply_all_with_mode_and_config(
+    tx: Sender<WorkerMsg>,
+    packages: Vec<Package>,
+    mode: ApplyMode,
+    config: SourceConfig,
+) {
     let gen = begin_background_work();
     thread::spawn(move || {
         execute_apply_all_inner(
@@ -804,6 +1017,7 @@ pub fn run_apply_all_with_mode(tx: Sender<WorkerMsg>, packages: Vec<Package>, mo
             mode,
             &SystemRuntime,
             CancelCheck::GlobalGen(gen),
+            &config,
         );
     });
 }
@@ -827,7 +1041,14 @@ pub fn run_apply_all_with_runtime_mode<R: OrchestratorRuntime>(
     let cancel = WorkCancel::new();
     let worker_cancel = cancel.clone();
     thread::spawn(move || {
-        execute_apply_all_inner(&tx, packages, mode, &runtime, CancelCheck::Token(worker_cancel));
+        execute_apply_all_inner(
+            &tx,
+            packages,
+            mode,
+            &runtime,
+            CancelCheck::Token(worker_cancel),
+            &SourceConfig::all_enabled(),
+        );
     });
     cancel
 }
@@ -850,7 +1071,33 @@ pub fn execute_apply_all_with_mode<R: OrchestratorRuntime>(
     runtime: &R,
     cancel: &WorkCancel,
 ) {
-    execute_apply_all_inner(tx, packages, mode, runtime, CancelCheck::Token(cancel.clone()));
+    execute_apply_all_with_mode_and_config(
+        tx,
+        packages,
+        mode,
+        runtime,
+        cancel,
+        &SourceConfig::all_enabled(),
+    );
+}
+
+/// Synchronously run the apply pipeline filtering out any disabled sources in `config`.
+pub fn execute_apply_all_with_mode_and_config<R: OrchestratorRuntime>(
+    tx: &Sender<WorkerMsg>,
+    packages: Vec<Package>,
+    mode: ApplyMode,
+    runtime: &R,
+    cancel: &WorkCancel,
+    config: &SourceConfig,
+) {
+    execute_apply_all_inner(
+        tx,
+        packages,
+        mode,
+        runtime,
+        CancelCheck::Token(cancel.clone()),
+        config,
+    );
 }
 
 fn execute_apply_all_inner<R: OrchestratorRuntime>(
@@ -859,8 +1106,13 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
     mode: ApplyMode,
     runtime: &R,
     cancel: CancelCheck,
+    config: &SourceConfig,
 ) {
     let ch = WorkChannel { tx, cancel };
+    let packages: Vec<Package> = packages
+        .into_iter()
+        .filter(|p| config.is_enabled(p.source))
+        .collect();
     let sources = crate::model::sources_present(&packages);
     if sources.is_empty() {
         ch.event(StateEvent::Fail {
@@ -1761,7 +2013,12 @@ mod tests {
             cancel_on_check_dnf: false,
             helper_calls: Mutex::new(Vec::new()),
         };
-        execute_check_all_inner(&tx, &rt_auth, CancelCheck::GlobalGen(gen));
+        execute_check_all_inner(
+            &tx,
+            &rt_auth,
+            CancelCheck::GlobalGen(gen),
+            &SourceConfig::all_enabled(),
+        );
         assert!(rx.try_recv().is_err());
         assert!(rt_auth.helper_calls.lock().unwrap().is_empty());
 
@@ -1773,7 +2030,12 @@ mod tests {
             cancel_on_check_dnf: true,
             helper_calls: Mutex::new(Vec::new()),
         };
-        execute_check_all_inner(&tx, &rt_dnf, CancelCheck::GlobalGen(gen));
+        execute_check_all_inner(
+            &tx,
+            &rt_dnf,
+            CancelCheck::GlobalGen(gen),
+            &SourceConfig::all_enabled(),
+        );
         let mut msgs = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             msgs.push(msg);
@@ -1791,5 +2053,57 @@ mod tests {
             .iter()
             .any(|m| matches!(m, WorkerMsg::Event(_))));
         assert_eq!(*rt_dnf.helper_calls.lock().unwrap(), vec![HelperCommand::CheckDnf]);
+    }
+
+    #[test]
+    fn source_config_filters_and_detects_all_disabled() {
+        let mut cfg = SourceConfig::all_enabled();
+        assert!(!cfg.all_disabled());
+        assert_eq!(cfg.enabled_sources(), UpdateSource::ALL);
+
+        cfg.disable("  FLATPAK  ");
+        assert!(!cfg.is_enabled(UpdateSource::FlatpakUser));
+        assert!(!cfg.is_enabled(UpdateSource::FlatpakSystem));
+        assert!(cfg.is_enabled(UpdateSource::Dnf));
+        assert!(cfg.is_enabled(UpdateSource::Firmware));
+        assert_eq!(
+            cfg.enabled_sources(),
+            vec![UpdateSource::Dnf, UpdateSource::Firmware]
+        );
+
+        cfg.disable("dnf");
+        cfg.disable("firmware");
+        assert!(cfg.all_disabled());
+        assert!(cfg.enabled_sources().is_empty());
+
+        cfg.enable("flatpak");
+        assert!(!cfg.all_disabled());
+        assert_eq!(
+            cfg.enabled_sources(),
+            vec![UpdateSource::FlatpakUser, UpdateSource::FlatpakSystem]
+        );
+
+        let from_keys = SourceConfig::from_disabled_keys([" ".into(), "Firmware".into()]);
+        assert!(!from_keys.is_enabled(UpdateSource::Firmware));
+        assert!(from_keys.is_enabled(UpdateSource::Dnf));
+    }
+
+    #[test]
+    fn default_and_probed_source_availability_cover_all_pref_sources() {
+        let defaults = default_source_availability();
+        for src in UpdateSource::pref_sources() {
+            let entry = defaults.get(src.pref_key()).expect("default availability");
+            assert!(entry.installed);
+            assert_eq!(entry.subtitle, "Installed");
+        }
+
+        let probed = probe_source_availability(true, false);
+        assert_eq!(
+            probed.get("dnf").map(|s| s.subtitle.as_str()),
+            Some("Installed (dnf5daemon D-Bus)")
+        );
+        assert!(probed.get("dnf").unwrap().installed);
+        assert!(probed.contains_key("flatpak"));
+        assert!(probed.contains_key("firmware"));
     }
 }

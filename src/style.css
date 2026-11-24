@@ -77,6 +77,66 @@ window.is-dark .package-badge.src-firmware {
   background-color: alpha(@warning_bg_color, 0.16);
 }
 
+.package-badge.src-ostree {
+  color: #0d6d7c;
+  background-color: alpha(#0d6d7c, 0.12);
+}
+
+window.is-dark .package-badge.src-ostree {
+  color: #63d2df;
+  background-color: alpha(#63d2df, 0.16);
+}
+
+.package-badge.src-brew {
+  color: #a84400;
+  background-color: alpha(#a84400, 0.12);
+}
+
+window.is-dark .package-badge.src-brew {
+  color: #ffa854;
+  background-color: alpha(#ffa854, 0.16);
+}
+
+.package-badge.src-ext {
+  color: #187037;
+  background-color: alpha(#187037, 0.12);
+}
+
+window.is-dark .package-badge.src-ext {
+  color: #57e389;
+  background-color: alpha(#57e389, 0.16);
+}
+
+.package-badge.src-container {
+  color: #4640b8;
+  background-color: alpha(#4640b8, 0.12);
+}
+
+window.is-dark .package-badge.src-container {
+  color: #b9b5ff;
+  background-color: alpha(#b9b5ff, 0.16);
+}
+
+.package-badge.src-toolchain {
+  color: #a61e5c;
+  background-color: alpha(#a61e5c, 0.12);
+}
+
+window.is-dark .package-badge.src-toolchain {
+  color: #ff9ac5;
+  background-color: alpha(#ff9ac5, 0.16);
+}
+
+.package-badge.src-hook {
+  color: #4f5966;
+  background-color: alpha(#4f5966, 0.12);
+}
+
+window.is-dark .package-badge.src-hook {
+  color: #b8c4d4;
+  background-color: alpha(#b8c4d4, 0.16);
+}
+
 .micro-tag {
   padding: 2px 6px;
   border-radius: 6px;
@@ -172,6 +232,54 @@ window.is-dark .source-dot.src-firmware {
 
 window.is-dark .source-dot.src-sec {
   background-color: #ff7b72;
+}
+
+.source-dot.src-ostree {
+  background-color: #0d6d7c;
+}
+
+window.is-dark .source-dot.src-ostree {
+  background-color: #63d2df;
+}
+
+.source-dot.src-brew {
+  background-color: #a84400;
+}
+
+window.is-dark .source-dot.src-brew {
+  background-color: #ffa854;
+}
+
+.source-dot.src-ext {
+  background-color: #187037;
+}
+
+window.is-dark .source-dot.src-ext {
+  background-color: #57e389;
+}
+
+.source-dot.src-container {
+  background-color: #4640b8;
+}
+
+window.is-dark .source-dot.src-container {
+  background-color: #b9b5ff;
+}
+
+.source-dot.src-toolchain {
+  background-color: #a61e5c;
+}
+
+window.is-dark .source-dot.src-toolchain {
+  background-color: #ff9ac5;
+}
+
+.source-dot.src-hook {
+  background-color: #4f5966;
+}
+
+window.is-dark .source-dot.src-hook {
+  background-color: #b8c4d4;
 }
 
 .tag-bz {

@@ -4,7 +4,7 @@ use crate::backend::dnf::package_implies_reboot;
 use crate::state::Phase;
 use crate::model::{
     count_by_source, format_bytes, total_download_bytes, ApplyMode, AuthPurpose, IdleScreen,
-    Package, PackageStatus, RetryAction, RunPass, UpdateSource,
+    Package, PackageStatus, RetryAction, RunPass, SourceCategory, UpdateSource,
 };
 
 pub const ABOUT_NAME: &str = "Fedora Updater";
@@ -106,6 +106,63 @@ pub fn check_progress(checked: &[UpdateSource]) -> (f64, u32, &'static str) {
         (true, true, true) => "System · Apps · Firmware done",
     };
     (fraction, groups_done, status)
+}
+
+/// Source-config-aware check progress grouped by active [`SourceCategory`].
+pub fn check_progress_for_sources(
+    checked: &[UpdateSource],
+    enabled: &[UpdateSource],
+) -> (f64, u32, u32, String) {
+    if enabled.is_empty() {
+        return (1.0, 0, 0, "No update sources enabled".into());
+    }
+
+    let mut active_categories = Vec::new();
+    for &cat in SourceCategory::ALL {
+        if enabled.iter().any(|s| s.category() == cat) {
+            active_categories.push(cat);
+        }
+    }
+
+    let groups_total = active_categories.len() as u32;
+    let done_backends = enabled.iter().filter(|s| checked.contains(s)).count();
+    let fraction = (done_backends as f64 / enabled.len() as f64).clamp(0.05, 1.0);
+
+    let mut category_done = Vec::with_capacity(active_categories.len());
+    let mut groups_done = 0u32;
+    for &cat in &active_categories {
+        let is_done = enabled
+            .iter()
+            .filter(|s| s.category() == cat)
+            .all(|s| checked.contains(s));
+        if is_done {
+            groups_done += 1;
+        }
+        category_done.push((cat, is_done));
+    }
+
+    let status = if groups_done == groups_total {
+        let labels: Vec<&str> = active_categories.iter().map(|c| c.label()).collect();
+        format!("{} done", labels.join(" · "))
+    } else {
+        let mut saw_in_progress = false;
+        let parts: Vec<String> = category_done
+            .into_iter()
+            .map(|(cat, done)| {
+                if done {
+                    format!("{} done", cat.label())
+                } else if !saw_in_progress {
+                    saw_in_progress = true;
+                    format!("{} in progress", cat.label())
+                } else {
+                    format!("{} queued", cat.label())
+                }
+            })
+            .collect();
+        parts.join(" · ")
+    };
+
+    (fraction, groups_done, groups_total, status)
 }
 
 /// HIG remaining-work text once progress is trustworthy.
@@ -445,9 +502,18 @@ pub fn activity_log_subtitle(matched: usize, total: usize) -> String {
 }
 
 pub fn checking_footnote(groups_done: u32, eta: Option<&str>) -> String {
+    checking_footnote_of(groups_done, 3, eta)
+}
+
+pub fn checking_footnote_of(groups_done: u32, groups_total: u32, eta: Option<&str>) -> String {
+    let noun = if groups_total == 1 {
+        "source"
+    } else {
+        "sources"
+    };
     match eta {
-        Some(eta) if !eta.is_empty() => format!("{eta} · {groups_done} of 3 sources"),
-        _ => format!("{groups_done} of 3 sources"),
+        Some(eta) if !eta.is_empty() => format!("{eta} · {groups_done} of {groups_total} {noun}"),
+        _ => format!("{groups_done} of {groups_total} {noun}"),
     }
 }
 
@@ -1724,5 +1790,56 @@ mod tests {
         assert_eq!(format_size_delta(0), "0 B");
         assert_eq!(format_size_delta(2 * 1024 * 1024), "+2.0 MB");
         assert_eq!(format_size_delta(-512 * 1024), "-512 KB");
+    }
+
+    #[test]
+    fn check_progress_for_sources_matches_legacy_and_handles_subsets() {
+        let all = UpdateSource::all_sources();
+        for checked in [
+            vec![],
+            vec![UpdateSource::Dnf],
+            vec![UpdateSource::Dnf, UpdateSource::FlatpakUser],
+            vec![
+                UpdateSource::Dnf,
+                UpdateSource::FlatpakUser,
+                UpdateSource::FlatpakSystem,
+            ],
+            vec![
+                UpdateSource::Dnf,
+                UpdateSource::FlatpakUser,
+                UpdateSource::FlatpakSystem,
+                UpdateSource::Firmware,
+            ],
+        ] {
+            let (l_frac, l_done, l_status) = check_progress(&checked);
+            let (g_frac, g_done, g_total, g_status) = check_progress_for_sources(&checked, all);
+            assert!((l_frac - g_frac).abs() < 1e-9);
+            assert_eq!(l_done, g_done);
+            assert_eq!(g_total, 3);
+            assert_eq!(l_status, g_status);
+        }
+
+        // With Firmware disabled, only System and Apps run and completion reaches 100%.
+        let no_fw = [
+            UpdateSource::Dnf,
+            UpdateSource::FlatpakUser,
+            UpdateSource::FlatpakSystem,
+        ];
+        let (frac, done, total, status) = check_progress_for_sources(&[UpdateSource::Dnf], &no_fw);
+        assert!((frac - (1.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(done, 1);
+        assert_eq!(total, 2);
+        assert_eq!(status, "System done · Apps in progress");
+
+        let (frac_done, done2, total2, status2) = check_progress_for_sources(&no_fw, &no_fw);
+        assert!((frac_done - 1.0).abs() < 1e-9);
+        assert_eq!(done2, 2);
+        assert_eq!(total2, 2);
+        assert_eq!(status2, "System · Apps done");
+        assert_eq!(checking_footnote_of(1, 1, None), "1 of 1 source");
+        assert_eq!(
+            checking_footnote_of(1, 2, Some("About 1 minute left")),
+            "About 1 minute left · 1 of 2 sources"
+        );
     }
 }

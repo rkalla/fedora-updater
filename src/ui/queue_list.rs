@@ -102,11 +102,7 @@ pub fn running_status_label(
 pub fn matches_source_filter(source: UpdateSource, filter: SourceFilter) -> bool {
     match filter {
         SourceFilter::All | SourceFilter::Security => true,
-        SourceFilter::System => source == UpdateSource::Dnf,
-        SourceFilter::Apps => {
-            matches!(source, UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem)
-        }
-        SourceFilter::Firmware => source == UpdateSource::Firmware,
+        SourceFilter::Category(cat) => source.category() == cat,
     }
 }
 
@@ -452,7 +448,7 @@ impl QueueRowWidgets {
         self.check_btn.set_active(is_selected);
         self.check_btn.set_visible(show_check);
         self.ignore_check.set(false);
-        for cls in ["src-dnf", "src-flatpak", "src-firmware"] {
+        for cls in UpdateSource::ALL_CSS_CLASSES {
             self.source_badge.remove_css_class(cls);
         }
         self.source_badge.set_label(pkg.source.badge());
@@ -1105,6 +1101,8 @@ mod tests {
 
     #[test]
     fn package_filter_matches_source_and_multi_token_queries() {
+        use fedora_updater::model::SourceCategory;
+
         let mut openssl = Package::new_dnf("openssl", "x86_64", "3.2.2-3.fc44", "updates");
         openssl.old_version = Some("3.2.2-1.fc44".into());
         openssl.advisories.push(PackageAdvisory {
@@ -1122,22 +1120,34 @@ mod tests {
         assert!(matches_package_filter(&openssl, SourceFilter::All, ""));
         assert!(matches_package_filter(
             &openssl,
-            SourceFilter::System,
+            SourceFilter::Category(SourceCategory::System),
             "ssl updates"
         ));
         assert!(matches_package_filter(
             &openssl,
-            SourceFilter::System,
+            SourceFilter::Category(SourceCategory::System),
             "cve-2026-2401"
         ));
-        assert!(!matches_package_filter(&openssl, SourceFilter::Apps, "ssl"));
+        assert!(!matches_package_filter(
+            &openssl,
+            SourceFilter::Category(SourceCategory::Apps),
+            "ssl"
+        ));
         assert!(matches_package_filter(
             &fp,
-            SourceFilter::Apps,
+            SourceFilter::Category(SourceCategory::Apps),
             "thunder flathub"
         ));
-        assert!(!matches_package_filter(&fp, SourceFilter::Firmware, ""));
-        assert!(matches_package_filter(&fw, SourceFilter::Firmware, "lvfs"));
+        assert!(!matches_package_filter(
+            &fp,
+            SourceFilter::Category(SourceCategory::Firmware),
+            ""
+        ));
+        assert!(matches_package_filter(
+            &fw,
+            SourceFilter::Category(SourceCategory::Firmware),
+            "lvfs"
+        ));
     }
 
     #[test]

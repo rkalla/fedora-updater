@@ -3,6 +3,7 @@ mod charts;
 mod dialogs;
 mod history;
 mod inspector;
+mod preferences;
 mod prefs;
 mod preview;
 mod queue_list;

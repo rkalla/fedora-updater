@@ -1,6 +1,7 @@
 //! Main application window — thin view over the pure state machine.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -20,17 +21,18 @@ use fedora_updater::backend::{dnf, dnf_dbus, fwupd_dbus};
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
     count_by_source, ApplyMode, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus,
-    RetryAction, RunPass, UpdateSource,
+    RetryAction, RunPass, SourceCategory, UpdateSource,
 };
 use fedora_updater::orchestrator::{
-    can_skip_apply_auth_ui, can_skip_check_auth_ui, cancel_background_work, load_history_system,
-    release_privileges, run_apply_all_with_mode, run_check_all, run_systemctl_reboot,
-    session_started_event, WorkerMsg,
+    can_skip_apply_auth_ui, can_skip_check_auth_ui, cancel_background_work,
+    default_source_availability, load_history_system, probe_source_availability,
+    release_privileges, run_apply_all_with_mode_and_config, run_check_with_config,
+    run_systemctl_reboot, session_started_event, SourceAvailability, WorkerMsg,
 };
 use fedora_updater::presenter::{
-    about_time_left, activity_log_subtitle, apply_cta_label, cache_activity_note, check_progress,
-    checking_footnote, done_clean_summary, done_header_subtitle, fail_retry_label,
-    history_subtitle, idle_chrome, now_playing_subtitle, now_playing_title,
+    about_time_left, activity_log_subtitle, apply_cta_label, cache_activity_note,
+    check_progress_for_sources, checking_footnote_of, done_clean_summary, done_header_subtitle,
+    fail_retry_label, history_subtitle, idle_chrome, now_playing_subtitle, now_playing_title,
     phase_completion_notification, pipeline_stage, quiet_ui, ready_banner_title,
     reboot_trigger_summary, run_heading, running_progress_captions, selection_summary_text,
     source_summary_line, window_header, DesktopNotification, HeaderView, PipelineStage, QuietInput,
@@ -42,8 +44,8 @@ use fedora_updater::privilege::{
 use fedora_updater::state::{self, session_started_purpose, AppState, Event, Phase, RunningState};
 
 use super::{
-    activity_log, charts, dialogs, history, inspector, obj, prefs, preview, queue_list, rows,
-    sidebar,
+    activity_log, charts, dialogs, history, inspector, obj, preferences, prefs, preview,
+    queue_list, rows, sidebar,
 };
 
 const WINDOW_UI: &str = include_str!(concat!(env!("OUT_DIR"), "/window.ui"));
@@ -93,6 +95,7 @@ struct Widgets {
     persist_prefs: Cell<bool>,
     prefs: RefCell<prefs::UiPrefs>,
     prefs_save_source: RefCell<Option<glib::SourceId>>,
+    source_availability: RefCell<BTreeMap<String, SourceAvailability>>,
     header_refresh: Button,
     stack: Stack,
     toast: ToastOverlay,
@@ -289,6 +292,7 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         persist_prefs: Cell::new(false),
         prefs: RefCell::new(prefs::UiPrefs::default()),
         prefs_save_source: RefCell::new(None),
+        source_availability: RefCell::new(default_source_availability()),
         header_refresh,
         stack: obj(builder, "stack"),
         toast: obj(builder, "toast"),
@@ -433,7 +437,7 @@ fn sync_shell_layout(w: &Widgets) {
 }
 
 fn capture_window_prefs(w: &Widgets) -> prefs::UiPrefs {
-    let mut current = *w.prefs.borrow();
+    let mut current = w.prefs.borrow().clone();
     current.sidebar_open = w.sidebar_open.get();
     if !w.window.is_maximized() && !w.window.is_fullscreen() {
         let (default_w, default_h) = w.window.default_size();
@@ -455,7 +459,7 @@ fn capture_window_prefs(w: &Widgets) -> prefs::UiPrefs {
         }
     }
     let normalized = current.normalized();
-    *w.prefs.borrow_mut() = normalized;
+    *w.prefs.borrow_mut() = normalized.clone();
     normalized
 }
 
@@ -490,6 +494,50 @@ fn flush_prefs_on_close(w: &Widgets) {
     }
     let latest = capture_window_prefs(w);
     let _ = prefs::save(&latest);
+}
+
+fn sync_sidebar_categories(w: &Widgets, state: &AppState) {
+    let cfg = w.prefs.borrow().source_config();
+    let availability = w.source_availability.borrow();
+    let categories: BTreeSet<SourceCategory> = UpdateSource::ALL
+        .iter()
+        .copied()
+        .filter(|src| {
+            let installed = availability
+                .get(src.pref_key())
+                .is_none_or(|info| info.installed);
+            installed && cfg.is_enabled(*src)
+        })
+        .map(UpdateSource::category)
+        .collect();
+    drop(availability);
+
+    let prev_filter = w.source_filter.get();
+    w.sidebar.set_available_categories(categories);
+    w.sidebar.paint(state);
+    let next_filter = w.sidebar.selected_source_filter();
+    if next_filter != prev_filter {
+        apply_source_filter(w, next_filter, state.packages().len());
+    }
+}
+
+fn apply_source_preference_change(
+    w: &Rc<Widgets>,
+    state: &Rc<RefCell<AppState>>,
+    pref_key: &str,
+    enabled: bool,
+) {
+    w.prefs
+        .borrow_mut()
+        .set_source_enabled(pref_key, enabled);
+    if let Some(source) = w.prefs_save_source.borrow_mut().take() {
+        source.remove();
+    }
+    if w.persist_prefs.get() {
+        let latest = capture_window_prefs(w);
+        let _ = prefs::save(&latest);
+    }
+    sync_sidebar_categories(w, &state.borrow());
 }
 
 fn toggle_sidebar(w: &Rc<Widgets>) {
@@ -571,6 +619,7 @@ pub fn build(app: &Application) {
     if let Some(cfg) = preview_cfg.as_ref() {
         apply_preview_config(cfg, &widgets);
     }
+    sync_sidebar_categories(&widgets, &state.borrow());
 
     let about = gio::SimpleAction::new("about", None);
     {
@@ -578,6 +627,7 @@ pub fn build(app: &Application) {
         about.connect_activate(move |_, _| dialogs::present_about(&window));
     }
     window.add_action(&about);
+    app.set_accels_for_action("win.preferences", &["<Primary>comma"]);
 
     let toggle_sidebar_action = gio::SimpleAction::new("toggle-sidebar", None);
     {
@@ -1072,20 +1122,23 @@ fn spawn_native_capability_probe(
     console: &Rc<RefCell<ConsoleBuffer>>,
     widgets: &Rc<Widgets>,
 ) {
-    let (tx, rx) = async_channel::bounded::<(bool, bool)>(1);
+    let (tx, rx) = async_channel::bounded::<(bool, bool, BTreeMap<String, SourceAvailability>)>(1);
     std::thread::spawn(move || {
         let dnf = dnf_dbus::is_available();
         let fwupd = fwupd_dbus::is_available();
-        let _ = tx.send_blocking((dnf, fwupd));
+        let availability = probe_source_availability(dnf, fwupd);
+        let _ = tx.send_blocking((dnf, fwupd, availability));
     });
     let state = state.clone();
     let console = console.clone();
     let widgets = widgets.clone();
     glib::spawn_future_local(async move {
-        if let Ok((dnf, fwupd)) = rx.recv().await {
+        if let Ok((dnf, fwupd, availability)) = rx.recv().await {
             widgets.native_dnf_available.set(dnf);
             widgets.native_fwupd_available.set(fwupd);
+            *widgets.source_availability.borrow_mut() = availability;
             widgets.sidebar.set_history_available(dnf || fwupd);
+            sync_sidebar_categories(&widgets, &state.borrow());
             render(&state.borrow(), &console.borrow(), &widgets);
         }
     });
@@ -1231,6 +1284,27 @@ fn register_view_actions(
         });
     }
     widgets.window.add_action(&apply_mode_action);
+
+    let preferences_action = gio::SimpleAction::new("preferences", None);
+    {
+        let widgets = widgets.clone();
+        let state = state.clone();
+        preferences_action.connect_activate(move |_, _| {
+            let current_prefs = widgets.prefs.borrow().clone();
+            let availability = widgets.source_availability.borrow().clone();
+            let widgets_cb = widgets.clone();
+            let state_cb = state.clone();
+            preferences::present_preferences_dialog(
+                &widgets.window,
+                &current_prefs,
+                &availability,
+                move |key, enabled| {
+                    apply_source_preference_change(&widgets_cb, &state_cb, key, enabled);
+                },
+            );
+        });
+    }
+    widgets.window.add_action(&preferences_action);
 }
 
 fn wire_observatory_views(
@@ -1441,9 +1515,29 @@ fn start_check(
     tx: async_channel::Sender<WorkerMsg>,
     then_apply: bool,
 ) {
+    let config = widgets.prefs.borrow().source_config();
+    if config.all_disabled() {
+        widgets.toast.add_toast(Toast::new(
+            "All update sources are disabled. Enable a source in Preferences.",
+        ));
+        dispatch(
+            state,
+            console,
+            widgets,
+            Event::Fail {
+                title: "All update sources are disabled".into(),
+                detail: "Enable at least one update source in Preferences (Ctrl+,) to check for updates.".into(),
+                retry: RetryAction::CheckAgain,
+            },
+            true,
+        );
+        return;
+    }
+
     prepare_for_operation(console, widgets);
     dispatch(state, console, widgets, Event::StartCheck { then_apply }, true);
-    if can_skip_check_auth_ui(widgets.native_dnf_available.get()) {
+    let dnf_enabled = config.is_enabled(UpdateSource::Dnf);
+    if !dnf_enabled || can_skip_check_auth_ui(widgets.native_dnf_available.get()) {
         dispatch(
             state,
             console,
@@ -1452,7 +1546,7 @@ fn start_check(
             true,
         );
     }
-    run_check_all(tx);
+    run_check_with_config(tx, config);
 }
 
 fn trigger_apply_from_ready(
@@ -1516,7 +1610,8 @@ fn begin_apply(
             true,
         );
     }
-    run_apply_all_with_mode(tx, packages, ApplyMode::Live);
+    let config = widgets.prefs.borrow().source_config();
+    run_apply_all_with_mode_and_config(tx, packages, ApplyMode::Live, config);
 }
 
 fn begin_apply_selected(
@@ -1548,7 +1643,8 @@ fn begin_apply_selected(
             true,
         );
     }
-    run_apply_all_with_mode(tx, packages, mode);
+    let config = widgets.prefs.borrow().source_config();
+    run_apply_all_with_mode_and_config(tx, packages, mode, config);
 }
 
 fn can_start_apply(state: &AppState) -> bool {
@@ -1924,9 +2020,9 @@ fn paint_stop_button(button: &Button, pass: RunPass) {
 
 fn paint_source_badge(label: &Label, package: Option<&Package>) {
     label.remove_css_class("package-badge");
-    label.remove_css_class("src-dnf");
-    label.remove_css_class("src-flatpak");
-    label.remove_css_class("src-firmware");
+    for cls in UpdateSource::ALL_CSS_CLASSES {
+        label.remove_css_class(cls);
+    }
     if let Some(package) = package {
         label.set_label(package.source.badge());
         label.add_css_class("package-badge");
@@ -2441,12 +2537,14 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
             w.stack.set_visible_child_name("checking");
             w.console_line
                 .set_text(console_preview_line(console.last_line()));
-            let (frac, groups_done, status) = check_progress(checked_sources);
+            let enabled_sources = w.prefs.borrow().source_config().enabled_sources();
+            let (frac, groups_done, groups_total, status) =
+                check_progress_for_sources(checked_sources, &enabled_sources);
             let eta = about_time_left(elapsed, frac);
-            let foot = checking_footnote(groups_done, eta.as_deref());
+            let foot = checking_footnote_of(groups_done, groups_total, eta.as_deref());
             paint_header(w, HeaderView::Checking { footnote: &foot });
             w.check_progress.set_fraction(frac);
-            w.check_progress_meta.set_text(status);
+            w.check_progress_meta.set_text(&status);
             w.check_progress_pct
                 .set_text(&format!("{:.0}%", frac * 100.0));
             let found = !packages_so_far.is_empty();
@@ -2699,6 +2797,7 @@ mod tests {
             header_at < stop_at,
             "pack_end prepends: list the menu before Stop so Stop is the start-side button"
         );
+        assert!(xml.contains("win.preferences"));
 
         let installed_at = xml
             .find("id=\"done_installed_heading\"")
@@ -3287,7 +3386,14 @@ mod tests {
         );
         assert_eq!(
             widgets.sidebar.pipeline_status_texts(),
-            ["0/1".to_string(), "Queued".to_string(), "—".to_string()]
+            vec!["0/1".to_string(), "Queued".to_string()]
+        );
+        assert_eq!(
+            widgets.sidebar.pipeline_categories(),
+            vec![
+                fedora_updater::model::SourceCategory::System,
+                fedora_updater::model::SourceCategory::Apps,
+            ]
         );
         assert!(!widgets.sidebar.sparkline_card().get_visible());
 
@@ -3382,7 +3488,7 @@ mod tests {
         );
         assert_eq!(
             widgets.sidebar.pipeline_status_texts(),
-            ["2/2 ✓".to_string(), "0/1".to_string(), "—".to_string()]
+            vec!["2/2 ✓".to_string(), "0/1".to_string()]
         );
         assert_eq!(widgets.run_completed.title().as_str(), "2 completed");
         assert!(
@@ -4075,7 +4181,10 @@ mod tests {
         // 5) Sidebar source navigation and sparkline scaffold API work cleanly.
         if let Some(apps_row) = widgets.sidebar.sources_list().row_at_index(3) {
             apps_row.activate();
-            assert_eq!(widgets.sidebar.selected_source(), SourceFilter::Apps);
+            assert_eq!(
+                widgets.sidebar.selected_source(),
+                SourceFilter::Category(fedora_updater::model::SourceCategory::Apps)
+            );
         }
         widgets
             .sidebar
@@ -4242,7 +4351,10 @@ mod tests {
             .row_at_index(3)
             .expect("Apps row")
             .activate();
-        assert_eq!(widgets.sidebar.selected_source(), SourceFilter::Apps);
+        assert_eq!(
+            widgets.sidebar.selected_source(),
+            SourceFilter::Category(fedora_updater::model::SourceCategory::Apps)
+        );
         assert_eq!(
             widgets.ready_queue.filtered_ids(),
             vec![thunderbird.id.clone()]
@@ -4875,6 +4987,132 @@ mod tests {
         gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
 
+    fn verify_preferences_dialog_and_dynamic_sidebar() {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        use std::rc::Rc;
+
+        use fedora_updater::model::SourceCategory;
+        use fedora_updater::orchestrator::SourceAvailability;
+        use fedora_updater::state::AppState;
+        use gtk::prelude::*;
+        use libadwaita::prelude::*;
+
+        let widgets = super::Widgets::for_test();
+        let state = Rc::new(RefCell::new(AppState::default()));
+        let console = Rc::new(RefCell::new(fedora_updater::console::ConsoleBuffer::new(100)));
+        super::wire_observatory_views(&widgets, &state, &console);
+
+        // 1) Default host sidebar shows System, Apps, Firmware and hides unused categories.
+        super::sync_sidebar_categories(&widgets, &state.borrow());
+        assert_eq!(
+            widgets.sidebar.visible_categories(),
+            vec![
+                SourceCategory::System,
+                SourceCategory::Apps,
+                SourceCategory::Firmware,
+            ]
+        );
+        assert!(!widgets
+            .sidebar
+            .category_row(SourceCategory::Extensions)
+            .get_visible());
+        assert!(!widgets
+            .sidebar
+            .category_row(SourceCategory::DevAndContainers)
+            .get_visible());
+
+        // 2) win.preferences action is registered on the window.
+        assert!(WidgetExt::activate_action(&widgets.window, "win.preferences", None).is_ok());
+
+        // 3) PreferencesDialog renders availability subtitles, persists toggles, and dynamically hides categories.
+        let mut availability = BTreeMap::new();
+        availability.insert(
+            "dnf".into(),
+            SourceAvailability {
+                pref_key: "dnf",
+                installed: true,
+                subtitle: "Installed (dnf5daemon D-Bus)".into(),
+            },
+        );
+        availability.insert(
+            "flatpak".into(),
+            SourceAvailability {
+                pref_key: "flatpak",
+                installed: true,
+                subtitle: "Installed".into(),
+            },
+        );
+        availability.insert(
+            "firmware".into(),
+            SourceAvailability {
+                pref_key: "firmware",
+                installed: false,
+                subtitle: "Not installed".into(),
+            },
+        );
+        *widgets.source_availability.borrow_mut() = availability.clone();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefs_path = dir.path().join("ui.json");
+        let current_prefs = widgets.prefs.borrow().clone();
+        let handle = {
+            let widgets_cb = widgets.clone();
+            let state_cb = state.clone();
+            let prefs_path = prefs_path.clone();
+            super::preferences::build_preferences_dialog(
+                &current_prefs,
+                &availability,
+                move |key, enabled| {
+                    super::apply_source_preference_change(&widgets_cb, &state_cb, key, enabled);
+                    super::prefs::save_to(&prefs_path, &widgets_cb.prefs.borrow())
+                        .expect("save prefs to temp ui.json");
+                },
+            )
+        };
+
+        assert_eq!(handle.switches.len(), 3);
+        assert_eq!(
+            handle.switches["dnf"].subtitle().as_deref(),
+            Some("Installed (dnf5daemon D-Bus)")
+        );
+        assert_eq!(
+            handle.switches["firmware"].subtitle().as_deref(),
+            Some("Not installed")
+        );
+        assert!(!handle.all_disabled_group.get_visible());
+
+        // Toggling Flatpak off updates UiPrefs, persists to temp ui.json, and hides Apps row.
+        handle.switches["flatpak"].set_active(false);
+        assert!(!widgets.prefs.borrow().is_source_enabled("flatpak"));
+        let disk_prefs = super::prefs::load_from(&prefs_path);
+        assert!(!disk_prefs.is_source_enabled("flatpak"));
+        assert!(!widgets
+            .sidebar
+            .category_row(SourceCategory::Apps)
+            .get_visible());
+        assert_eq!(
+            widgets.sidebar.visible_categories(),
+            vec![SourceCategory::System]
+        );
+
+        // Disabling remaining sources reveals inline warning hint; re-enabling one clears it.
+        handle.switches["dnf"].set_active(false);
+        handle.switches["firmware"].set_active(false);
+        assert!(widgets.prefs.borrow().source_config().all_disabled());
+        assert!(handle.all_disabled_group.get_visible());
+
+        handle.switches["dnf"].set_active(true);
+        assert!(!widgets.prefs.borrow().source_config().all_disabled());
+        assert!(!handle.all_disabled_group.get_visible());
+        assert_eq!(
+            widgets.sidebar.visible_categories(),
+            vec![SourceCategory::System]
+        );
+
+        gtk::prelude::GtkWindowExt::destroy(&widgets.window);
+    }
+
     /// Serialized on a single thread because GTK4/Libadwaita asserts main-thread ownership.
     #[test]
     fn gtk_widget_window_rows_and_dialogs_e2e() {
@@ -4899,5 +5137,6 @@ mod tests {
         verify_queue_inspector_and_activity_log();
         verify_preview_presets_render_cleanly();
         verify_phase2_native_controls_and_history();
+        verify_preferences_dialog_and_dynamic_sidebar();
     }
 }

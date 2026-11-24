@@ -1,11 +1,14 @@
 //! Observatory navigation sidebar frame and Fedora release-upgrade cards.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use gtk::prelude::*;
 
-use fedora_updater::model::{count_by_source, count_security, DetailView, PackageStatus, UpdateSource};
+use fedora_updater::model::{
+    count_by_category, count_security, DetailView, PackageStatus, SourceCategory, UpdateSource,
+};
 use fedora_updater::presenter::{about_time_left, format_elapsed, QuietUi};
 use fedora_updater::release_upgrade::{banner_title, release_age_caption, upgrade_button_name};
 use fedora_updater::state::{AppState, Phase, RunningState};
@@ -17,9 +20,7 @@ pub enum SourceFilter {
     #[default]
     All,
     Security,
-    System,
-    Apps,
-    Firmware,
+    Category(SourceCategory),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,21 +42,23 @@ pub enum SourceRunStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourcePipelineItem {
+    pub category: SourceCategory,
     pub label: &'static str,
+    pub dot_class: &'static str,
     pub status: SourceRunStatus,
     pub badge: String,
 }
 
-fn build_pipeline_item<F: Fn(UpdateSource) -> bool>(
-    running: &RunningState,
-    label: &'static str,
-    matches_group: F,
-) -> SourcePipelineItem {
+fn build_pipeline_item(running: &RunningState, category: SourceCategory) -> SourcePipelineItem {
     let mut total = 0usize;
     let mut done = 0usize;
     let mut failed = 0usize;
     let mut has_live = false;
-    for pkg in running.packages.iter().filter(|p| matches_group(p.source)) {
+    for pkg in running
+        .packages
+        .iter()
+        .filter(|p| p.source.category() == category)
+    {
         total += 1;
         match pkg.status {
             PackageStatus::Completed => done += 1,
@@ -64,7 +67,9 @@ fn build_pipeline_item<F: Fn(UpdateSource) -> bool>(
             PackageStatus::Pending => {}
         }
     }
-    let is_current = running.current_source.is_some_and(matches_group);
+    let is_current = running
+        .current_source
+        .is_some_and(|s| s.category() == category);
     let (status, badge) = if total == 0 {
         (SourceRunStatus::Skipped, "—".to_string())
     } else if failed > 0 && done + failed == total {
@@ -77,20 +82,38 @@ fn build_pipeline_item<F: Fn(UpdateSource) -> bool>(
         (SourceRunStatus::Queued, "Queued".to_string())
     };
     SourcePipelineItem {
-        label,
+        category,
+        label: category.sidebar_label(),
+        dot_class: category.dot_css_class(),
         status,
         badge,
     }
 }
 
-pub fn running_source_checklist(running: &RunningState) -> [SourcePipelineItem; 3] {
-    [
-        build_pipeline_item(running, "System · DNF", |s| s == UpdateSource::Dnf),
-        build_pipeline_item(running, "Apps · Flatpak", |s| {
-            matches!(s, UpdateSource::FlatpakUser | UpdateSource::FlatpakSystem)
-        }),
-        build_pipeline_item(running, "Firmware · LVFS", |s| s == UpdateSource::Firmware),
-    ]
+pub fn running_source_checklist_for_categories(
+    running: &RunningState,
+    categories: &[SourceCategory],
+) -> Vec<SourcePipelineItem> {
+    SourceCategory::ALL
+        .iter()
+        .copied()
+        .filter(|cat| categories.contains(cat))
+        .map(|cat| build_pipeline_item(running, cat))
+        .collect()
+}
+
+pub fn running_source_checklist(running: &RunningState) -> Vec<SourcePipelineItem> {
+    let active_categories: Vec<SourceCategory> = SourceCategory::ALL
+        .iter()
+        .copied()
+        .filter(|&cat| {
+            running.packages.iter().any(|p| p.source.category() == cat)
+                || running
+                    .current_source
+                    .is_some_and(|s| s.category() == cat)
+        })
+        .collect();
+    running_source_checklist_for_categories(running, &active_categories)
 }
 
 pub fn release_upgrade_allowed_in_sidebar(phase: &Phase) -> bool {
@@ -264,6 +287,12 @@ impl UpgradeCard {
     }
 }
 
+struct CategoryRow {
+    category: SourceCategory,
+    row: gtk::ListBoxRow,
+    count: gtk::Label,
+}
+
 pub struct Sidebar {
     root: gtk::Box,
     sparkline_card: gtk::Box,
@@ -271,16 +300,13 @@ pub struct Sidebar {
     sources_list: gtk::ListBox,
     row_all: gtk::ListBoxRow,
     row_security: gtk::ListBoxRow,
-    row_system: gtk::ListBoxRow,
-    row_apps: gtk::ListBoxRow,
-    row_firmware: gtk::ListBoxRow,
+    category_rows: Vec<CategoryRow>,
+    available_categories: RefCell<BTreeSet<SourceCategory>>,
     count_all: gtk::Label,
     count_security: gtk::Label,
-    count_system: gtk::Label,
-    count_apps: gtk::Label,
-    count_firmware: gtk::Label,
     nav_context_stack: gtk::Stack,
-    pipeline_rows: [(gtk::Box, gtk::Label); 3],
+    pipeline_list: gtk::Box,
+    pipeline_rows: RefCell<Vec<(SourceCategory, gtk::Box, gtk::Label)>>,
     telemetry_elapsed: gtk::Label,
     telemetry_eta: gtk::Label,
     views_list: gtk::ListBox,
@@ -308,7 +334,7 @@ impl Sidebar {
         sparkline_inner.append(sparkline.widget());
         sparkline_card.append(&sparkline_inner);
 
-        // Sources navigation list (All, System, Apps, Firmware).
+        // Sources navigation list (All, Security, and dynamic SourceCategory rows).
         let sources_label = section_heading("Sources");
         let sources_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
@@ -321,17 +347,30 @@ impl Sidebar {
         let (row_security, count_security) =
             source_row("source:security", "Security Fixes", Some("src-sec"), None);
         row_security.set_visible(false);
-        let (row_system, count_system) =
-            source_row("source:system", "System · DNF", Some("src-dnf"), None);
-        let (row_apps, count_apps) =
-            source_row("source:apps", "Apps · Flatpak", Some("src-flatpak"), None);
-        let (row_firmware, count_firmware) =
-            source_row("source:firmware", "Firmware · LVFS", Some("src-firmware"), None);
+
         sources_list.append(&row_all);
         sources_list.append(&row_security);
-        sources_list.append(&row_system);
-        sources_list.append(&row_apps);
-        sources_list.append(&row_firmware);
+
+        let default_available: BTreeSet<SourceCategory> = UpdateSource::ALL
+            .iter()
+            .map(|src| src.category())
+            .collect();
+        let mut category_rows = Vec::with_capacity(SourceCategory::ALL.len());
+        for &cat in SourceCategory::ALL {
+            let (row, count) = source_row(
+                cat.filter_key(),
+                cat.sidebar_label(),
+                Some(cat.dot_css_class()),
+                None,
+            );
+            row.set_visible(default_available.contains(&cat));
+            sources_list.append(&row);
+            category_rows.push(CategoryRow {
+                category: cat,
+                row,
+                count,
+            });
+        }
         sources_list.select_row(Some(&row_all));
 
         let sources_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -341,12 +380,6 @@ impl Sidebar {
         // Running Pipeline Telemetry (Execution Queue + Elapsed/ETA card).
         let pipeline_heading = section_heading("Execution Queue");
         let pipeline_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        let pipe_sys = pipeline_row("System · DNF", "src-dnf");
-        let pipe_apps = pipeline_row("Apps · Flatpak", "src-flatpak");
-        let pipe_fw = pipeline_row("Firmware · LVFS", "src-firmware");
-        pipeline_list.append(&pipe_sys.0);
-        pipeline_list.append(&pipe_apps.0);
-        pipeline_list.append(&pipe_fw.0);
 
         let telemetry_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         telemetry_card.add_css_class("card");
@@ -471,16 +504,13 @@ impl Sidebar {
             sources_list,
             row_all,
             row_security,
-            row_system,
-            row_apps,
-            row_firmware,
+            category_rows,
+            available_categories: RefCell::new(default_available),
             count_all,
             count_security,
-            count_system,
-            count_apps,
-            count_firmware,
             nav_context_stack,
-            pipeline_rows: [pipe_sys, pipe_apps, pipe_fw],
+            pipeline_list,
+            pipeline_rows: RefCell::new(Vec::new()),
             telemetry_elapsed,
             telemetry_eta,
             views_list,
@@ -515,12 +545,13 @@ impl Sidebar {
             if ignore_nav.get() {
                 return;
             }
-            let filter = match row.widget_name().as_str() {
-                "source:security" => SourceFilter::Security,
-                "source:system" => SourceFilter::System,
-                "source:apps" => SourceFilter::Apps,
-                "source:firmware" => SourceFilter::Firmware,
-                _ => SourceFilter::All,
+            let name = row.widget_name();
+            let filter = if name.as_str() == "source:security" {
+                SourceFilter::Security
+            } else if let Some(cat) = SourceCategory::from_filter_key(name.as_str()) {
+                SourceFilter::Category(cat)
+            } else {
+                SourceFilter::All
             };
             selected_source.set(filter);
             on_source(filter);
@@ -544,13 +575,24 @@ impl Sidebar {
         let row = match filter {
             SourceFilter::All => &self.row_all,
             SourceFilter::Security => &self.row_security,
-            SourceFilter::System => &self.row_system,
-            SourceFilter::Apps => &self.row_apps,
-            SourceFilter::Firmware => &self.row_firmware,
+            SourceFilter::Category(cat) => self
+                .category_rows
+                .iter()
+                .find(|entry| entry.category == cat)
+                .map(|entry| &entry.row)
+                .unwrap_or(&self.row_all),
         };
         self.ignore_nav.set(true);
         self.sources_list.select_row(Some(row));
         self.ignore_nav.set(false);
+    }
+
+    pub fn selected_source_filter(&self) -> SourceFilter {
+        self.selected_source.get()
+    }
+
+    pub fn set_available_categories(&self, categories: BTreeSet<SourceCategory>) {
+        *self.available_categories.borrow_mut() = categories;
     }
 
     pub fn set_history_available(&self, available: bool) {
@@ -580,9 +622,49 @@ impl Sidebar {
         self.ignore_nav.set(false);
     }
 
+    fn sync_pipeline_rows(&self, items: &[SourcePipelineItem]) {
+        let mut rows = self.pipeline_rows.borrow_mut();
+        let categories_match = rows.len() == items.len()
+            && rows
+                .iter()
+                .zip(items.iter())
+                .all(|((cat, _, _), item)| *cat == item.category);
+        if !categories_match {
+            while let Some(child) = self.pipeline_list.first_child() {
+                self.pipeline_list.remove(&child);
+            }
+            rows.clear();
+            for item in items {
+                let (row_box, pill) = pipeline_row(item.label, item.dot_class);
+                self.pipeline_list.append(&row_box);
+                rows.push((item.category, row_box, pill));
+            }
+        }
+        for ((_, row_box, pill), item) in rows.iter().zip(items.iter()) {
+            row_box.remove_css_class("active");
+            for cls in [
+                "pipeline-pill-active",
+                "pipeline-pill-done",
+                "pipeline-pill-error",
+            ] {
+                pill.remove_css_class(cls);
+            }
+            pill.set_text(&item.badge);
+            match item.status {
+                SourceRunStatus::Active => {
+                    row_box.add_css_class("active");
+                    pill.add_css_class("pipeline-pill-active");
+                }
+                SourceRunStatus::Done => pill.add_css_class("pipeline-pill-done"),
+                SourceRunStatus::Failed => pill.add_css_class("pipeline-pill-error"),
+                SourceRunStatus::Skipped | SourceRunStatus::Queued => {}
+            }
+        }
+    }
+
     pub fn paint(&self, state: &AppState) {
         let packages = state.packages();
-        let (dnf, flatpak, firmware) = count_by_source(packages);
+        let counts = count_by_category(packages);
         let sec = count_security(packages);
         self.count_all.set_text(&packages.len().to_string());
         self.count_security.set_text(&sec.to_string());
@@ -590,29 +672,27 @@ impl Sidebar {
         if sec == 0 && self.selected_source.get() == SourceFilter::Security {
             self.select_source(SourceFilter::All);
         }
-        self.count_system.set_text(&dnf.to_string());
-        self.count_apps.set_text(&flatpak.to_string());
-        self.count_firmware.set_text(&firmware.to_string());
+
+        let available = self.available_categories.borrow();
+        let mut reset_to_all = false;
+        for entry in &self.category_rows {
+            let count = counts.get(&entry.category).copied().unwrap_or(0);
+            entry.count.set_text(&count.to_string());
+            let visible = available.contains(&entry.category) || count > 0;
+            entry.row.set_visible(visible);
+            if !visible && self.selected_source.get() == SourceFilter::Category(entry.category) {
+                reset_to_all = true;
+            }
+        }
+        drop(available);
+        if reset_to_all {
+            self.select_source(SourceFilter::All);
+        }
 
         if let Phase::Running(running) = &state.phase {
             self.nav_context_stack.set_visible_child_name("pipeline");
             let items = running_source_checklist(running);
-            for ((row_box, pill), item) in self.pipeline_rows.iter().zip(items.iter()) {
-                row_box.remove_css_class("active");
-                for cls in ["pipeline-pill-active", "pipeline-pill-done", "pipeline-pill-error"] {
-                    pill.remove_css_class(cls);
-                }
-                pill.set_text(&item.badge);
-                match item.status {
-                    SourceRunStatus::Active => {
-                        row_box.add_css_class("active");
-                        pill.add_css_class("pipeline-pill-active");
-                    }
-                    SourceRunStatus::Done => pill.add_css_class("pipeline-pill-done"),
-                    SourceRunStatus::Failed => pill.add_css_class("pipeline-pill-error"),
-                    SourceRunStatus::Skipped | SourceRunStatus::Queued => {}
-                }
-            }
+            self.sync_pipeline_rows(&items);
         } else {
             self.nav_context_stack.set_visible_child_name("sources");
         }
@@ -675,12 +755,38 @@ impl Sidebar {
 
     #[cfg(test)]
     pub fn count_texts(&self) -> (String, String, String, String) {
+        let count_for = |cat: SourceCategory| -> String {
+            self.category_rows
+                .iter()
+                .find(|entry| entry.category == cat)
+                .map(|entry| entry.count.text().to_string())
+                .unwrap_or_default()
+        };
         (
             self.count_all.text().to_string(),
-            self.count_system.text().to_string(),
-            self.count_apps.text().to_string(),
-            self.count_firmware.text().to_string(),
+            count_for(SourceCategory::System),
+            count_for(SourceCategory::Apps),
+            count_for(SourceCategory::Firmware),
         )
+    }
+
+    #[cfg(test)]
+    pub fn category_row(&self, cat: SourceCategory) -> &gtk::ListBoxRow {
+        &self
+            .category_rows
+            .iter()
+            .find(|entry| entry.category == cat)
+            .expect("category row")
+            .row
+    }
+
+    #[cfg(test)]
+    pub fn visible_categories(&self) -> Vec<SourceCategory> {
+        self.category_rows
+            .iter()
+            .filter(|entry| entry.row.get_visible())
+            .map(|entry| entry.category)
+            .collect()
     }
 
     #[cfg(test)]
@@ -691,12 +797,21 @@ impl Sidebar {
     }
 
     #[cfg(test)]
-    pub fn pipeline_status_texts(&self) -> [String; 3] {
-        [
-            self.pipeline_rows[0].1.text().to_string(),
-            self.pipeline_rows[1].1.text().to_string(),
-            self.pipeline_rows[2].1.text().to_string(),
-        ]
+    pub fn pipeline_status_texts(&self) -> Vec<String> {
+        self.pipeline_rows
+            .borrow()
+            .iter()
+            .map(|(_, _, pill)| pill.text().to_string())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn pipeline_categories(&self) -> Vec<SourceCategory> {
+        self.pipeline_rows
+            .borrow()
+            .iter()
+            .map(|(cat, _, _)| *cat)
+            .collect()
     }
 
     #[cfg(test)]
@@ -939,11 +1054,26 @@ mod tests {
 
         let mut running = RunningState::new(vec![d1.clone(), d2, fp.clone()]);
         running.current_source = Some(UpdateSource::Dnf);
-        let items = running_source_checklist(&running);
-        assert_eq!(items[0].status, SourceRunStatus::Active);
-        assert_eq!(items[0].badge, "1/2");
-        assert_eq!(items[1].status, SourceRunStatus::Queued);
-        assert_eq!(items[1].badge, "Queued");
+        let dynamic_items = running_source_checklist(&running);
+        assert_eq!(dynamic_items.len(), 2);
+        assert_eq!(dynamic_items[0].category, SourceCategory::System);
+        assert_eq!(dynamic_items[0].status, SourceRunStatus::Active);
+        assert_eq!(dynamic_items[0].badge, "1/2");
+        assert_eq!(dynamic_items[1].category, SourceCategory::Apps);
+        assert_eq!(dynamic_items[1].status, SourceRunStatus::Queued);
+        assert_eq!(dynamic_items[1].badge, "Queued");
+
+        // Explicit category list still marks absent categories as Skipped.
+        let items = running_source_checklist_for_categories(
+            &running,
+            &[
+                SourceCategory::System,
+                SourceCategory::Apps,
+                SourceCategory::Firmware,
+            ],
+        );
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].category, SourceCategory::Firmware);
         assert_eq!(items[2].status, SourceRunStatus::Skipped);
         assert_eq!(items[2].badge, "—");
 
@@ -956,6 +1086,7 @@ mod tests {
         let mut running2 = RunningState::new(vec![d1, fp_active, fw_fail]);
         running2.current_source = Some(UpdateSource::FlatpakUser);
         let items2 = running_source_checklist(&running2);
+        assert_eq!(items2.len(), 3);
         assert_eq!(items2[0].status, SourceRunStatus::Done);
         assert_eq!(items2[0].badge, "1/1 ✓");
         assert_eq!(items2[1].status, SourceRunStatus::Active);
