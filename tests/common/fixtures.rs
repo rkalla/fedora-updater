@@ -94,6 +94,13 @@ pub const ALL_FIXTURES: &[&str] = &[
     "toolchains/pipx_list.json",
     "toolchains/pipx_outdated.txt",
     "toolchains/pipx_upgrade_log.txt",
+    // cleanup/
+    "cleanup/flatpak_unused.txt",
+    "cleanup/flatpak_unused_empty.txt",
+    "cleanup/brew_autoremove_dry_run.txt",
+    "cleanup/brew_autoremove_empty.txt",
+    "cleanup/flatpak_uninstall_unused_log.txt",
+    "cleanup/brew_autoremove_log.txt",
 ];
 
 #[derive(Debug, Clone)]

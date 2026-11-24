@@ -814,3 +814,44 @@ fn toolchains_fixtures_cover_rustup_mise_uv_and_pipx() {
     );
     assert!(!detect_reboot(UpdateSource::Pipx, &pipx_log, &pipx_pkgs));
 }
+
+#[test]
+fn cleanup_fixtures_parse_flatpak_unused_and_brew_autoremove() {
+    use fedora_updater::backend::cleanup::{
+        parse_brew_autoremove_dry_run, parse_flatpak_unused_dry_run, CleanupPlan, CleanupSource,
+    };
+
+    let fp_raw = read_fixture("cleanup/flatpak_unused.txt");
+    let fp_items = parse_flatpak_unused_dry_run(&fp_raw, true);
+    assert_eq!(fp_items.len(), 2);
+    assert_eq!(fp_items[0].source, CleanupSource::FlatpakUser);
+    assert_eq!(fp_items[0].id, "org.freedesktop.Platform.GL.default");
+    assert!(fp_items[0].size_bytes.is_some());
+    assert_eq!(fp_items[1].id, "runtime/org.gnome.Platform/x86_64/45");
+    assert!(fp_items[1].size_bytes.unwrap() > 1_000_000_000);
+
+    let fp_empty_raw = read_fixture("cleanup/flatpak_unused_empty.txt");
+    assert!(parse_flatpak_unused_dry_run(&fp_empty_raw, false).is_empty());
+
+    let brew_raw = read_fixture("cleanup/brew_autoremove_dry_run.txt");
+    let brew_items = parse_brew_autoremove_dry_run(&brew_raw);
+    assert_eq!(brew_items.len(), 3);
+    assert_eq!(brew_items[0].source, CleanupSource::Homebrew);
+    assert_eq!(brew_items[0].id, "gdbm");
+    assert_eq!(brew_items[1].id, "mpdecimal");
+    assert!(brew_items[1].size_bytes.is_some());
+    assert_eq!(brew_items[2].id, "readline");
+    assert!(brew_items[2].size_bytes.is_some());
+
+    let brew_empty_raw = read_fixture("cleanup/brew_autoremove_empty.txt");
+    assert!(parse_brew_autoremove_dry_run(&brew_empty_raw).is_empty());
+
+    let mut plan = CleanupPlan {
+        items: [fp_items, brew_items].concat(),
+        warnings: Vec::new(),
+    };
+    plan.normalize();
+    assert_eq!(plan.len(), 5);
+    assert!(plan.known_reclaimable_bytes() > 1_500_000_000);
+    assert!(plan.summary_banner_title().starts_with("Clean up 5 unused items ("));
+}

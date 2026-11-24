@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use fedora_updater::backend::hooks::CustomHook;
 use fedora_updater::model::UpdateSource;
 use fedora_updater::orchestrator::SourceConfig;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,8 @@ pub struct UiPrefs {
     pub disabled_sources: BTreeSet<String>,
     #[serde(default)]
     pub enabled_opt_in_sources: BTreeSet<String>,
+    #[serde(default)]
+    pub custom_hooks: Vec<CustomHook>,
 }
 
 impl Default for UiPrefs {
@@ -51,13 +54,14 @@ impl Default for UiPrefs {
             window_height: DEFAULT_WINDOW_HEIGHT,
             disabled_sources: BTreeSet::new(),
             enabled_opt_in_sources: BTreeSet::new(),
+            custom_hooks: Vec::new(),
         }
     }
 }
 
 impl UiPrefs {
     /// Clamp out-of-range dimensions back to Observatory defaults while keeping
-    /// the sidebar toggle and normalized source keys intact.
+    /// the sidebar toggle, source keys, and normalized user hooks intact.
     pub fn normalized(self) -> Self {
         let window_width =
             if (MIN_WINDOW_WIDTH..=MAX_WINDOW_EXTENT).contains(&self.window_width) {
@@ -71,12 +75,19 @@ impl UiPrefs {
             } else {
                 DEFAULT_WINDOW_HEIGHT
             };
+        let custom_hooks = self
+            .custom_hooks
+            .into_iter()
+            .map(|hook| hook.normalized())
+            .filter(CustomHook::is_valid)
+            .collect();
         Self {
             sidebar_open: self.sidebar_open,
             window_width,
             window_height,
             disabled_sources: normalize_key_set(self.disabled_sources),
             enabled_opt_in_sources: normalize_key_set(self.enabled_opt_in_sources),
+            custom_hooks,
         }
     }
 
@@ -110,9 +121,10 @@ impl UiPrefs {
     }
 
     pub fn source_config(&self) -> SourceConfig {
-        SourceConfig::from_prefs(
+        SourceConfig::from_prefs_with_hooks(
             self.disabled_sources.iter().cloned(),
             self.enabled_opt_in_sources.iter().cloned(),
+            self.custom_hooks.clone(),
         )
     }
 }
@@ -267,6 +279,7 @@ mod tests {
             window_height: 740,
             disabled_sources: BTreeSet::new(),
             enabled_opt_in_sources: BTreeSet::new(),
+            custom_hooks: Vec::new(),
         };
         prefs.set_source_enabled("firmware", false);
         prefs.set_source_enabled("toolbx", true);
@@ -304,6 +317,7 @@ mod tests {
                 window_height: DEFAULT_WINDOW_HEIGHT,
                 disabled_sources: BTreeSet::new(),
                 enabled_opt_in_sources: BTreeSet::new(),
+                custom_hooks: Vec::new(),
             }
         );
 
@@ -321,6 +335,7 @@ mod tests {
                 window_height: DEFAULT_WINDOW_HEIGHT,
                 disabled_sources: BTreeSet::new(),
                 enabled_opt_in_sources: BTreeSet::new(),
+                custom_hooks: Vec::new(),
             }
         );
     }
@@ -392,6 +407,12 @@ mod tests {
             window_height: 700,
             disabled_sources: BTreeSet::from(["firmware".into()]),
             enabled_opt_in_sources: BTreeSet::from(["toolbx".into()]),
+            custom_hooks: vec![CustomHook {
+                name: "Cargo update".into(),
+                check_command: Some("cargo install-update --list".into()),
+                apply_command: "cargo install-update -a".into(),
+                enabled: true,
+            }],
         };
 
         assert!(!save_if_enabled(Some(&path), &custom, true));
@@ -409,5 +430,41 @@ mod tests {
         );
         assert_eq!(load_if_enabled(None, false), UiPrefs::default());
         assert!(!save_if_enabled(None, &custom, false));
+    }
+
+    #[test]
+    fn custom_hooks_persist_normalize_and_preserve_legacy_json_compatibility() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ui.json");
+        fs::write(
+            &path,
+            r#"{"sidebar_open":true,"window_width":1000,"window_height":700,"disabled_sources":["dnf"]}"#,
+        )
+        .expect("write legacy json");
+        let mut loaded = load_from(&path);
+        assert!(loaded.custom_hooks.is_empty());
+        assert!(!loaded.source_config().is_enabled(UpdateSource::CustomHook));
+
+        loaded.custom_hooks.push(CustomHook {
+            name: "  Chezmoi  ".into(),
+            check_command: Some("   ".into()),
+            apply_command: "  chezmoi update  ".into(),
+            enabled: true,
+        });
+        loaded.custom_hooks.push(CustomHook {
+            name: "   ".into(),
+            check_command: None,
+            apply_command: "echo invalid".into(),
+            enabled: true,
+        });
+        save_to(&path, &loaded).expect("save custom hooks");
+
+        let reloaded = load_from(&path);
+        assert_eq!(reloaded.custom_hooks.len(), 1);
+        assert_eq!(reloaded.custom_hooks[0].name, "Chezmoi");
+        assert_eq!(reloaded.custom_hooks[0].check_command, None);
+        assert_eq!(reloaded.custom_hooks[0].apply_command, "chezmoi update");
+        assert!(reloaded.custom_hooks[0].enabled);
+        assert!(reloaded.source_config().is_enabled(UpdateSource::CustomHook));
     }
 }

@@ -1,0 +1,4 @@
+==> Autoremoving 3 unneeded formulae:
+Uninstalling gdbm... (12 files, 1.2MB)
+Uninstalling mpdecimal... (21 files, 1.5MB)
+Uninstalling readline... (48 files, 2.0MB)

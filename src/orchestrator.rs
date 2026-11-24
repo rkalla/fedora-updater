@@ -10,8 +10,8 @@ use std::time::SystemTime;
 use async_channel::Sender;
 
 use crate::backend::{
-    self, brew, containers, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, gnome_extensions, logind,
-    mise, python_tools, rpm_ostree, rustup, ProgressHint,
+    self, brew, cleanup, containers, dnf, dnf_dbus, flatpak, fwupd, fwupd_dbus, gnome_extensions,
+    hooks, logind, mise, python_tools, rpm_ostree, rustup, ProgressHint,
 };
 pub use crate::backend::NativeOutcome;
 use crate::helper_protocol::{split_helper_line, HelperCommand, HelperOutput};
@@ -31,11 +31,13 @@ fn normalize_config_keys(keys: impl IntoIterator<Item = String>) -> BTreeSet<Str
 }
 
 /// Enabled/disabled source filter applied during check and apply pipelines.
-/// Opt-in sources (`Distrobox`, `Toolbx`) remain disabled unless explicitly enabled.
+/// Opt-in sources (`Distrobox`, `Toolbx`) remain disabled unless explicitly enabled,
+/// and `CustomHook` activates only when at least one enabled valid hook is configured.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceConfig {
     pub disabled_keys: BTreeSet<String>,
     pub enabled_opt_in_keys: BTreeSet<String>,
+    pub custom_hooks: Vec<hooks::CustomHook>,
 }
 
 impl SourceConfig {
@@ -49,6 +51,7 @@ impl SourceConfig {
         Self {
             disabled_keys: BTreeSet::new(),
             enabled_opt_in_keys,
+            custom_hooks: Vec::new(),
         }
     }
 
@@ -60,10 +63,32 @@ impl SourceConfig {
         disabled_keys: impl IntoIterator<Item = String>,
         enabled_opt_in_keys: impl IntoIterator<Item = String>,
     ) -> Self {
+        Self::from_prefs_with_hooks(disabled_keys, enabled_opt_in_keys, Vec::new())
+    }
+
+    pub fn from_prefs_with_hooks(
+        disabled_keys: impl IntoIterator<Item = String>,
+        enabled_opt_in_keys: impl IntoIterator<Item = String>,
+        custom_hooks: Vec<hooks::CustomHook>,
+    ) -> Self {
         Self {
             disabled_keys: normalize_config_keys(disabled_keys),
             enabled_opt_in_keys: normalize_config_keys(enabled_opt_in_keys),
+            custom_hooks: custom_hooks
+                .into_iter()
+                .map(|h| h.normalized())
+                .filter(hooks::CustomHook::is_valid)
+                .collect(),
         }
+    }
+
+    pub fn with_custom_hooks(mut self, custom_hooks: Vec<hooks::CustomHook>) -> Self {
+        self.custom_hooks = custom_hooks
+            .into_iter()
+            .map(|h| h.normalized())
+            .filter(hooks::CustomHook::is_valid)
+            .collect();
+        self
     }
 
     pub fn is_key_enabled(&self, pref_key: &str) -> bool {
@@ -77,6 +102,10 @@ impl SourceConfig {
     }
 
     pub fn is_enabled(&self, source: UpdateSource) -> bool {
+        if source == UpdateSource::CustomHook {
+            return self.is_key_enabled(source.pref_key())
+                && !hooks::enabled_hooks_with_ids(&self.custom_hooks).is_empty();
+        }
         self.is_key_enabled(source.pref_key())
     }
 
@@ -623,6 +652,12 @@ pub trait OrchestratorRuntime: Send + 'static {
         )
     }
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String>;
+    fn query_flatpak_unused(&self, _user: bool) -> NativeOutcome<Vec<flatpak::FlatpakListedRef>> {
+        NativeOutcome::Unavailable("libflatpak unused query unavailable in test runtime".into())
+    }
+    fn has_flatpak_cli(&self) -> bool {
+        false
+    }
     fn apply_flatpak_native(
         &self,
         _user: bool,
@@ -800,6 +835,14 @@ impl OrchestratorRuntime for SystemRuntime {
 
     fn query_flatpak(&self, user: bool) -> Result<flatpak::FlatpakCheck, String> {
         flatpak::query_updates(user)
+    }
+
+    fn query_flatpak_unused(&self, user: bool) -> NativeOutcome<Vec<flatpak::FlatpakListedRef>> {
+        flatpak::query_unused_refs(user)
+    }
+
+    fn has_flatpak_cli(&self) -> bool {
+        command_exists("flatpak")
     }
 
     fn apply_flatpak_native(
@@ -1310,6 +1353,23 @@ fn execute_check_all_inner<R: OrchestratorRuntime>(
                 &mut soft_errors,
             );
         }
+    }
+
+    if config.is_enabled(UpdateSource::CustomHook) {
+        if !ch.is_current() {
+            return;
+        }
+        let hooks_res = check_custom_hooks(&ch, runtime, &config.custom_hooks, &mut soft_errors);
+        if !ch.is_current() {
+            return;
+        }
+        emit_backend_check(
+            &ch,
+            UpdateSource::CustomHook,
+            hooks_res,
+            &mut all,
+            &mut soft_errors,
+        );
     }
 
     // 5) fwupd — prefer native org.freedesktop.fwupd D-Bus, falling back cleanly
@@ -3135,6 +3195,22 @@ fn execute_apply_all_inner<R: OrchestratorRuntime>(
                     }
                 }
             }
+            UpdateSource::CustomHook => {
+                if mode == ApplyMode::DownloadOnly {
+                    ch.line(
+                        tag,
+                        "Skipping custom user hooks during Download Only mode.".into(),
+                    );
+                    (0, String::new(), false, None)
+                } else {
+                    match run_custom_hooks_apply(&ch, runtime, &packages, &config.custom_hooks) {
+                        ToolchainApplyOutcome::Cancelled => return,
+                        ToolchainApplyOutcome::Finished { code, log, error } => {
+                            (code, log, false, error)
+                        }
+                    }
+                }
+            }
             UpdateSource::Firmware => {
                 if mode == ApplyMode::DownloadOnly {
                     ch.line(
@@ -3351,6 +3427,251 @@ fn run_local_apply_with_env<R: OrchestratorRuntime>(
         Err(e) => {
             ch.line(tag, format!("error: {e}"));
             (-1, e)
+        }
+    }
+}
+
+fn check_custom_hooks<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    custom_hooks: &[hooks::CustomHook],
+    soft_errors: &mut Vec<String>,
+) -> Result<Vec<Package>, String> {
+    let tag = UpdateSource::CustomHook.console_tag();
+    let work_cancel = ch.cancel.work_cancel();
+    let active = hooks::enabled_hooks_with_ids(custom_hooks);
+    if active.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pkgs = Vec::new();
+    let mut hook_errors = Vec::new();
+
+    for (id, hook) in active {
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        if let Some(check_cmd) = hook.check_command.as_deref() {
+            ch.line(tag, format!("Checking custom hook \"{}\"…", hook.name));
+            let mut out = String::new();
+            let exec_res = runtime.run_cancellable_local_env(
+                "sh",
+                &["-c", check_cmd],
+                &[],
+                Some(&work_cancel),
+                &mut |l| {
+                    out.push_str(&l);
+                    out.push('\n');
+                },
+            );
+            if !ch.is_current() || work_cancel.is_cancelled() {
+                return Err("cancelled".into());
+            }
+            match exec_res {
+                Ok(code) => {
+                    let decision = hooks::interpret_check_result(code, &out);
+                    match &decision {
+                        hooks::HookCheckResult::UpToDate => {
+                            ch.line(tag, format!("  {}: up to date", hook.name));
+                        }
+                        hooks::HookCheckResult::UpdateAvailable { summary, .. } => {
+                            ch.line(tag, format!("  {}: {}", hook.name, summary));
+                            if let Some(pkg) =
+                                hooks::package_from_checked_hook(&id, &hook, &decision)
+                            {
+                                pkgs.push(pkg);
+                            }
+                        }
+                        hooks::HookCheckResult::Failed(detail) => {
+                            let msg = format!("{}: {detail}", hook.name);
+                            ch.line(tag, format!("  error: {msg}"));
+                            hook_errors.push(msg);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let msg = format!("{}: {err}", hook.name);
+                    ch.line(tag, format!("  error: {msg}"));
+                    hook_errors.push(msg);
+                }
+            }
+        } else {
+            ch.line(
+                tag,
+                format!(
+                    "  {}: custom user command enabled (no check command)",
+                    hook.name
+                ),
+            );
+            pkgs.push(hooks::package_from_unverified_hook(&id, &hook));
+        }
+    }
+
+    if !hook_errors.is_empty() {
+        let joined = format!("Custom hooks check: {}", hook_errors.join("; "));
+        if pkgs.is_empty() {
+            return Err(joined);
+        }
+        soft_errors.push(joined);
+    }
+
+    Ok(pkgs)
+}
+
+fn run_custom_hooks_apply<R: OrchestratorRuntime>(
+    ch: &WorkChannel,
+    runtime: &R,
+    packages: &[Package],
+    custom_hooks: &[hooks::CustomHook],
+) -> ToolchainApplyOutcome {
+    let tag = UpdateSource::CustomHook.console_tag();
+    let work_cancel = ch.cancel.work_cancel();
+    let selected: Vec<&Package> = packages
+        .iter()
+        .filter(|p| p.source == UpdateSource::CustomHook)
+        .collect();
+    if selected.is_empty() {
+        return ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: String::new(),
+            error: None,
+        };
+    }
+
+    let mut full_log = String::new();
+    let mut failed_errors = Vec::new();
+
+    for pkg in selected {
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return ToolchainApplyOutcome::Cancelled;
+        }
+        let resolved = hooks::resolve_hooks_for_packages(custom_hooks, &[pkg]);
+        let Some((_, hook, name)) = resolved.into_iter().next() else {
+            let reason = format!("{}: custom hook is disabled or no longer configured", pkg.name);
+            ch.line(tag, format!("error: {reason}"));
+            full_log.push_str(&reason);
+            full_log.push('\n');
+            failed_errors.push(reason);
+            emit_progress_hint(
+                ch,
+                UpdateSource::CustomHook,
+                ProgressHint {
+                    package_name: Some(pkg.name.clone()),
+                    status: Some(PackageStatus::Failed),
+                    progress: None,
+                    phase_label: Some("Failed".into()),
+                    stage_current: None,
+                    stage_total: None,
+                },
+            );
+            continue;
+        };
+
+        ch.line(tag, format!("── Running hook: {name} (unprivileged user) ──"));
+        emit_progress_hint(
+            ch,
+            UpdateSource::CustomHook,
+            ProgressHint {
+                package_name: Some(name.clone()),
+                status: Some(PackageStatus::Installing),
+                progress: None,
+                phase_label: Some(format!("Running {name}")),
+                stage_current: None,
+                stage_total: None,
+            },
+        );
+
+        let mut per_log = String::new();
+        let exec_res = runtime.run_cancellable_local_env(
+            "sh",
+            &["-c", hook.apply_command.as_str()],
+            &[],
+            Some(&work_cancel),
+            &mut |l| {
+                per_log.push_str(&l);
+                per_log.push('\n');
+                full_log.push_str(&l);
+                full_log.push('\n');
+                ch.line(tag, l.clone());
+
+                let mut hint = backend::parse_progress(UpdateSource::CustomHook, &l);
+                if hint.status.is_some() || hint.progress.is_some() || hint.phase_label.is_some() {
+                    if hint.package_name.is_none() {
+                        hint.package_name = Some(name.clone());
+                    }
+                    emit_progress_hint(ch, UpdateSource::CustomHook, hint);
+                }
+            },
+        );
+        if !ch.is_current() || work_cancel.is_cancelled() {
+            return ToolchainApplyOutcome::Cancelled;
+        }
+
+        match exec_res {
+            Ok(0) => {
+                emit_progress_hint(
+                    ch,
+                    UpdateSource::CustomHook,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Completed),
+                        progress: Some(1.0),
+                        phase_label: Some("Complete".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+            Ok(code) => {
+                let reason = format!("{name}: exited with {code}");
+                ch.line(tag, format!("error: {reason}"));
+                failed_errors.push(reason);
+                emit_progress_hint(
+                    ch,
+                    UpdateSource::CustomHook,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Failed),
+                        progress: None,
+                        phase_label: Some("Failed".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+            Err(err) => {
+                let reason = format!("{name}: {err}");
+                ch.line(tag, format!("error: {reason}"));
+                full_log.push_str(&reason);
+                full_log.push('\n');
+                failed_errors.push(reason);
+                emit_progress_hint(
+                    ch,
+                    UpdateSource::CustomHook,
+                    ProgressHint {
+                        package_name: Some(name),
+                        status: Some(PackageStatus::Failed),
+                        progress: None,
+                        phase_label: Some("Failed".into()),
+                        stage_current: None,
+                        stage_total: None,
+                    },
+                );
+            }
+        }
+    }
+
+    if failed_errors.is_empty() {
+        ToolchainApplyOutcome::Finished {
+            code: 0,
+            log: full_log,
+            error: None,
+        }
+    } else {
+        ToolchainApplyOutcome::Finished {
+            code: 1,
+            log: full_log,
+            error: Some(format!("Custom hooks: {}", failed_errors.join("; "))),
         }
     }
 }
@@ -3590,6 +3911,294 @@ pub fn execute_systemctl_reboot<R: OrchestratorRuntime>(tx: &Sender<WorkerMsg>, 
     }
 }
 
+/// Summary of a user-confirmed post-update cleanup execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanupRunOutcome {
+    pub removed_count: usize,
+    pub reclaimed_bytes: u64,
+    pub failed_steps: Vec<String>,
+    pub cancelled: bool,
+    pub remaining_plan: cleanup::CleanupPlan,
+}
+
+/// Probe unused Flatpak runtimes and Homebrew leaves without modifying system state.
+pub fn discover_cleanup(
+    config: &SourceConfig,
+    cancel: Option<&WorkCancel>,
+) -> Result<cleanup::CleanupPlan, String> {
+    discover_cleanup_with(&SystemRuntime, config, cancel)
+}
+
+/// Testable read-only unused cleanup discovery over an injected [`OrchestratorRuntime`].
+pub fn discover_cleanup_with<R: OrchestratorRuntime>(
+    runtime: &R,
+    config: &SourceConfig,
+    cancel: Option<&WorkCancel>,
+) -> Result<cleanup::CleanupPlan, String> {
+    if cancel.is_some_and(WorkCancel::is_cancelled) {
+        return Err("cancelled".into());
+    }
+
+    let mut plan = cleanup::CleanupPlan::default();
+
+    if config.is_enabled(UpdateSource::FlatpakUser) {
+        for user in [true, false] {
+            if cancel.is_some_and(WorkCancel::is_cancelled) {
+                return Err("cancelled".into());
+            }
+            let scope_label = if user {
+                "User Flatpak"
+            } else {
+                "System Flatpak"
+            };
+            match runtime.query_flatpak_unused(user) {
+                NativeOutcome::Handled(Ok(refs)) => {
+                    plan.items
+                        .extend(cleanup::cleanup_items_from_flatpak_refs(&refs, user));
+                }
+                NativeOutcome::Handled(Err(err)) => {
+                    plan.warnings.push(format!("{scope_label} cleanup probe: {err}"));
+                }
+                NativeOutcome::Unavailable(_) => {
+                    if runtime.has_flatpak_cli() {
+                        let args = cleanup::flatpak_uninstall_unused_dry_run_args(user);
+                        let mut out = String::new();
+                        let res = runtime.run_cancellable_local_env(
+                            "flatpak",
+                            &args,
+                            &[],
+                            cancel,
+                            &mut |l| {
+                                out.push_str(&l);
+                                out.push('\n');
+                            },
+                        );
+                        if cancel.is_some_and(WorkCancel::is_cancelled) {
+                            return Err("cancelled".into());
+                        }
+                        match res {
+                            Ok(code) => {
+                                let parsed = cleanup::parse_flatpak_unused_dry_run(&out, user);
+                                if !parsed.is_empty() {
+                                    plan.items.extend(parsed);
+                                } else {
+                                    let lower = out.to_ascii_lowercase();
+                                    let unsupported = lower.contains("unknown option");
+                                    let nothing = lower.contains("nothing unused");
+                                    if code != 0 && code != 1 && !unsupported && !nothing {
+                                        plan.warnings.push(format!(
+                                            "{scope_label} cleanup probe exited with {code}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                plan.warnings.push(format!("{scope_label} cleanup probe: {err}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if config.is_enabled(UpdateSource::Homebrew) {
+        if let Some(brew_bin) = runtime.brew_binary() {
+            if cancel.is_some_and(WorkCancel::is_cancelled) {
+                return Err("cancelled".into());
+            }
+            let brew_str = brew_bin.to_string_lossy();
+            let mut out = String::new();
+            let res = runtime.run_cancellable_local_env(
+                brew_str.as_ref(),
+                &["autoremove", "--dry-run"],
+                brew::NONINTERACTIVE_NO_AUTO_UPDATE_ENV,
+                cancel,
+                &mut |l| {
+                    out.push_str(&l);
+                    out.push('\n');
+                },
+            );
+            if cancel.is_some_and(WorkCancel::is_cancelled) {
+                return Err("cancelled".into());
+            }
+            match res {
+                Ok(code) => {
+                    let parsed = cleanup::parse_brew_autoremove_dry_run(&out);
+                    if !parsed.is_empty() {
+                        plan.items.extend(parsed);
+                    } else if code != 0 {
+                        plan.warnings
+                            .push(format!("Homebrew cleanup probe exited with {code}"));
+                    }
+                }
+                Err(err) => {
+                    plan.warnings.push(format!("Homebrew cleanup probe: {err}"));
+                }
+            }
+        }
+    }
+
+    plan.normalize();
+    Ok(plan)
+}
+
+/// Execute a user-confirmed cleanup plan on the host and refresh remaining reclaimable items.
+pub fn run_cleanup(
+    plan: &cleanup::CleanupPlan,
+    config: &SourceConfig,
+    cancel: Option<&WorkCancel>,
+    tx: Option<&Sender<WorkerMsg>>,
+) -> CleanupRunOutcome {
+    run_cleanup_with(&SystemRuntime, plan, config, cancel, tx)
+}
+
+/// Testable user-confirmed cleanup runner over an injected [`OrchestratorRuntime`].
+///
+/// Cleanup commands execute strictly locally without `--helper` / `pkexec`.
+pub fn run_cleanup_with<R: OrchestratorRuntime>(
+    runtime: &R,
+    plan: &cleanup::CleanupPlan,
+    config: &SourceConfig,
+    cancel: Option<&WorkCancel>,
+    tx: Option<&Sender<WorkerMsg>>,
+) -> CleanupRunOutcome {
+    let emit = |tag: &str, text: String| {
+        if let Some(sender) = tx {
+            line(sender, tag, text);
+        }
+    };
+
+    if plan.is_empty() {
+        return CleanupRunOutcome::default();
+    }
+    if cancel.is_some_and(WorkCancel::is_cancelled) {
+        return CleanupRunOutcome {
+            cancelled: true,
+            remaining_plan: plan.clone(),
+            ..CleanupRunOutcome::default()
+        };
+    }
+
+    let mut failed_steps = Vec::new();
+    let mut cancelled = false;
+
+    for (enabled, tag, label, user) in [
+        (
+            plan.has_flatpak_user(),
+            cleanup::CleanupSource::FlatpakUser.console_tag(),
+            cleanup::CleanupSource::FlatpakUser.label(),
+            true,
+        ),
+        (
+            plan.has_flatpak_system(),
+            cleanup::CleanupSource::FlatpakSystem.console_tag(),
+            cleanup::CleanupSource::FlatpakSystem.label(),
+            false,
+        ),
+    ] {
+        if !enabled {
+            continue;
+        }
+        if cancel.is_some_and(WorkCancel::is_cancelled) {
+            cancelled = true;
+            break;
+        }
+        emit("orchestrator", format!("── Cleaning unused {label} ──"));
+        let args = cleanup::flatpak_uninstall_unused_args(user);
+        let res = runtime.run_cancellable_local_env(
+            "flatpak",
+            &args,
+            &[],
+            cancel,
+            &mut |l| emit(tag, l),
+        );
+        if cancel.is_some_and(WorkCancel::is_cancelled) {
+            cancelled = true;
+            break;
+        }
+        match res {
+            Ok(0) => {}
+            Ok(code) => {
+                let msg = format!("{label} exited with {code}");
+                emit(tag, format!("error: {msg}"));
+                failed_steps.push(msg);
+            }
+            Err(err) => {
+                let msg = format!("{label}: {err}");
+                emit(tag, format!("error: {msg}"));
+                failed_steps.push(msg);
+            }
+        }
+    }
+
+    if !cancelled && plan.has_homebrew() {
+        if cancel.is_some_and(WorkCancel::is_cancelled) {
+            cancelled = true;
+        } else if let Some(brew_bin) = runtime.brew_binary() {
+            let tag = cleanup::CleanupSource::Homebrew.console_tag();
+            emit("orchestrator", "── Cleaning unused Homebrew formulae ──".into());
+            let brew_str = brew_bin.to_string_lossy();
+            let res = runtime.run_cancellable_local_env(
+                brew_str.as_ref(),
+                &["autoremove"],
+                brew::NONINTERACTIVE_NO_AUTO_UPDATE_ENV,
+                cancel,
+                &mut |l| emit(tag, l),
+            );
+            if cancel.is_some_and(WorkCancel::is_cancelled) {
+                cancelled = true;
+            } else {
+                match res {
+                    Ok(0) => {}
+                    Ok(code) => {
+                        let msg = format!("Homebrew exited with {code}");
+                        emit(tag, format!("error: {msg}"));
+                        failed_steps.push(msg);
+                    }
+                    Err(err) => {
+                        let msg = format!("Homebrew: {err}");
+                        emit(tag, format!("error: {msg}"));
+                        failed_steps.push(msg);
+                    }
+                }
+            }
+        } else {
+            failed_steps.push("Homebrew binary not found".into());
+        }
+    }
+
+    let remaining_plan = if cancelled {
+        plan.clone()
+    } else {
+        discover_cleanup_with(runtime, config, cancel).unwrap_or_default()
+    };
+
+    let remaining_keys: BTreeSet<(cleanup::CleanupSource, String)> = remaining_plan
+        .items
+        .iter()
+        .map(|item| (item.source, item.id.clone()))
+        .collect();
+    let mut removed_count = 0usize;
+    let mut reclaimed_bytes = 0u64;
+    for item in &plan.items {
+        if !remaining_keys.contains(&(item.source, item.id.clone())) {
+            removed_count += 1;
+            if let Some(bytes) = item.size_bytes {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
+            }
+        }
+    }
+
+    CleanupRunOutcome {
+        removed_count,
+        reclaimed_bytes,
+        failed_steps,
+        cancelled,
+        remaining_plan,
+    }
+}
+
 pub fn session_started_event(purpose: AuthPurpose) -> StateEvent {
     StateEvent::SessionReady { purpose }
 }
@@ -3668,6 +4277,7 @@ pub fn load_history_system(limit: i64) -> Vec<dnf_dbus::HistoryEntry> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Mutex, MutexGuard};
 
     use super::*;
@@ -4244,5 +4854,281 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn source_config_custom_hooks_activate_only_when_enabled_valid_hooks_exist() {
+        let mut cfg = SourceConfig::all_enabled();
+        assert!(!cfg.is_enabled(UpdateSource::CustomHook));
+
+        cfg = cfg.with_custom_hooks(vec![hooks::CustomHook {
+            name: "Disabled".into(),
+            check_command: None,
+            apply_command: "echo skip".into(),
+            enabled: false,
+        }]);
+        assert!(!cfg.is_enabled(UpdateSource::CustomHook));
+
+        cfg = cfg.with_custom_hooks(vec![hooks::CustomHook {
+            name: "Cargo update".into(),
+            check_command: Some("cargo install-update --list".into()),
+            apply_command: "cargo install-update -a".into(),
+            enabled: true,
+        }]);
+        assert!(cfg.is_enabled(UpdateSource::CustomHook));
+
+        cfg.disable("custom-hooks");
+        assert!(!cfg.is_enabled(UpdateSource::CustomHook));
+    }
+
+    #[derive(Default)]
+    struct CleanupAndHookTestRuntime {
+        ensure_calls: std::sync::atomic::AtomicUsize,
+        helper_calls: std::sync::atomic::AtomicUsize,
+        unused_user: Mutex<VecDeque<NativeOutcome<Vec<flatpak::FlatpakListedRef>>>>,
+        unused_system: Mutex<VecDeque<NativeOutcome<Vec<flatpak::FlatpakListedRef>>>>,
+        local_cmds: Mutex<Vec<(String, Vec<String>)>>,
+        local_results: Mutex<VecDeque<(i32, Vec<String>)>>,
+        brew_path: Option<PathBuf>,
+    }
+
+    impl OrchestratorRuntime for CleanupAndHookTestRuntime {
+        fn ensure_session(&self) -> Result<(), SessionError> {
+            self.ensure_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn run_helper(
+            &self,
+            _cmd: HelperCommand,
+            _on_line: &mut dyn FnMut(String),
+        ) -> Result<i32, SessionError> {
+            self.helper_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+
+        fn run_local(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _on_line: &mut dyn FnMut(String),
+        ) -> Result<i32, String> {
+            Ok(0)
+        }
+
+        fn run_cancellable_local(
+            &self,
+            program: &str,
+            args: &[&str],
+            on_line: &mut dyn FnMut(String),
+        ) -> Result<i32, String> {
+            self.local_cmds.lock().unwrap().push((
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            ));
+            let (code, lines) = self
+                .local_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((0, Vec::new()));
+            for l in lines {
+                on_line(l);
+            }
+            Ok(code)
+        }
+
+        fn brew_binary(&self) -> Option<PathBuf> {
+            self.brew_path.clone()
+        }
+
+        fn query_flatpak(&self, _user: bool) -> Result<flatpak::FlatpakCheck, String> {
+            Ok(flatpak::FlatpakCheck {
+                packages: Vec::new(),
+                warning: None,
+            })
+        }
+
+        fn query_flatpak_unused(
+            &self,
+            user: bool,
+        ) -> NativeOutcome<Vec<flatpak::FlatpakListedRef>> {
+            let queue = if user {
+                &self.unused_user
+            } else {
+                &self.unused_system
+            };
+            queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| NativeOutcome::Handled(Ok(Vec::new())))
+        }
+    }
+
+    #[test]
+    fn cleanup_discovery_and_execution_never_call_helper_and_refresh_state() {
+        let rt = CleanupAndHookTestRuntime {
+            brew_path: Some(PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew")),
+            ..Default::default()
+        };
+        let fp_ref = flatpak::FlatpakListedRef {
+            formatted_ref: "runtime/org.gnome.Platform/x86_64/45".into(),
+            name: "GNOME Platform".into(),
+            arch: "x86_64".into(),
+            branch: "45".into(),
+            version: "45".into(),
+            origin: "flathub".into(),
+            summary: None,
+            installed_size_bytes: Some(800_000_000),
+        };
+        rt.unused_user
+            .lock()
+            .unwrap()
+            .push_back(NativeOutcome::Handled(Ok(vec![fp_ref])));
+        rt.unused_user
+            .lock()
+            .unwrap()
+            .push_back(NativeOutcome::Handled(Ok(Vec::new())));
+        rt.unused_system
+            .lock()
+            .unwrap()
+            .push_back(NativeOutcome::Handled(Ok(Vec::new())));
+        rt.unused_system
+            .lock()
+            .unwrap()
+            .push_back(NativeOutcome::Handled(Ok(Vec::new())));
+
+        let mut local = rt.local_results.lock().unwrap();
+        // 1) Initial discovery: brew autoremove --dry-run
+        local.push_back((0, vec!["==> Would autoremove 1 unneeded formulae:".into(), "gdbm (2.0 MB)".into()]));
+        // 2) Cleanup apply: flatpak uninstall --user --unused -y --noninteractive
+        local.push_back((0, vec!["Uninstalling runtime/org.gnome.Platform/x86_64/45".into()]));
+        // 3) Cleanup apply: brew autoremove
+        local.push_back((0, vec!["Uninstalling gdbm...".into()]));
+        // 4) Post-cleanup refresh: brew autoremove --dry-run (empty)
+        local.push_back((0, vec!["==> No unneeded formulae to autoremove.".into()]));
+        drop(local);
+
+        let cfg = SourceConfig::default();
+        let plan = discover_cleanup_with(&rt, &cfg, None).expect("cleanup discovery");
+        assert_eq!(plan.len(), 2);
+        assert!(plan.known_reclaimable_bytes() >= 802_000_000);
+
+        let (tx, rx) = async_channel::unbounded();
+        let outcome = run_cleanup_with(&rt, &plan, &cfg, None, Some(&tx));
+        assert!(!outcome.cancelled);
+        assert!(outcome.failed_steps.is_empty());
+        assert_eq!(outcome.removed_count, 2);
+        assert!(outcome.remaining_plan.is_empty());
+        assert_eq!(rt.ensure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rt.helper_calls.load(Ordering::SeqCst), 0);
+        let mut logged = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let WorkerMsg::ConsoleLine { text, .. } = msg {
+                logged.push(text);
+            }
+        }
+        assert!(logged.iter().any(|l| l.contains("Uninstalling gdbm")));
+    }
+
+    #[test]
+    fn custom_hooks_check_apply_and_cancellation_run_strictly_unprivileged() {
+        let rt = CleanupAndHookTestRuntime::default();
+        {
+            let mut local = rt.local_results.lock().unwrap();
+            // Checked hook 1 reports updates.
+            local.push_back((0, vec!["bat 0.24 -> 0.25".into()]));
+            // Checked hook 2 reports up-to-date.
+            local.push_back((0, Vec::new()));
+            // Apply checked hook 1 + unverified hook 3.
+            local.push_back((0, vec!["Updated bat 100%".into()]));
+            local.push_back((0, vec!["Synced dotfiles".into()]));
+        }
+
+        let cfg = SourceConfig::from_prefs(
+            [
+                "dnf",
+                "rpm-ostree",
+                "flatpak",
+                "gnome-extensions",
+                "homebrew",
+                "rustup",
+                "mise",
+                "uv",
+                "pipx",
+                "firmware",
+            ]
+            .into_iter()
+            .map(String::from),
+            [],
+        )
+        .with_custom_hooks(vec![
+            hooks::CustomHook {
+                name: "Cargo tools".into(),
+                check_command: Some("cargo install-update --list".into()),
+                apply_command: "sudo dnf upgrade -y && cargo install-update -a".into(),
+                enabled: true,
+            },
+            hooks::CustomHook {
+                name: "Neovim plugins".into(),
+                check_command: Some("nvim --headless +Lazy check".into()),
+                apply_command: "nvim --headless +Lazy sync +qa".into(),
+                enabled: true,
+            },
+            hooks::CustomHook {
+                name: "Chezmoi".into(),
+                check_command: None,
+                apply_command: "chezmoi update".into(),
+                enabled: true,
+            },
+        ]);
+
+        let (tx, rx) = async_channel::unbounded();
+        let cancel = WorkCancel::new();
+        execute_check_all_with_config(&tx, &rt, &cancel, &cfg);
+        let mut checked_pkgs = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let WorkerMsg::Event(StateEvent::CheckComplete { packages, .. }) = msg {
+                checked_pkgs = packages;
+            }
+        }
+        assert_eq!(checked_pkgs.len(), 2);
+        assert!(checked_pkgs.iter().all(|p| p.source == UpdateSource::CustomHook));
+        assert_eq!(rt.ensure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rt.helper_calls.load(Ordering::SeqCst), 0);
+
+        let (tx2, rx2) = async_channel::unbounded();
+        execute_apply_all_with_mode_and_config(
+            &tx2,
+            checked_pkgs,
+            ApplyMode::Live,
+            &rt,
+            &cancel,
+            &cfg,
+        );
+        let mut apply_done = false;
+        let mut hook_apply_ok = false;
+        while let Ok(msg) = rx2.try_recv() {
+            match msg {
+                WorkerMsg::Event(StateEvent::BackendApplyDone {
+                    source: UpdateSource::CustomHook,
+                    success,
+                    ..
+                }) => {
+                    assert!(success);
+                    hook_apply_ok = true;
+                }
+                WorkerMsg::Event(StateEvent::ApplyComplete { needs_reboot }) => {
+                    assert!(!needs_reboot);
+                    apply_done = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(hook_apply_ok);
+        assert!(apply_done);
+        assert_eq!(rt.ensure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rt.helper_calls.load(Ordering::SeqCst), 0);
     }
 }

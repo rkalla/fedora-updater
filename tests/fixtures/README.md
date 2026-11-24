@@ -2,7 +2,7 @@
 
 Checked-in, deterministic, offline test inputs for unit, functional, and end-to-end suites ([rkalla/fedora-updater#20](https://github.com/rkalla/fedora-updater/issues/20)).
 
-All 74 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
+All 80 fixture files below are indexed in `tests/common/fixtures.rs::ALL_FIXTURES` and validated offline by `tests/fixture_corpus.rs`.
 
 ## Usage in Tests
 
@@ -142,3 +142,14 @@ Integration tests import `mod common;` and read fixtures via `common::fixtures`:
 | `toolchains/pipx_list.json` | `pipx list --json` (exit 0) | Isolated pipx venv metadata with unpinned `ansible-lint` and `pinned: true` `black` |
 | `toolchains/pipx_outdated.txt` | `pipx list --outdated` (exit 0) | Outdated lines for unpinned `ansible-lint` and pinned `black` (pinned entry skipped cleanly) |
 | `toolchains/pipx_upgrade_log.txt` | `pipx upgrade ansible-lint` (exit 0) | Per-package `upgrading ...` and `upgraded package ...` completion lines |
+
+### `cleanup/` (6 fixtures)
+
+| File | Simulated Command & Exit | Scenario & Edge-Case Signals |
+|---|---|---|
+| `cleanup/flatpak_unused.txt` | `flatpak uninstall --user --unused --assumeno` (exit 1) | Numbered Flatpak unused table with runtime branch (`23.08`, `45`), `runtime/...` ref, MB and `< 1.2 GB` size columns, and `[Y/n]: n` prompt |
+| `cleanup/flatpak_unused_empty.txt` | `flatpak uninstall --system --unused --assumeno` (exit 0) | Clean `Nothing unused to uninstall` response yielding zero reclaimable items |
+| `cleanup/brew_autoremove_dry_run.txt` | `brew autoremove --dry-run` (exit 0) | Standard `==> Would autoremove 3 unneeded formulae:` output with plain and parenthesized-size leaf formulae |
+| `cleanup/brew_autoremove_empty.txt` | `brew autoremove --dry-run` (exit 0) | Clean `==> No unneeded formulae to autoremove.` output yielding zero reclaimable items |
+| `cleanup/flatpak_uninstall_unused_log.txt` | `flatpak uninstall --user --unused -y --noninteractive` (exit 0) | Confirmed user Flatpak unused removal streaming output |
+| `cleanup/brew_autoremove_log.txt` | `brew autoremove` (exit 0) | Confirmed Homebrew leaf dependency autoremove streaming output |

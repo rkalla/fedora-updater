@@ -8,6 +8,8 @@ use gtk::prelude::*;
 use gtk::Label;
 use libadwaita::prelude::*;
 
+use fedora_updater::backend::cleanup::CleanupPlan;
+use fedora_updater::model::format_bytes;
 use fedora_updater::presenter::{
     stale_update_dialog, stop_update_dialog, DialogCopy, ABOUT_COMMENTS, ABOUT_NAME,
 };
@@ -166,4 +168,83 @@ pub(super) fn prompt_stop_during_transaction(
     on_confirm: impl Fn() + 'static,
 ) {
     present_confirm(parent, stop_update_dialog(), on_confirm);
+}
+
+pub(crate) fn build_cleanup_confirm_dialog(
+    plan: &CleanupPlan,
+    on_confirm: impl Fn() + 'static,
+) -> libadwaita::AlertDialog {
+    let count = plan.len();
+    let noun = if count == 1 { "item" } else { "items" };
+    let heading = format!("Clean up {count} unused {noun}?");
+    let body = match plan.formatted_size() {
+        Some(size) => format!(
+            "Removing these unused items can reclaim about {size}. Review the list below; nothing is deleted until you confirm."
+        ),
+        None => "Review the unused items below; nothing is deleted until you confirm.".to_string(),
+    };
+
+    let dialog = libadwaita::AlertDialog::new(Some(&heading), Some(&body));
+
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    for item in &plan.items {
+        let size_label = item
+            .size_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "Size unknown".to_string());
+        let escaped_title = glib::markup_escape_text(&item.name);
+        let escaped_sub = glib::markup_escape_text(&format!(
+            "{} · {} · {}",
+            item.source.label(),
+            item.id,
+            size_label
+        ));
+        let row = libadwaita::ActionRow::builder()
+            .title(escaped_title.as_str())
+            .subtitle(escaped_sub.as_str())
+            .activatable(false)
+            .build();
+        let badge = gtk::Label::builder()
+            .label(item.source.short_badge())
+            .valign(gtk::Align::Center)
+            .css_classes(["caption", "dimmed"])
+            .build();
+        row.add_suffix(&badge);
+        list.append(&row);
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(260)
+        .child(&list)
+        .build();
+    dialog.set_extra_child(Some(&scroller));
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove Unused");
+    dialog.set_response_appearance("remove", libadwaita::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |_dlg, response| {
+        if response == "remove" {
+            on_confirm();
+        }
+    });
+    dialog
+}
+
+pub(crate) fn present_cleanup_confirm_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    plan: &CleanupPlan,
+    on_confirm: impl Fn() + 'static,
+) -> libadwaita::AlertDialog {
+    let dialog = build_cleanup_confirm_dialog(plan, on_confirm);
+    dialog.present(Some(parent));
+    dialog
 }

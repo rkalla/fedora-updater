@@ -52,12 +52,14 @@ impl InspectorViewModel {
             UpdateSource::Pipx => "Dev & Containers (pipx)",
             UpdateSource::Distrobox => "Dev & Containers (Distrobox)",
             UpdateSource::Toolbx => "Dev & Containers (Toolbx)",
+            UpdateSource::CustomHook => "Dev & Containers (Custom Hook)",
             UpdateSource::Firmware => "Firmware (LVFS)",
         };
         let is_container = matches!(
             package.source,
             UpdateSource::Distrobox | UpdateSource::Toolbx
         );
+        let is_hook = package.source == UpdateSource::CustomHook;
         let repo_label = if is_container {
             "Base Image"
         } else {
@@ -70,6 +72,8 @@ impl InspectorViewModel {
         };
         let note_title = if is_container {
             "Container Note"
+        } else if is_hook {
+            "Security Boundary"
         } else {
             "Session Note"
         };
@@ -122,6 +126,8 @@ impl InspectorViewModel {
             })
         } else if is_container {
             Some("Container updates check and apply packages inside the container when run.".to_string())
+        } else if is_hook {
+            Some("Custom hooks execute strictly as your desktop user account and never invoke pkexec or administrator privileges.".to_string())
         } else {
             None
         };
@@ -1107,5 +1113,23 @@ mod tests {
         assert_eq!(rust_vm.source_title, "Dev & Containers (Rustup)");
         assert_eq!(rust_vm.version_display, "1.86.0 → 1.87.0");
         assert!(!rust_vm.needs_reboot);
+
+        let mut hook_pkg = Package::new_dnf("Cargo tools", "user", "available", "custom hook (user)");
+        hook_pkg.source = UpdateSource::CustomHook;
+        hook_pkg.old_version = Some("checked".into());
+        hook_pkg.summary = Some("Custom user hook: bat 0.24 -> 0.25".into());
+        let hook_vm = InspectorViewModel::from_package(&hook_pkg);
+        assert_eq!(hook_vm.badge, "HOOK");
+        assert_eq!(hook_vm.badge_css, "src-hook");
+        assert_eq!(hook_vm.source_title, "Dev & Containers (Custom Hook)");
+        assert_eq!(hook_vm.note_title, "Security Boundary");
+        assert!(hook_vm
+            .session_note
+            .as_deref()
+            .is_some_and(|n| n.contains("never invoke pkexec")));
+        assert_eq!(
+            hook_vm.summary.as_deref(),
+            Some("Custom user hook: bat 0.24 -> 0.25")
+        );
     }
 }

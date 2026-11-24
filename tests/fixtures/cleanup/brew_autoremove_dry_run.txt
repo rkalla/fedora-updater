@@ -1,0 +1,4 @@
+==> Would autoremove 3 unneeded formulae:
+gdbm
+mpdecimal (1.5 MB)
+readline (2.0 MB)

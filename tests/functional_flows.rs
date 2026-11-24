@@ -4858,3 +4858,329 @@ fn toolchains_edge_cases_rpm_rustup_pipx_uv_fallbacks_mode_skips_and_cancel() {
     assert!(rt_cancel.helper_calls().is_empty());
     assert!(matches!(h_cancel.state.phase, Phase::Running(_)));
 }
+
+#[test]
+fn cleanup_discovery_requires_confirmation_and_executes_unprivileged() {
+    use common::runtime::fixture_to_local_lines;
+    use fedora_updater::backend::brew::LINUXBREW_SYSTEM_PATH;
+    use fedora_updater::backend::cleanup::CleanupSource;
+    use fedora_updater::backend::flatpak::FlatpakListedRef;
+    use fedora_updater::backend::NativeOutcome;
+    use fedora_updater::orchestrator::{
+        discover_cleanup_with, run_cleanup_with, SourceConfig, WorkCancel, WorkerMsg,
+    };
+
+    let rt = FakeRuntime::new();
+    rt.set_brew_available(true);
+    rt.set_flatpak_cli_available(true);
+    rt.push_flatpak_unused(
+        true,
+        NativeOutcome::Handled(Ok(vec![FlatpakListedRef {
+            formatted_ref: "runtime/org.gnome.Platform/x86_64/45".into(),
+            name: "GNOME Application Platform".into(),
+            arch: "x86_64".into(),
+            branch: "45".into(),
+            version: "45".into(),
+            origin: "flathub".into(),
+            summary: None,
+            installed_size_bytes: Some(1_150_000_000),
+        }])),
+    );
+    // System scope falls back to CLI dry-run returning empty ("Nothing unused").
+    rt.push_flatpak_unused(false, NativeOutcome::Unavailable("no sys unused".into()));
+    rt.push_local_step(
+        "flatpak",
+        &["uninstall", "--system", "--unused", "--assumeno"],
+        LocalStep {
+            lines: fixture_to_local_lines(&read_fixture("cleanup/flatpak_unused_empty.txt")),
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+    rt.push_local_step(
+        LINUXBREW_SYSTEM_PATH,
+        &["autoremove", "--dry-run"],
+        LocalStep {
+            lines: fixture_to_local_lines(&read_fixture("cleanup/brew_autoremove_dry_run.txt")),
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+
+    let cfg = SourceConfig::default();
+    let plan = discover_cleanup_with(&rt, &cfg, None).expect("discover cleanup");
+    assert_eq!(plan.len(), 4);
+    assert!(plan.has_flatpak_user());
+    assert!(!plan.has_flatpak_system());
+    assert!(plan.has_homebrew());
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+
+    // Discovery only invoked dry-run probes; never uninstall or autoremove without confirmation.
+    let probe_calls = rt.local_calls();
+    assert!(!probe_calls
+        .iter()
+        .any(|(_, args)| args.contains(&"-y".to_string()) || args == &["autoremove".to_string()]));
+
+    // Now script confirmed execution + post-cleanup empty refresh.
+    rt.push_local_step(
+        "flatpak",
+        &["uninstall", "--user", "--unused", "-y", "--noninteractive"],
+        LocalStep {
+            lines: fixture_to_local_lines(&read_fixture(
+                "cleanup/flatpak_uninstall_unused_log.txt",
+            )),
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+    rt.push_local_step(
+        LINUXBREW_SYSTEM_PATH,
+        &["autoremove"],
+        LocalStep {
+            lines: fixture_to_local_lines(&read_fixture("cleanup/brew_autoremove_log.txt")),
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+    rt.push_flatpak_unused(true, NativeOutcome::Handled(Ok(Vec::new())));
+    rt.push_flatpak_unused(false, NativeOutcome::Handled(Ok(Vec::new())));
+    rt.push_local_step(
+        LINUXBREW_SYSTEM_PATH,
+        &["autoremove", "--dry-run"],
+        LocalStep {
+            lines: fixture_to_local_lines(&read_fixture("cleanup/brew_autoremove_empty.txt")),
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+
+    let (tx, rx) = async_channel::unbounded();
+    let cancel = WorkCancel::new();
+    let outcome = run_cleanup_with(&rt, &plan, &cfg, Some(&cancel), Some(&tx));
+    assert!(!outcome.cancelled);
+    assert!(outcome.failed_steps.is_empty());
+    assert_eq!(outcome.removed_count, 4);
+    assert!(outcome.reclaimed_bytes >= 1_153_000_000);
+    assert!(outcome.remaining_plan.is_empty());
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+
+    let mut streamed = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let WorkerMsg::ConsoleLine { tag, text } = msg {
+            if tag == CleanupSource::FlatpakUser.console_tag()
+                || tag == CleanupSource::Homebrew.console_tag()
+            {
+                streamed.push(text);
+            }
+        }
+    }
+    assert!(streamed.iter().any(|l| l.contains("Uninstall complete")));
+    assert!(streamed.iter().any(|l| l.contains("Uninstalling readline")));
+
+    // Cancelled cleanup stops cleanly before executing commands.
+    let precancelled = WorkCancel::new();
+    precancelled.cancel();
+    let rt_cancel = FakeRuntime::new();
+    let cancel_out = run_cleanup_with(&rt_cancel, &plan, &cfg, Some(&precancelled), None);
+    assert!(cancel_out.cancelled);
+    assert_eq!(cancel_out.remaining_plan.len(), 4);
+    assert!(rt_cancel.local_calls().is_empty());
+}
+
+#[test]
+fn custom_hooks_check_apply_cancel_and_never_touch_privileged_helper() {
+    use fedora_updater::backend::hooks::CustomHook;
+    use fedora_updater::model::UpdateSource;
+    use fedora_updater::orchestrator::{
+        execute_apply_all_with_mode_and_config, execute_check_all_with_config, SourceConfig,
+        WorkCancel,
+    };
+
+    let rt = FakeRuntime::new();
+    // 1) Hook A has check_command (mentions sudo/dnf to prove zero routing to helper!)
+    //    and reports updates on stdout with exit 0.
+    rt.push_local_step(
+        "sh",
+        &["-c", "sudo dnf --version >/dev/null; echo 'ripgrep 14.0 -> 14.1'"],
+        LocalStep {
+            lines: vec!["ripgrep 14.0 -> 14.1".into()],
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+    // 2) Hook B has check_command returning exit 0 with empty output (up to date -> hidden).
+    rt.push_local_step(
+        "sh",
+        &["-c", "nvim --headless +Lazy check"],
+        LocalStep {
+            lines: Vec::new(),
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+
+    let cfg = SourceConfig::from_prefs(
+        [
+            "dnf",
+            "rpm-ostree",
+            "flatpak",
+            "gnome-extensions",
+            "homebrew",
+            "rustup",
+            "mise",
+            "uv",
+            "pipx",
+            "firmware",
+        ]
+        .into_iter()
+        .map(String::from),
+        [],
+    )
+    .with_custom_hooks(vec![
+        CustomHook {
+            name: "Tools & DNF-named hook".into(),
+            check_command: Some(
+                "sudo dnf --version >/dev/null; echo 'ripgrep 14.0 -> 14.1'".into(),
+            ),
+            apply_command: "pkexec /usr/bin/dnf check && cargo install-update -a".into(),
+            enabled: true,
+        },
+        CustomHook {
+            name: "Neovim".into(),
+            check_command: Some("nvim --headless +Lazy check".into()),
+            apply_command: "nvim --headless +Lazy sync +qa".into(),
+            enabled: true,
+        },
+        CustomHook {
+            name: "Sync dotfiles".into(),
+            check_command: None,
+            apply_command: "chezmoi update".into(),
+            enabled: true,
+        },
+        CustomHook {
+            name: "Disabled hook".into(),
+            check_command: None,
+            apply_command: "echo should not run".into(),
+            enabled: false,
+        },
+    ]);
+
+    let mut h_check = FlowHarness::new();
+    h_check.dispatch(Event::StartCheck { then_apply: false });
+    h_check.dispatch(session_started_event(
+        session_started_purpose(&h_check.state.phase).unwrap(),
+    ));
+    let (tx_c, rx_c) = async_channel::unbounded();
+    execute_check_all_with_config(&tx_c, &rt, &WorkCancel::new(), &cfg);
+    drop(tx_c);
+    h_check.drain(&rx_c);
+
+    let pkgs = match &h_check.state.phase {
+        Phase::Ready { packages, .. } => packages.clone(),
+        other => panic!("expected Ready with custom hooks, got {other:?}"),
+    };
+    assert_eq!(pkgs.len(), 2);
+    assert!(pkgs.iter().all(|p| p.source == UpdateSource::CustomHook));
+    let tools_pkg = pkgs
+        .iter()
+        .find(|p| p.name == "Tools & DNF-named hook")
+        .expect("checked hook present")
+        .clone();
+    assert!(tools_pkg
+        .summary
+        .as_deref()
+        .is_some_and(|s| s.contains("ripgrep 14.0 -> 14.1")));
+    let dotfiles_pkg = pkgs
+        .iter()
+        .find(|p| p.name == "Sync dotfiles")
+        .expect("unverified enabled hook present")
+        .clone();
+    assert!(dotfiles_pkg
+        .summary
+        .as_deref()
+        .is_some_and(|s| s.contains("no check command configured")));
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(rt.helper_calls().is_empty());
+
+    // Selective apply of the first hook only, even with `pkexec /usr/bin/dnf` in its string.
+    let first_only = vec![tools_pkg.clone()];
+    rt.push_local_step(
+        "sh",
+        &["-c", "pkexec /usr/bin/dnf check && cargo install-update -a"],
+        LocalStep {
+            lines: vec!["Building 50%".into(), "Updated ripgrep".into()],
+            result: Ok(0),
+            hook_after_line: None,
+        },
+    );
+    let mut h_apply = FlowHarness::ready(first_only.clone());
+    h_apply.dispatch(Event::StartApply);
+    h_apply.dispatch(session_started_event(
+        session_started_purpose(&h_apply.state.phase).unwrap(),
+    ));
+    let (tx_a, rx_a) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_a,
+        first_only,
+        ApplyMode::Live,
+        &rt,
+        &WorkCancel::new(),
+        &cfg,
+    );
+    drop(tx_a);
+    h_apply.drain(&rx_a);
+
+    assert_eq!(rt.ensure_session_calls(), 0);
+    assert!(
+        rt.helper_calls().is_empty(),
+        "custom hooks must NEVER call HelperCommand / pkexec"
+    );
+    assert!(matches!(h_apply.state.phase, Phase::Done { failed: 0, .. }));
+    assert!(rt
+        .local_calls()
+        .iter()
+        .any(|(prog, args)| prog == "sh" && args.get(1).is_some_and(|c| c.contains("cargo install-update -a"))));
+
+    // Mid-apply WorkCancel halts subsequent hooks cleanly (`pkgs` is sorted alphabetically:
+    // "Sync dotfiles" runs first, cancels mid-flight, and "Tools & DNF-named hook" never starts).
+    let cancel = WorkCancel::new();
+    let cancel_hook = cancel.clone();
+    let rt_cancel = FakeRuntime::new();
+    rt_cancel.push_local_step(
+        "sh",
+        &["-c", "chezmoi update"],
+        LocalStep {
+            lines: vec!["Step 1".into()],
+            result: Ok(0),
+            hook_after_line: Some((
+                0,
+                Box::new(move || {
+                    cancel_hook.cancel();
+                }),
+            )),
+        },
+    );
+    let mut h_cancel = FlowHarness::ready(pkgs.clone());
+    h_cancel.dispatch(Event::StartApply);
+    h_cancel.dispatch(session_started_event(
+        session_started_purpose(&h_cancel.state.phase).unwrap(),
+    ));
+    let (tx_k, rx_k) = async_channel::unbounded();
+    execute_apply_all_with_mode_and_config(
+        &tx_k,
+        pkgs,
+        ApplyMode::Live,
+        &rt_cancel,
+        &cancel,
+        &cfg,
+    );
+    drop(tx_k);
+    h_cancel.drain(&rx_k);
+
+    assert_eq!(rt_cancel.local_calls().len(), 1);
+    assert_eq!(rt_cancel.ensure_session_calls(), 0);
+    assert!(rt_cancel.helper_calls().is_empty());
+    assert!(matches!(h_cancel.state.phase, Phase::Running(_)));
+}

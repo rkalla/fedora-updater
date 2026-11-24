@@ -1,0 +1,6 @@
+These runtimes in installation 'user' are no longer used and will be uninstalled:
+        ID                                      Branch     Op     Remote     Download / Size
+ 1.     org.freedesktop.Platform.GL.default     23.08      r      flathub    412.5 MB
+ 2.     runtime/org.gnome.Platform/x86_64/45    45         r      flathub    < 1.2 GB
+
+Proceed with these changes to the user installation? [Y/n]: n

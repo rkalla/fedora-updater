@@ -116,6 +116,7 @@ pub enum UpdateSource {
     Pipx,
     Distrobox,
     Toolbx,
+    CustomHook,
     Firmware,
 }
 
@@ -133,6 +134,7 @@ impl UpdateSource {
         Self::Pipx,
         Self::Distrobox,
         Self::Toolbx,
+        Self::CustomHook,
         Self::Firmware,
     ];
 
@@ -163,7 +165,8 @@ impl UpdateSource {
             | Self::UvTools
             | Self::Pipx
             | Self::Distrobox
-            | Self::Toolbx => SourceCategory::DevAndContainers,
+            | Self::Toolbx
+            | Self::CustomHook => SourceCategory::DevAndContainers,
             Self::Firmware => SourceCategory::Firmware,
         }
     }
@@ -181,6 +184,7 @@ impl UpdateSource {
             Self::Pipx => "pipx",
             Self::Distrobox => "distrobox",
             Self::Toolbx => "toolbx",
+            Self::CustomHook => "custom-hooks",
             Self::Firmware => "firmware",
         }
     }
@@ -198,6 +202,7 @@ impl UpdateSource {
             Self::Pipx => "Python CLI Tools (pipx)",
             Self::Distrobox => "Distrobox Containers",
             Self::Toolbx => "Toolbx Containers",
+            Self::CustomHook => "Custom User Hooks",
             Self::Firmware => "Firmware (fwupd / LVFS)",
         }
     }
@@ -214,7 +219,8 @@ impl UpdateSource {
             | Self::UvTools
             | Self::Pipx
             | Self::Distrobox
-            | Self::Toolbx => false,
+            | Self::Toolbx
+            | Self::CustomHook => false,
         }
     }
 
@@ -234,6 +240,7 @@ impl UpdateSource {
             | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx
+            | Self::CustomHook
             | Self::Firmware => true,
         }
     }
@@ -253,6 +260,7 @@ impl UpdateSource {
             | Self::Pipx
             | Self::Distrobox
             | Self::Toolbx
+            | Self::CustomHook
             | Self::Firmware => true,
         }
     }
@@ -275,6 +283,7 @@ impl UpdateSource {
                     | Self::Pipx
                     | Self::Distrobox
                     | Self::Toolbx
+                    | Self::CustomHook
             )
     }
 
@@ -297,10 +306,12 @@ impl UpdateSource {
     }
 
     /// Deduplicated preference-level sources for the given host OS mode.
+    /// Custom hooks are configured individually in the Preferences "Custom Hooks"
+    /// section rather than via a single host-binary switch.
     pub fn pref_sources_for_host(ostree_booted: bool) -> Vec<UpdateSource> {
         let mut out = Vec::new();
         for &src in Self::ALL {
-            if !src.is_applicable_for_host(ostree_booted) {
+            if !src.is_applicable_for_host(ostree_booted) || src == Self::CustomHook {
                 continue;
             }
             if !out
@@ -331,6 +342,7 @@ impl UpdateSource {
             Self::Pipx => "PIPX",
             Self::Distrobox => "DBOX",
             Self::Toolbx => "TBX",
+            Self::CustomHook => "HOOK",
             Self::Firmware => "FW",
         }
     }
@@ -344,6 +356,7 @@ impl UpdateSource {
             Self::Homebrew => "src-brew",
             Self::Rustup | Self::Mise | Self::UvTools | Self::Pipx => "src-toolchain",
             Self::Distrobox | Self::Toolbx => "src-container",
+            Self::CustomHook => "src-hook",
             Self::Firmware => "src-firmware",
         }
     }
@@ -362,11 +375,12 @@ impl UpdateSource {
             Self::Pipx => "pipx",
             Self::Distrobox => "distrobox",
             Self::Toolbx => "toolbx",
+            Self::CustomHook => "hook",
             Self::Firmware => "fwupd",
         }
     }
 
-    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Toolchains (rustup, mise, uv, pipx) → Containers (Distrobox, Toolbx) → Firmware.
+    /// Apply order: System (DNF / rpm-ostree) → Flatpak user → Flatpak system → GNOME Extensions → Homebrew → Toolchains (rustup, mise, uv, pipx) → Containers (Distrobox, Toolbx) → Custom Hooks → Firmware.
     pub fn apply_order(self) -> u8 {
         match self {
             Self::Dnf | Self::RpmOstree => 0,
@@ -380,7 +394,8 @@ impl UpdateSource {
             Self::Pipx => 8,
             Self::Distrobox => 9,
             Self::Toolbx => 10,
-            Self::Firmware => 11,
+            Self::CustomHook => 11,
+            Self::Firmware => 12,
         }
     }
 }
@@ -958,7 +973,10 @@ impl Package {
         if matches!(self.source, UpdateSource::UvTools | UpdateSource::Pipx) {
             return normalize_python_pkg_name(&self.name) == normalize_python_pkg_name(hint);
         }
-        if matches!(self.source, UpdateSource::Distrobox | UpdateSource::Toolbx) {
+        if matches!(
+            self.source,
+            UpdateSource::Distrobox | UpdateSource::Toolbx | UpdateSource::CustomHook
+        ) {
             return false;
         }
         // Flatpak/fwupd ids: `flatpak:user:app/org.foo/x86_64/stable`, `fwupd:<device>`.
@@ -1653,6 +1671,7 @@ mod tests {
         assert_eq!(UpdateSource::Pipx.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Distrobox.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Toolbx.label(), "Dev & Containers");
+        assert_eq!(UpdateSource::CustomHook.label(), "Dev & Containers");
         assert_eq!(UpdateSource::Firmware.label(), "Firmware");
 
         assert_eq!(UpdateSource::Dnf.badge(), "DNF");
@@ -1666,6 +1685,7 @@ mod tests {
         assert_eq!(UpdateSource::Pipx.badge(), "PIPX");
         assert_eq!(UpdateSource::Distrobox.badge(), "DBOX");
         assert_eq!(UpdateSource::Toolbx.badge(), "TBX");
+        assert_eq!(UpdateSource::CustomHook.badge(), "HOOK");
         assert_eq!(UpdateSource::Firmware.badge(), "FW");
 
         assert_eq!(UpdateSource::Dnf.css_class(), "src-dnf");
@@ -1679,6 +1699,7 @@ mod tests {
         assert_eq!(UpdateSource::Pipx.css_class(), "src-toolchain");
         assert_eq!(UpdateSource::Distrobox.css_class(), "src-container");
         assert_eq!(UpdateSource::Toolbx.css_class(), "src-container");
+        assert_eq!(UpdateSource::CustomHook.css_class(), "src-hook");
         assert_eq!(UpdateSource::Firmware.css_class(), "src-firmware");
 
         assert_eq!(UpdateSource::Dnf.console_tag(), "dnf");
@@ -1692,6 +1713,7 @@ mod tests {
         assert_eq!(UpdateSource::Pipx.console_tag(), "pipx");
         assert_eq!(UpdateSource::Distrobox.console_tag(), "distrobox");
         assert_eq!(UpdateSource::Toolbx.console_tag(), "toolbx");
+        assert_eq!(UpdateSource::CustomHook.console_tag(), "hook");
         assert_eq!(UpdateSource::Firmware.console_tag(), "fwupd");
 
         assert_eq!(UpdateSource::Dnf.to_string(), "System");
@@ -1840,6 +1862,7 @@ mod tests {
                 UpdateSource::Pipx,
                 UpdateSource::Distrobox,
                 UpdateSource::Toolbx,
+                UpdateSource::CustomHook,
                 UpdateSource::Firmware,
             ]
         );
@@ -1879,6 +1902,10 @@ mod tests {
             UpdateSource::Toolbx.category(),
             SourceCategory::DevAndContainers
         );
+        assert_eq!(
+            UpdateSource::CustomHook.category(),
+            SourceCategory::DevAndContainers
+        );
         assert_eq!(UpdateSource::Firmware.category(), SourceCategory::Firmware);
 
         assert_eq!(UpdateSource::Dnf.pref_key(), "dnf");
@@ -1893,6 +1920,7 @@ mod tests {
         assert_eq!(UpdateSource::Pipx.pref_key(), "pipx");
         assert_eq!(UpdateSource::Distrobox.pref_key(), "distrobox");
         assert_eq!(UpdateSource::Toolbx.pref_key(), "toolbx");
+        assert_eq!(UpdateSource::CustomHook.pref_key(), "custom-hooks");
         assert_eq!(UpdateSource::Firmware.pref_key(), "firmware");
 
         assert!(UpdateSource::Dnf.requires_root());
@@ -1907,6 +1935,7 @@ mod tests {
         assert!(!UpdateSource::Pipx.requires_root());
         assert!(!UpdateSource::Distrobox.requires_root());
         assert!(!UpdateSource::Toolbx.requires_root());
+        assert!(!UpdateSource::CustomHook.requires_root());
         assert!(UpdateSource::Firmware.requires_root());
 
         assert!(UpdateSource::Dnf.installed_by_default());
@@ -1923,8 +1952,10 @@ mod tests {
         assert!(!UpdateSource::Pipx.installed_by_default());
         assert!(!UpdateSource::Distrobox.installed_by_default());
         assert!(!UpdateSource::Toolbx.installed_by_default());
+        assert!(!UpdateSource::CustomHook.installed_by_default());
         assert!(UpdateSource::Distrobox.is_opt_in());
         assert!(UpdateSource::Toolbx.is_opt_in());
+        assert!(!UpdateSource::CustomHook.is_opt_in());
         assert!(!UpdateSource::Homebrew.is_opt_in());
         assert!(!UpdateSource::Rustup.is_opt_in());
         assert!(!UpdateSource::Mise.is_opt_in());

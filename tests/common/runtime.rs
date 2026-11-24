@@ -12,7 +12,7 @@ use fedora_updater::backend::dnf_dbus::{
     upgrade_specs_from_packages, DnfApplyOutcome, DnfHistoryTransaction, ThroughputSample,
 };
 use fedora_updater::backend::flatpak::{
-    packages_from_flatpak_updates, FlatpakApplyOutcome, FlatpakCheck,
+    packages_from_flatpak_updates, FlatpakApplyOutcome, FlatpakCheck, FlatpakListedRef,
 };
 use fedora_updater::backend::fwupd_dbus::{FwupdApplyOutcome, FwupdHistoryEntry};
 use fedora_updater::backend::gnome_extensions::{
@@ -170,6 +170,9 @@ struct FakeState {
     local_steps: VecDeque<LocalMatcher>,
     flatpak_user_steps: VecDeque<Result<FlatpakCheck, String>>,
     flatpak_system_steps: VecDeque<Result<FlatpakCheck, String>>,
+    flatpak_unused_user_steps: VecDeque<NativeOutcome<Vec<FlatpakListedRef>>>,
+    flatpak_unused_system_steps: VecDeque<NativeOutcome<Vec<FlatpakListedRef>>>,
+    has_flatpak_cli: bool,
     flatpak_native_apply_steps: VecDeque<FlatpakNativeApplyStep>,
     dnf_dbus_check_steps: VecDeque<NativeOutcome<Vec<Package>>>,
     dnf_dbus_apply_steps: VecDeque<DnfDbusApplyStep>,
@@ -235,6 +238,9 @@ impl FakeRuntime {
                 local_steps: VecDeque::new(),
                 flatpak_user_steps: VecDeque::new(),
                 flatpak_system_steps: VecDeque::new(),
+                flatpak_unused_user_steps: VecDeque::new(),
+                flatpak_unused_system_steps: VecDeque::new(),
+                has_flatpak_cli: false,
                 flatpak_native_apply_steps: VecDeque::new(),
                 dnf_dbus_check_steps: VecDeque::new(),
                 dnf_dbus_apply_steps: VecDeque::new(),
@@ -388,6 +394,19 @@ impl FakeRuntime {
                 warning: None,
             }),
         );
+    }
+
+    pub fn push_flatpak_unused(&self, user: bool, result: NativeOutcome<Vec<FlatpakListedRef>>) {
+        let mut s = self.inner.lock().unwrap();
+        if user {
+            s.flatpak_unused_user_steps.push_back(result);
+        } else {
+            s.flatpak_unused_system_steps.push_back(result);
+        }
+    }
+
+    pub fn set_flatpak_cli_available(&self, available: bool) {
+        self.inner.lock().unwrap().has_flatpak_cli = available;
     }
 
     pub fn ensure_session_calls(&self) -> usize {
@@ -800,6 +819,22 @@ impl OrchestratorRuntime for FakeRuntime {
         res.unwrap_or_else(|| {
             panic!("FakeRuntime: unscripted flatpak query user={user}")
         })
+    }
+
+    fn query_flatpak_unused(&self, user: bool) -> NativeOutcome<Vec<FlatpakListedRef>> {
+        let mut s = self.inner.lock().unwrap();
+        let queue = if user {
+            &mut s.flatpak_unused_user_steps
+        } else {
+            &mut s.flatpak_unused_system_steps
+        };
+        queue
+            .pop_front()
+            .unwrap_or_else(|| NativeOutcome::Unavailable("libflatpak unused not scripted".into()))
+    }
+
+    fn has_flatpak_cli(&self) -> bool {
+        self.inner.lock().unwrap().has_flatpak_cli
     }
 
     fn apply_flatpak_native(

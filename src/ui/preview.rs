@@ -5,7 +5,9 @@ use gtk::gdk::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
 
+use fedora_updater::backend::cleanup::{CleanupItem, CleanupPlan, CleanupSource};
 use fedora_updater::backend::dnf_dbus::{HistoryEntry, HistoryPackageChange, HistorySource};
+use fedora_updater::backend::hooks::CustomHook;
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
     parse_size_bytes, AdvisoryKind, ApplyMode, AuthPurpose, DetailView, IdleScreen, Package,
@@ -23,6 +25,8 @@ pub struct PreviewConfig {
     pub ostree_booted: bool,
     pub sample_history: Vec<HistoryEntry>,
     pub sample_throughput: Vec<(f64, u64, u64)>,
+    pub sample_cleanup: Option<CleanupPlan>,
+    pub sample_custom_hooks: Vec<CustomHook>,
 }
 
 pub fn initial_config() -> Option<PreviewConfig> {
@@ -103,6 +107,8 @@ pub fn config_for(phase: &str) -> PreviewConfig {
     let mut ostree_booted = false;
     let mut sample_history = Vec::new();
     let mut sample_throughput = Vec::new();
+    let mut sample_cleanup = None;
+    let mut sample_custom_hooks = Vec::new();
 
     state.phase = match phase {
         "idle" => Phase::Idle(IdleScreen::Fresh),
@@ -341,6 +347,38 @@ pub fn config_for(phase: &str) -> PreviewConfig {
             packages: sample_toolchain_packages(),
             soft_errors: vec![],
         },
+        "idle-cleanup" => {
+            sample_cleanup = Some(sample_cleanup_plan());
+            Phase::Idle(IdleScreen::Current {
+                checked_at: "just now".into(),
+                detail: None,
+            })
+        }
+        "done-cleanup" => {
+            sample_cleanup = Some(sample_cleanup_plan());
+            Phase::Done {
+                packages: sample_packages(false)
+                    .into_iter()
+                    .filter(|p| p.name != "kernel" && p.source != UpdateSource::Firmware)
+                    .map(|mut p| {
+                        p.status = PackageStatus::Completed;
+                        p
+                    })
+                    .collect(),
+                duration: "2m 14s".into(),
+                needs_reboot: false,
+                failed: 0,
+                failure_reasons: vec![],
+            }
+        }
+        "ready-hooks" => {
+            let (hooks, pkgs) = sample_custom_hooks_and_packages();
+            sample_custom_hooks = hooks;
+            Phase::Ready {
+                packages: pkgs,
+                soft_errors: vec![],
+            }
+        }
         other => {
             eprintln!("unknown FEDORA_UPDATER_PREVIEW={other}, using idle");
             Phase::Idle(IdleScreen::Fresh)
@@ -356,6 +394,8 @@ pub fn config_for(phase: &str) -> PreviewConfig {
         ostree_booted,
         sample_history,
         sample_throughput,
+        sample_cleanup,
+        sample_custom_hooks,
     }
 }
 
@@ -427,13 +467,83 @@ fn pkg(
         UpdateSource::Distrobox | UpdateSource::Toolbx => {
             Package::new_container(source, "c0ffee123456", name, old, version, None)
         }
+        UpdateSource::CustomHook => fedora_updater::backend::hooks::package_from_unverified_hook(
+            "hook:0:preview",
+            &CustomHook {
+                name: name.to_string(),
+                check_command: None,
+                apply_command: format!("echo {name}"),
+                enabled: true,
+            },
+        ),
     };
-    if !matches!(source, UpdateSource::Distrobox | UpdateSource::Toolbx) {
+    if !matches!(
+        source,
+        UpdateSource::Distrobox | UpdateSource::Toolbx | UpdateSource::CustomHook
+    ) {
         p.old_version = Some(old.into());
     }
     p.size_bytes = parse_size_bytes(size);
     p.status = status;
     p
+}
+
+fn sample_cleanup_plan() -> CleanupPlan {
+    let mut plan = CleanupPlan {
+        items: vec![
+            CleanupItem {
+                source: CleanupSource::FlatpakUser,
+                id: "runtime/org.gnome.Platform/x86_64/45".into(),
+                name: "GNOME Application Platform (45)".into(),
+                size_bytes: Some(1_150_000_000),
+                user_scope: true,
+            },
+            CleanupItem {
+                source: CleanupSource::FlatpakUser,
+                id: "runtime/org.freedesktop.Platform.GL.default/x86_64/23.08".into(),
+                name: "Mesa (23.08)".into(),
+                size_bytes: Some(460_000_000),
+                user_scope: true,
+            },
+            CleanupItem {
+                source: CleanupSource::Homebrew,
+                id: "gdbm".into(),
+                name: "gdbm".into(),
+                size_bytes: Some(3_400_000),
+                user_scope: true,
+            },
+        ],
+        warnings: Vec::new(),
+    };
+    plan.normalize();
+    plan
+}
+
+fn sample_custom_hooks_and_packages() -> (Vec<CustomHook>, Vec<Package>) {
+    use fedora_updater::backend::hooks::{
+        interpret_check_result, package_from_checked_hook, package_from_unverified_hook,
+    };
+    let hooks = vec![
+        CustomHook {
+            name: "Cargo tools".into(),
+            check_command: Some("cargo install-update --list".into()),
+            apply_command: "cargo install-update -a".into(),
+            enabled: true,
+        },
+        CustomHook {
+            name: "Dotfiles sync".into(),
+            check_command: None,
+            apply_command: "chezmoi update".into(),
+            enabled: true,
+        },
+    ];
+    let check_res = interpret_check_result(0, "bat 0.24.0 -> 0.25.0");
+    let mut pkgs = Vec::new();
+    if let Some(checked) = package_from_checked_hook("hook:0:cargo-tools", &hooks[0], &check_res) {
+        pkgs.push(checked);
+    }
+    pkgs.push(package_from_unverified_hook("hook:1:dotfiles-sync", &hooks[1]));
+    (hooks, pkgs)
 }
 
 fn sample_toolchain_packages() -> Vec<Package> {
@@ -998,6 +1108,18 @@ mod tests {
                     && packages.iter().any(|p| p.source == UpdateSource::Mise)
                     && packages.iter().any(|p| p.source == UpdateSource::UvTools)
                     && packages.iter().any(|p| p.source == UpdateSource::Pipx)
+        ));
+        let idle_cleanup = super::config_for("idle-cleanup");
+        assert_eq!(idle_cleanup.sample_cleanup.as_ref().map(|p| p.len()), Some(3));
+        let done_cleanup = super::config_for("done-cleanup");
+        assert_eq!(done_cleanup.sample_cleanup.as_ref().map(|p| p.len()), Some(3));
+        let ready_hooks = super::config_for("ready-hooks");
+        assert_eq!(ready_hooks.sample_custom_hooks.len(), 2);
+        assert!(matches!(
+            &ready_hooks.state.phase,
+            Phase::Ready { packages, .. }
+                if packages.len() == 2
+                    && packages.iter().all(|p| p.source == UpdateSource::CustomHook)
         ));
 
         if std::env::var_os("FEDORA_UPDATER_PREVIEW").is_none() {

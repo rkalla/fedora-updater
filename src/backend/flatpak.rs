@@ -226,6 +226,46 @@ pub fn query_updates(user: bool) -> Result<FlatpakCheck, String> {
     })
 }
 
+/// List unused installed Flatpak refs (runtimes/extensions) via `libflatpak.so.0`.
+///
+/// Returns `NativeOutcome::Unavailable` whenever `libflatpak.so.0` or
+/// `flatpak_installation_list_unused_refs` is missing so callers can fall
+/// back cleanly without failing discovery.
+pub fn query_unused_refs(user: bool) -> NativeOutcome<Vec<FlatpakListedRef>> {
+    let api = match flatpak_api() {
+        Ok(api) => api,
+        Err(reason) => return NativeOutcome::Unavailable(reason),
+    };
+    let Some(list_unused) = api.list_unused else {
+        return NativeOutcome::Unavailable(
+            "libflatpak is missing flatpak_installation_list_unused_refs".into(),
+        );
+    };
+
+    unsafe {
+        let mut error: *mut glib::ffi::GError = std::ptr::null_mut();
+        let inst_ptr = if user {
+            (api.new_user)(std::ptr::null_mut(), &mut error)
+        } else {
+            (api.new_system)(std::ptr::null_mut(), &mut error)
+        };
+        let Some(installation) = OwnedGObj::from_raw(inst_ptr) else {
+            return NativeOutcome::Unavailable(take_error(error));
+        };
+
+        let listed_ptr = list_unused(
+            installation.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut error,
+        );
+        let Some(listed) = OwnedGPtrArray::from_raw(listed_ptr) else {
+            return NativeOutcome::Handled(Err(take_error(error)));
+        };
+        NativeOutcome::Handled(Ok(listed_refs_from_array(api, listed.as_ptr())))
+    }
+}
+
 type RawQueryResult = (
     Vec<FlatpakListedRef>,
     Vec<FlatpakResolvedOp>,
@@ -583,6 +623,14 @@ struct FlatpakApi {
         Cancel,
         ErrSlot,
     ) -> *mut glib::ffi::GPtrArray,
+    list_unused: Option<
+        unsafe extern "C" fn(
+            *mut FlatpakInstallation,
+            *const c_char,
+            Cancel,
+            ErrSlot,
+        ) -> *mut glib::ffi::GPtrArray,
+    >,
     format_ref: unsafe extern "C" fn(*mut FlatpakRef) -> *mut c_char,
     get_arch: unsafe extern "C" fn(*mut FlatpakRef) -> *const c_char,
     get_branch: unsafe extern "C" fn(*mut FlatpakRef) -> *const c_char,
@@ -634,6 +682,7 @@ unsafe fn load_flatpak_api() -> Result<FlatpakApi, String> {
             handle,
             c"flatpak_installation_list_installed_refs_for_update",
         )?,
+        list_unused: load_opt_fn(handle, c"flatpak_installation_list_unused_refs"),
         format_ref: load_fn(handle, c"flatpak_ref_format_ref")?,
         get_arch: load_fn(handle, c"flatpak_ref_get_arch")?,
         get_branch: load_fn(handle, c"flatpak_ref_get_branch")?,

@@ -193,6 +193,20 @@ Adw.ApplicationWindow window {
                         margin-start: 12;
                         margin-end: 12;
 
+                        child: Gtk.Box idle_cleanup_slot {
+                          orientation: vertical;
+                          visible: false;
+                          margin-top: 4;
+                          margin-bottom: 12;
+                        };
+                      }
+
+                      Adw.Clamp {
+                        maximum-size: 680;
+                        tightening-threshold: 500;
+                        margin-start: 12;
+                        margin-end: 12;
+
                         child: Gtk.Box idle_upgrade_slot {
                           orientation: vertical;
                           visible: false;
@@ -953,6 +967,20 @@ Adw.ApplicationWindow window {
                           child: Adw.ClampScrollable done_list_clamp {
                             maximum-size: 704;
                             tightening-threshold: 500;
+                          };
+                        }
+
+                        Adw.Clamp {
+                          maximum-size: 680;
+                          tightening-threshold: 500;
+                          margin-start: 12;
+                          margin-end: 12;
+
+                          child: Gtk.Box done_cleanup_slot {
+                            orientation: vertical;
+                            visible: false;
+                            margin-top: 4;
+                            margin-bottom: 10;
                           };
                         }
 

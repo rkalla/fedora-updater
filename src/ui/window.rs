@@ -17,18 +17,21 @@ use libadwaita::{
     ToolbarStyle, ToolbarView, WindowTitle,
 };
 
+use fedora_updater::backend::cleanup::{CleanupPlan, CleanupSource};
+use fedora_updater::backend::hooks::CustomHook;
 use fedora_updater::backend::{dnf, dnf_dbus, fwupd_dbus, gnome_extensions, rpm_ostree};
 use fedora_updater::console::ConsoleBuffer;
 use fedora_updater::model::{
-    ApplyMode, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus, RetryAction, RunPass,
-    SourceCategory, UpdateSource,
+    format_bytes, ApplyMode, AuthPurpose, DetailView, IdleScreen, Package, PackageStatus,
+    RetryAction, RunPass, SourceCategory, UpdateSource,
 };
 use fedora_updater::orchestrator::{
     apply_skips_helper_auth_ui, cancel_background_work, check_requires_helper_auth,
-    default_source_availability, default_source_availability_for_host, load_history_system,
-    probe_source_availability_for_host, release_privileges, run_apply_all_with_mode_and_config,
-    run_check_with_config, run_systemctl_reboot, session_started_event, SourceAvailability,
-    WorkerMsg,
+    default_source_availability, default_source_availability_for_host, discover_cleanup,
+    load_history_system, probe_source_availability_for_host, release_privileges,
+    run_apply_all_with_mode_and_config, run_check_with_config, run_cleanup,
+    run_systemctl_reboot, session_started_event, CleanupRunOutcome, SourceAvailability,
+    WorkCancel, WorkerMsg,
 };
 use fedora_updater::presenter::{
     about_time_left, activity_log_subtitle, apply_cta_label, cache_activity_note,
@@ -57,6 +60,117 @@ enum ApplyMenuKind {
     Standard,
     MixedWithOstree,
     OstreeOnly,
+}
+
+#[derive(Clone)]
+struct CleanupCard {
+    root: gtk::Box,
+    title: Label,
+    subtitle: Label,
+    action: Button,
+}
+
+impl CleanupCard {
+    fn new_inline() -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.add_css_class("card");
+        root.set_visible(false);
+
+        let inner = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        inner.set_margin_top(12);
+        inner.set_margin_bottom(12);
+        inner.set_margin_start(16);
+        inner.set_margin_end(16);
+
+        let icon = gtk::Image::from_icon_name("user-trash-symbolic");
+        icon.set_valign(gtk::Align::Center);
+        icon.add_css_class("dimmed");
+
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        copy.set_hexpand(true);
+        copy.set_valign(gtk::Align::Center);
+
+        let title = Label::builder()
+            .label("")
+            .xalign(0.0)
+            .halign(gtk::Align::Start)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build();
+
+        let subtitle = Label::builder()
+            .label("")
+            .xalign(0.0)
+            .halign(gtk::Align::Start)
+            .wrap(true)
+            .css_classes(["dimmed", "caption"])
+            .build();
+
+        copy.append(&title);
+        copy.append(&subtitle);
+
+        let action = Button::builder()
+            .label("Review & Clean…")
+            .valign(gtk::Align::Center)
+            .build();
+
+        inner.append(&icon);
+        inner.append(&copy);
+        inner.append(&action);
+        root.append(&inner);
+
+        Self {
+            root,
+            title,
+            subtitle,
+            action,
+        }
+    }
+
+    fn root(&self) -> &gtk::Box {
+        &self.root
+    }
+
+    fn action(&self) -> &Button {
+        &self.action
+    }
+
+    fn paint(&self, plan: Option<&CleanupPlan>, running: bool, show_on_page: bool) {
+        if !show_on_page {
+            self.root.set_visible(false);
+            return;
+        }
+        if running {
+            self.title.set_text("Removing unused items…");
+            self.subtitle
+                .set_text("Running local cleanup; live output streams in the Activity Log.");
+            self.action.set_label("Cleaning…");
+            self.action.set_sensitive(false);
+            self.root.set_visible(true);
+            return;
+        }
+        let Some(plan) = plan.filter(|p| !p.is_empty()) else {
+            self.root.set_visible(false);
+            return;
+        };
+
+        let mut sources = Vec::new();
+        for src in [
+            CleanupSource::FlatpakUser,
+            CleanupSource::FlatpakSystem,
+            CleanupSource::Homebrew,
+        ] {
+            if plan.items.iter().any(|item| item.source == src) {
+                sources.push(src.label());
+            }
+        }
+        self.title.set_text(&plan.summary_banner_title());
+        self.subtitle
+            .set_text(&format!("{} · Requires confirmation before removing", sources.join(", ")));
+        self.action.set_label("Review & Clean…");
+        self.action.set_sensitive(true);
+        self.root.set_visible(true);
+    }
 }
 
 fn append_apply_mode_item(section: &gio::Menu, label: &str, target: &str) {
@@ -126,6 +240,13 @@ struct Widgets {
     sidebar_toggle: ToggleButton,
     sidebar_close_btn: Button,
     sidebar: sidebar::Sidebar,
+    idle_cleanup_slot: gtk::Box,
+    done_cleanup_slot: gtk::Box,
+    idle_cleanup: CleanupCard,
+    done_cleanup: CleanupCard,
+    cleanup_plan: RefCell<Option<CleanupPlan>>,
+    cleanup_running: Cell<bool>,
+    cleanup_cancel: RefCell<Option<WorkCancel>>,
     idle_upgrade_slot: gtk::Box,
     ready_upgrade_slot: gtk::Box,
     done_upgrade_slot: gtk::Box,
@@ -261,6 +382,14 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
     let done_list_clamp: libadwaita::ClampScrollable = obj(builder, "done_list_clamp");
     done_list_clamp.set_child(Some(done_queue.list_view()));
 
+    let idle_cleanup_slot: gtk::Box = obj(builder, "idle_cleanup_slot");
+    let idle_cleanup = CleanupCard::new_inline();
+    idle_cleanup_slot.append(idle_cleanup.root());
+
+    let done_cleanup_slot: gtk::Box = obj(builder, "done_cleanup_slot");
+    let done_cleanup = CleanupCard::new_inline();
+    done_cleanup_slot.append(done_cleanup.root());
+
     let idle_upgrade_slot: gtk::Box = obj(builder, "idle_upgrade_slot");
     let idle_upgrade = sidebar::UpgradeCard::new_inline();
     idle_upgrade_slot.append(idle_upgrade.root());
@@ -328,6 +457,13 @@ fn widgets_from_builder(builder: &Builder, window: ApplicationWindow) -> Rc<Widg
         sidebar_toggle,
         sidebar_close_btn,
         sidebar,
+        idle_cleanup_slot,
+        done_cleanup_slot,
+        idle_cleanup,
+        done_cleanup,
+        cleanup_plan: RefCell::new(None),
+        cleanup_running: Cell::new(false),
+        cleanup_cancel: RefCell::new(None),
         idle_upgrade_slot,
         ready_upgrade_slot,
         done_upgrade_slot,
@@ -563,7 +699,8 @@ fn can_selective_apply(packages: &[Package], native_dnf: bool, native_fwupd: boo
             | UpdateSource::UvTools
             | UpdateSource::Pipx
             | UpdateSource::Distrobox
-            | UpdateSource::Toolbx => pkg.source.supports_selective_apply(),
+            | UpdateSource::Toolbx
+            | UpdateSource::CustomHook => pkg.source.supports_selective_apply(),
         })
 }
 
@@ -608,6 +745,26 @@ fn apply_source_preference_change(
     w.prefs
         .borrow_mut()
         .set_source_enabled(pref_key, enabled);
+    if let Some(source) = w.prefs_save_source.borrow_mut().take() {
+        source.remove();
+    }
+    if w.persist_prefs.get() {
+        let latest = capture_window_prefs(w);
+        let _ = prefs::save(&latest);
+    }
+    sync_sidebar_categories(w, &state.borrow());
+}
+
+fn apply_custom_hooks_preference_change(
+    w: &Rc<Widgets>,
+    state: &Rc<RefCell<AppState>>,
+    hooks: &[CustomHook],
+) {
+    w.prefs.borrow_mut().custom_hooks = hooks
+        .iter()
+        .map(CustomHook::normalized)
+        .filter(CustomHook::is_valid)
+        .collect();
     if let Some(source) = w.prefs_save_source.borrow_mut().take() {
         source.remove();
     }
@@ -668,6 +825,10 @@ fn apply_preview_config(cfg: &preview::PreviewConfig, w: &Widgets) {
         w.run_completed.set_expanded(true);
         w.ignore_expand.set(false);
     }
+    if !cfg.sample_custom_hooks.is_empty() {
+        w.prefs.borrow_mut().custom_hooks = cfg.sample_custom_hooks.clone();
+    }
+    *w.cleanup_plan.borrow_mut() = cfg.sample_cleanup.clone();
 }
 
 pub fn build(app: &Application) {
@@ -788,6 +949,7 @@ pub fn build(app: &Application) {
         });
     }
     wire_upgrade_buttons(&widgets, &state);
+    wire_cleanup_buttons(&widgets, &state, &tx);
     {
         let state = state.clone();
         let console = console.clone();
@@ -959,6 +1121,7 @@ pub fn build(app: &Application) {
         let widgets = widgets.clone();
         window.connect_close_request(move |_| {
             flush_prefs_on_close(&widgets);
+            cancel_cleanup_work(&widgets);
             cancel_background_work();
             release_privileges();
             glib::Propagation::Proceed
@@ -980,6 +1143,7 @@ pub fn build(app: &Application) {
     if !is_preview {
         spawn_release_lookup(&state, &console, &widgets);
         spawn_native_capability_probe(&state, &console, &widgets);
+        spawn_cleanup_discovery(&state, &widgets);
     }
     {
         let hooked = widgets.clone();
@@ -1438,12 +1602,17 @@ fn register_view_actions(
             let availability = widgets.source_availability.borrow().clone();
             let widgets_cb = widgets.clone();
             let state_cb = state.clone();
+            let widgets_hooks = widgets.clone();
+            let state_hooks = state.clone();
             preferences::present_preferences_dialog(
                 &widgets.window,
                 &current_prefs,
                 &availability,
                 move |key, enabled| {
                     apply_source_preference_change(&widgets_cb, &state_cb, key, enabled);
+                },
+                move |hooks| {
+                    apply_custom_hooks_preference_change(&widgets_hooks, &state_hooks, hooks);
                 },
             );
         });
@@ -1639,10 +1808,48 @@ fn wire_upgrade_buttons(widgets: &Rc<Widgets>, state: &Rc<RefCell<AppState>>) {
     }
 }
 
+fn wire_cleanup_buttons(
+    widgets: &Rc<Widgets>,
+    state: &Rc<RefCell<AppState>>,
+    tx: &async_channel::Sender<WorkerMsg>,
+) {
+    for card in [&widgets.idle_cleanup, &widgets.done_cleanup] {
+        let widgets = widgets.clone();
+        let state = state.clone();
+        let tx = tx.clone();
+        card.action().connect_clicked(move |_| {
+            if widgets.cleanup_running.get() {
+                return;
+            }
+            let Some(plan) = widgets
+                .cleanup_plan
+                .borrow()
+                .clone()
+                .filter(|p| !p.is_empty())
+            else {
+                return;
+            };
+            let widgets_confirm = widgets.clone();
+            let state_confirm = state.clone();
+            let tx_confirm = tx.clone();
+            let plan_for_cb = plan.clone();
+            dialogs::present_cleanup_confirm_dialog(&widgets.window, &plan, move || {
+                spawn_cleanup_run(
+                    &widgets_confirm,
+                    &state_confirm,
+                    plan_for_cb.clone(),
+                    tx_confirm.clone(),
+                );
+            });
+        });
+    }
+}
+
 fn prepare_for_operation(
     console: &Rc<RefCell<ConsoleBuffer>>,
     widgets: &Widgets,
 ) {
+    cancel_cleanup_work(widgets);
     *widgets.reboot_blocker_detail.borrow_mut() = None;
     close_inspector(widgets);
     reset_filters(widgets, 0);
@@ -1918,6 +2125,10 @@ fn handle_worker(
     tx: &async_channel::Sender<WorkerMsg>,
     msg: WorkerMsg,
 ) {
+    let check_or_apply_done = matches!(
+        &msg,
+        WorkerMsg::Event(Event::CheckComplete { .. } | Event::ApplyComplete { .. })
+    );
     handle_worker_with_reboot(
         state,
         console,
@@ -1933,6 +2144,14 @@ fn handle_worker(
             run_systemctl_reboot(tx.clone());
         },
     );
+    if check_or_apply_done
+        && matches!(
+            state.borrow().phase,
+            Phase::Idle(IdleScreen::Current { .. }) | Phase::Done { .. }
+        )
+    {
+        spawn_cleanup_discovery(state, widgets);
+    }
 }
 
 #[cfg(test)]
@@ -2572,6 +2791,114 @@ fn paint_release_upgrade(w: &Widgets, version: Option<u32>, days: Option<u32>) {
     sync_release_upgrade_cards(w);
 }
 
+fn sync_cleanup_cards(w: &Widgets, state: &AppState) {
+    let plan = w.cleanup_plan.borrow();
+    let running = w.cleanup_running.get();
+    let on_idle_current = matches!(state.phase, Phase::Idle(IdleScreen::Current { .. }));
+    let on_done = matches!(state.phase, Phase::Done { .. });
+
+    w.idle_cleanup.paint(plan.as_ref(), running, on_idle_current);
+    w.idle_cleanup_slot
+        .set_visible(w.idle_cleanup.root().get_visible());
+
+    w.done_cleanup.paint(plan.as_ref(), running, on_done);
+    w.done_cleanup_slot
+        .set_visible(w.done_cleanup.root().get_visible());
+}
+
+fn cancel_cleanup_work(w: &Widgets) {
+    if let Some(token) = w.cleanup_cancel.borrow_mut().take() {
+        token.cancel();
+    }
+}
+
+fn spawn_cleanup_discovery(state: &Rc<RefCell<AppState>>, widgets: &Rc<Widgets>) {
+    if widgets.cleanup_running.get() {
+        return;
+    }
+    cancel_cleanup_work(widgets);
+    let cancel = WorkCancel::new();
+    *widgets.cleanup_cancel.borrow_mut() = Some(cancel.clone());
+    let config = widgets.prefs.borrow().source_config();
+    let (tx, rx) = async_channel::bounded::<Result<CleanupPlan, String>>(1);
+    let cancel_bg = cancel.clone();
+    std::thread::spawn(move || {
+        let res = discover_cleanup(&config, Some(&cancel_bg));
+        let _ = tx.send_blocking(res);
+    });
+    let state = state.clone();
+    let widgets = widgets.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(res) = rx.recv().await {
+            if !cancel.is_cancelled() {
+                if let Ok(plan) = res {
+                    *widgets.cleanup_plan.borrow_mut() = Some(plan);
+                }
+                *widgets.cleanup_cancel.borrow_mut() = None;
+            }
+            sync_cleanup_cards(&widgets, &state.borrow());
+        }
+    });
+}
+
+fn spawn_cleanup_run(
+    widgets: &Rc<Widgets>,
+    state: &Rc<RefCell<AppState>>,
+    plan: CleanupPlan,
+    worker_tx: async_channel::Sender<WorkerMsg>,
+) {
+    cancel_cleanup_work(widgets);
+    let cancel = WorkCancel::new();
+    *widgets.cleanup_cancel.borrow_mut() = Some(cancel.clone());
+    widgets.cleanup_running.set(true);
+    sync_cleanup_cards(widgets, &state.borrow());
+
+    let config = widgets.prefs.borrow().source_config();
+    let (tx, rx) = async_channel::bounded::<CleanupRunOutcome>(1);
+    let cancel_bg = cancel.clone();
+    std::thread::spawn(move || {
+        let outcome = run_cleanup(&plan, &config, Some(&cancel_bg), Some(&worker_tx));
+        let _ = tx.send_blocking(outcome);
+    });
+
+    let widgets = widgets.clone();
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(outcome) = rx.recv().await {
+            widgets.cleanup_running.set(false);
+            *widgets.cleanup_cancel.borrow_mut() = None;
+            if !outcome.cancelled && !cancel.is_cancelled() {
+                *widgets.cleanup_plan.borrow_mut() = Some(outcome.remaining_plan.clone());
+                let msg = if !outcome.failed_steps.is_empty() {
+                    format!(
+                        "Cleanup finished with warnings: {}",
+                        outcome.failed_steps.join("; ")
+                    )
+                } else if outcome.removed_count > 0 {
+                    let noun = if outcome.removed_count == 1 {
+                        "item"
+                    } else {
+                        "items"
+                    };
+                    if outcome.reclaimed_bytes > 0 {
+                        format!(
+                            "Cleaned up {} unused {noun} ({} reclaimed)",
+                            outcome.removed_count,
+                            format_bytes(outcome.reclaimed_bytes)
+                        )
+                    } else {
+                        format!("Cleaned up {} unused {noun}", outcome.removed_count)
+                    }
+                } else {
+                    "Unused cleanup finished".to_string()
+                };
+                widgets.toast.add_toast(Toast::new(&msg));
+            }
+            sync_cleanup_cards(&widgets, &state.borrow());
+        }
+    });
+}
+
 fn toolbar_styles_for_phase(phase: &Phase) -> (ToolbarStyle, ToolbarStyle) {
     match phase {
         Phase::Idle(_) | Phase::Authenticating { .. } | Phase::Failed { .. } => {
@@ -2625,6 +2952,7 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
     w.inline_upgrade_slot
         .set(sidebar::release_upgrade_inline_slot(&state.phase));
     paint_release_upgrade(w, state.release_upgrade, state.release_age_days);
+    sync_cleanup_cards(w, state);
     w.sidebar.paint(state);
     sync_console_drawer(
         w,
@@ -2710,7 +3038,8 @@ fn render(state: &AppState, console: &ConsoleBuffer, w: &Widgets) {
                 .enabled_sources_for_host(ostree)
                 .into_iter()
                 .filter(|src| {
-                    src.installed_by_default_for_host(ostree)
+                    *src == UpdateSource::CustomHook
+                        || src.installed_by_default_for_host(ostree)
                         || availability
                             .get(src.pref_key())
                             .is_some_and(|info| info.installed)
@@ -3159,6 +3488,7 @@ mod tests {
             (UpdateSource::Pipx, "PIPX", "src-toolchain"),
             (UpdateSource::Distrobox, "DBOX", "src-container"),
             (UpdateSource::Toolbx, "TBX", "src-container"),
+            (UpdateSource::CustomHook, "HOOK", "src-hook"),
             (UpdateSource::Firmware, "FW", "src-firmware"),
         ] {
             let lbl = rows::source_badge(source);
@@ -5407,6 +5737,7 @@ mod tests {
                     super::prefs::save_to(&prefs_path, &widgets_cb.prefs.borrow())
                         .expect("save prefs to temp ui.json");
                 },
+                |_| {},
             )
         };
 
@@ -5629,7 +5960,7 @@ mod tests {
         let ostree_avail = default_source_availability_for_host(true);
         let prefs = super::prefs::UiPrefs::default();
         let pref_handle =
-            super::preferences::build_preferences_dialog(&prefs, &ostree_avail, |_, _| {});
+            super::preferences::build_preferences_dialog(&prefs, &ostree_avail, |_, _| {}, |_| {});
         assert_eq!(pref_handle.switches.len(), 11);
         assert!(pref_handle.switches.contains_key("rpm-ostree"));
         assert!(!pref_handle.switches.contains_key("dnf"));
@@ -5762,5 +6093,142 @@ mod tests {
         verify_phase2_native_controls_and_history();
         verify_preferences_dialog_and_dynamic_sidebar();
         verify_ostree_ui_adaptation();
+        verify_cleanup_and_custom_hooks_ui();
+    }
+
+    fn collect_widget_labels(root: &gtk::Widget, out: &mut Vec<String>) {
+        use gtk::prelude::*;
+
+        if let Ok(lbl) = root.clone().downcast::<gtk::Label>() {
+            let txt = lbl.text().to_string();
+            if !txt.is_empty() {
+                out.push(txt);
+            }
+        }
+        let mut child = root.first_child();
+        while let Some(c) = child {
+            collect_widget_labels(&c, out);
+            child = c.next_sibling();
+        }
+    }
+
+    fn verify_cleanup_and_custom_hooks_ui() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use fedora_updater::backend::cleanup::{CleanupItem, CleanupPlan, CleanupSource};
+        use fedora_updater::backend::hooks::CustomHook;
+        use fedora_updater::console::ConsoleBuffer;
+        use fedora_updater::orchestrator::default_source_availability;
+        use gtk::prelude::*;
+        use libadwaita::prelude::*;
+
+        // 1) Cleanup banner shows on Idle::Current and Done when reclaimable items exist.
+        let widgets = super::Widgets::for_test();
+        let idle_cfg = super::super::preview::config_for("idle-cleanup");
+        super::apply_preview_config(&idle_cfg, &widgets);
+        super::render(&idle_cfg.state, &ConsoleBuffer::new(16), &widgets);
+        assert!(widgets.idle_cleanup_slot.get_visible());
+        assert!(widgets.idle_cleanup.root().get_visible());
+        assert!(!widgets.done_cleanup_slot.get_visible());
+        assert!(widgets
+            .idle_cleanup
+            .title
+            .text()
+            .as_str()
+            .contains("Clean up 3 unused items"));
+
+        let done_cfg = super::super::preview::config_for("done-cleanup");
+        super::apply_preview_config(&done_cfg, &widgets);
+        super::render(&done_cfg.state, &ConsoleBuffer::new(16), &widgets);
+        assert!(!widgets.idle_cleanup_slot.get_visible());
+        assert!(widgets.done_cleanup_slot.get_visible());
+        assert!(widgets.done_cleanup.root().get_visible());
+
+        // 2) Confirmation dialog lists exact items and sizes without auto-deleting.
+        let plan = idle_cfg.sample_cleanup.clone().expect("sample cleanup plan");
+        let confirmed = Arc::new(AtomicBool::new(false));
+        let confirmed_cb = confirmed.clone();
+        let dlg = super::super::dialogs::build_cleanup_confirm_dialog(&plan, move || {
+            confirmed_cb.store(true, Ordering::SeqCst);
+        });
+        assert!(!confirmed.load(Ordering::SeqCst));
+        assert_eq!(dlg.heading().as_deref(), Some("Clean up 3 unused items?"));
+        let extra = dlg.extra_child().expect("cleanup item list");
+        let mut labels = Vec::new();
+        collect_widget_labels(&extra, &mut labels);
+        let joined = labels.join(" | ");
+        assert!(joined.contains("GNOME Application Platform (45)"));
+        assert!(joined.contains("gdbm"));
+
+        // 3) Custom Hooks preferences escape Pango characters (&, <), toggle, edit, and delete cleanly.
+        let prefs = super::super::prefs::UiPrefs {
+            custom_hooks: vec![CustomHook {
+                name: "Rust & Tools <dev>".into(),
+                check_command: Some("cargo install-update --list && echo ok".into()),
+                apply_command: "cargo install-update -a".into(),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        let avail = default_source_availability();
+        let observed: Rc<RefCell<Vec<CustomHook>>> = Rc::new(RefCell::new(prefs.custom_hooks.clone()));
+        let observed_cb = observed.clone();
+        let pref_handle = super::super::preferences::build_preferences_dialog(
+            &prefs,
+            &avail,
+            |_, _| {},
+            move |hooks| {
+                *observed_cb.borrow_mut() = hooks.to_vec();
+            },
+        );
+        assert_eq!(pref_handle.switches.len(), 11);
+        assert_eq!(pref_handle.custom_hooks_group.title().as_str(), "Custom Hooks");
+        let mut add_btn_labels = Vec::new();
+        collect_widget_labels(pref_handle.add_hook_button.upcast_ref(), &mut add_btn_labels);
+        assert!(add_btn_labels.iter().any(|l| l == "Add Hook"));
+        assert_eq!(pref_handle.hook_switches.borrow().len(), 1);
+        assert!(pref_handle.hook_switches.borrow()[0].is_active());
+        pref_handle.hook_switches.borrow()[0].set_active(false);
+        assert!(!observed.borrow()[0].enabled);
+
+        // Editor modal validates & emits normalized hook.
+        let saved: Rc<RefCell<Option<CustomHook>>> = Rc::new(RefCell::new(None));
+        let saved_cb = saved.clone();
+        let editor = super::super::preferences::build_hook_editor_dialog(None, move |hook| {
+            *saved_cb.borrow_mut() = Some(hook);
+        });
+        assert!(!editor.save_btn.is_sensitive());
+        editor.dialog.present(Some(&widgets.window));
+        editor.name_entry.set_text("Chezmoi & Dotfiles");
+        editor.check_entry.set_text("");
+        editor.apply_entry.set_text("chezmoi update");
+        assert!(editor.save_btn.is_sensitive());
+        editor.save_btn.emit_clicked();
+        let added = saved.borrow().clone().expect("saved hook");
+        assert_eq!(added.name, "Chezmoi & Dotfiles");
+        assert_eq!(added.check_command, None);
+        assert_eq!(added.apply_command, "chezmoi update");
+
+        // Delete button removes row and notifies listener.
+        let del_btn = pref_handle.hook_delete_buttons.borrow()[0].clone();
+        del_btn.emit_clicked();
+        assert!(observed.borrow().is_empty());
+        assert!(pref_handle.hook_switches.borrow().is_empty());
+
+        let single_plan = CleanupPlan {
+            items: vec![CleanupItem {
+                source: CleanupSource::Homebrew,
+                id: "xz".into(),
+                name: "xz".into(),
+                size_bytes: None,
+                user_scope: true,
+            }],
+            warnings: Vec::new(),
+        };
+        assert_eq!(single_plan.summary_banner_title(), "Clean up 1 unused item");
+
+        gtk::prelude::GtkWindowExt::destroy(&widgets.window);
     }
 }

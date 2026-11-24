@@ -2,6 +2,7 @@
 //! Flatpak discovery and transaction apply call libflatpak natively, with flatpak CLI fallback.
 
 pub mod brew;
+pub mod cleanup;
 pub mod containers;
 pub mod dnf;
 pub mod dnf_dbus;
@@ -9,6 +10,7 @@ pub mod flatpak;
 pub mod fwupd;
 pub mod fwupd_dbus;
 pub mod gnome_extensions;
+pub mod hooks;
 pub mod logind;
 pub mod mise;
 pub mod python_tools;
@@ -135,6 +137,7 @@ pub fn parse_progress(source: UpdateSource, line: &str) -> ProgressHint {
         UpdateSource::UvTools => python_tools::parse_uv_progress_line(line),
         UpdateSource::Pipx => python_tools::parse_pipx_progress_line(line),
         UpdateSource::Distrobox | UpdateSource::Toolbx => containers::parse_progress_line(line),
+        UpdateSource::CustomHook => hooks::parse_progress_line(line),
         UpdateSource::Firmware => fwupd::parse_progress_line(line),
     }
 }
@@ -152,7 +155,8 @@ pub fn detect_reboot(source: UpdateSource, log: &str, packages: &[Package]) -> b
         | UpdateSource::UvTools
         | UpdateSource::Pipx
         | UpdateSource::Distrobox
-        | UpdateSource::Toolbx => false,
+        | UpdateSource::Toolbx
+        | UpdateSource::CustomHook => false,
         UpdateSource::Firmware => fwupd::detect_reboot_needed(log),
     }
 }
@@ -331,6 +335,11 @@ mod tests {
         ));
         assert!(!detect_reboot(
             UpdateSource::Toolbx,
+            "An update requires a reboot to complete.",
+            &kernel
+        ));
+        assert!(!detect_reboot(
+            UpdateSource::CustomHook,
             "An update requires a reboot to complete.",
             &kernel
         ));
