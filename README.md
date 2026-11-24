@@ -9,9 +9,13 @@ A fast, transparent GTK4 + Libadwaita desktop updater for Fedora that brings **s
 
 [![Reviewing pending Flatpak and developer toolchain updates in Fedora Updater](screenshots/ready.png)](screenshots/ready.png)
 
-| Live Telemetry | Update History | Safe Completion |
-|:---:|:---:|:---:|
-| [![Live download throughput and multi-stage progress](screenshots/running.png)](screenshots/running.png) | [![Searchable DNF and fwupd update history timeline](screenshots/history.png)](screenshots/history.png) | [![Completion summary with logind-aware restart action](screenshots/done.png)](screenshots/done.png) |
+| Multi-Source Apply (`rustup` & Flatpak) | Live Download Telemetry |
+|:---:|:---:|
+| [![Applying Flatpak and rustup toolchain updates with multi-stage progress](screenshots/applying.png)](screenshots/applying.png) | [![Live download throughput and multi-stage progress](screenshots/running.png)](screenshots/running.png) |
+
+| Update History | Safe Completion |
+|:---:|:---:|
+| [![Searchable DNF and fwupd update history timeline](screenshots/history.png)](screenshots/history.png) | [![Completion summary with logind-aware restart action](screenshots/done.png)](screenshots/done.png) |
 
 ---
 
